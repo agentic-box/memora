@@ -13,6 +13,7 @@ interface Env {
   OPENROUTER_API_KEY?: string;
   CHAT_MODEL?: string;
   EMBEDDING_MODEL?: string;
+  REWRITE_MODEL?: string;
 }
 
 function getDatabase(env: Env, dbName: string | null): D1Database {
@@ -402,6 +403,139 @@ async function searchMemories(
   };
 }
 
+// ── Query rewriting for improved RAG ──────────────────────────────────
+
+interface RewriteResult {
+  queries: string[];
+  filters: {
+    date_from?: string | null;
+    date_to?: string | null;
+    tags_any?: string[] | null;
+  };
+}
+
+async function rewriteQuery(
+  message: string,
+  apiKey: string,
+  model: string
+): Promise<RewriteResult> {
+  const fallback: RewriteResult = { queries: [message], filters: {} };
+
+  const today = new Date().toISOString().split("T")[0];
+
+  const systemPrompt =
+    "You are a search query optimizer for a personal knowledge base. " +
+    "Given a user's question, generate 1-3 search queries that would find relevant memories.\n\n" +
+    "Rules:\n" +
+    "- Generate diverse queries: rephrase, use synonyms, extract key entities\n" +
+    "- If the user message is already a simple search query, return just that query\n" +
+    "- If the message contains a time reference, extract it as date_from/date_to in ISO format (YYYY-MM-DD)\n" +
+    "- If the message references categories/types, extract relevant tags into tags_any\n" +
+    "- Keep queries concise (under 15 words each)\n" +
+    "- For conversational/meta messages, return the original as a single query\n\n" +
+    "Respond with JSON only (no markdown fences):\n" +
+    '{"queries": ["q1", "q2"], "filters": {"date_from": null, "date_to": null, "tags_any": null}}';
+
+  try {
+    const response = await fetch(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: "system", content: systemPrompt },
+            {
+              role: "user",
+              content: `User message: "${message}"\nToday's date: ${today}`,
+            },
+          ],
+          temperature: 0.3,
+          max_tokens: 300,
+          stream: false,
+        }),
+      }
+    );
+
+    if (!response.ok) return fallback;
+
+    const data = await response.json<{
+      choices: Array<{ message: { content: string } }>;
+    }>();
+    let text = data.choices?.[0]?.message?.content?.trim() || "";
+
+    // Strip markdown fences
+    if (text.startsWith("```")) {
+      text = text.split("\n").slice(1).join("\n").replace(/```\s*$/, "").trim();
+    }
+
+    const parsed = JSON.parse(text) as RewriteResult;
+
+    const queries = (parsed.queries || [])
+      .filter((q): q is string => typeof q === "string" && q.trim().length > 0)
+      .slice(0, 3);
+
+    if (queries.length === 0) return fallback;
+
+    return { queries, filters: parsed.filters || {} };
+  } catch {
+    return fallback;
+  }
+}
+
+async function multiQuerySearch(
+  db: D1Database,
+  queries: string[],
+  apiKey: string,
+  embeddingModel: string,
+  topK: number = 8
+): Promise<{
+  results: Array<{ memory: MemoryRow; score: number }>;
+  method: string;
+}> {
+  if (queries.length === 0) {
+    return { results: [], method: "none" };
+  }
+
+  // Run searches in parallel
+  const searchPromises = queries.map((q) =>
+    searchMemories(db, q, apiKey, embeddingModel, topK)
+  );
+  const searchResults = await Promise.all(searchPromises);
+
+  // Second-level RRF fusion across query results
+  const rrfK = 60;
+  const scores = new Map<number, number>();
+  const memoriesById = new Map<number, MemoryRow>();
+  let method = "multi_query";
+
+  for (const { results, method: m } of searchResults) {
+    if (method === "multi_query") method = `multi_query_${m}`;
+    for (let rank = 0; rank < results.length; rank++) {
+      const mem = results[rank].memory;
+      memoriesById.set(mem.id, mem);
+      const prev = scores.get(mem.id) || 0;
+      scores.set(mem.id, prev + 1 / (rrfK + rank));
+    }
+  }
+
+  // Sort by fused score, take top-K
+  const sorted = [...scores.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, topK);
+
+  const fusedResults = sorted.map(([id, score]) => ({
+    memory: memoriesById.get(id)!,
+    score: Math.round(score * 1000) / 1000,
+  }));
+
+  return { results: fusedResults, method };
+}
+
 // ── LLM call helper ───────────────────────────────────────────────────
 
 interface LLMCallOptions {
@@ -540,9 +674,19 @@ export const onRequestPost: PagesFunction<Env> = async ({
     env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
   const origin = url.origin;
 
-  // Search for relevant memories
+  // Rewrite query for improved retrieval, then multi-query search
+  const rewriteModel =
+    env.REWRITE_MODEL || env.CHAT_MODEL || "deepseek/deepseek-chat";
+  const rewriteResult = await rewriteQuery(message, apiKey, rewriteModel);
+
   const { results: searchResults, method: searchMethod } =
-    await searchMemories(db, message, apiKey, embeddingModel, 8);
+    await multiQuerySearch(
+      db,
+      rewriteResult.queries,
+      apiKey,
+      embeddingModel,
+      8
+    );
 
   // Build references and context
   const references: MemoryReference[] = [];

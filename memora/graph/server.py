@@ -17,7 +17,7 @@ import json
 from importlib.resources import files as _pkg_files
 
 from .data import get_graph_data, get_memory_for_api
-from ..storage import connect, add_memory, update_memory, delete_memory, get_memory, hybrid_search, _get_llm_client, LLM_MODEL
+from ..storage import connect, add_memory, update_memory, delete_memory, get_memory, hybrid_search, rewrite_query, multi_query_hybrid_search, _get_llm_client, LLM_MODEL
 
 
 CHAT_TOOLS = [
@@ -380,12 +380,28 @@ def start_graph_server(host: str, port: int) -> None:
                     status_code=503,
                 )
 
-            # Search relevant memories via hybrid search (sync, run in executor)
+            # Rewrite query for improved retrieval, then multi-query search
             loop = asyncio.get_event_loop()
+
+            rewrite_result = await loop.run_in_executor(
+                None, functools.partial(rewrite_query, message, max_queries=3)
+            )
+            queries = rewrite_result["queries"]
+            filters = rewrite_result.get("filters", {})
+
             conn = connect()
             try:
                 results = await loop.run_in_executor(
-                    None, functools.partial(hybrid_search, conn, message, top_k=8)
+                    None,
+                    functools.partial(
+                        multi_query_hybrid_search,
+                        conn,
+                        queries,
+                        top_k=8,
+                        date_from=filters.get("date_from"),
+                        date_to=filters.get("date_to"),
+                        tags_any=filters.get("tags_any"),
+                    ),
                 )
             finally:
                 conn.close()

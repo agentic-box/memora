@@ -36,3 +36,5 @@ DEFAULT_DB = "memora"
 DB_CONFIG = '{"memora": "MEMORA", "ob1": "OB1"}'
 # Chat LLM model (via OpenRouter). Set OPENROUTER_API_KEY as a secret.
 CHAT_MODEL = "deepseek/deepseek-chat"
+# Model for query rewriting (fast, cheap). Falls back to CHAT_MODEL if unset.
+REWRITE_MODEL = "deepseek/deepseek-chat"

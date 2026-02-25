@@ -43,6 +43,7 @@ EMBEDDING_MODEL = os.getenv("MEMORA_EMBEDDING_MODEL", "openai")  # openai, sente
 # LLM configuration for deduplication comparison
 LLM_ENABLED = os.getenv("MEMORA_LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 LLM_MODEL = os.getenv("MEMORA_LLM_MODEL", "gpt-4o-mini")
+REWRITE_MODEL = os.getenv("MEMORA_REWRITE_MODEL", "") or LLM_MODEL
 
 # Event notification configuration
 EVENT_TRIGGER_TAG = "shared-cache"
@@ -1172,6 +1173,157 @@ Respond with JSON only (no markdown):
             "reasoning": f"LLM error: {str(e)[:100]}",
             "suggested_action": "review",
         }
+
+
+# ---------------------------------------------------------------------------
+# Query rewriting for improved RAG retrieval
+# ---------------------------------------------------------------------------
+
+_REWRITE_SYSTEM_PROMPT = (
+    "You are a search query optimizer for a personal knowledge base. "
+    "Given a user's question, generate 1-3 search queries that would find relevant memories.\n\n"
+    "Rules:\n"
+    "- Generate diverse queries: rephrase, use synonyms, extract key entities\n"
+    "- If the user message is already a simple search query, return just that query\n"
+    "- If the message contains a time reference, extract it as date_from/date_to in ISO format (YYYY-MM-DD)\n"
+    "- If the message references categories/types, extract relevant tags into tags_any\n"
+    "- Keep queries concise (under 15 words each)\n"
+    "- For conversational/meta messages, return the original message as a single query\n\n"
+    "Respond with JSON only (no markdown fences):\n"
+    '{"queries": ["q1", "q2"], "filters": {"date_from": null, "date_to": null, "tags_any": null}}'
+)
+
+
+def rewrite_query(
+    message: str,
+    *,
+    max_queries: int = 3,
+) -> Dict[str, Any]:
+    """Use LLM to decompose/rewrite a user message into multiple search queries.
+
+    Returns dict with:
+        - queries: List[str] - 1 to max_queries search queries
+        - filters: Dict with optional date_from, date_to, tags_any
+
+    Falls back to {"queries": [message], "filters": {}} on any failure.
+    """
+    fallback: Dict[str, Any] = {"queries": [message], "filters": {}}
+
+    client = _get_llm_client()
+    if not client:
+        return fallback
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    user_prompt = f'User message: "{message}"\nToday\'s date: {today}'
+
+    try:
+        response = client.chat.completions.create(
+            model=REWRITE_MODEL,
+            messages=[
+                {"role": "system", "content": _REWRITE_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=300,
+        )
+
+        result_text = response.choices[0].message.content.strip()
+        # Strip markdown fences if present
+        if result_text.startswith("```"):
+            result_text = result_text.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+
+        result = json.loads(result_text)
+
+        # Validate and clamp queries
+        queries = result.get("queries", [])
+        if not isinstance(queries, list) or len(queries) == 0:
+            return fallback
+        queries = [q for q in queries if isinstance(q, str) and q.strip()][:max_queries]
+        if not queries:
+            return fallback
+
+        # Validate filters
+        filters = result.get("filters", {})
+        if not isinstance(filters, dict):
+            filters = {}
+        clean_filters: Dict[str, Any] = {}
+        for key in ("date_from", "date_to"):
+            val = filters.get(key)
+            if isinstance(val, str) and val.strip():
+                clean_filters[key] = val.strip()
+        tags_any = filters.get("tags_any")
+        if isinstance(tags_any, list) and tags_any:
+            clean_filters["tags_any"] = [t for t in tags_any if isinstance(t, str)]
+
+        return {"queries": queries, "filters": clean_filters}
+
+    except (json.JSONDecodeError, Exception):
+        return fallback
+
+
+def multi_query_hybrid_search(
+    conn: "sqlite3.Connection",
+    queries: List[str],
+    *,
+    semantic_weight: float = 0.6,
+    top_k: int = 10,
+    min_score: float = 0.0,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Run hybrid_search for each query and fuse results via second-level RRF.
+
+    Returns deduplicated, RRF-fused results sorted by combined score.
+    Same return format as hybrid_search().
+    """
+    if not queries:
+        return []
+
+    rrf_k = 60
+    fused_scores: Dict[int, float] = {}
+    memories_by_id: Dict[int, Dict[str, Any]] = {}
+
+    for query in queries:
+        per_query_results = hybrid_search(
+            conn,
+            query,
+            semantic_weight=semantic_weight,
+            top_k=top_k,
+            min_score=0.0,  # Don't filter early; filter after fusion
+            metadata_filters=metadata_filters,
+            date_from=date_from,
+            date_to=date_to,
+            tags_any=tags_any,
+            tags_all=tags_all,
+            tags_none=tags_none,
+        )
+        for rank, result in enumerate(per_query_results):
+            memory = result.get("memory", result)
+            memory_id = memory["id"]
+            memories_by_id[memory_id] = memory
+            rrf_contribution = 1.0 / (rrf_k + rank)
+            fused_scores[memory_id] = fused_scores.get(memory_id, 0) + rrf_contribution
+
+    # Sort by fused score, return top_k
+    sorted_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
+
+    results: List[Dict[str, Any]] = []
+    for memory_id in sorted_ids:
+        if len(results) >= top_k:
+            break
+        score = fused_scores[memory_id]
+        if score < min_score:
+            continue
+        results.append({
+            "score": round(score, 4),
+            "memory": memories_by_id[memory_id],
+        })
+
+    return results
 
 
 def find_duplicate_candidates(
