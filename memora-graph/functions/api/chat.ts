@@ -139,7 +139,9 @@ const CHAT_TOOLS = [
 async function executeToolCall(
   db: D1Database,
   toolName: string,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  apiKey: string,
+  embeddingModel: string
 ): Promise<string> {
   try {
     if (toolName === "create_memory") {
@@ -152,6 +154,9 @@ async function executeToolCall(
         .bind(content, JSON.stringify(tags))
         .run();
       const newId = result.meta?.last_row_id;
+      if (newId) {
+        await computeAndStoreEmbedding(db, newId, content, apiKey, embeddingModel);
+      }
       return JSON.stringify({
         success: true,
         action: "created",
@@ -188,6 +193,9 @@ async function executeToolCall(
         )
         .bind(newContent, newTags, mid)
         .run();
+      if (args.content !== undefined || args.tags !== undefined) {
+        await computeAndStoreEmbedding(db, mid, newContent, apiKey, embeddingModel);
+      }
       return JSON.stringify({
         success: true,
         action: "updated",
@@ -211,9 +219,15 @@ async function executeToolCall(
           error: `Memory #${mid} not found.`,
         });
       }
-      // Delete related data first, then the memory
+      // Delete embedding separately — table may not exist
+      try {
+        await db.prepare("DELETE FROM memories_embeddings WHERE memory_id = ?").bind(mid).run();
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg.includes("no such table")) throw e;
+      }
+      // Delete remaining related data and the memory
       await db.batch([
-        db.prepare("DELETE FROM memories_embeddings WHERE memory_id = ?").bind(mid),
         db.prepare("DELETE FROM memories_crossrefs WHERE memory_id = ?").bind(mid),
         db.prepare("DELETE FROM memories WHERE id = ?").bind(mid),
       ]);
@@ -258,6 +272,46 @@ async function getQueryEmbedding(
     return data.data?.[0]?.embedding || null;
   } catch {
     return null;
+  }
+}
+
+function denseToSparse(vector: number[]): string {
+  const pairs: Array<[string, number]> = [];
+  for (let i = 0; i < vector.length; i++) {
+    if (Math.abs(vector[i]) > 0.001) {
+      pairs.push([String(i), vector[i]]);
+    }
+  }
+  return JSON.stringify(pairs);
+}
+
+async function computeAndStoreEmbedding(
+  db: D1Database,
+  memoryId: number,
+  content: string,
+  apiKey: string,
+  model: string
+): Promise<void> {
+  try {
+    const embedding = await getQueryEmbedding(content, apiKey, model);
+    if (!embedding) return;
+    const sparse = denseToSparse(embedding);
+    await db
+      .prepare(
+        "CREATE TABLE IF NOT EXISTS memories_embeddings (" +
+          "memory_id INTEGER PRIMARY KEY, embedding TEXT, " +
+          "FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE)"
+      )
+      .run();
+    await db
+      .prepare(
+        "INSERT INTO memories_embeddings (memory_id, embedding) VALUES (?, ?) " +
+          "ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding"
+      )
+      .bind(memoryId, sparse)
+      .run();
+  } catch (e) {
+    console.error(`Failed to compute embedding for memory #${memoryId}:`, e);
   }
 }
 
@@ -384,13 +438,56 @@ async function searchMemories(
   results: Array<{ memory: MemoryRow; score: number }>;
   method: string;
 }> {
-  const queryEmbedding = await getQueryEmbedding(query, apiKey, embeddingModel);
-  if (queryEmbedding) {
-    const results = await semanticSearch(db, queryEmbedding, topK);
-    if (results.length > 0) return { results, method: "semantic" };
+  // Run both semantic and keyword search in parallel — one failing doesn't block the other
+  const semanticPromise = (async () => {
+    try {
+      const queryEmbedding = await getQueryEmbedding(query, apiKey, embeddingModel);
+      if (queryEmbedding) {
+        return await semanticSearch(db, queryEmbedding, topK);
+      }
+    } catch (e) {
+      console.error("Semantic search failed:", e);
+    }
+    return [] as Array<{ memory: MemoryRow; score: number }>;
+  })();
+
+  const keywordPromise = (async () => {
+    try {
+      return await keywordSearch(db, query, topK);
+    } catch (e) {
+      console.error("Keyword search failed:", e);
+      return [] as Array<{ memory: MemoryRow; score: number }>;
+    }
+  })();
+
+  const [semanticResults, kwResults] = await Promise.all([semanticPromise, keywordPromise]);
+
+  // Merge: semantic results preferred, keyword fills gaps
+  const seen = new Set<number>();
+  const merged: Array<{ memory: MemoryRow; score: number }> = [];
+
+  for (const r of semanticResults) {
+    seen.add(r.memory.id);
+    merged.push(r);
   }
-  const kwResults = await keywordSearch(db, query, topK);
-  if (kwResults.length > 0) return { results: kwResults, method: "keyword" };
+  for (const r of kwResults) {
+    if (!seen.has(r.memory.id)) {
+      seen.add(r.memory.id);
+      merged.push(r);
+    }
+  }
+
+  if (merged.length > 0) {
+    const method =
+      semanticResults.length > 0 && kwResults.length > 0
+        ? "semantic+keyword"
+        : semanticResults.length > 0
+          ? "semantic"
+          : "keyword";
+    return { results: merged.slice(0, topK), method };
+  }
+
+  // Final safety net: recent memories
   const result = await db
     .prepare(
       "SELECT id, content, tags FROM memories ORDER BY created_at DESC LIMIT ?"
@@ -809,7 +906,7 @@ export const onRequestPost: PagesFunction<Env> = async ({
           /* empty args */
         }
 
-        const resultStr = await executeToolCall(db, tc.name, args);
+        const resultStr = await executeToolCall(db, tc.name, args, apiKey, embeddingModel);
 
         // Emit action event to frontend
         const actionData = JSON.parse(resultStr);

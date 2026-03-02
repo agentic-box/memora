@@ -88,6 +88,21 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
         crossrefs = cursor.fetchall()
         print(f"Found {len(crossrefs)} crossrefs")
 
+        # Get embeddings
+        print("Fetching embeddings...")
+        try:
+            cursor = conn.execute(
+                "SELECT memory_id, embedding FROM memories_embeddings"
+            )
+            embeddings = cursor.fetchall()
+        except Exception as e:
+            err_msg = str(e).lower()
+            if "no such table" in err_msg:
+                embeddings = []
+            else:
+                raise
+        print(f"Found {len(embeddings)} embeddings")
+
         # Get actions
         print("Fetching actions...")
         try:
@@ -105,6 +120,8 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
             "-- Auto-generated sync from memora to D1",
             "-- WARNING: This will replace all data in D1",
             "",
+            "BEGIN;",
+            "",
             "-- Ensure actions table exists",
             "CREATE TABLE IF NOT EXISTS memories_actions ("
             "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -114,6 +131,13 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
             "    timestamp TEXT NOT NULL DEFAULT (datetime('now'))"
             ");",
             "",
+            "-- Ensure embeddings table exists",
+            "CREATE TABLE IF NOT EXISTS memories_embeddings ("
+            "    memory_id INTEGER PRIMARY KEY,"
+            "    embedding TEXT,"
+            "    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE"
+            ");",
+            "",
             "",
         ]
 
@@ -121,6 +145,7 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
             sql_lines.extend([
                 "-- Clear existing data (--replace mode)",
                 "DELETE FROM memories_actions;",
+                "DELETE FROM memories_embeddings;",
                 "DELETE FROM memories_crossrefs;",
                 "DELETE FROM memories;",
                 "",
@@ -189,6 +214,19 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
                     f"{escape_sql_string(timestamp)});"
                 )
 
+        if embeddings:
+            sql_lines.append("")
+            sql_lines.append(f"-- {insert_verb} embeddings")
+            for row in embeddings:
+                memory_id, embedding = row
+                sql_lines.append(
+                    f"INSERT OR REPLACE INTO memories_embeddings (memory_id, embedding) "
+                    f"VALUES ({memory_id}, {escape_sql_string(embedding)});"
+                )
+
+        sql_lines.append("")
+        sql_lines.append("COMMIT;")
+
         # Write SQL to temp file
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".sql", delete=False
@@ -225,6 +263,7 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
         print("\nSync complete!")
         print(f"  Memories: {len(memories)}")
         print(f"  Crossrefs: {len(crossrefs)}")
+        print(f"  Embeddings: {len(embeddings)}")
         print(f"  Actions: {len(actions)}")
 
         # Clean up temp file
