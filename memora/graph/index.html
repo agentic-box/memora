@@ -34,6 +34,37 @@ div.vis-tooltip {
 #panel .tag { display: inline-block; background: #30363d; padding: 3px 8px; border-radius: 12px; font-size: 12px; margin: 2px; cursor: pointer; }
 #panel .tag:hover { background: #484f58; }
 #panel .meta { color: #8b949e; font-size: 12px; margin-bottom: 15px; }
+#panel .detail-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+#panel .detail-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+#panel .detail-btn:hover { background: #30363d; }
+#panel .detail-btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+#panel .detail-btn.primary:hover { background: #388bfd; border-color: #388bfd; }
+#panel .detail-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+#panel .detail-status { display: none; margin-bottom: 12px; padding: 8px 10px; border-radius: 6px; font-size: 12px; }
+#panel .detail-status.show { display: block; }
+#panel .detail-status.error { background: rgba(248,81,73,0.12); color: #ffb3ad; border: 1px solid rgba(248,81,73,0.25); }
+#panel .detail-status.success { background: rgba(46,160,67,0.12); color: #7ee787; border: 1px solid rgba(46,160,67,0.25); }
+#panel .detail-section { margin-bottom: 16px; }
+#panel .detail-section-title { color: #8b949e; font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; margin-bottom: 8px; }
+#panel .tags.readonly { margin-bottom: 0; }
+#panel .tag-input-row, #panel .metadata-add-row { display: flex; gap: 8px; margin-top: 8px; }
+#panel .tag-input, #panel .metadata-key-input, #panel .metadata-value-input, #panel .metadata-type-select { width: 100%; background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; padding: 6px 8px; font-size: 12px; }
+#panel .tag-input:focus, #panel .metadata-key-input:focus, #panel .metadata-value-input:focus, #panel .metadata-type-select:focus { outline: none; border-color: #58a6ff; }
+#panel .tag-editor-list { display: flex; flex-direction: column; gap: 8px; }
+#panel .tag-editor-row, #panel .metadata-row { display: grid; gap: 8px; align-items: center; }
+#panel .tag-editor-row { grid-template-columns: 1fr auto; }
+#panel .metadata-row { grid-template-columns: 1.2fr 120px 1fr auto; margin-bottom: 8px; }
+#panel .metadata-empty, #panel .complex-metadata-empty { color: #6e7681; font-size: 12px; font-style: italic; }
+#panel .metadata-readonly-table, #panel .complex-metadata-table { width: 100%; border-collapse: collapse; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+#panel .metadata-readonly-table th, #panel .metadata-readonly-table td, #panel .complex-metadata-table th, #panel .complex-metadata-table td { border-bottom: 1px solid #30363d; padding: 8px 10px; text-align: left; font-size: 12px; vertical-align: top; }
+#panel .metadata-readonly-table tr:last-child td, #panel .complex-metadata-table tr:last-child td { border-bottom: none; }
+#panel .metadata-readonly-table th, #panel .complex-metadata-table th { width: 30%; color: #8b949e; font-weight: 600; background: #161b22; }
+#panel .complex-metadata-table pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.5; color: #c9d1d9; }
+#panel .metadata-type-select, #panel .metadata-boolean-select { min-width: 0; }
+#panel .metadata-value-static { color: #8b949e; font-size: 12px; padding: 6px 0; }
+#panel .row-remove-btn { background: transparent; border: 1px solid #30363d; color: #8b949e; border-radius: 6px; width: 30px; height: 30px; cursor: pointer; }
+#panel .row-remove-btn:hover { color: #fff; border-color: #8b949e; }
+#panel .readonly-tag-list { display: flex; flex-wrap: wrap; gap: 4px; }
 #panel .content { font-size: 13px; line-height: 1.6; background: #0d1117; padding: 15px; border-radius: 6px; max-height: calc(100vh - 200px); overflow-y: auto; }
 #panel .content h1, #panel .content h2, #panel .content h3 { color: #58a6ff; margin: 16px 0 8px 0; }
 #panel .content h1 { font-size: 1.4em; border-bottom: 1px solid #30363d; padding-bottom: 8px; }
@@ -446,7 +477,24 @@ div.vis-tooltip {
         <div id="tab-detail" class="active">
             <h2 id="panel-title">Memory #</h2>
             <div class="meta" id="panel-meta"></div>
-            <div class="tags" id="panel-tags"></div>
+            <div class="detail-actions" id="panel-actions">
+                <button class="detail-btn" id="panel-edit-btn" onclick="enterPanelEditMode()">Edit</button>
+                <button class="detail-btn primary" id="panel-save-btn" onclick="savePanelEdits()" style="display:none;">Save</button>
+                <button class="detail-btn" id="panel-cancel-btn" onclick="cancelPanelEdits()" style="display:none;">Cancel</button>
+            </div>
+            <div class="detail-status" id="panel-status"></div>
+            <div class="detail-section">
+                <div class="detail-section-title">Tags</div>
+                <div class="tags readonly" id="panel-tags"></div>
+            </div>
+            <div class="detail-section">
+                <div class="detail-section-title">Metadata</div>
+                <div id="panel-metadata"></div>
+            </div>
+            <div class="detail-section">
+                <div class="detail-section-title">Complex Metadata</div>
+                <div id="panel-complex-metadata"></div>
+            </div>
             <div class="content" id="panel-content"></div>
         </div>
         <div id="tab-timeline">
@@ -516,6 +564,12 @@ div.vis-tooltip {
         var nodes, edges, network;
         var currentFilter = null;
         var memoryCache = {};
+        var panelEditMode = false;
+        var panelSaving = false;
+        var panelDraftMemory = null;
+        var panelDraftTags = [];
+        var panelDraftMetadataRows = [];
+        var panelDraftComplexMetadata = {};
         var currentDb = 'memora';
 
         // Initialize database from URL parameter
@@ -691,6 +745,354 @@ div.vis-tooltip {
             if (category) html += '<span class="todo-badge category">' + category + '</span>';
             html += '</div>';
             return html;
+        }
+
+        function cloneJson(value) {
+            return JSON.parse(JSON.stringify(value || {}));
+        }
+
+        function isScalarMetadataValue(value) {
+            return value === null || ['string', 'number', 'boolean'].indexOf(typeof value) !== -1;
+        }
+
+        function getMetadataType(value) {
+            if (value === null) return 'null';
+            return typeof value;
+        }
+
+        function formatMetadataValue(value) {
+            if (value === null) return '<span class="metadata-value-static">null</span>';
+            if (typeof value === 'boolean') return value ? 'true' : 'false';
+            return escapeHtmlText(String(value));
+        }
+
+        function buildPanelDraft(mem) {
+            var metadata = cloneJson(mem.metadata || {});
+            var rows = [];
+            var complex = {};
+            Object.keys(metadata).sort().forEach(function(key) {
+                if (key === 'images') {
+                    complex[key] = metadata[key];
+                    return;
+                }
+                if (isScalarMetadataValue(metadata[key])) {
+                    rows.push({ key: key, type: getMetadataType(metadata[key]), value: metadata[key] });
+                } else {
+                    complex[key] = metadata[key];
+                }
+            });
+            panelDraftMemory = cloneJson(mem);
+            panelDraftTags = (mem.tags || []).slice();
+            panelDraftMetadataRows = rows;
+            panelDraftComplexMetadata = complex;
+        }
+
+        function renderPanelStatus(message, kind) {
+            var el = document.getElementById('panel-status');
+            if (!message) {
+                el.className = 'detail-status';
+                el.textContent = '';
+                return;
+            }
+            el.className = 'detail-status show ' + (kind || '');
+            el.textContent = message;
+        }
+
+        function renderReadonlyTags(tags) {
+            if (!tags || tags.length === 0) {
+                return '<div class="metadata-empty">No tags</div>';
+            }
+            return '<div class="readonly-tag-list">' + tags.map(function(t) {
+                return '<span class="tag" onclick="filterByTag(\'' + t + '\'); event.stopPropagation();">' + t + '</span>';
+            }).join('') + '</div>';
+        }
+
+        function renderTagEditor() {
+            var rows = panelDraftTags.map(function(tag, index) {
+                return '<div class="tag-editor-row">' +
+                    '<input class="tag-input" value="' + escapeHtmlText(tag) + '" oninput="updateDraftTag(' + index + ', this.value)" placeholder="tag">' +
+                    '<button class="row-remove-btn" onclick="removeDraftTag(' + index + ')" title="Remove tag">&times;</button>' +
+                    '</div>';
+            }).join('');
+            return '<div class="tag-editor-list">' +
+                (rows || '<div class="metadata-empty">No tags yet</div>') +
+                '<div class="tag-input-row"><input class="tag-input" id="new-tag-input" placeholder="New tag"><button class="detail-btn" onclick="addDraftTag()">Add Tag</button></div>' +
+                '</div>';
+        }
+
+        function renderReadonlyMetadata(metadata) {
+            var rows = [];
+            Object.keys(metadata || {}).sort().forEach(function(key) {
+                if (key === 'images' || !isScalarMetadataValue(metadata[key])) return;
+                rows.push('<tr><th>' + escapeHtmlText(key) + '</th><td>' + formatMetadataValue(metadata[key]) + '</td></tr>');
+            });
+            if (rows.length === 0) return '<div class="metadata-empty">No editable metadata</div>';
+            return '<table class="metadata-readonly-table"><tbody>' + rows.join('') + '</tbody></table>';
+        }
+
+        function renderMetadataEditor() {
+            if (panelDraftMetadataRows.length === 0) {
+                return '<div class="metadata-empty">No editable metadata</div>' +
+                    '<div class="metadata-add-row"><button class="detail-btn" onclick="addDraftMetadataRow()">Add Metadata</button></div>';
+            }
+            var rows = panelDraftMetadataRows.map(function(row, index) {
+                var valueInput = '';
+                if (row.type === 'boolean') {
+                    valueInput = '<select class="metadata-type-select metadata-boolean-select" onchange="updateDraftMetadataValue(' + index + ', this.value)">' +
+                        '<option value="true"' + (row.value === true ? ' selected' : '') + '>true</option>' +
+                        '<option value="false"' + (row.value === false ? ' selected' : '') + '>false</option>' +
+                        '</select>';
+                } else if (row.type === 'null') {
+                    valueInput = '<div class="metadata-value-static">null</div>';
+                } else {
+                    valueInput = '<input class="metadata-value-input" value="' + escapeHtmlText(row.value === null ? '' : String(row.value)) + '" oninput="updateDraftMetadataValue(' + index + ', this.value)" placeholder="Value">';
+                }
+                return '<div class="metadata-row">' +
+                    '<input class="metadata-key-input" value="' + escapeHtmlText(row.key) + '" oninput="updateDraftMetadataKey(' + index + ', this.value)" placeholder="Key">' +
+                    '<select class="metadata-type-select" onchange="updateDraftMetadataType(' + index + ', this.value)">' +
+                        '<option value="string"' + (row.type === 'string' ? ' selected' : '') + '>string</option>' +
+                        '<option value="number"' + (row.type === 'number' ? ' selected' : '') + '>number</option>' +
+                        '<option value="boolean"' + (row.type === 'boolean' ? ' selected' : '') + '>boolean</option>' +
+                        '<option value="null"' + (row.type === 'null' ? ' selected' : '') + '>null</option>' +
+                    '</select>' +
+                    valueInput +
+                    '<button class="row-remove-btn" onclick="removeDraftMetadataRow(' + index + ')" title="Remove metadata">&times;</button>' +
+                    '</div>';
+            }).join('');
+            return rows + '<div class="metadata-add-row"><button class="detail-btn" onclick="addDraftMetadataRow()">Add Metadata</button></div>';
+        }
+
+        function renderComplexMetadata(metadata) {
+            var rows = [];
+            Object.keys(metadata || {}).sort().forEach(function(key) {
+                if (key === 'images') return;
+                rows.push('<tr><th>' + escapeHtmlText(key) + '</th><td><pre>' + escapeHtmlText(JSON.stringify(metadata[key], null, 2)) + '</pre></td></tr>');
+            });
+            if (rows.length === 0) return '<div class="complex-metadata-empty">No complex metadata</div>';
+            return '<table class="complex-metadata-table"><tbody>' + rows.join('') + '</tbody></table>';
+        }
+
+        function getPanelDisplayMemory(mem) {
+            if (!panelEditMode) return mem;
+            var draft = cloneJson(mem);
+            draft.tags = panelDraftTags.slice();
+            var metadata = cloneJson(panelDraftComplexMetadata);
+            panelDraftMetadataRows.forEach(function(row) {
+                if (row.key) metadata[row.key] = row.value;
+            });
+            draft.metadata = metadata;
+            return draft;
+        }
+
+        function setPanelEditMode(isEditing) {
+            panelEditMode = isEditing;
+            document.getElementById('panel-edit-btn').style.display = isEditing ? 'none' : 'inline-block';
+            document.getElementById('panel-save-btn').style.display = isEditing ? 'inline-block' : 'none';
+            document.getElementById('panel-cancel-btn').style.display = isEditing ? 'inline-block' : 'none';
+        }
+
+        function updatePanelControls() {
+            var saveBtn = document.getElementById('panel-save-btn');
+            var editBtn = document.getElementById('panel-edit-btn');
+            saveBtn.disabled = panelSaving;
+            editBtn.disabled = panelSaving;
+            document.getElementById('panel-cancel-btn').disabled = panelSaving;
+            saveBtn.textContent = panelSaving ? 'Saving...' : 'Save';
+        }
+
+        function updateDraftTag(index, value) {
+            panelDraftTags[index] = value;
+        }
+
+        function removeDraftTag(index) {
+            panelDraftTags.splice(index, 1);
+            rerenderPanelDraft();
+        }
+
+        function addDraftTag() {
+            var input = document.getElementById('new-tag-input');
+            if (!input) return;
+            var value = input.value.trim();
+            if (!value) return;
+            panelDraftTags.push(value);
+            input.value = '';
+            rerenderPanelDraft();
+        }
+
+        function addDraftMetadataRow() {
+            panelDraftMetadataRows.push({ key: '', type: 'string', value: '' });
+            rerenderPanelDraft();
+        }
+
+        function removeDraftMetadataRow(index) {
+            panelDraftMetadataRows.splice(index, 1);
+            rerenderPanelDraft();
+        }
+
+        function updateDraftMetadataKey(index, value) {
+            panelDraftMetadataRows[index].key = value;
+        }
+
+        function updateDraftMetadataType(index, value) {
+            panelDraftMetadataRows[index].type = value;
+            if (value === 'boolean') panelDraftMetadataRows[index].value = true;
+            else if (value === 'null') panelDraftMetadataRows[index].value = null;
+            else if (value === 'number') panelDraftMetadataRows[index].value = 0;
+            else panelDraftMetadataRows[index].value = '';
+            rerenderPanelDraft();
+        }
+
+        function updateDraftMetadataValue(index, value) {
+            if (panelDraftMetadataRows[index].type === 'boolean') {
+                panelDraftMetadataRows[index].value = value === 'true';
+            } else {
+                panelDraftMetadataRows[index].value = value;
+            }
+        }
+
+        function rerenderPanelDraft() {
+            if (!panelDraftMemory) return;
+            showPanel(getPanelDisplayMemory(panelDraftMemory));
+        }
+
+        function syncPanelDraftFromDom() {
+            if (!panelEditMode) return;
+
+            panelDraftTags = Array.from(document.querySelectorAll('#panel-tags .tag-editor-row .tag-input'))
+                .map(function(input) { return input.value; });
+
+            panelDraftMetadataRows = Array.from(document.querySelectorAll('#panel-metadata .metadata-row'))
+                .map(function(row) {
+                    var keyInput = row.querySelector('.metadata-key-input');
+                    var selects = row.querySelectorAll('.metadata-type-select');
+                    var typeSelect = selects[0];
+                    var type = typeSelect ? typeSelect.value : 'string';
+                    var value;
+
+                    if (type === 'boolean') {
+                        value = selects[1] ? selects[1].value === 'true' : false;
+                    } else if (type === 'null') {
+                        value = null;
+                    } else {
+                        var valueInput = row.querySelector('.metadata-value-input');
+                        value = valueInput ? valueInput.value : '';
+                    }
+
+                    return {
+                        key: keyInput ? keyInput.value : '',
+                        type: type,
+                        value: value
+                    };
+                });
+        }
+
+        function validatePanelDraft() {
+            var seenKeys = {};
+            for (var i = 0; i < panelDraftTags.length; i++) {
+                panelDraftTags[i] = (panelDraftTags[i] || '').trim();
+                if (!panelDraftTags[i]) return 'Tags cannot be empty.';
+            }
+            for (var j = 0; j < panelDraftMetadataRows.length; j++) {
+                var row = panelDraftMetadataRows[j];
+                row.key = (row.key || '').trim();
+                if (!row.key) return 'Metadata keys cannot be empty.';
+                if (row.key === 'images') return 'The images key is reserved.';
+                if (seenKeys[row.key]) return 'Metadata keys must be unique.';
+                seenKeys[row.key] = true;
+                if (row.type === 'number') {
+                    if (row.value === '' || row.value === null || Number.isNaN(Number(row.value))) {
+                        return 'Number metadata values must be valid numbers.';
+                    }
+                }
+            }
+            return null;
+        }
+
+        function buildPanelSavePayload() {
+            var metadata = cloneJson(panelDraftComplexMetadata);
+            panelDraftMetadataRows.forEach(function(row) {
+                if (row.type === 'number') metadata[row.key] = Number(row.value);
+                else if (row.type === 'boolean') metadata[row.key] = !!row.value;
+                else if (row.type === 'null') metadata[row.key] = null;
+                else metadata[row.key] = row.value;
+            });
+            return {
+                tags: panelDraftTags.slice(),
+                metadata: metadata
+            };
+        }
+
+        async function patchMemory(memId, payload) {
+            var response = await fetch('/api/memories/' + memId + getDbParam(), {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            var data = await response.json();
+            if (!response.ok) {
+                throw new Error(data.error || 'Save failed');
+            }
+            return data;
+        }
+
+        async function enterPanelEditMode() {
+            if (!currentPanelMemoryId) return;
+            if (!memoryCache[currentPanelMemoryId]) {
+                var response = await fetch('/api/memories/' + currentPanelMemoryId + getDbParam());
+                var mem = await response.json();
+                if (mem && !mem.error) {
+                    memoryCache[currentPanelMemoryId] = mem;
+                } else {
+                    renderPanelStatus('Could not load memory for editing.', 'error');
+                    return;
+                }
+            }
+            buildPanelDraft(memoryCache[currentPanelMemoryId]);
+            setPanelEditMode(true);
+            renderPanelStatus('', '');
+            updatePanelControls();
+            showPanel(getPanelDisplayMemory(panelDraftMemory));
+        }
+
+        function cancelPanelEdits() {
+            if (!panelDraftMemory) return;
+            panelSaving = false;
+            renderPanelStatus('', '');
+            setPanelEditMode(false);
+            updatePanelControls();
+            showPanel(memoryCache[currentPanelMemoryId] || panelDraftMemory);
+        }
+
+        async function savePanelEdits() {
+            if (!currentPanelMemoryId || !panelDraftMemory) return;
+            syncPanelDraftFromDom();
+            var validationError = validatePanelDraft();
+            if (validationError) {
+                renderPanelStatus(validationError, 'error');
+                return;
+            }
+            panelSaving = true;
+            renderPanelStatus('', '');
+            updatePanelControls();
+            try {
+                var updated = await patchMemory(currentPanelMemoryId, buildPanelSavePayload());
+                memoryCache[currentPanelMemoryId] = updated;
+                panelDraftMemory = cloneJson(updated);
+                setPanelEditMode(false);
+                panelSaving = false;
+                updatePanelControls();
+                renderPanelStatus('Memory updated.', 'success');
+                showPanel(updated);
+                cachedTimelineMemories = null;
+                reloadGraphData();
+            } catch (e) {
+                panelSaving = false;
+                updatePanelControls();
+                renderPanelStatus(e.message || 'Save failed', 'error');
+                if (memoryCache[currentPanelMemoryId]) {
+                    buildPanelDraft(memoryCache[currentPanelMemoryId]);
+                }
+            }
         }
 
         // Filtering functions
@@ -928,7 +1330,11 @@ div.vis-tooltip {
             } else if (tabName === 'history') {
                 populateHistoryList();
             } else if (tabName === 'detail' && currentPanelMemoryId) {
-                loadMemoryToPanel(currentPanelMemoryId);
+                if (panelEditMode && panelDraftMemory && panelDraftMemory.id === currentPanelMemoryId) {
+                    showPanel(getPanelDisplayMemory(panelDraftMemory));
+                } else {
+                    loadMemoryToPanel(currentPanelMemoryId);
+                }
             }
         }
 
@@ -1046,21 +1452,26 @@ div.vis-tooltip {
             var newState = !isActive;
             el.classList.toggle('active', newState);
             el.textContent = newState ? '\u2605' : '\u2606';
-            if (cachedTimelineMemories) {
-                cachedTimelineMemories.forEach(function(mem) {
-                    if (mem.id === memId) {
-                        if (!mem.metadata) mem.metadata = {};
-                        if (newState) { mem.metadata.favorite = true; } else { delete mem.metadata.favorite; }
+            var baseMem = memoryCache[memId] || (cachedTimelineMemories || []).find(function(mem) { return mem.id === memId; });
+            var metadata = cloneJson(baseMem && baseMem.metadata ? baseMem.metadata : {});
+            if (newState) metadata.favorite = true;
+            else delete metadata.favorite;
+            patchMemory(memId, { metadata: metadata })
+                .then(function(updated) {
+                    memoryCache[memId] = updated;
+                    if (cachedTimelineMemories) {
+                        cachedTimelineMemories.forEach(function(mem, index) {
+                            if (mem.id === memId) cachedTimelineMemories[index] = updated;
+                        });
                     }
+                    if (currentPanelMemoryId === memId && !panelEditMode) {
+                        showPanel(updated);
+                    }
+                })
+                .catch(function() {
+                    el.classList.toggle('active', isActive);
+                    el.textContent = isActive ? '\u2605' : '\u2606';
                 });
-            }
-            var dbParam = new URLSearchParams(window.location.search).get('db');
-            var url = '/api/memories/' + memId + (dbParam ? '?db=' + dbParam : '');
-            fetch(url, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ favorite: newState })
-            });
         }
 
         function populateHistoryList() {
@@ -1243,12 +1654,23 @@ div.vis-tooltip {
             document.getElementById('resize-handle').classList.remove('active');
             document.body.classList.remove('panel-open');
             currentPanelMemoryId = null;
+            panelEditMode = false;
+            panelSaving = false;
+            panelDraftMemory = null;
+            panelDraftTags = [];
+            panelDraftMetadataRows = [];
+            panelDraftComplexMetadata = {};
+            renderPanelStatus('', '');
             document.querySelectorAll('.subsection-item.selected, .section-item.selected').forEach(el => el.classList.remove('selected'));
             updateTimelinePosition();
         }
 
         function showPanel(mem) {
             currentPanelMemoryId = mem.id;
+            memoryCache[mem.id] = mem;
+            if ((!panelEditMode || !panelDraftMemory || panelDraftMemory.id !== mem.id) && memoryCache[mem.id]) {
+                panelDraftMemory = cloneJson(memoryCache[mem.id]);
+            }
 
             if (currentTab !== 'detail') {
                 document.querySelectorAll('#panel-tabs .tab').forEach(function(t) { t.classList.remove('active'); });
@@ -1260,6 +1682,8 @@ div.vis-tooltip {
             }
 
             document.getElementById('panel-title').textContent = 'Memory #' + mem.id;
+            setPanelEditMode(panelEditMode);
+            updatePanelControls();
 
             var badgesHtml = renderIssueBadges(mem.metadata) + renderTodoBadges(mem.metadata);
             var metaHtml = badgesHtml + 'Created: ' + mem.created;
@@ -1268,9 +1692,15 @@ div.vis-tooltip {
             }
             document.getElementById('panel-meta').innerHTML = metaHtml;
 
-            document.getElementById('panel-tags').innerHTML = mem.tags.map(function(t) {
-                return '<span class="tag" onclick="filterByTag(\'' + t + '\'); event.stopPropagation();">' + t + '</span>';
-            }).join('');
+            document.getElementById('panel-tags').innerHTML = panelEditMode ? renderTagEditor() : renderReadonlyTags(mem.tags);
+            document.getElementById('panel-metadata').innerHTML = panelEditMode ? renderMetadataEditor() : renderReadonlyMetadata(mem.metadata || {});
+            document.getElementById('panel-complex-metadata').innerHTML = renderComplexMetadata(panelEditMode ? panelDraftComplexMetadata : (function() {
+                var complex = {};
+                Object.keys(mem.metadata || {}).forEach(function(key) {
+                    if (key === 'images' || !isScalarMetadataValue(mem.metadata[key])) complex[key] = mem.metadata[key];
+                });
+                return complex;
+            })());
 
             document.getElementById('panel-content').innerHTML = renderMarkdown(mem.content);
             renderMermaidBlocks();

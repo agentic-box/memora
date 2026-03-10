@@ -24,6 +24,15 @@ interface Memory {
   updated_at: string | null;
 }
 
+interface MemoryResponse {
+  id: number;
+  content: string;
+  tags: string[];
+  created: string;
+  updated: string | null;
+  metadata: Record<string, unknown>;
+}
+
 function parseJson<T>(str: string | null, defaultValue: T): T {
   if (!str) return defaultValue;
   try {
@@ -51,6 +60,18 @@ function expandR2Urls(metadata: Record<string, unknown> | null): Record<string, 
   return metadata;
 }
 
+function toMemoryResponse(result: Memory): MemoryResponse {
+  const meta = parseJson<Record<string, unknown>>(result.metadata, {});
+  return {
+    id: result.id,
+    content: result.content,
+    tags: parseJson<string[]>(result.tags, []),
+    created: result.created_at || "",
+    updated: result.updated_at,
+    metadata: expandR2Urls(meta),
+  };
+}
+
 export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
@@ -61,30 +82,52 @@ export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request 
     return Response.json({ error: "invalid_id" }, { status: 400 });
   }
 
-  const body = await request.json<{ favorite?: boolean }>();
-  const favorite = Boolean(body.favorite);
+  const body = await request.json<{
+    favorite?: boolean;
+    tags?: string[];
+    metadata?: Record<string, unknown>;
+  }>();
 
-  // Read current metadata
   const row = await db.prepare(
-    "SELECT metadata FROM memories WHERE id = ?"
-  ).bind(id).first<{ metadata: string }>();
+    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories WHERE id = ?"
+  ).bind(id).first<Memory>();
 
   if (!row) {
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
-  const meta = parseJson<Record<string, unknown>>(row.metadata, {});
-  if (favorite) {
-    meta.favorite = true;
-  } else {
-    delete meta.favorite;
+  if (body.tags !== undefined && !Array.isArray(body.tags)) {
+    return Response.json({ error: "invalid_tags" }, { status: 400 });
+  }
+  if (body.metadata !== undefined && (!body.metadata || Array.isArray(body.metadata) || typeof body.metadata !== "object")) {
+    return Response.json({ error: "invalid_metadata" }, { status: 400 });
   }
 
-  await db.prepare(
-    "UPDATE memories SET metadata = ?, updated_at = datetime('now') WHERE id = ?"
-  ).bind(JSON.stringify(meta), id).run();
+  const meta = body.metadata !== undefined
+    ? { ...body.metadata }
+    : parseJson<Record<string, unknown>>(row.metadata, {});
+  if (body.favorite !== undefined) {
+    if (body.favorite) {
+      meta.favorite = true;
+    } else {
+      delete meta.favorite;
+    }
+  }
+  const tags = body.tags !== undefined ? body.tags : parseJson<string[]>(row.tags, []);
 
-  return Response.json({ ok: true });
+  await db.prepare(
+    "UPDATE memories SET metadata = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"
+  ).bind(JSON.stringify(meta), JSON.stringify(tags), id).run();
+
+  const updated = await db.prepare(
+    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories WHERE id = ?"
+  ).bind(id).first<Memory>();
+
+  if (!updated) {
+    return Response.json({ error: "not_found" }, { status: 404 });
+  }
+
+  return Response.json(toMemoryResponse(updated));
 };
 
 export const onRequestGet: PagesFunction<Env> = async ({ env, params, request }) => {
@@ -106,14 +149,5 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
-  const meta = parseJson<Record<string, unknown>>(result.metadata, {});
-
-  return Response.json({
-    id: result.id,
-    content: result.content,
-    tags: parseJson<string[]>(result.tags, []),
-    created: result.created_at || "",
-    updated: result.updated_at,
-    metadata: expandR2Urls(meta),
-  });
+  return Response.json(toMemoryResponse(result));
 };

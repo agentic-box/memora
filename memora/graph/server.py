@@ -7,6 +7,7 @@ import os
 import socket
 import sys
 import threading
+from copy import deepcopy
 from importlib.metadata import version as get_version
 
 from starlette.requests import Request
@@ -108,6 +109,19 @@ def _get_memora_version() -> str:
     except Exception as exc:
         logger.debug("Unable to read memora package version: %s", exc)
         return ""
+
+
+def _serialize_memory_api_result(memory: dict) -> dict:
+    """Normalize a memory record to the graph API shape."""
+    meta = memory.get("metadata") or {}
+    return {
+        "id": memory["id"],
+        "content": memory["content"],
+        "tags": memory.get("tags", []),
+        "created": memory.get("created_at", ""),
+        "updated": memory.get("updated_at"),
+        "metadata": meta,
+    }
 
 
 def _normalize_host_for_connect(host: str) -> str:
@@ -300,32 +314,51 @@ def start_graph_server(host: str, port: int) -> None:
         return EventSourceResponse(event_generator())
 
     async def api_memory_patch(request: Request):
-        """API endpoint: Toggle favorite on a memory."""
-        import json
+        """API endpoint: Update tags and/or metadata for a memory."""
         try:
             memory_id = int(request.path_params.get("id"))
             body = await request.json()
-            favorite = bool(body.get("favorite", False))
+            tags = body.get("tags")
+            metadata = body.get("metadata")
+            favorite = body.get("favorite")
 
             conn = connect()
-            row = conn.execute(
-                "SELECT metadata FROM memories WHERE id = ?", (memory_id,)
-            ).fetchone()
-            if not row:
+            existing = get_memory(conn, memory_id)
+            if not existing:
                 conn.close()
                 return JSONResponse({"error": "not_found"}, status_code=404)
 
-            metadata = json.loads(row["metadata"]) if row["metadata"] else {}
-            if favorite:
-                metadata["favorite"] = True
-            else:
-                metadata.pop("favorite", None)
+            merged_metadata = deepcopy(existing.get("metadata") or {})
+            if metadata is not None:
+                if not isinstance(metadata, dict):
+                    conn.close()
+                    return JSONResponse({"error": "invalid_metadata"}, status_code=400)
+                merged_metadata = metadata
+            if favorite is not None:
+                if bool(favorite):
+                    merged_metadata["favorite"] = True
+                else:
+                    merged_metadata.pop("favorite", None)
 
-            update_memory(conn, memory_id, metadata=metadata)
+            if tags is not None and not isinstance(tags, list):
+                conn.close()
+                return JSONResponse({"error": "invalid_tags"}, status_code=400)
+
+            result = update_memory(
+                conn,
+                memory_id,
+                metadata=merged_metadata if metadata is not None or favorite is not None else None,
+                tags=tags,
+            )
             conn.close()
-            return JSONResponse({"ok": True})
+            if result is None:
+                return JSONResponse({"error": "not_found"}, status_code=404)
+            return JSONResponse(_serialize_memory_api_result(result))
+        except ValueError as e:
+            logger.exception("Graph memory patch validation failed: %s", e)
+            return JSONResponse({"error": str(e)}, status_code=400)
         except Exception as e:
-            logger.exception("Graph favorite patch API request failed: %s", e)
+            logger.exception("Graph memory patch API request failed: %s", e)
             return JSONResponse({"error": str(e)}, status_code=500)
 
     async def r2_image_proxy(request: Request):
@@ -578,6 +611,7 @@ def start_graph_server(host: str, port: int) -> None:
             Route("/api/chat", api_chat, methods=["POST"]),
             Route("/api/memories", api_memories_list),
             Route("/api/memories/{id:int}", api_memory),
+            Route("/api/memories/{id:int}", api_memory_patch, methods=["PATCH"]),
             Route("/api/memories/{id:int}/favorite", api_memory_patch, methods=["PATCH"]),
             Route("/api/actions", api_actions),
             Route("/r2/{path:path}", r2_image_proxy),
