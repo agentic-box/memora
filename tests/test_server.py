@@ -3,15 +3,6 @@ import asyncio
 import pytest
 
 import memora.server as server
-import memora.storage as storage
-from memora.backends import LocalSQLiteBackend
-
-
-@pytest.fixture()
-def local_db(tmp_path, monkeypatch):
-    backend = LocalSQLiteBackend(tmp_path / "memories.db")
-    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
-    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
 
 
 def _new_memory(*args, content="Repeat memory text", tags=["task"], **kwargs):
