@@ -468,8 +468,17 @@ async def memory_create(
         )
 
     if response_mode == "minimal":
+        minimal_result: Dict[str, Any] = {"memory": {"id": result["memory"]["id"]}}
+        if "similar_memories" in result:
+            minimal_result["similar_memories"] = result["similar_memories"]
+        if "consolidation_hint" in result:
+            minimal_result["consolidation_hint"] = result["consolidation_hint"]
+        duplicate_warning = result.get("warnings", {}).get("duplicate_warning")
+        if duplicate_warning:
+            minimal_result["warnings"] = {"duplicate_warning": duplicate_warning}
+
         _schedule_cloud_graph_sync()
-        return {"memory": {"id": result["memory"]["id"]}}
+        return minimal_result
 
     _schedule_cloud_graph_sync()
     return result
