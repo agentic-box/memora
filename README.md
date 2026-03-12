@@ -11,6 +11,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 <a href="https://github.com/agentic-mcp-tools/memora/releases"><img src="https://img.shields.io/github/v/tag/agentic-mcp-tools/memora?label=version&color=blue" alt="Version"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
 <a href="https://github.com/thedotmack/awesome-claude-code"><img src="https://awesome.re/mentioned-badge.svg" alt="Mentioned in Awesome Claude Code"></a>
+<a href="https://mcpampel.com/repo/agentic-mcp-tools/memora"><img src="https://img.shields.io/endpoint?url=https://mcpampel.com/badge/agentic-mcp-tools/memora.json" alt="MCPAmpel"></a>
 </p>
 
 <p align="center">
