@@ -1,38 +1,115 @@
-# Memora Context Plugin for Claude Code
+# Memora Plugin for Claude Code
 
-Automatically injects relevant memories from Memora at session start.
+Persistent semantic memory for Claude Code sessions. Automatically injects relevant context at session start, captures significant actions via hooks, and provides 30+ MCP tools for memory management.
 
-## What it does
+## Features
 
-When you start a Claude Code session, this plugin:
-1. Loads memora config from `.mcp.json` (supports cloud storage)
-2. Extracts the project name from your working directory
-3. Searches Memora for related memories
-4. Injects relevant context into the session
+- **Context injection**: SessionStart hook searches memora for relevant memories and injects them into the session
+- **Auto-capture**: PostToolUse hook captures git commits, test results, web research, and documentation edits
+- **MCP tools**: 30+ tools for creating, searching, organizing, and maintaining memories
+- **Knowledge graph**: Interactive visualization at `http://localhost:8765`
+- **Semantic search**: Hybrid search combining keyword (FTS) and vector similarity
 
 ## Installation
 
-Symlink or copy to Claude Code plugins directory:
+### Prerequisites
+
+Install memora via pip:
 
 ```bash
-# Option 1: Symlink (recommended for development)
-ln -s ~/repos/agentic-mcp-tools/memora/claude-plugin ~/.claude/plugins/memora-context
+pip install git+https://github.com/agentic-mcp-tools/memora.git
+```
 
-# Option 2: Copy
-cp -r ~/repos/agentic-mcp-tools/memora/claude-plugin ~/.claude/plugins/memora-context
+Verify the server binary is available:
+
+```bash
+memora-server info
+```
+
+### Plugin Installation
+
+#### Option 1: Symlink (recommended for development)
+
+```bash
+ln -s /path/to/memora/claude-plugin ~/.claude/plugins/memora
+```
+
+#### Option 2: Copy
+
+```bash
+cp -r /path/to/memora/claude-plugin ~/.claude/plugins/memora
+```
+
+#### Option 3: Claude Code marketplace (when available)
+
+```bash
+claude plugins add memora
+```
+
+### Enable the Plugin
+
+Add to `~/.claude/settings.json` under `enabledPlugins`:
+
+```json
+{
+  "enabledPlugins": {
+    "memora@memora": true
+  }
+}
 ```
 
 Restart Claude Code after installation.
 
-## Requirements
+## What's Included
 
-- Memora with dependencies installed (venv at `~/repos/agentic-mcp-tools/.venv`)
-- `.mcp.json` with memora server config (for cloud storage env vars)
-- Claude Code with plugin support
+| Component         | File                              | Purpose                                    |
+| ----------------- | --------------------------------- | ------------------------------------------ |
+| Manifest          | `.claude-plugin/plugin.json`      | Plugin metadata and version                |
+| MCP Server        | `.mcp.json`                       | Auto-configures memora MCP server          |
+| SessionStart Hook | `hooks-handlers/session_start.py` | Injects relevant memories at session start |
+| PostToolUse Hook  | `hooks-handlers/post_tool_use.py` | Auto-captures significant actions          |
+| Skill             | `skills/memora/SKILL.md`          | Usage guide for memora MCP tools           |
 
 ## Configuration
 
-The hook:
-- Runs with a 5-second timeout to avoid blocking session start
-- Loads env vars from `.mcp.json` to connect to same database as MCP server
-- Searches for top 5 memories with minimum relevance score of 0.02
+The plugin uses sensible defaults. To customize, set environment variables:
+
+| Variable               | Default                             | Description                             |
+| ---------------------- | ----------------------------------- | --------------------------------------- |
+| `MEMORA_DB_PATH`       | `~/.local/share/memora/memories.db` | SQLite database location                |
+| `MEMORA_ALLOW_ANY_TAG` | `1`                                 | Allow creating tags on the fly          |
+| `MEMORA_GRAPH_PORT`    | `8765`                              | Knowledge graph server port             |
+| `MEMORA_AUTO_CAPTURE`  | `false`                             | Enable auto-capture in PostToolUse hook |
+
+Override via the `.mcp.json` `env` section or system environment variables.
+
+## How It Works
+
+### SessionStart Hook
+
+1. Loads memora config from plugin `.mcp.json` (falls back to `~/.claude/settings.json`)
+2. Extracts project name from working directory
+3. Runs hybrid search (keyword + semantic) for top 5 relevant memories
+4. Injects formatted memories as `additionalContext` in the session prompt
+
+### PostToolUse Hook (when `MEMORA_AUTO_CAPTURE=true`)
+
+Captures actions with inherent context:
+
+- **Git commits**: Maintained as a single per-project log memory
+- **Test results**: Failures automatically create issues
+- **Web research**: GitHub repos, documentation, comparison research
+- **Documentation edits**: README, CHANGELOG, CONTRIBUTING, etc.
+
+Does **not** capture raw code edits (Edit/Write to source files) since the hook lacks conversation context about _why_ changes were made.
+
+Features:
+
+- Content-hash deduplication with 30-minute TTL cache
+- Significance scoring to filter noise
+- Automatic hierarchy placement based on existing memory structure
+- Finds and updates existing memories instead of creating duplicates
+
+## Portability
+
+All paths use `${CLAUDE_PLUGIN_ROOT}` for portability. The hooks use `python3` from the system PATH — memora must be installed in the default Python environment or a virtualenv that's on your PATH.

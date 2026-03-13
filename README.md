@@ -14,7 +14,8 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 </p>
 
 <p align="center">
-<img src="media/demo.gif" alt="Memora Demo" width="800">
+<img src="media/demo.gif" alt="Memora Demo" width="400">
+<img src="media/demo2.gif" alt="Memora Demo" width="400">
 </p>
 
 <p align="center">

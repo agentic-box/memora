@@ -1,5 +1,18 @@
 {
-  "name": "memora-context",
-  "version": "0.1.0",
-  "description": "Inject relevant memories from Memora at session start"
+  "name": "memora",
+  "version": "0.2.20",
+  "description": "Persistent semantic memory for Claude Code — auto-injects relevant context at session start, captures git commits, test results, and research via hooks, and provides 30+ MCP tools for memory management.",
+  "author": {
+    "name": "agentic-mcp-tools",
+    "url": "https://github.com/agentic-mcp-tools"
+  },
+  "repository": "https://github.com/agentic-mcp-tools/memora",
+  "license": "MIT",
+  "keywords": [
+    "memory",
+    "persistence",
+    "knowledge-graph",
+    "semantic-search",
+    "mcp"
+  ]
 }

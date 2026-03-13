@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "memora": {
+      "command": "memora-server",
+      "args": [],
+      "env": {
+        "MEMORA_DB_PATH": "~/.local/share/memora/memories.db",
+        "MEMORA_ALLOW_ANY_TAG": "1",
+        "MEMORA_GRAPH_PORT": "8765"
+      }
+    }
+  }
+}
