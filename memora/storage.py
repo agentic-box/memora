@@ -9,7 +9,6 @@ import mimetypes
 import os
 import re
 import sqlite3
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -19,6 +18,27 @@ from typing import Sequence as TypingSequence
 from PIL import Image
 
 from .backends import D1Connection, parse_backend_uri
+from .embeddings import (
+    check_embedding_model_mismatch as _check_embedding_model_mismatch_impl,
+)
+from .embeddings import (
+    compute_embedding as _compute_embedding_impl,
+)
+from .embeddings import (
+    cosine_similarity as _cosine_similarity,
+)
+from .embeddings import (
+    delete_embedding as _delete_embedding,
+)
+from .embeddings import (
+    get_embeddings_for_ids as _get_embeddings_for_ids,
+)
+from .embeddings import (
+    rebuild_all_embeddings as _rebuild_all_embeddings,
+)
+from .embeddings import (
+    upsert_embedding as _upsert_embedding,
+)
 from .schema import ensure_schema as _ensure_schema
 
 ROOT = Path(__file__).resolve().parent
@@ -800,123 +820,21 @@ def _enforce_tag_whitelist(tags: List[str]) -> None:
         raise ValueError(f"Tag '{tag}' is not in the allowed tag list")
 
 
-_TOKEN_RE = re.compile(r"[a-z0-9]+")
-
-# Cache for embedding models
-_embedding_model_cache: Dict[str, Any] = {}
-
-
-def _get_embedding_text(
-    content: str,
-    metadata: Optional[Dict[str, Any]],
-    tags: List[str],
-) -> str:
-    """Combine content, metadata, and tags into a single text for embedding."""
-    parts: List[str] = [content]
-
-    if metadata:
-        try:
-            metadata_str = json.dumps(metadata, ensure_ascii=False)
-        except (TypeError, ValueError):
-            metadata_str = str(metadata)
-        parts.append(metadata_str)
-
-    if tags:
-        parts.append(" ".join(tags))
-
-    return " \n ".join(parts)
-
-
-def _compute_embedding_tfidf(text: str) -> Dict[str, float]:
-    """TF-IDF style bag-of-words embedding (default, no dependencies)."""
-    tokens = _TOKEN_RE.findall(text.lower())
-    if not tokens:
-        return {}
-
-    counts = Counter(tokens)
-    total = sum(counts.values())
-    if not total:
-        return {}
-
-    return {token: count / total for token, count in counts.items()}
-
-
-def _compute_embedding_sentence_transformers(text: str) -> Dict[str, float]:
-    """Use sentence-transformers for better semantic embeddings."""
-    try:
-        if "sentence_transformers" not in _embedding_model_cache:
-            from sentence_transformers import SentenceTransformer
-            # Use a small, fast model by default
-            model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-            _embedding_model_cache["sentence_transformers"] = SentenceTransformer(model_name)
-
-        model = _embedding_model_cache["sentence_transformers"]
-        embedding = model.encode(text, convert_to_numpy=True)
-
-        # Convert numpy array to dict for storage (use indices as keys)
-        return {str(i): float(val) for i, val in enumerate(embedding)}
-
-    except ImportError:
-        # Fallback to TF-IDF if sentence-transformers not available
-        return _compute_embedding_tfidf(text)
-    except Exception:
-        # Fallback on any error
-        return _compute_embedding_tfidf(text)
-
-
-def _compute_embedding_openai(text: str) -> Dict[str, float]:
-    """Use OpenAI embeddings API."""
-    try:
-        import openai
-
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            # Fallback to TF-IDF if no API key
-            return _compute_embedding_tfidf(text)
-
-        if "openai_client" not in _embedding_model_cache:
-            _embedding_model_cache["openai_client"] = openai.OpenAI(api_key=api_key)
-
-        client = _embedding_model_cache["openai_client"]
-        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-
-        response = client.embeddings.create(
-            input=text,
-            model=model_name,
-        )
-
-        embedding = response.data[0].embedding
-
-        # Convert to dict for storage
-        return {str(i): float(val) for i, val in enumerate(embedding)}
-
-    except ImportError:
-        # Fallback to TF-IDF if openai not available
-        return _compute_embedding_tfidf(text)
-    except Exception:
-        # Fallback on any error (API error, rate limit, etc.)
-        return _compute_embedding_tfidf(text)
-
-
 def _compute_embedding(
     content: str,
     metadata: Optional[Dict[str, Any]],
     tags: List[str],
 ) -> Dict[str, float]:
     """Compute embedding using configured backend."""
-    text = _get_embedding_text(content, metadata, tags)
-
-    if EMBEDDING_MODEL == "sentence-transformers":
-        return _compute_embedding_sentence_transformers(text)
-    elif EMBEDDING_MODEL == "openai":
-        return _compute_embedding_openai(text)
-    else:  # Default to tfidf
-        return _compute_embedding_tfidf(text)
+    return _compute_embedding_impl(content, metadata, tags, EMBEDDING_MODEL)
 
 
 # ---------------------------------------------------------------------------
 # LLM-based memory comparison for deduplication
 # ---------------------------------------------------------------------------
+
+_llm_client_cache: Dict[str, Any] = {}
+
 
 def _get_llm_client():
     """Get or create cached LLM client for comparison."""
@@ -930,14 +848,14 @@ def _get_llm_client():
         if not api_key:
             return None
 
-        if "llm_client" not in _embedding_model_cache:
+        if "llm_client" not in _llm_client_cache:
             base_url = os.getenv("OPENAI_BASE_URL")
             client_kwargs = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
-            _embedding_model_cache["llm_client"] = openai.OpenAI(**client_kwargs)
+            _llm_client_cache["llm_client"] = openai.OpenAI(**client_kwargs)
 
-        return _embedding_model_cache["llm_client"]
+        return _llm_client_cache["llm_client"]
 
     except ImportError:
         return None
@@ -1234,81 +1152,8 @@ def find_duplicate_candidates(
     return candidates[:limit]
 
 
-def _embedding_to_json(vector: Dict[str, float]) -> Optional[str]:
-    if not vector:
-        return None
-    items = sorted(vector.items())
-    return json.dumps(items, ensure_ascii=False)
 
-
-def _json_to_embedding(data: Optional[str]) -> Dict[str, float]:
-    if not data:
-        return {}
-    try:
-        items = json.loads(data)
-    except json.JSONDecodeError:
-        return {}
-    if isinstance(items, list):
-        return {str(token): float(weight) for token, weight in items}
-    return {}
-
-
-def _embedding_norm(vector: Dict[str, float]) -> float:
-    return math.sqrt(sum(weight * weight for weight in vector.values()))
-
-
-def _cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float:
-    if not vec_a or not vec_b:
-        return 0.0
-    dot = 0.0
-    for token, weight in vec_a.items():
-        dot += weight * vec_b.get(token, 0.0)
-    norm_a = _embedding_norm(vec_a)
-    norm_b = _embedding_norm(vec_b)
-    if norm_a == 0.0 or norm_b == 0.0:
-        return 0.0
-    return dot / (norm_a * norm_b)
-
-
-def _upsert_embedding(
-    conn: sqlite3.Connection,
-    memory_id: int,
-    vector: Dict[str, float],
-) -> None:
-    embedding_json = _embedding_to_json(vector)
-    conn.execute(
-        """
-        INSERT INTO memories_embeddings(memory_id, embedding)
-        VALUES(?, ?)
-        ON CONFLICT(memory_id) DO UPDATE SET embedding=excluded.embedding
-        """,
-        (memory_id, embedding_json),
-    )
-
-
-def _delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
-    conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
-
-
-def _get_embeddings_for_ids(
-    conn: sqlite3.Connection,
-    memory_ids: List[int],
-    *,
-    batch_size: int = 50,
-) -> Dict[int, Dict[str, float]]:
-    if not memory_ids:
-        return {}
-    mapping: Dict[int, Dict[str, float]] = {}
-    for i in range(0, len(memory_ids), batch_size):
-        batch = memory_ids[i : i + batch_size]
-        placeholders = ",".join("?" for _ in batch)
-        rows = conn.execute(
-            f"SELECT memory_id, embedding FROM memories_embeddings WHERE memory_id IN ({placeholders})",
-            batch,
-        ).fetchall()
-        for row in rows:
-            mapping[row["memory_id"]] = _json_to_embedding(row["embedding"])
-    return mapping
+# Embedding utility aliases (delegated to embeddings module)
 
 
 def _search_by_vector(
@@ -2534,59 +2379,12 @@ def hybrid_search(
     return results
 
 
-def _get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
-    """Get the embedding model name stored in the database."""
-    row = conn.execute(
-        "SELECT value FROM memories_meta WHERE key = 'embedding_model'"
-    ).fetchone()
-    return row["value"] if row else None
-
-
-def _set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
-    """Store the embedding model name in the database."""
-    conn.execute(
-        """
-        INSERT INTO memories_meta (key, value) VALUES ('embedding_model', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (model,),
-    )
-    conn.commit()
-
-
 def _check_embedding_model_mismatch(conn: sqlite3.Connection) -> bool:
-    """Check if current embedding model differs from stored model.
-
-    Returns True if mismatch detected (rebuild needed).
-    """
-    stored = _get_stored_embedding_model(conn)
-    if stored is None:
-        # No model stored yet - check if embeddings exist
-        count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
-        if count > 0:
-            # Embeddings exist but no model recorded - assume mismatch
-            return True
-        return False
-    return stored != EMBEDDING_MODEL
+    return _check_embedding_model_mismatch_impl(conn, EMBEDDING_MODEL)
 
 
 def rebuild_embeddings(conn: sqlite3.Connection) -> int:
-    """Rebuild all embeddings using current EMBEDDING_MODEL."""
-    rows = conn.execute(
-        "SELECT id, content, metadata, tags FROM memories"
-    ).fetchall()
-    updated = 0
-    for row in rows:
-        memory_id = row["id"]
-        metadata = json.loads(row["metadata"]) if row["metadata"] else None
-        tags = json.loads(row["tags"]) if row["tags"] else []
-        vector = _compute_embedding(row["content"], metadata, tags)
-        _upsert_embedding(conn, memory_id, vector)
-        updated += 1
-    # Store the model name after successful rebuild
-    _set_stored_embedding_model(conn, EMBEDDING_MODEL)
-    conn.commit()
-    return updated
+    return _rebuild_all_embeddings(conn, EMBEDDING_MODEL)
 
 
 def calculate_importance(
