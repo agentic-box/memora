@@ -5,7 +5,7 @@ import argparse
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
@@ -66,6 +66,9 @@ DUPLICATE_THRESHOLD = 0.85
 
 # Auto-assign hierarchy when top suggestion confidence >= this threshold
 AUTO_HIERARCHY_THRESHOLD = 0.5
+
+# Allow token-efficient small MCP response payload
+CREATE_RESPONSE_MODES = {"full", "minimal"}
 
 
 def _infer_type(content: str) -> Optional[str]:
@@ -320,6 +323,7 @@ async def memory_create(
     tags: Optional[list[str]] = None,
     suggest_similar: bool = True,
     similarity_threshold: float = 0.2,
+    response_mode: Literal["full", "minimal"] = "full",
 ) -> Dict[str, Any]:
     """Create a new memory entry.
 
@@ -329,7 +333,15 @@ async def memory_create(
         tags: Optional list of tags
         suggest_similar: If True, find similar memories and suggest consolidation (default: True)
         similarity_threshold: Minimum similarity score for suggestions (default: 0.2)
+        response_mode: "full" (default) or "minimal" response payload size
     """
+    if response_mode not in CREATE_RESPONSE_MODES:
+        valid = ", ".join(sorted(CREATE_RESPONSE_MODES))
+        return {
+            "error": "invalid_input",
+            "message": f"response_mode must be one of: {valid}",
+        }
+
     # Check hierarchy path BEFORE creating to detect new paths
     new_path = extract_hierarchy_path(metadata)
     existing_paths = (
@@ -454,6 +466,19 @@ async def memory_create(
             (record or {}).get("id"),
             exc,
         )
+
+    if response_mode == "minimal":
+        minimal_result: Dict[str, Any] = {"memory": {"id": result["memory"]["id"]}}
+        if "similar_memories" in result:
+            minimal_result["similar_memories"] = result["similar_memories"]
+        if "consolidation_hint" in result:
+            minimal_result["consolidation_hint"] = result["consolidation_hint"]
+        duplicate_warning = result.get("warnings", {}).get("duplicate_warning")
+        if duplicate_warning:
+            minimal_result["warnings"] = {"duplicate_warning": duplicate_warning}
+
+        _schedule_cloud_graph_sync()
+        return minimal_result
 
     _schedule_cloud_graph_sync()
     return result
