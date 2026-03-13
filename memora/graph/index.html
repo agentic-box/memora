@@ -34,7 +34,12 @@ div.vis-tooltip {
 #panel .tag { display: inline-block; background: #30363d; padding: 3px 8px; border-radius: 12px; font-size: 12px; margin: 2px; cursor: pointer; }
 #panel .tag:hover { background: #484f58; }
 #panel .meta { color: #8b949e; font-size: 12px; margin-bottom: 15px; }
-#panel .detail-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+#panel .panel-title-row { display: flex; align-items: center; justify-content: space-between; }
+#panel .panel-title-row h2 { margin: 0; }
+#panel .edit-icon-btn { background: transparent; border: none; color: #8b949e; cursor: pointer; padding: 4px 6px; border-radius: 4px; font-size: 16px; line-height: 1; }
+#panel .edit-icon-btn:hover { color: #c9d1d9; background: #21262d; }
+#panel .detail-actions { display: none; gap: 8px; margin-bottom: 12px; }
+#panel .detail-actions.show { display: flex; }
 #panel .detail-btn { background: #21262d; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
 #panel .detail-btn:hover { background: #30363d; }
 #panel .detail-btn.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
@@ -475,12 +480,14 @@ div.vis-tooltip {
             <span class="tab" onclick="switchTab('history')">History</span>
         </div>
         <div id="tab-detail" class="active">
-            <h2 id="panel-title">Memory #</h2>
+            <div class="panel-title-row">
+                <h2 id="panel-title">Memory #</h2>
+                <button class="edit-icon-btn" id="panel-edit-btn" onclick="enterPanelEditMode()" title="Edit tags &amp; metadata">&#9998;</button>
+            </div>
             <div class="meta" id="panel-meta"></div>
             <div class="detail-actions" id="panel-actions">
-                <button class="detail-btn" id="panel-edit-btn" onclick="enterPanelEditMode()">Edit</button>
-                <button class="detail-btn primary" id="panel-save-btn" onclick="savePanelEdits()" style="display:none;">Save</button>
-                <button class="detail-btn" id="panel-cancel-btn" onclick="cancelPanelEdits()" style="display:none;">Cancel</button>
+                <button class="detail-btn primary" id="panel-save-btn" onclick="savePanelEdits()">Save</button>
+                <button class="detail-btn" id="panel-cancel-btn" onclick="cancelPanelEdits()">Cancel</button>
             </div>
             <div class="detail-status" id="panel-status"></div>
             <div class="detail-section">
@@ -491,7 +498,7 @@ div.vis-tooltip {
                 <div class="detail-section-title">Metadata</div>
                 <div id="panel-metadata"></div>
             </div>
-            <div class="detail-section">
+            <div class="detail-section" id="panel-complex-metadata-section" style="display:none;">
                 <div class="detail-section-title">Complex Metadata</div>
                 <div id="panel-complex-metadata"></div>
             </div>
@@ -886,9 +893,8 @@ div.vis-tooltip {
 
         function setPanelEditMode(isEditing) {
             panelEditMode = isEditing;
-            document.getElementById('panel-edit-btn').style.display = isEditing ? 'none' : 'inline-block';
-            document.getElementById('panel-save-btn').style.display = isEditing ? 'inline-block' : 'none';
-            document.getElementById('panel-cancel-btn').style.display = isEditing ? 'inline-block' : 'none';
+            document.getElementById('panel-edit-btn').style.display = isEditing ? 'none' : '';
+            document.getElementById('panel-actions').className = isEditing ? 'detail-actions show' : 'detail-actions';
         }
 
         function updatePanelControls() {
@@ -1694,13 +1700,17 @@ div.vis-tooltip {
 
             document.getElementById('panel-tags').innerHTML = panelEditMode ? renderTagEditor() : renderReadonlyTags(mem.tags);
             document.getElementById('panel-metadata').innerHTML = panelEditMode ? renderMetadataEditor() : renderReadonlyMetadata(mem.metadata || {});
-            document.getElementById('panel-complex-metadata').innerHTML = renderComplexMetadata(panelEditMode ? panelDraftComplexMetadata : (function() {
+            var complexData = panelEditMode ? panelDraftComplexMetadata : (function() {
                 var complex = {};
                 Object.keys(mem.metadata || {}).forEach(function(key) {
-                    if (key === 'images' || !isScalarMetadataValue(mem.metadata[key])) complex[key] = mem.metadata[key];
+                    if (key === 'images' || key === 'hierarchy') return;
+                    if (!isScalarMetadataValue(mem.metadata[key])) complex[key] = mem.metadata[key];
                 });
                 return complex;
-            })());
+            })();
+            var hasComplex = Object.keys(complexData).length > 0;
+            document.getElementById('panel-complex-metadata-section').style.display = hasComplex ? '' : 'none';
+            document.getElementById('panel-complex-metadata').innerHTML = hasComplex ? renderComplexMetadata(complexData) : '';
 
             document.getElementById('panel-content').innerHTML = renderMarkdown(mem.content);
             renderMermaidBlocks();
