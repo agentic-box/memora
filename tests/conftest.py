@@ -12,6 +12,14 @@ from memora.backends import LocalSQLiteBackend
 from memora.graph.server import start_graph_server
 
 
+@pytest.fixture(autouse=True)
+def clean_aws_env(monkeypatch):
+    for var in ("AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN", "AWS_PROFILE", "AWS_CONFIG_FILE",
+                "AWS_SHARED_CREDENTIALS_FILE"):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture()
 def local_db(tmp_path, monkeypatch):
     backend = LocalSQLiteBackend(tmp_path / "memories.db")

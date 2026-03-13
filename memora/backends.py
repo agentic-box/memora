@@ -12,7 +12,6 @@ import logging
 import os
 import shutil
 import sqlite3
-import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -27,8 +26,8 @@ except ImportError:
 
 try:
     import boto3
-    from botocore.exceptions import ClientError, NoCredentialsError, EndpointConnectionError
     from botocore.config import Config as BotoConfig
+    from botocore.exceptions import ClientError, EndpointConnectionError, NoCredentialsError
 except ImportError:
     boto3 = None
     ClientError = None
@@ -627,8 +626,8 @@ class CloudSQLiteBackend(StorageBackend):
                                 f"Current ETag: {current_remote_etag}"
                             )
                             raise ConflictError(
-                                f"Database was modified by another process. "
-                                f"Run 'memora-server sync-pull' to get latest changes."
+                                "Database was modified by another process. "
+                                "Run 'memora-server sync-pull' to get latest changes."
                             )
                     except ClientError as e:
                         if e.response["Error"]["Code"] != "404":
@@ -859,8 +858,8 @@ class D1Connection:
 
     def _execute_api(self, sql: str, params: tuple = None) -> dict:
         """Execute SQL via D1 HTTP API with session affinity for read-your-writes."""
-        import urllib.request
         import urllib.error
+        import urllib.request
 
         url = f"{self.base_url}/query"
 

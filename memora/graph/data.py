@@ -17,7 +17,7 @@ def _get_memora_version() -> str:
 # Closed items older than this will appear gray and smaller
 STALE_DAYS = int(os.getenv("MEMORA_STALE_DAYS", "30"))
 
-from ..storage import (
+from ..storage import (  # noqa: E402
     connect,
     detect_clusters,
     get_crossrefs,
@@ -25,22 +25,22 @@ from ..storage import (
     list_memories,
     rebuild_crossrefs,
 )
-from .issues import (
+from .issues import (  # noqa: E402
     TAG_COLORS,
-    build_status_to_nodes,
     build_issue_category_to_nodes,
+    build_issue_legend_html,
+    build_status_to_nodes,
     get_issue_node_style,
     is_issue,
-    build_issue_legend_html,
 )
-from .todos import (
-    build_todo_status_to_nodes,
+from .templates import build_static_html  # noqa: E402
+from .todos import (  # noqa: E402
     build_todo_category_to_nodes,
+    build_todo_legend_html,
+    build_todo_status_to_nodes,
     get_todo_node_style,
     is_todo,
-    build_todo_legend_html,
 )
-from .templates import build_static_html
 
 # Similarity threshold for duplicate detection
 DUPLICATE_THRESHOLD = 0.85

@@ -2,6 +2,7 @@
 
 import asyncio
 import functools
+import json
 import logging
 import os
 import socket
@@ -9,17 +10,24 @@ import sys
 import threading
 from copy import deepcopy
 from importlib.metadata import version as get_version
-
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
-from sse_starlette.sse import EventSourceResponse
-
-import json
 from importlib.resources import files as _pkg_files
 
-from .data import get_graph_data, get_memory_for_api
-from ..storage import connect, add_memory, update_memory, delete_memory, get_memory, hybrid_search, rewrite_query, multi_query_hybrid_search, _get_llm_client, LLM_MODEL
+from sse_starlette.sse import EventSourceResponse
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
+from ..storage import (
+    LLM_MODEL,
+    _get_llm_client,
+    add_memory,
+    connect,
+    delete_memory,
+    get_memory,
+    multi_query_hybrid_search,
+    rewrite_query,
+    update_memory,
+)
+from .data import get_graph_data, get_memory_for_api
 
 CHAT_TOOLS = [
     {
@@ -333,7 +341,11 @@ def start_graph_server(host: str, port: int) -> None:
                 if not isinstance(metadata, dict):
                     conn.close()
                     return JSONResponse({"error": "invalid_metadata"}, status_code=400)
-                merged_metadata = metadata
+                for key, value in metadata.items():
+                    if value is None:
+                        merged_metadata.pop(key, None)
+                    else:
+                        merged_metadata[key] = value
             if favorite is not None:
                 if bool(favorite):
                     merged_metadata["favorite"] = True

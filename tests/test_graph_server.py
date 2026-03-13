@@ -61,3 +61,53 @@ def test_graph_patch_rejects_invalid_tags_against_whitelist(
 
     assert status == 400
     assert "Tag" in data["error"]
+
+
+def test_patch_metadata_merges_keys(graph_request, memory_factory):
+    """PATCH with partial metadata should preserve existing keys."""
+    created = memory_factory(metadata={"existing_key": "keep", "section": "docs"})
+
+    status, data = graph_request(
+        "PATCH",
+        f"/api/memories/{created['id']}",
+        {"metadata": {"new_key": "added"}},
+    )
+
+    assert status == 200
+    assert data["metadata"]["existing_key"] == "keep"
+    assert data["metadata"]["section"] == "docs"
+    assert data["metadata"]["new_key"] == "added"
+
+
+def test_patch_metadata_null_deletes_key(graph_request, memory_factory):
+    """PATCH with null value should delete that metadata key."""
+    created = memory_factory(metadata={"to_remove": "bye", "to_keep": "stay"})
+
+    status, data = graph_request(
+        "PATCH",
+        f"/api/memories/{created['id']}",
+        {"metadata": {"to_remove": None}},
+    )
+
+    assert status == 200
+    assert "to_remove" not in data["metadata"]
+    assert data["metadata"]["to_keep"] == "stay"
+
+
+def test_patch_preserves_favorite(graph_request, memory_factory):
+    """PATCH metadata should preserve favorite field."""
+    created = memory_factory(metadata={"note": "test"})
+
+    # Set favorite via compatibility field
+    graph_request("PATCH", f"/api/memories/{created['id']}", {"favorite": True})
+
+    # Patch metadata without touching favorite
+    status, data = graph_request(
+        "PATCH",
+        f"/api/memories/{created['id']}",
+        {"metadata": {"note": "updated"}},
+    )
+
+    assert status == 200
+    assert data["metadata"]["favorite"] is True
+    assert data["metadata"]["note"] == "updated"

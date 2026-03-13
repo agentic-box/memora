@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memora-mcp"
-version = "0.2.23"
+version = "0.2.23.1"
 description = "MCP-compatible memory server backed by SQLite"
 license = "MIT"
 readme = "README.md"
@@ -32,6 +32,14 @@ dev = [
 
 [project.scripts]
 memora-server = "memora.server:main"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E501"]
 
 [tool.setuptools.packages.find]
 where = ["."]

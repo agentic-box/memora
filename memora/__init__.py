@@ -1,8 +1,8 @@
 """Memory MCP server package."""
 
-from pathlib import Path as _Path
 import json
 import os
+from pathlib import Path as _Path
 
 DEFAULT_TAGS = {
     "general",

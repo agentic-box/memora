@@ -9,15 +9,17 @@ import mimetypes
 import os
 import re
 import sqlite3
-
-from PIL import Image
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence as TypingSequence
+from typing import Any, Dict, Iterable, List, Optional
+from typing import Sequence as TypingSequence
 
-from .backends import StorageBackend, parse_backend_uri, D1Connection
+from PIL import Image
+
+from .backends import D1Connection, parse_backend_uri
+from .schema import ensure_schema as _ensure_schema
 
 ROOT = Path(__file__).resolve().parent
 
@@ -253,171 +255,25 @@ def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: 
 
 
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
-    """Create a database connection using the configured storage backend.
-
-    For cloud backends, this will automatically sync from cloud before use.
-
-    Args:
-        check_same_thread: SQLite connection parameter
-
-    Returns:
-        sqlite3.Connection ready for use
-    """
-    conn = STORAGE_BACKEND.connect(check_same_thread=check_same_thread)
-    ensure_schema(conn)
-    return conn
+    """Create a database connection using the configured storage backend."""
+    from .schema import connect as _connect
+    return _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
 
 
 def sync_to_cloud() -> None:
-    """Sync database to cloud storage if using a cloud backend.
-
-    This should be called after write operations to ensure changes are
-    persisted to cloud storage.
-    """
-    STORAGE_BACKEND.sync_after_write()
+    """Sync database to cloud storage if using a cloud backend."""
+    from .schema import sync_to_cloud as _sync
+    _sync(STORAGE_BACKEND)
 
 
 def get_backend_info() -> dict:
-    """Get information about the current storage backend.
-
-    Returns:
-        Dictionary with backend type, configuration, and status
-    """
-    return STORAGE_BACKEND.get_info()
+    """Get information about the current storage backend."""
+    from .schema import get_backend_info as _info
+    return _info(STORAGE_BACKEND)
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            content TEXT NOT NULL,
-            metadata TEXT,
-            tags TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT
-        )
-        """
-    )
-    conn.commit()
-    _ensure_fts(conn)
-    _ensure_embeddings_table(conn)
-    _ensure_crossrefs_table(conn)
-    _ensure_events_table(conn)
-    _ensure_actions_table(conn)
-    _ensure_importance_columns(conn)
-    _ensure_updated_at_column(conn)
-
-
-def _ensure_fts(conn: sqlite3.Connection) -> None:
-    # D1 doesn't support FTS5 virtual tables
-    if isinstance(conn, D1Connection):
-        return
-    table_exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
-    ).fetchone()
-    if not table_exists:
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE memories_fts
-            USING fts5(content, metadata, tags)
-            """
-        )
-        conn.commit()
-
-
-def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories_embeddings (
-            memory_id INTEGER PRIMARY KEY,
-            embedding TEXT,
-            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
-        )
-        """
-    )
-    # Metadata table for storing embedding model info
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories_meta (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """
-    )
-    conn.commit()
-
-
-def _ensure_crossrefs_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories_crossrefs (
-            memory_id INTEGER PRIMARY KEY,
-            related TEXT,
-            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.commit()
-
-
-def _ensure_events_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id INTEGER NOT NULL,
-            tags TEXT NOT NULL,
-            timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-            consumed INTEGER DEFAULT 0,
-            FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
-        )
-        """
-    )
-    conn.commit()
-
-
-def _ensure_actions_table(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS memories_actions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            memory_id INTEGER,
-            action TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            timestamp TEXT NOT NULL DEFAULT (datetime('now'))
-        )
-        """
-    )
-    conn.commit()
-
-
-def _ensure_importance_columns(conn: sqlite3.Connection) -> None:
-    """Add importance scoring columns to memories table if they don't exist."""
-    # Check if columns already exist
-    cursor = conn.execute("PRAGMA table_info(memories)")
-    columns = {row[1] for row in cursor.fetchall()}
-
-    if "importance" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 1.0")
-
-    if "last_accessed" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN last_accessed TEXT")
-
-    if "access_count" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0")
-
-    conn.commit()
-
-
-def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
-    """Add updated_at column to memories table if it doesn't exist."""
-    cursor = conn.execute("PRAGMA table_info(memories)")
-    columns = {row[1] for row in cursor.fetchall()}
-
-    if "updated_at" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT")
-        conn.commit()
+    _ensure_schema(conn)
 
 
 def _build_metadata_dict(metadata: Mapping[str, Any]) -> Dict[str, Any]:
@@ -2071,7 +1927,7 @@ def add_memories(
     if not prepared:
         return []
 
-    cur = conn.executemany(
+    conn.executemany(
         "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
         prepared,
     )
@@ -2145,15 +2001,18 @@ def update_memory(
         return None
 
     # Determine what to update
-    new_content = content.strip() if content is not None else existing["content"]
+    new_content = _validate_content(content) if content is not None else existing["content"]
     new_metadata = _prepare_metadata(metadata) if metadata is not None else existing.get("metadata")
     new_tags = _validate_tags(tags) if tags is not None else existing.get("tags", [])
 
     if tags is not None:
         _enforce_tag_whitelist(new_tags)
 
-    # Check if content actually changed (affects whether we need to recompute embeddings)
+    # Check what changed (affects whether we need to recompute indexes)
     content_changed = content is not None and new_content != existing["content"]
+    tags_changed = tags is not None and sorted(new_tags) != sorted(existing.get("tags", []))
+    metadata_changed = metadata is not None and new_metadata != existing.get("metadata")
+    index_changed = content_changed or tags_changed or metadata_changed
 
     # Serialize for storage
     metadata_json = json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
@@ -2171,9 +2030,8 @@ def update_memory(
         # Row wasn't updated - this shouldn't happen since we checked existence
         raise RuntimeError(f"UPDATE affected 0 rows for memory {memory_id}")
 
-    # Only recompute expensive operations if content changed
-    # Metadata-only updates (status, tags, etc.) don't need embedding/crossref recalc
-    if content_changed:
+    # Recompute indexes when content, tags, or metadata changed
+    if index_changed:
         # Update FTS index
         _fts_upsert(conn, memory_id, new_content, metadata_json, tags_json)
 
@@ -2216,8 +2074,9 @@ def update_memory(
 
 def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
     # Clean up R2 images before deleting memory
-    from .image_storage import get_image_storage_instance
     import logging
+
+    from .image_storage import get_image_storage_instance
 
     image_storage = get_image_storage_instance()
     if image_storage:
@@ -2248,8 +2107,9 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
         return 0
 
     # Clean up R2 images for all memories
-    from .image_storage import get_image_storage_instance
     import logging
+
+    from .image_storage import get_image_storage_instance
 
     image_storage = get_image_storage_instance()
     if image_storage:

@@ -9,38 +9,6 @@ from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
 
-from .storage import (
-    add_memory,
-    add_memories,
-    boost_memory,
-    clear_events,
-    collect_all_tags,
-    connect,
-    delete_memory,
-    delete_memories,
-    export_memories,
-    find_invalid_tag_entries,
-    generate_insights,
-    get_backend_info,
-    get_crossrefs,
-    get_memory,
-    get_statistics,
-    hybrid_search,
-    import_memories,
-    list_memories,
-    poll_events,
-    rebuild_embeddings,
-    rebuild_crossrefs,
-    semantic_search,
-    sync_to_cloud,
-    update_crossrefs,
-    update_memory,
-    _redact_secrets,
-    add_link,
-    remove_link,
-    detect_clusters,
-    EDGE_TYPES,
-)
 from .cloud_sync import schedule_sync as _schedule_cloud_graph_sync
 from .hierarchy import (
     build_hierarchy_tree,
@@ -49,6 +17,36 @@ from .hierarchy import (
     find_similar_paths,
     get_existing_hierarchy_paths,
     suggest_hierarchy_from_similar,
+)
+from .storage import (
+    _redact_secrets,
+    add_link,
+    add_memories,
+    add_memory,
+    boost_memory,
+    clear_events,
+    collect_all_tags,
+    connect,
+    delete_memories,
+    delete_memory,
+    detect_clusters,
+    export_memories,
+    find_invalid_tag_entries,
+    generate_insights,
+    get_crossrefs,
+    get_memory,
+    get_statistics,
+    hybrid_search,
+    import_memories,
+    list_memories,
+    poll_events,
+    rebuild_crossrefs,
+    rebuild_embeddings,
+    remove_link,
+    semantic_search,
+    sync_to_cloud,
+    update_crossrefs,
+    update_memory,
 )
 
 # Content type inference patterns
@@ -94,8 +92,7 @@ def _suggest_tags(content: str, inferred_type: Optional[str]) -> List[str]:
     return suggestions
 
 
-from .graph import export_graph_html, start_graph_server
-
+from .graph import export_graph_html, start_graph_server  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -1136,7 +1133,7 @@ async def memory_find_duplicates(
         - analyzed: Number of pairs analyzed with LLM
         - llm_available: Whether LLM comparison was available
     """
-    from .storage import find_duplicate_candidates, compare_memories_llm, connect
+    from .storage import compare_memories_llm, connect, find_duplicate_candidates
 
     with connect() as conn:
         candidates = find_duplicate_candidates(conn, min_similarity, max_similarity, limit * 2)
@@ -1214,7 +1211,7 @@ async def memory_merge(
     Returns:
         Updated target memory and deletion confirmation
     """
-    from .storage import connect, update_memory, delete_memory
+    from .storage import connect, delete_memory, update_memory
 
     source = _get_memory(source_id)
     target = _get_memory(target_id)
@@ -1299,8 +1296,8 @@ async def memory_upload_image(
     Returns:
         Dictionary with r2_url (the r2:// reference) and image object ready for metadata
     """
-    import os
     import mimetypes
+    import os
 
     from .image_storage import get_image_storage_instance
 
@@ -1370,6 +1367,7 @@ async def memory_migrate_images(dry_run: bool = False) -> Dict[str, Any]:
 def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
     """Migrate all base64 images to R2 storage."""
     import json as json_lib
+
     from .image_storage import get_image_storage_instance, parse_data_uri
     from .storage import update_memory
 
@@ -1596,25 +1594,25 @@ def main(argv: Optional[list[str]] = None) -> None:
     )
 
     # Subcommand: sync-pull
-    sync_pull_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "sync-pull",
         help="Force pull database from cloud storage (ignore local cache)"
     )
 
     # Subcommand: sync-push
-    sync_push_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "sync-push",
         help="Force push database to cloud storage"
     )
 
     # Subcommand: sync-status
-    sync_status_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "sync-status",
         help="Show sync status and backend information"
     )
 
     # Subcommand: info
-    info_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "info",
         help="Show storage backend information"
     )
@@ -1669,7 +1667,6 @@ def main(argv: Optional[list[str]] = None) -> None:
 
 def _handle_sync_pull() -> None:
     """Handle sync-pull command."""
-    import json
     from .backends import CloudSQLiteBackend
     from .storage import STORAGE_BACKEND
 
@@ -1693,7 +1690,6 @@ def _handle_sync_pull() -> None:
 
 def _handle_sync_push() -> None:
     """Handle sync-push command."""
-    import json
     from .backends import CloudSQLiteBackend
     from .storage import STORAGE_BACKEND
 
@@ -1718,7 +1714,7 @@ def _handle_sync_push() -> None:
 def _handle_sync_status() -> None:
     """Handle sync-status command."""
     import json
-    from .backends import CloudSQLiteBackend
+
     from .storage import STORAGE_BACKEND
 
     info = STORAGE_BACKEND.get_info()
@@ -1752,6 +1748,7 @@ def _handle_sync_status() -> None:
 def _handle_info() -> None:
     """Handle info command."""
     import json
+
     from .storage import STORAGE_BACKEND
 
     info = STORAGE_BACKEND.get_info()

@@ -14,7 +14,6 @@ from typing import Optional
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
-
 logger = logging.getLogger(__name__)
 
 # Auto-detect sync script location (sibling memora-graph directory)

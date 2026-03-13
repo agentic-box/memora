@@ -103,9 +103,20 @@ export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request 
     return Response.json({ error: "invalid_metadata" }, { status: 400 });
   }
 
+  const existingMeta = parseJson<Record<string, unknown>>(row.metadata, {});
   const meta = body.metadata !== undefined
-    ? { ...body.metadata }
-    : parseJson<Record<string, unknown>>(row.metadata, {});
+    ? (() => {
+        const merged = { ...existingMeta };
+        for (const [key, value] of Object.entries(body.metadata)) {
+          if (value === null) {
+            delete merged[key];
+          } else {
+            merged[key] = value;
+          }
+        }
+        return merged;
+      })()
+    : existingMeta;
   if (body.favorite !== undefined) {
     if (body.favorite) {
       meta.favorite = true;

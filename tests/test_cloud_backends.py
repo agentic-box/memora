@@ -1,7 +1,4 @@
 """Tests for cloud storage backends using moto to mock AWS S3."""
-import os
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -504,7 +501,6 @@ class TestConflictDetection:
 
     def test_no_conflict_after_sync_pull(self, tmp_path):
         """Test that sync_pull resolves conflicts."""
-        from memora.backends import ConflictError
 
         # Agent 1: Create and upload initial database
         backend1 = CloudSQLiteBackend(

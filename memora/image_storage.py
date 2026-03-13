@@ -251,7 +251,7 @@ def parse_data_uri(data_uri: str) -> tuple[bytes, str]:
     # Match data URI format: data:mime/type;base64,DATA
     match = re.match(r'^data:([^;]+);base64,(.+)$', data_uri)
     if not match:
-        raise ValueError(f"Invalid data URI format")
+        raise ValueError("Invalid data URI format")
 
     content_type = match.group(1)
     b64_data = match.group(2)

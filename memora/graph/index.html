@@ -8,6 +8,7 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js" integrity="sha384-jBCB5dlp4nGfbMkRPJ95JLPMn1GpZQGQaP1eWfaFal0oYEB3Kz9o1is5mCxMS4ng" crossorigin="anonymous"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css" rel="stylesheet">
     <style>
 /* Base CSS */
@@ -661,7 +662,11 @@ div.vis-tooltip {
         });
 
         function renderMarkdown(text) {
-            return marked.parse(text);
+            var html = marked.parse(text);
+            if (typeof DOMPurify !== 'undefined') {
+                html = DOMPurify.sanitize(html, {ADD_TAGS: ['div'], ADD_ATTR: ['class']});
+            }
+            return html;
         }
 
         async function renderMermaidBlocks() {
@@ -723,7 +728,7 @@ div.vis-tooltip {
             var html = '<div class="issue-badges">';
             html += '<span class="issue-badge" style="background:' + (statusColors[statusKey] || '#8b949e') + '">' + statusDisplay + '</span>';
             html += '<span class="issue-badge" style="background:' + (severityColors[severity] || '#8b949e') + '">' + severity + '</span>';
-            if (component) html += '<span class="issue-badge component">' + component + '</span>';
+            if (component) html += '<span class="issue-badge component">' + escapeHtmlText(component) + '</span>';
             if (commit) html += '<span class="issue-badge commit">#' + commit.slice(0,7) + '</span>';
             html += '</div>';
             return html;
@@ -749,7 +754,7 @@ div.vis-tooltip {
             var html = '<div class="todo-badges">';
             html += '<span class="todo-badge" style="background:' + (statusColors[statusKey] || '#8b949e') + '">' + statusDisplay + '</span>';
             html += '<span class="todo-badge" style="background:' + (priorityColors[priority] || '#8b949e') + '">' + priority + '</span>';
-            if (category) html += '<span class="todo-badge category">' + category + '</span>';
+            if (category) html += '<span class="todo-badge category">' + escapeHtmlText(category) + '</span>';
             html += '</div>';
             return html;
         }
@@ -810,7 +815,7 @@ div.vis-tooltip {
                 return '<div class="metadata-empty">No tags</div>';
             }
             return '<div class="readonly-tag-list">' + tags.map(function(t) {
-                return '<span class="tag" onclick="filterByTag(\'' + t + '\'); event.stopPropagation();">' + t + '</span>';
+                return '<span class="tag" data-filter-tag="' + escapeHtmlText(t) + '">' + escapeHtmlText(t) + '</span>';
             }).join('') + '</div>';
         }
 
@@ -1309,8 +1314,8 @@ div.vis-tooltip {
             var idLine = parts[0] || '';
             var descLine = parts.slice(1).join(' ') || '';
             var tooltip = document.getElementById('node-tooltip');
-            tooltip.innerHTML = '<div class="tooltip-id">' + idLine + '</div>' +
-                                (descLine ? '<div class="tooltip-desc">' + descLine + '</div>' : '');
+            tooltip.innerHTML = '<div class="tooltip-id">' + escapeHtmlText(idLine) + '</div>' +
+                                (descLine ? '<div class="tooltip-desc">' + escapeHtmlText(descLine) + '</div>' : '');
             tooltip.style.left = (pointer.DOM.x + 15) + 'px';
             tooltip.style.top = (pointer.DOM.y + 15) + 'px';
             tooltip.style.display = 'block';
@@ -2028,7 +2033,7 @@ div.vis-tooltip {
             var legendHtml = '';
             var tagEntries = Object.entries(graphData.tagColors).slice(0, 12);
             for (var [tag, color] of tagEntries) {
-                legendHtml += '<div class="legend-item" data-tag="' + tag + '" onclick="filterByTag(\'' + tag + '\')"><span class="legend-color" style="background:' + color + '"></span>' + tag + '</div>';
+                legendHtml += '<div class="legend-item" data-tag="' + escapeHtmlText(tag) + '" data-filter-tag="' + escapeHtmlText(tag) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(tag) + '</div>';
             }
             document.getElementById('legend-items').innerHTML = legendHtml;
 
@@ -2040,14 +2045,14 @@ div.vis-tooltip {
                 for (var [status, nodeIds] of Object.entries(graphData.statusToNodes)) {
                     var color = statusColors[status] || '#8b949e';
                     var displayName = status.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    issuesHtml += '<div class="legend-item issue-status" data-status="' + status + '" onclick="filterByStatus(\'' + status + '\')"><span class="legend-color" style="background:' + color + '"></span>' + displayName + ' (' + nodeIds.length + ')</div>';
+                    issuesHtml += '<div class="legend-item issue-status" data-status="' + escapeHtmlText(status) + '" data-filter-status="' + escapeHtmlText(status) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(displayName) + ' (' + nodeIds.length + ')</div>';
                 }
                 if (graphData.issueCategoryToNodes && Object.keys(graphData.issueCategoryToNodes).length > 0) {
                     issuesHtml += '<div class="issue-categories collapsed"><b>Components</b><span class="legend-toggle" onclick="toggleSection(this)">[+]</span><div class="section-items">';
                     var components = Object.keys(graphData.issueCategoryToNodes).sort();
                     for (var component of components) {
                         var count = graphData.issueCategoryToNodes[component].length;
-                        issuesHtml += '<div class="legend-item issue-category" data-issue-category="' + component + '" onclick="filterByIssueCategory(\'' + component + '\')"><span class="legend-color small" style="background:#8b949e"></span>' + component + ' (' + count + ')</div>';
+                        issuesHtml += '<div class="legend-item issue-category" data-issue-category="' + escapeHtmlText(component) + '" data-filter-issue-category="' + escapeHtmlText(component) + '"><span class="legend-color small" style="background:#8b949e"></span>' + escapeHtmlText(component) + ' (' + count + ')</div>';
                     }
                     issuesHtml += '</div></div>';
                 }
@@ -2064,14 +2069,14 @@ div.vis-tooltip {
                 for (var [status, nodeIds] of Object.entries(graphData.todoStatusToNodes)) {
                     var color = todoStatusColors[status] || '#8b949e';
                     var displayName = todoStatusDisplay[status] || status.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    todosHtml += '<div class="legend-item todo-status" data-todo-status="' + status + '" onclick="filterByTodoStatus(\'' + status + '\')"><span class="legend-color" style="background:' + color + '"></span>' + displayName + ' (' + nodeIds.length + ')</div>';
+                    todosHtml += '<div class="legend-item todo-status" data-todo-status="' + escapeHtmlText(status) + '" data-filter-todo-status="' + escapeHtmlText(status) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(displayName) + ' (' + nodeIds.length + ')</div>';
                 }
                 if (graphData.todoCategoryToNodes && Object.keys(graphData.todoCategoryToNodes).length > 0) {
                     todosHtml += '<div class="todo-categories collapsed"><b>Categories</b><span class="legend-toggle" onclick="toggleSection(this)">[+]</span><div class="section-items">';
                     var categories = Object.keys(graphData.todoCategoryToNodes).sort();
                     for (var category of categories) {
                         var count = graphData.todoCategoryToNodes[category].length;
-                        todosHtml += '<div class="legend-item todo-category" data-todo-category="' + category + '" onclick="filterByTodoCategory(\'' + category + '\')"><span class="legend-color small" style="background:#8b949e"></span>' + category + ' (' + count + ')</div>';
+                        todosHtml += '<div class="legend-item todo-category" data-todo-category="' + escapeHtmlText(category) + '" data-filter-todo-category="' + escapeHtmlText(category) + '"><span class="legend-color small" style="background:#8b949e"></span>' + escapeHtmlText(category) + ' (' + count + ')</div>';
                     }
                     todosHtml += '</div></div>';
                 }
@@ -2102,7 +2107,7 @@ div.vis-tooltip {
             // Build sections
             var sectionsHtml = '';
             for (var [section, nodeIds] of Object.entries(graphData.sectionToNodes)) {
-                sectionsHtml += '<div class="section-item" data-section="' + section + '" onclick="filterBySection(\'' + section + '\')">' + section + ' (' + nodeIds.length + ')</div>';
+                sectionsHtml += '<div class="section-item" data-section="' + escapeHtmlText(section) + '" data-filter-section="' + escapeHtmlText(section) + '">' + escapeHtmlText(section) + ' (' + nodeIds.length + ')</div>';
                 var sectionPaths = Object.keys(graphData.subsectionToNodes).filter(k => k.startsWith(section + '/')).sort();
                 var rendered = new Set();
                 for (var fullPath of sectionPaths) {
@@ -2115,7 +2120,7 @@ div.vis-tooltip {
                             rendered.add(renderKey);
                             var indent = '&nbsp;&nbsp;'.repeat(i);
                             var count = (graphData.subsectionToNodes[renderKey] || []).length;
-                            sectionsHtml += '<div class="subsection-item" data-subsection="' + renderKey + '" onclick="filterBySubsection(\'' + renderKey + '\')" style="padding-left:' + (8 + i*12) + 'px;">' + indent + '\u2514 ' + parts[i] + ' (' + count + ')</div>';
+                            sectionsHtml += '<div class="subsection-item" data-subsection="' + escapeHtmlText(renderKey) + '" data-filter-subsection="' + escapeHtmlText(renderKey) + '" style="padding-left:' + (8 + i*12) + 'px;">' + indent + '\u2514 ' + escapeHtmlText(parts[i]) + ' (' + count + ')</div>';
                         }
                     }
                 }
@@ -2227,6 +2232,19 @@ div.vis-tooltip {
             var versionEl = document.getElementById('version');
             if (versionEl) versionEl.innerHTML = '<span id="version-db">' + (MEMORA_CONFIG.dbSelector ? currentDb : 'memora') + '</span> | v' + MEMORA_CONFIG.version;
         }
+
+        // Delegated click handlers for data-filter-* and data-mem-id attributes (XSS-safe)
+        document.addEventListener('click', function(e) {
+            var el;
+            if ((el = e.target.closest('[data-filter-tag]'))) { filterByTag(el.dataset.filterTag); e.stopPropagation(); }
+            else if ((el = e.target.closest('[data-filter-status]'))) { filterByStatus(el.dataset.filterStatus); }
+            else if ((el = e.target.closest('[data-filter-section]'))) { filterBySection(el.dataset.filterSection); }
+            else if ((el = e.target.closest('[data-filter-subsection]'))) { filterBySubsection(el.dataset.filterSubsection); }
+            else if ((el = e.target.closest('[data-filter-issue-category]'))) { filterByIssueCategory(el.dataset.filterIssueCategory); }
+            else if ((el = e.target.closest('[data-filter-todo-status]'))) { filterByTodoStatus(el.dataset.filterTodoStatus); }
+            else if ((el = e.target.closest('[data-filter-todo-category]'))) { filterByTodoCategory(el.dataset.filterTodoCategory); }
+            else if ((el = e.target.closest('[data-mem-id]'))) { e.preventDefault(); showMemoryDetails(parseInt(el.dataset.memId, 10)); }
+        });
 
         // Initialize database from URL and load graph
         if (MEMORA_CONFIG.dbSelector) initDbFromUrl();
@@ -2376,14 +2394,14 @@ div.vis-tooltip {
             var legendHtml = '';
             var tagEntries = Object.entries(graphData.tagColors).slice(0, 12);
             for (var [tag, color] of tagEntries) {
-                legendHtml += '<div class="legend-item" data-tag="' + tag + '" onclick="filterByTag(\'' + tag + '\')"><span class="legend-color" style="background:' + color + '"></span>' + tag + '</div>';
+                legendHtml += '<div class="legend-item" data-tag="' + escapeHtmlText(tag) + '" data-filter-tag="' + escapeHtmlText(tag) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(tag) + '</div>';
             }
             document.getElementById('legend-items').innerHTML = legendHtml;
 
             // Update section items with subsections
             var sectionsHtml = '';
             for (var [section, nodeIds] of Object.entries(graphData.sectionToNodes)) {
-                sectionsHtml += '<div class="section-item" data-section="' + section + '" onclick="filterBySection(\'' + section + '\')">' + section + ' (' + nodeIds.length + ')</div>';
+                sectionsHtml += '<div class="section-item" data-section="' + escapeHtmlText(section) + '" data-filter-section="' + escapeHtmlText(section) + '">' + escapeHtmlText(section) + ' (' + nodeIds.length + ')</div>';
                 var sectionPaths = Object.keys(graphData.subsectionToNodes).filter(k => k.startsWith(section + '/')).sort();
                 var rendered = new Set();
                 for (var fullPath of sectionPaths) {
@@ -2396,7 +2414,7 @@ div.vis-tooltip {
                             rendered.add(renderKey);
                             var indent = '&nbsp;&nbsp;'.repeat(i);
                             var count = (graphData.subsectionToNodes[renderKey] || []).length;
-                            sectionsHtml += '<div class="subsection-item" data-subsection="' + renderKey + '" onclick="filterBySubsection(\'' + renderKey + '\')" style="padding-left:' + (8 + i*12) + 'px;">' + indent + '\u2514 ' + parts[i] + ' (' + count + ')</div>';
+                            sectionsHtml += '<div class="subsection-item" data-subsection="' + escapeHtmlText(renderKey) + '" data-filter-subsection="' + escapeHtmlText(renderKey) + '" style="padding-left:' + (8 + i*12) + 'px;">' + indent + '\u2514 ' + escapeHtmlText(parts[i]) + ' (' + count + ')</div>';
                         }
                     }
                 }
@@ -2411,14 +2429,14 @@ div.vis-tooltip {
                 for (var [status, nodeIds] of Object.entries(graphData.statusToNodes)) {
                     var color = statusColors[status] || '#8b949e';
                     var displayName = status.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    issuesHtml += '<div class="legend-item issue-status" data-status="' + status + '" onclick="filterByStatus(\'' + status + '\')"><span class="legend-color" style="background:' + color + '"></span>' + displayName + ' (' + nodeIds.length + ')</div>';
+                    issuesHtml += '<div class="legend-item issue-status" data-status="' + escapeHtmlText(status) + '" data-filter-status="' + escapeHtmlText(status) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(displayName) + ' (' + nodeIds.length + ')</div>';
                 }
                 if (graphData.issueCategoryToNodes && Object.keys(graphData.issueCategoryToNodes).length > 0) {
                     issuesHtml += '<div class="issue-categories collapsed"><b>Components</b><span class="legend-toggle" onclick="toggleSection(this)">[+]</span><div class="section-items">';
                     var components = Object.keys(graphData.issueCategoryToNodes).sort();
                     for (var component of components) {
                         var count = graphData.issueCategoryToNodes[component].length;
-                        issuesHtml += '<div class="legend-item issue-category" data-issue-category="' + component + '" onclick="filterByIssueCategory(\'' + component + '\')"><span class="legend-color small" style="background:#8b949e"></span>' + component + ' (' + count + ')</div>';
+                        issuesHtml += '<div class="legend-item issue-category" data-issue-category="' + escapeHtmlText(component) + '" data-filter-issue-category="' + escapeHtmlText(component) + '"><span class="legend-color small" style="background:#8b949e"></span>' + escapeHtmlText(component) + ' (' + count + ')</div>';
                     }
                     issuesHtml += '</div></div>';
                 }
@@ -2435,14 +2453,14 @@ div.vis-tooltip {
                 for (var [status, nodeIds] of Object.entries(graphData.todoStatusToNodes)) {
                     var color = todoStatusColors[status] || '#8b949e';
                     var displayName = todoStatusDisplay[status] || status.replace('_', ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    todosHtml += '<div class="legend-item todo-status" data-todo-status="' + status + '" onclick="filterByTodoStatus(\'' + status + '\')"><span class="legend-color" style="background:' + color + '"></span>' + displayName + ' (' + nodeIds.length + ')</div>';
+                    todosHtml += '<div class="legend-item todo-status" data-todo-status="' + escapeHtmlText(status) + '" data-filter-todo-status="' + escapeHtmlText(status) + '"><span class="legend-color" style="background:' + color + '"></span>' + escapeHtmlText(displayName) + ' (' + nodeIds.length + ')</div>';
                 }
                 if (graphData.todoCategoryToNodes && Object.keys(graphData.todoCategoryToNodes).length > 0) {
                     todosHtml += '<div class="todo-categories collapsed"><b>Categories</b><span class="legend-toggle" onclick="toggleSection(this)">[+]</span><div class="section-items">';
                     var categories = Object.keys(graphData.todoCategoryToNodes).sort();
                     for (var category of categories) {
                         var count = graphData.todoCategoryToNodes[category].length;
-                        todosHtml += '<div class="legend-item todo-category" data-todo-category="' + category + '" onclick="filterByTodoCategory(\'' + category + '\')"><span class="legend-color small" style="background:#8b949e"></span>' + category + ' (' + count + ')</div>';
+                        todosHtml += '<div class="legend-item todo-category" data-todo-category="' + escapeHtmlText(category) + '" data-filter-todo-category="' + escapeHtmlText(category) + '"><span class="legend-color small" style="background:#8b949e"></span>' + escapeHtmlText(category) + ' (' + count + ')</div>';
                     }
                     todosHtml += '</div></div>';
                 }
@@ -2574,7 +2592,7 @@ div.vis-tooltip {
 
         function linkifyMemoryRefs(html) {
             return html.replace(/\[Memory #(\d+)\]/g, function(match, id) {
-                return '<a class="chat-mem-link" href="#" onclick="showMemoryDetails(' + id + '); return false;">' + match + '</a>';
+                return '<a class="chat-mem-link" href="#" data-mem-id="' + id + '">' + escapeHtmlText(match) + '</a>';
             });
         }
 
