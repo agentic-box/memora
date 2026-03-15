@@ -1100,17 +1100,20 @@ def multi_query_hybrid_search(
     return results
 
 
+# Threshold for duplicate detection — aligned with graph UI
+DUPLICATE_THRESHOLD = 0.85
+
+
 def find_duplicate_candidates(
     conn: "sqlite3.Connection",
-    min_similarity: float = 0.7,
-    max_similarity: float = 0.95,
+    min_similarity: float = DUPLICATE_THRESHOLD,
     limit: int = 50,
 ) -> List[Dict[str, Any]]:
-    """Find memory pairs in similarity range that might be duplicates.
+    """Find memory pairs with similarity >= threshold that are likely duplicates.
 
-    Returns list of pairs with their similarity scores.
+    Uses the same threshold as the graph UI duplicate detection.
+    Returns list of pairs with their similarity scores, highest first.
     """
-    # Get all cross-refs from database
     cursor = conn.execute(
         "SELECT memory_id, related FROM memories_crossrefs WHERE related IS NOT NULL"
     )
@@ -1134,9 +1137,7 @@ def find_duplicate_candidates(
             if related_id is None:
                 continue
 
-            # Check if in similarity range
-            if min_similarity <= score <= max_similarity:
-                # Avoid duplicate pairs (A,B) and (B,A)
+            if score >= min_similarity:
                 pair_key = tuple(sorted([memory_id, related_id]))
                 if pair_key not in pairs_seen:
                     pairs_seen.add(pair_key)
@@ -1146,7 +1147,6 @@ def find_duplicate_candidates(
                         "similarity_score": score,
                     })
 
-    # Sort by similarity (highest first)
     candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
 
     return candidates[:limit]
@@ -2671,7 +2671,7 @@ def generate_insights(
 
     # --- C. Consolidation suggestions ---
     period_ids = {m["id"] for m in period_memories}
-    all_candidates = find_duplicate_candidates(conn, min_similarity=0.6, max_similarity=0.95, limit=100)
+    all_candidates = find_duplicate_candidates(conn, min_similarity=0.6, limit=100)
     scoped = [
         c for c in all_candidates
         if c["memory_a_id"] in period_ids or c["memory_b_id"] in period_ids

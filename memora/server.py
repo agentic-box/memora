@@ -1110,33 +1110,34 @@ async def memory_clusters(
 
 @mcp.tool()
 async def memory_find_duplicates(
-    min_similarity: float = 0.7,
-    max_similarity: float = 0.95,
+    min_similarity: float = 0.85,
+    max_similarity: float = 1.0,
     limit: int = 10,
     use_llm: bool = True,
 ) -> Dict[str, Any]:
     """Find potential duplicate memory pairs with optional LLM-powered comparison.
 
-    Scans cross-references to find memory pairs with similarity scores in the
-    specified range, then optionally uses LLM to semantically compare them.
+    Scans cross-references to find memory pairs with similarity >= threshold,
+    then optionally uses LLM to semantically compare them. Uses the same
+    threshold (0.85) as the graph UI duplicate detection.
 
     Args:
-        min_similarity: Minimum similarity score to consider (default: 0.7)
-        max_similarity: Maximum similarity score to consider (default: 0.95)
+        min_similarity: Minimum similarity score to consider (default: 0.85)
+        max_similarity: Maximum similarity score (default: 1.0, kept for backward compatibility)
         limit: Maximum pairs to analyze (default: 10)
         use_llm: Whether to use LLM for semantic comparison (default: True)
 
     Returns:
         Dictionary with:
         - pairs: List of potential duplicate pairs with analysis
-        - total_candidates: Total pairs found in range
+        - total_candidates: Total pairs found
         - analyzed: Number of pairs analyzed with LLM
         - llm_available: Whether LLM comparison was available
     """
     from .storage import compare_memories_llm, connect, find_duplicate_candidates
 
     with connect() as conn:
-        candidates = find_duplicate_candidates(conn, min_similarity, max_similarity, limit * 2)
+        candidates = find_duplicate_candidates(conn, min_similarity, limit * 2)
 
     total_candidates = len(candidates)
     pairs = []
