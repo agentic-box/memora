@@ -32,6 +32,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
   // Join path segments
   let objectKey = pathSegments.join("/");
 
+  // Block path traversal sequences
+  if (objectKey.includes("..") || objectKey.startsWith("/")) {
+    return new Response("Invalid path", { status: 400 });
+  }
+
   // Handle both bucket-prefixed and non-prefixed paths
   // R2 stores files like: images/123/0.jpg
   // URLs might come as: memora/images/123/0.jpg or images/123/0.jpg
@@ -46,6 +51,18 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
     bucket = getBucket(env, dbName);
   }
 
+  // After db prefix stripping, require images/ prefix
+  if (!objectKey.startsWith("images/")) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  // Block non-image extensions as secondary check
+  const ext = objectKey.split(".").pop()?.toLowerCase() || "";
+  const imageExts = new Set(["jpg", "jpeg", "png", "gif", "webp", "svg", "bmp", "ico"]);
+  if (!imageExts.has(ext)) {
+    return new Response("Not found", { status: 404 });
+  }
+
   try {
     const object = await bucket.get(objectKey);
 
@@ -53,10 +70,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
       return new Response("Not found", { status: 404 });
     }
 
-    // Determine content type
-    const contentType = object.httpMetadata?.contentType ||
-      getContentType(objectKey) ||
-      "application/octet-stream";
+    // Validate content type from R2 metadata (don't trust extension-derived MIME)
+    const contentType = object.httpMetadata?.contentType || "";
+    if (!contentType.startsWith("image/")) {
+      return new Response("Not found", { status: 404 });
+    }
 
     const headers = new Headers();
     headers.set("Content-Type", contentType);

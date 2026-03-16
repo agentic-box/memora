@@ -5,6 +5,7 @@ import argparse
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Literal, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -49,6 +50,15 @@ from .storage import (
     update_memory,
 )
 
+logger = logging.getLogger(__name__)
+
+
+def _safe_error(e: Exception, context: str = "operation") -> Dict[str, str]:
+    """Return sanitized error for unexpected exceptions. Log full details internally."""
+    logger.error("Failed %s: %s", context, e, exc_info=True)
+    return {"error": f"{context}_failed", "message": f"The {context} failed. Check server logs for details."}
+
+
 # Content type inference patterns
 TYPE_PATTERNS: List[tuple[str, str]] = [
     (r'^(?:TODO|TASK)[:>\s]', 'todo'),
@@ -67,6 +77,41 @@ AUTO_HIERARCHY_THRESHOLD = 0.5
 
 # Allow token-efficient small MCP response payload
 CREATE_RESPONSE_MODES = {"full", "minimal"}
+
+# Tool cooldowns (seconds) — prevents resource exhaustion via repeated expensive operations
+_TOOL_COOLDOWNS: Dict[str, int] = {
+    "memory_rebuild_embeddings": 300,
+    "memory_rebuild_crossrefs": 300,
+    "memory_find_duplicates": 120,
+    "memory_migrate_images": 300,
+    "memory_insights": 120,
+    "memory_export": 60,
+    "memory_import": 60,
+}
+_tool_last_call: Dict[str, float] = {}
+_tool_running: Dict[str, bool] = {}
+
+
+def _check_tool_cooldown(tool_name: str) -> Optional[str]:
+    """Check if a tool is running or within its cooldown period. Returns error message or None."""
+    cooldown = _TOOL_COOLDOWNS.get(tool_name)
+    if not cooldown:
+        return None
+    # Single-flight: reject if already running
+    if _tool_running.get(tool_name):
+        return f"{tool_name} is already running."
+    last = _tool_last_call.get(tool_name, 0)
+    elapsed = time.time() - last
+    if elapsed < cooldown:
+        return f"Rate limited. Try again in {int(cooldown - elapsed)}s."
+    _tool_running[tool_name] = True
+    return None
+
+
+def _finish_tool(tool_name: str) -> None:
+    """Mark a tool as finished and record its completion time."""
+    _tool_running.pop(tool_name, None)
+    _tool_last_call[tool_name] = time.time()
 
 
 def _infer_type(content: str) -> Optional[str]:
@@ -937,10 +982,14 @@ async def memory_hybrid_search(
 
 @mcp.tool()
 async def memory_rebuild_embeddings() -> Dict[str, Any]:
-    """Recompute embeddings for all memories."""
-
-    updated = _rebuild_embeddings()
-    return {"updated": updated}
+    """Recompute embeddings for all memories. Rate limited: 300s cooldown."""
+    if msg := _check_tool_cooldown("memory_rebuild_embeddings"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        updated = _rebuild_embeddings()
+        return {"updated": updated}
+    finally:
+        _finish_tool("memory_rebuild_embeddings")
 
 
 @mcp.tool()
@@ -953,10 +1002,14 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
 
 @mcp.tool()
 async def memory_rebuild_crossrefs() -> Dict[str, Any]:
-    """Recompute cross-reference links for all memories."""
-
-    updated = _rebuild_crossrefs()
-    return {"updated": updated}
+    """Recompute cross-reference links for all memories. Rate limited: 300s cooldown."""
+    if msg := _check_tool_cooldown("memory_rebuild_crossrefs"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        updated = _rebuild_crossrefs()
+        return {"updated": updated}
+    finally:
+        _finish_tool("memory_rebuild_crossrefs")
 
 
 @mcp.tool()
@@ -986,9 +1039,15 @@ async def memory_insights(
         - open_items: Open TODOs and issues with stale detection
         - consolidation_candidates: Similar memory pairs that could be merged
         - llm_analysis: Themes, focus areas, gaps, and summary (or null)
+    Rate limited: 120s cooldown.
     """
-    stale_days = int(os.getenv("MEMORA_STALE_DAYS", "14"))
-    return _generate_insights(period, stale_days, include_llm_analysis)
+    if msg := _check_tool_cooldown("memory_insights"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        stale_days = int(os.getenv("MEMORA_STALE_DAYS", "14"))
+        return _generate_insights(period, stale_days, include_llm_analysis)
+    finally:
+        _finish_tool("memory_insights")
 
 
 @mcp.tool()
@@ -1133,7 +1192,20 @@ async def memory_find_duplicates(
         - total_candidates: Total pairs found
         - analyzed: Number of pairs analyzed with LLM
         - llm_available: Whether LLM comparison was available
+
+    Rate limited: 120s cooldown.
     """
+    if msg := _check_tool_cooldown("memory_find_duplicates"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        return await _find_duplicates_impl(min_similarity, max_similarity, limit, use_llm)
+    finally:
+        _finish_tool("memory_find_duplicates")
+
+
+async def _find_duplicates_impl(
+    min_similarity: float, max_similarity: float, limit: int, use_llm: bool
+) -> Dict[str, Any]:
     from .storage import compare_memories_llm, connect, find_duplicate_candidates
 
     with connect() as conn:
@@ -1270,10 +1342,14 @@ async def memory_merge(
 
 @mcp.tool()
 async def memory_export() -> Dict[str, Any]:
-    """Export all memories to JSON format for backup or transfer."""
-
-    memories = _export_memories()
-    return {"count": len(memories), "memories": memories}
+    """Export all memories to JSON format for backup or transfer. Rate limited: 60s cooldown."""
+    if msg := _check_tool_cooldown("memory_export"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        memories = _export_memories()
+        return {"count": len(memories), "memories": memories}
+    finally:
+        _finish_tool("memory_export")
 
 
 @mcp.tool()
@@ -1297,8 +1373,9 @@ async def memory_upload_image(
     Returns:
         Dictionary with r2_url (the r2:// reference) and image object ready for metadata
     """
-    import mimetypes
-    import os
+    from pathlib import Path as _Path
+
+    from PIL import Image as _PILImage
 
     from .image_storage import get_image_storage_instance
 
@@ -1309,18 +1386,47 @@ async def memory_upload_image(
             "message": "R2 storage is not configured. Set MEMORA_STORAGE_URI to s3:// and configure AWS credentials.",
         }
 
-    # Validate file exists
-    if not os.path.isfile(file_path):
-        return {"error": "file_not_found", "message": f"File not found: {file_path}"}
+    # --- Path validation (defense in depth) ---
+    raw_path = _Path(file_path)
 
-    # Determine content type
-    content_type, _ = mimetypes.guess_type(file_path)
-    if not content_type or not content_type.startswith("image/"):
-        content_type = "image/png"  # Default to PNG for unknown types
+    # 1. Reject symlinks anywhere in the path chain
+    for part in [raw_path] + list(raw_path.parents):
+        if part.is_symlink():
+            return {"error": "invalid_path", "message": "Symlinks are not supported"}
+
+    try:
+        resolved = raw_path.resolve(strict=True)
+    except (OSError, ValueError):
+        return {"error": "file_not_found", "message": "File not found"}
+
+    # 2. Validate extension — aligned with image_storage.py ext_map
+    _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    if resolved.suffix.lower() not in _UPLOAD_EXTENSIONS:
+        return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
+
+    # 3. Block known sensitive directories
+    _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
+    path_str = str(resolved).lower()
+    for pattern in _BLOCKED_PATTERNS:
+        if pattern in path_str:
+            return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
+
+    # 4. Verify file is actually an image and derive MIME from content
+    _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
+    try:
+        with _PILImage.open(str(resolved)) as img:
+            img.verify()
+            pillow_format = img.format
+    except Exception:
+        return {"error": "invalid_image", "message": "File is not a valid image"}
+
+    content_type = _PILLOW_TO_MIME.get(pillow_format)
+    if not content_type:
+        return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
 
     try:
         # Read file and upload
-        with open(file_path, "rb") as f:
+        with open(str(resolved), "rb") as f:
             image_data = f.read()
 
         r2_url = image_storage.upload_image(
@@ -1335,17 +1441,17 @@ async def memory_upload_image(
         if caption:
             image_obj["caption"] = caption
 
+        # Don't echo local file_path in response (path disclosure fix)
         return {
             "r2_url": r2_url,
             "image": image_obj,
-            "file_path": file_path,
             "content_type": content_type,
             "size_bytes": len(image_data),
         }
 
     except Exception as e:
-        logger.error("Failed to upload image '%s' for memory %s: %s", file_path, memory_id, e)
-        return {"error": "upload_failed", "message": str(e)}
+        logger.error("Failed to upload image for memory %s: %s", memory_id, e)
+        return {"error": "upload_failed", "message": "Image upload failed. Check server logs for details."}
 
 
 @mcp.tool()
@@ -1360,8 +1466,15 @@ async def memory_migrate_images(dry_run: bool = False) -> Dict[str, Any]:
 
     Returns:
         Dictionary with migration results including count of migrated images
+
+    Rate limited: 300s cooldown.
     """
-    return _migrate_images_to_r2(dry_run=dry_run)
+    if msg := _check_tool_cooldown("memory_migrate_images"):
+        return {"error": "rate_limited", "message": msg}
+    try:
+        return _migrate_images_to_r2(dry_run=dry_run)
+    finally:
+        _finish_tool("memory_migrate_images")
 
 
 @_with_connection(writes=True)
@@ -1441,7 +1554,7 @@ def _migrate_images_to_r2(conn, dry_run: bool = False) -> Dict[str, Any]:
                 results["errors"].append({
                     "memory_id": memory_id,
                     "image_index": idx,
-                    "error": str(e),
+                    "error": "migration_failed",
                 })
 
         if updated:
@@ -1494,18 +1607,28 @@ async def memory_import(
     data: List[Dict[str, Any]],
     strategy: str = "append",
 ) -> Dict[str, Any]:
-    """Import memories from JSON format.
+    """Import memories from JSON format. Rate limited: 60s cooldown.
 
     Args:
         data: List of memory dictionaries with content, metadata, tags, created_at
         strategy: "replace" (clear all first), "merge" (skip duplicates), or "append" (add all)
     """
+    # Validate inputs before consuming cooldown
+    if strategy not in ("replace", "merge", "append"):
+        return {"error": "invalid_input", "message": f"Unknown strategy: {strategy}"}
+    if not data:
+        return {"error": "invalid_input", "message": "No data provided"}
+
+    if msg := _check_tool_cooldown("memory_import"):
+        return {"error": "rate_limited", "message": msg}
     try:
         result = _import_memories(data, strategy)
+        _schedule_cloud_graph_sync()
+        return result
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
-    _schedule_cloud_graph_sync()
-    return result
+    finally:
+        _finish_tool("memory_import")
 
 
 @_with_connection

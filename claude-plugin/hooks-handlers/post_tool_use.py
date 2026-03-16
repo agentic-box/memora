@@ -269,44 +269,103 @@ def compute_content_hash(capture_type: str, tool_name: str, tool_input: dict) ->
     return hashlib.md5("|".join(key_parts).encode()).hexdigest()[:16]
 
 
+def _cache_path(session_id: str) -> Path:
+    """Get secure cache path with hashed session ID."""
+    safe_id = hashlib.sha256(session_id.encode()).hexdigest()[:16]
+    cache_dir = Path.home() / ".cache" / "memora"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"capture_cache_{safe_id}.json"
+
+
 def load_cache(session_id: str) -> dict:
-    """Load capture cache for session."""
-    cache_file = Path(f"/tmp/memora_capture_cache_{session_id}.json")
-    if cache_file.exists():
-        try:
-            with open(cache_file) as f:
-                return json.load(f)
-        except Exception:
-            pass
+    """Load capture cache for session (with file locking)."""
+    cache_file = _cache_path(session_id)
+    lock_file = cache_file.with_suffix(".lock")
+    try:
+        with open(lock_file, "w") as lf:
+            import fcntl
+            fcntl.flock(lf, fcntl.LOCK_SH)
+            try:
+                if cache_file.exists():
+                    return json.loads(cache_file.read_text())
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception:
+        pass
     return {}
 
 
 def save_cache(session_id: str, cache: dict):
-    """Save capture cache for session."""
-    cache_file = Path(f"/tmp/memora_capture_cache_{session_id}.json")
+    """Save capture cache for session (atomic write with file locking)."""
+    import tempfile
+    cache_file = _cache_path(session_id)
+    lock_file = cache_file.with_suffix(".lock")
     try:
-        with open(cache_file, "w") as f:
-            json.dump(cache, f)
+        with open(lock_file, "w") as lf:
+            import fcntl
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                fd, tmp_path = tempfile.mkstemp(dir=cache_file.parent, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(cache, f)
+                    os.chmod(tmp_path, 0o600)
+                    os.replace(tmp_path, str(cache_file))
+                except Exception:
+                    os.unlink(tmp_path)
+                    raise
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
     except Exception:
         pass
 
 
 def is_duplicate(content_hash: str, session_id: str) -> bool:
-    """Check if action was recently captured."""
-    cache = load_cache(session_id)
-    now = datetime.now()
+    """Check if action was recently captured (atomic read-modify-write)."""
+    import fcntl
+    import tempfile
 
-    cache = {
-        k: v for k, v in cache.items()
-        if now - datetime.fromisoformat(v) < timedelta(minutes=CACHE_TTL_MINUTES)
-    }
+    cache_file = _cache_path(session_id)
+    lock_file = cache_file.with_suffix(".lock")
+    try:
+        with open(lock_file, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                # Read
+                cache = {}
+                if cache_file.exists():
+                    try:
+                        cache = json.loads(cache_file.read_text())
+                    except Exception:
+                        cache = {}
 
-    if content_hash in cache:
-        return True
+                # Prune expired entries
+                now = datetime.now()
+                cache = {
+                    k: v for k, v in cache.items()
+                    if now - datetime.fromisoformat(v) < timedelta(minutes=CACHE_TTL_MINUTES)
+                }
 
-    cache[content_hash] = now.isoformat()
-    save_cache(session_id, cache)
-    return False
+                # Check
+                if content_hash in cache:
+                    return True
+
+                # Insert + Write atomically
+                cache[content_hash] = now.isoformat()
+                fd, tmp_path = tempfile.mkstemp(dir=cache_file.parent, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(cache, f)
+                    os.chmod(tmp_path, 0o600)
+                    os.replace(tmp_path, str(cache_file))
+                except Exception:
+                    os.unlink(tmp_path)
+                    raise
+                return False
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception:
+        return False
 
 
 def format_memory_content(

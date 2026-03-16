@@ -700,8 +700,10 @@ div.vis-tooltip {
                 } else if (src && src.startsWith(MEMORA_CONFIG.r2Prefix) && !src.includes('?db=')) {
                     src = src + getDbParam();
                 }
-                html += '<div class="memory-image"><img src="' + src + '" alt="' + (img.caption || '') + '">';
-                if (img.caption) html += '<div class="caption">' + img.caption + '</div>';
+                // Validate src is a safe URL scheme
+                if (src && !/^(https?:\/\/|\/api\/r2\/|\/r2\/)/.test(src)) src = '';
+                html += '<div class="memory-image"><img src="' + escapeHtmlAttr(src || '') + '" alt="' + escapeHtmlAttr(img.caption || '') + '">';
+                if (img.caption) html += '<div class="caption">' + escapeHtmlText(img.caption) + '</div>';
                 html += '</div>';
             }
             return html + '</div>';
@@ -1124,7 +1126,7 @@ div.vis-tooltip {
 
         function filterByTag(tag) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.legend-item[data-tag="' + tag + '"]');
+            var el = document.querySelector('.legend-item[data-tag="' + CSS.escape(tag) + '"]');
             if (el) el.classList.add('active');
             currentFilter = tag;
             var nodeIds = graphData.tagToNodes[tag] || [];
@@ -1133,7 +1135,7 @@ div.vis-tooltip {
 
         function filterBySection(section) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.section-item[data-section="' + section + '"]');
+            var el = document.querySelector('.section-item[data-section="' + CSS.escape(section) + '"]');
             if (el) el.classList.add('active');
             currentFilter = section;
             var nodeIds = graphData.sectionToNodes[section] || [];
@@ -1142,7 +1144,7 @@ div.vis-tooltip {
 
         function filterBySubsection(subsection) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.subsection-item[data-subsection="' + subsection + '"]');
+            var el = document.querySelector('.subsection-item[data-subsection="' + CSS.escape(subsection) + '"]');
             if (el) el.classList.add('active');
             currentFilter = subsection;
             var nodeIds = graphData.subsectionToNodes[subsection] || [];
@@ -1262,7 +1264,7 @@ div.vis-tooltip {
 
         function filterByStatus(status) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.legend-item[data-status="' + status + '"]');
+            var el = document.querySelector('.legend-item[data-status="' + CSS.escape(status) + '"]');
             if (el) el.classList.add('active');
             currentFilter = 'status:' + status;
             var nodeIds = graphData.statusToNodes[status] || [];
@@ -1271,7 +1273,7 @@ div.vis-tooltip {
 
         function filterByIssueCategory(category) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.legend-item[data-issue-category="' + category + '"]');
+            var el = document.querySelector('.legend-item[data-issue-category="' + CSS.escape(category) + '"]');
             if (el) el.classList.add('active');
             currentFilter = 'issue-category:' + category;
             var nodeIds = graphData.issueCategoryToNodes[category] || [];
@@ -1290,7 +1292,7 @@ div.vis-tooltip {
 
         function filterByTodoStatus(status) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.legend-item[data-todo-status="' + status + '"]');
+            var el = document.querySelector('.legend-item[data-todo-status="' + CSS.escape(status) + '"]');
             if (el) el.classList.add('active');
             currentFilter = 'todo-status:' + status;
             var nodeIds = graphData.todoStatusToNodes[status] || [];
@@ -1299,7 +1301,7 @@ div.vis-tooltip {
 
         function filterByTodoCategory(category) {
             document.querySelectorAll('.legend-item, .section-item, .subsection-item').forEach(el => el.classList.remove('active'));
-            var el = document.querySelector('.legend-item[data-todo-category="' + category + '"]');
+            var el = document.querySelector('.legend-item[data-todo-category="' + CSS.escape(category) + '"]');
             if (el) el.classList.add('active');
             currentFilter = 'todo-category:' + category;
             var nodeIds = graphData.todoCategoryToNodes[category] || [];
@@ -1577,14 +1579,14 @@ div.vis-tooltip {
                 if (statusKey === 'closed' && mem.metadata.closed_reason) {
                     statusKey = 'closed:' + mem.metadata.closed_reason;
                 }
-                var issueEl = document.querySelector('.legend-item.issue-status[data-status="' + statusKey + '"]');
+                var issueEl = document.querySelector('.legend-item.issue-status[data-status="' + CSS.escape(statusKey) + '"]');
                 if (issueEl) issueEl.classList.add('selected');
             } else if (mem.metadata.type === 'todo' && mem.metadata.status) {
                 var statusKey = mem.metadata.status;
                 if (statusKey === 'closed' && mem.metadata.closed_reason) {
                     statusKey = 'closed:' + mem.metadata.closed_reason;
                 }
-                var todoEl = document.querySelector('.legend-item.todo-status[data-todo-status="' + statusKey + '"]');
+                var todoEl = document.querySelector('.legend-item.todo-status[data-todo-status="' + CSS.escape(statusKey) + '"]');
                 if (todoEl) todoEl.classList.add('selected');
             } else {
                 var section, subsection;
@@ -1597,11 +1599,11 @@ div.vis-tooltip {
                     subsection = mem.metadata.subsection;
                 }
                 if (section) {
-                    var sectionEl = document.querySelector('.section-item[data-section="' + section + '"]');
+                    var sectionEl = document.querySelector('.section-item[data-section="' + CSS.escape(section) + '"]');
                     if (sectionEl) sectionEl.classList.add('selected');
                     if (subsection) {
                         var path = section + '/' + subsection;
-                        var el = document.querySelector('.subsection-item[data-subsection="' + path + '"]');
+                        var el = document.querySelector('.subsection-item[data-subsection="' + CSS.escape(path) + '"]');
                         if (el) el.classList.add('selected');
                     }
                 }
@@ -1658,6 +1660,10 @@ div.vis-tooltip {
             var div = document.createElement('div');
             div.textContent = text;
             return div.innerHTML;
+        }
+
+        function escapeHtmlAttr(text) {
+            return escapeHtmlText(String(text || '')).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         }
 
         function closePanel() {

@@ -185,6 +185,30 @@ memora-graph/
 | `GET /api/memories/:id` | Returns single memory by ID |
 | `GET /api/r2/*` | Proxies images from R2 storage |
 
+## Security Model
+
+Memora is a **single-user** memory system. All memories in a database are
+accessible to any authenticated user. Multi-user/multi-tenant isolation is
+not supported and the `?db=` parameter is not a tenant boundary — it selects
+between the owner's own databases.
+
+Access control is enforced at the infrastructure level:
+- **Cloud:** Cloudflare Access gates all Pages endpoints (authentication required)
+- **Local:** Graph server binds to localhost by default
+- **MCP:** Server runs as a local process under the user's own permissions
+
+### Rate Limiting
+
+- **Cloud chat:** Cloudflare Rate Limiting rule — 30 req/min per IP for `/api/chat`
+- **Local chat:** Built-in middleware — 30 req/min per IP for `/api/chat`
+- **MCP tools:** Operation-specific cooldowns on expensive tools (rebuild, export, import)
+
+### Local Cache
+
+When using cloud backends (S3/R2), a local SQLite cache is stored at
+`~/.cache/memora/`. This cache is unencrypted. For sensitive data,
+ensure your disk uses full-disk encryption.
+
 ## Troubleshooting
 
 ### "wrangler: command not found"
