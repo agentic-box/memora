@@ -8,7 +8,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 </p>
 
 <p align="center">
-<a href="https://github.com/agentic-mcp-tools/memora/releases"><img src="https://img.shields.io/github/v/tag/agentic-mcp-tools/memora?label=version&color=blue" alt="Version"></a>
+<a href="https://github.com/agentic-box/memora/releases"><img src="https://img.shields.io/github/v/tag/agentic-box/memora?label=version&color=blue" alt="Version"></a>
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
 <a href="https://github.com/thedotmack/awesome-claude-code"><img src="https://awesome.re/mentioned-badge.svg" alt="Mentioned in Awesome Claude Code"></a>
 </p>
@@ -49,14 +49,14 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 ## Install
 
 ```bash
-pip install git+https://github.com/agentic-mcp-tools/memora.git
+pip install git+https://github.com/agentic-box/memora.git
 ```
 
 Includes cloud storage (S3/R2) and OpenAI embeddings out of the box.
 
 ```bash
 # Optional: local embeddings (offline, ~2GB for PyTorch)
-pip install "memora[local]" @ git+https://github.com/agentic-mcp-tools/memora.git
+pip install "memora[local]" @ git+https://github.com/agentic-box/memora.git
 ```
 
 <details id="usage">
