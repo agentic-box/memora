@@ -830,6 +830,12 @@ export const onRequestPost: PagesFunction<Env> = async ({
       "The memory database has many more entries than what's shown in context below — if the user references a memory ID, trust them and call the tool.",
       "When creating a memory, write substantive, well-structured content.",
       "When updating, apply the user's requested changes to the existing content.",
+      "",
+      "## When NOT to use tools",
+      "",
+      "Do NOT create, update, or delete memories unless the user EXPLICITLY asks you to.",
+      "If the user asks a question, searches for something, or wants to discuss a topic — just answer using the context provided.",
+      "Asking about a memory is NOT a request to create one.",
     ].join("\n"),
   };
 

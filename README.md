@@ -40,7 +40,7 @@ A lightweight MCP server for semantic memory storage, knowledge graphs, conversa
 - ⚡ **Memory Automation** - Structured tools for TODOs, issues, and sections
 - 🕸️ **Knowledge Graph** - Interactive visualization with Mermaid rendering and cluster overlays
 - 🌐 **Live Graph Server** - Built-in HTTP server with cloud-hosted option (D1/Pages)
-- 💬 **Chat with Memories** - RAG-powered chat panel that searches relevant memories and streams LLM responses
+- 💬 **Chat with Memories** - RAG-powered chat panel with LLM tool calling to search, create, update, and delete memories via streaming chat
 - 📡 **Event Notifications** - Poll-based system for inter-agent communication
 - 📊 **Statistics & Analytics** - Tag usage, trends, and connection insights
 - 🧠 **Memory Insights** - Activity summary, stale detection, consolidation suggestions, and LLM-powered pattern analysis
@@ -325,11 +325,12 @@ See [`memora-graph/`](memora-graph/) for detailed setup and multi-database confi
 <details id="chat-with-memories">
 <summary><big><big><strong>Chat with Memories</strong></big></big></summary>
 
-Ask questions about your knowledge base directly from the graph UI. The chat panel uses RAG (Retrieval-Augmented Generation) to search relevant memories and stream LLM responses.
+Ask questions about your knowledge base directly from the graph UI. The chat panel uses RAG (Retrieval-Augmented Generation) to search relevant memories and stream LLM responses with tool calling support.
 
 - **Toggle** via the floating chat icon at bottom-right
 - **Semantic search** finds the most relevant memories as context
 - **Streaming responses** with clickable `[Memory #ID]` references that focus the graph node
+- **Tool calling** — the LLM can create, update, and delete memories directly from chat (e.g., "save this as a memory", "delete memory #42", "update memory #10 with...")
 - Works on both the local server and Cloudflare Pages deployment
 
 **Configure the chat model:**
@@ -339,7 +340,7 @@ Ask questions about your knowledge base directly from the graph UI. The chat pan
 | Local server | `CHAT_MODEL` env var | Falls back to `MEMORA_LLM_MODEL` |
 | Cloudflare Pages | `CHAT_MODEL` in `wrangler.toml` | `deepseek/deepseek-chat` |
 
-Requires an OpenAI-compatible API (`OPENAI_API_KEY` + `OPENAI_BASE_URL` for local, `OPENROUTER_API_KEY` secret for Cloudflare).
+Requires an OpenAI-compatible API (`OPENAI_API_KEY` + `OPENAI_BASE_URL` for local, `OPENROUTER_API_KEY` secret for Cloudflare). The chat model must support tool use (function calling).
 
 </details>
 
