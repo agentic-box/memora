@@ -1684,7 +1684,12 @@ div.vis-tooltip {
 
         function showPanel(mem) {
             currentPanelMemoryId = mem.id;
-            memoryCache[mem.id] = mem;
+            // Don't overwrite memoryCache while editing this memory: rerenderPanelDraft()
+            // calls showPanel() with draft-derived data, which would corrupt the cache
+            // and cause Cancel to restore the draft instead of the persisted state.
+            if (!panelEditMode || !panelDraftMemory || panelDraftMemory.id !== mem.id) {
+                memoryCache[mem.id] = mem;
+            }
             if ((!panelEditMode || !panelDraftMemory || panelDraftMemory.id !== mem.id) && memoryCache[mem.id]) {
                 panelDraftMemory = cloneJson(memoryCache[mem.id]);
             }
