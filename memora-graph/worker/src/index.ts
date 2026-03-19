@@ -111,17 +111,8 @@ export class GraphSyncDO implements DurableObject {
       connections: this.connections.size,
     }));
 
-    // Handle messages
-    server.addEventListener("message", (event) => {
-      try {
-        const data = JSON.parse(event.data as string);
-        if (data.type === "ping") {
-          server.send(JSON.stringify({ type: "pong", timestamp: new Date().toISOString() }));
-        }
-      } catch {
-        // Ignore invalid messages
-      }
-    });
+    // Handle messages (no-op; kept for future use)
+    server.addEventListener("message", () => {});
 
     // Handle close
     server.addEventListener("close", () => {

@@ -2325,13 +2325,6 @@ div.vis-tooltip {
                     updateConnectionStatus('error');
                 };
 
-                // Keepalive ping every 30 seconds
-                setInterval(function() {
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({ type: 'ping' }));
-                    }
-                }, 30000);
-
             } catch (e) {
                 console.error('WebSocket connection error:', e);
                 setTimeout(connectWebSocket, wsReconnectDelay);
