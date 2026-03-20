@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 from urllib.error import URLError
@@ -39,6 +40,11 @@ _sync_timer: Optional[threading.Timer] = None
 _sync_lock = threading.Lock()
 SYNC_DEBOUNCE_SECONDS = float(os.getenv("MEMORA_CLOUD_GRAPH_DEBOUNCE", "1.0"))
 
+# Track whether anyone is listening — skip broadcasts when no clients connected
+_known_connections: int = 0  # connection count from last broadcast response
+_last_check: float = 0.0  # monotonic time of last broadcast
+_NO_CLIENTS_RECHECK_SECONDS = 10.0  # re-check every 10s when no clients
+
 
 def _do_sync() -> None:
     """Perform the actual sync operation."""
@@ -62,13 +68,27 @@ def _do_sync() -> None:
 
 
 def _broadcast_update() -> None:
-    """Notify connected WebSocket clients of an update."""
+    """Notify connected WebSocket clients of an update.
+
+    Skips the broadcast when no clients were connected on the last check,
+    re-checking every _NO_CLIENTS_RECHECK_SECONDS to detect new viewers.
+    """
+    global _known_connections, _last_check
+
     worker_url = _get_worker_url()
     if not worker_url:
         logger.debug("Skipping cloud graph broadcast; MEMORA_CLOUD_GRAPH_WORKER_URL is not set")
         return
 
+    with _sync_lock:
+        now = time.monotonic()
+        if _known_connections == 0 and (now - _last_check) < _NO_CLIENTS_RECHECK_SECONDS:
+            logger.debug("Skipping broadcast — no clients connected (next check in %.0fs)",
+                          _NO_CLIENTS_RECHECK_SECONDS - (now - _last_check))
+            return
+
     url = f"{worker_url}/broadcast"
+    data: dict = {}
     try:
         req = Request(
             url,
@@ -80,7 +100,16 @@ def _broadcast_update() -> None:
             method="POST",
         )
         with urlopen(req, timeout=5) as resp:
-            logger.debug("Cloud graph broadcast OK (%s)", resp.status)
+            body = resp.read()
+            try:
+                data = json.loads(body)
+            except (json.JSONDecodeError, AttributeError):
+                pass
+            with _sync_lock:
+                _last_check = time.monotonic()
+                _known_connections = data.get("remaining", 0)
+            logger.debug("Cloud graph broadcast OK (%s), sent=%s, remaining=%s",
+                         resp.status, data.get("sent", "?"), _known_connections)
     except URLError as e:
         logger.warning("Cloud graph broadcast failed for %s: %s", url, e)
     except Exception as e:

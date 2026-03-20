@@ -111,9 +111,6 @@ export class GraphSyncDO implements DurableObject {
       connections: this.connections.size,
     }));
 
-    // Handle messages (no-op; kept for future use)
-    server.addEventListener("message", () => {});
-
     // Handle close
     server.addEventListener("close", () => {
       this.connections.delete(server);
