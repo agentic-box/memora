@@ -2265,6 +2265,8 @@ div.vis-tooltip {
         var ws = null;
         var wsReconnectDelay = 1000;
         var wsMaxReconnectDelay = 30000;
+        var wsReconnectTimer = null;
+        var wsStopped = false;  // true when tab is hidden — suppresses reconnection
 
         function connectRealtime() {
             if (MEMORA_CONFIG.sseUrl) connectSSE();
@@ -2286,6 +2288,7 @@ div.vis-tooltip {
         }
 
         function connectWebSocket() {
+            if (wsStopped) return;
             try {
                 ws = new WebSocket(MEMORA_CONFIG.wsUrl);
 
@@ -2301,9 +2304,7 @@ div.vis-tooltip {
                         console.log('WebSocket message:', data);
 
                         if (data.type === 'graph_updated') {
-                            // Show update notification
                             showUpdateNotification();
-                            // Reload graph data
                             reloadGraphData();
                         } else if (data.type === 'connected') {
                             console.log('Connected, active clients:', data.connections);
@@ -2314,10 +2315,12 @@ div.vis-tooltip {
                 };
 
                 ws.onclose = function() {
-                    console.log('WebSocket disconnected, reconnecting in', wsReconnectDelay, 'ms');
+                    console.log('WebSocket disconnected');
                     updateConnectionStatus('disconnected');
-                    setTimeout(connectWebSocket, wsReconnectDelay);
-                    wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                    if (!wsStopped) {
+                        wsReconnectTimer = setTimeout(connectWebSocket, wsReconnectDelay);
+                        wsReconnectDelay = Math.min(wsReconnectDelay * 2, wsMaxReconnectDelay);
+                    }
                 };
 
                 ws.onerror = function(error) {
@@ -2327,9 +2330,25 @@ div.vis-tooltip {
 
             } catch (e) {
                 console.error('WebSocket connection error:', e);
-                setTimeout(connectWebSocket, wsReconnectDelay);
+                if (!wsStopped) {
+                    wsReconnectTimer = setTimeout(connectWebSocket, wsReconnectDelay);
+                }
             }
         }
+
+        // Stop WebSocket when tab is hidden, reconnect when visible
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                wsStopped = true;
+                if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+                if (ws) { ws.close(); ws = null; }
+                updateConnectionStatus('disconnected');
+            } else {
+                wsStopped = false;
+                wsReconnectDelay = 1000;
+                connectWebSocket();
+            }
+        });
 
         function updateConnectionStatus(status) {
             var indicator = document.getElementById('connection-status');
