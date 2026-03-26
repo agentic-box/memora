@@ -88,12 +88,32 @@ def _save_state(claude_session_id: str, state: dict):
     _state_path(claude_session_id).write_text(json.dumps(state))
 
 
+def _resolve_db_path() -> str:
+    """Resolve MEMORA_DB_PATH from env, then .mcp.json, then fallback."""
+    val = os.environ.get("MEMORA_DB_PATH")
+    if val:
+        return val
+    for mcp_path in [
+        WORKTREE / ".mcp.json",
+        WORKTREE.parent.parent / ".mcp.json",
+    ]:
+        if mcp_path.exists():
+            try:
+                config = json.loads(mcp_path.read_text())
+                env = config.get("mcpServers", {}).get("memory", {}).get("env", {})
+                if env.get("MEMORA_DB_PATH"):
+                    return env["MEMORA_DB_PATH"]
+            except Exception:
+                pass
+    return "~/.local/share/memora/memories.db"
+
+
 def _call_memora(func_name: str, **kwargs):
     """Call a memora.sessions function directly."""
     # Set PYTHONPATH so we load the worktree code
     env = os.environ.copy()
     env["PYTHONPATH"] = str(WORKTREE)
-    env["MEMORA_DB_PATH"] = os.environ.get("MEMORA_DB_PATH", "/tmp/memora-session-test.db")
+    env["MEMORA_DB_PATH"] = _resolve_db_path()
     env["MEMORA_EMBEDDING_MODEL"] = os.environ.get("MEMORA_EMBEDDING_MODEL", "tfidf")
     env["MEMORA_ALLOW_ANY_TAG"] = "1"
 
@@ -262,7 +282,7 @@ def _background_llm_compress(memora_session_id: str):
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(WORKTREE)
-    env["MEMORA_DB_PATH"] = os.environ.get("MEMORA_DB_PATH", "/tmp/memora-session-test.db")
+    env["MEMORA_DB_PATH"] = _resolve_db_path()
     env["MEMORA_EMBEDDING_MODEL"] = os.environ.get("MEMORA_EMBEDDING_MODEL", "tfidf")
     env["MEMORA_ALLOW_ANY_TAG"] = "1"
 
