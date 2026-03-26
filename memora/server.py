@@ -32,6 +32,7 @@ from .storage import (
     delete_memory,
     detect_clusters,
     export_memories,
+    export_sessions,
     find_invalid_tag_entries,
     generate_insights,
     get_crossrefs,
@@ -1678,6 +1679,287 @@ async def memory_events_clear(event_ids: List[int]) -> Dict[str, Any]:
     """
     cleared = _clear_events(event_ids)
     return {"cleared": cleared}
+
+
+# ── Session memory tools ────────────────────────────────────────────────
+# These bypass FTS/embeddings/crossrefs/sync. Local SQLite only.
+
+from .sessions import (
+    SessionBackendError,
+    SessionError,
+    branch_state_get as _branch_state_get,
+    scoped_search as _scoped_search_impl,
+    session_close as _session_close_impl,
+    session_delta as _session_delta_impl,
+    session_get as _session_get_impl,
+    session_list as _session_list_impl,
+    session_start as _session_start_impl,
+)
+
+
+def _session_error(msg: str) -> Dict[str, str]:
+    return {"error": "session_error", "message": msg}
+
+
+def _require_session_backend() -> Optional[Dict[str, str]]:
+    """Check if the backend supports sessions. Returns error dict or None."""
+    if not STORAGE_BACKEND.supports_sessions:
+        return _session_error(
+            "Session memory requires local SQLite backend. "
+            "Current backend does not support sessions."
+        )
+    return None
+
+
+@mcp.tool()
+async def session_start(
+    repo_identity: str,
+    branch: str,
+    head_commit: Optional[str] = None,
+    objective: Optional[str] = None,
+    claude_session_id: Optional[str] = None,
+    pane_id: Optional[str] = None,
+    workspace_id: Optional[str] = None,
+    transcript_path: Optional[str] = None,
+    transcript_start_line: Optional[int] = None,
+    start_key: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Start a new memory session.
+
+    Args:
+        repo_identity: Canonical repo ID (git remote hash)
+        branch: Git branch name
+        head_commit: Commit hash at session start
+        objective: Session objective (auto-extracted from first prompt)
+        claude_session_id: Claude Code conversation UUID
+        pane_id: tmux pane ID
+        workspace_id: clmux workspace ID
+        transcript_path: Path to conversation JSONL
+        transcript_start_line: First line in transcript for this session
+        start_key: Replay-idempotency key (pane:inode:gen:offset)
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            return _session_start_impl(
+                conn,
+                repo_identity=repo_identity,
+                branch=branch,
+                head_commit=head_commit,
+                objective=objective,
+                claude_session_id=claude_session_id,
+                pane_id=pane_id,
+                workspace_id=workspace_id,
+                transcript_path=transcript_path,
+                transcript_start_line=transcript_start_line,
+                start_key=start_key,
+            )
+        finally:
+            conn.close()
+    except SessionError as e:
+        return _session_error(str(e))
+    except Exception as e:
+        return _safe_error(e, "session_start")
+
+
+@mcp.tool()
+async def session_delta(
+    session_id: str,
+    structured_facts: Dict[str, Any],
+    delta_id: str,
+) -> Dict[str, Any]:
+    """Append a delta to a session. Fast path — no FTS/embeddings/sync.
+
+    Args:
+        session_id: Session UUID
+        structured_facts: JSON object with structured data (branch, files, todos, etc.)
+        delta_id: Transport-level idempotency key (pane:inode:gen:offset)
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            return _session_delta_impl(
+                conn,
+                session_id=session_id,
+                structured_facts=structured_facts,
+                delta_id=delta_id,
+            )
+        finally:
+            conn.close()
+    except SessionError as e:
+        return _session_error(str(e))
+    except Exception as e:
+        return _safe_error(e, "session_delta")
+
+
+@mcp.tool()
+async def session_close(
+    session_id: str,
+    summary: Optional[str] = None,
+    outcome: Optional[str] = None,
+    snapshot: Optional[Dict[str, Any]] = None,
+    head_commit_end: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Close a session. Triggers exact-once close state machine.
+
+    Args:
+        session_id: Session UUID
+        summary: One-liner session summary
+        outcome: What actually happened
+        snapshot: Branch state snapshot (JSON object)
+        head_commit_end: Commit hash at session end
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            return _session_close_impl(
+                conn,
+                session_id=session_id,
+                summary=summary,
+                outcome=outcome,
+                snapshot=snapshot,
+                head_commit_end=head_commit_end,
+            )
+        finally:
+            conn.close()
+    except SessionError as e:
+        return _session_error(str(e))
+    except Exception as e:
+        return _safe_error(e, "session_close")
+
+
+@mcp.tool()
+async def session_get(session_id: str) -> Dict[str, Any]:
+    """Get a session with all its deltas.
+
+    Args:
+        session_id: Session UUID
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            result = _session_get_impl(conn, session_id)
+            if result is None:
+                return _session_error(f"Session {session_id} not found")
+            return result
+        finally:
+            conn.close()
+    except Exception as e:
+        return _safe_error(e, "session_get")
+
+
+@mcp.tool()
+async def session_list(
+    repo_identity: Optional[str] = None,
+    branch: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """List sessions with optional filters.
+
+    Args:
+        repo_identity: Filter by repo identity
+        branch: Filter by branch name
+        state: Filter by state (open, closing, closed)
+        limit: Maximum results (default 50)
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            sessions = _session_list_impl(
+                conn,
+                repo_identity=repo_identity,
+                branch=branch,
+                state=state,
+                limit=limit,
+            )
+            return {"sessions": sessions, "count": len(sessions)}
+        finally:
+            conn.close()
+    except Exception as e:
+        return _safe_error(e, "session_list")
+
+
+@mcp.tool()
+async def memory_scoped_search(
+    query: str,
+    scope: Literal["auto", "project", "global"] = "auto",
+    repo_identity: Optional[str] = None,
+    branch: Optional[str] = None,
+    session_id: Optional[str] = None,
+    top_k: int = 10,
+) -> Dict[str, Any]:
+    """Search memories with scoped retrieval across session, branch, and global tiers.
+
+    Args:
+        query: Search query text
+        scope: "auto" (tiered fallback), "project" (repo-wide), or "global"
+        repo_identity: Canonical repo ID (required for auto/project scope)
+        branch: Git branch name (used for auto scope)
+        session_id: Current session UUID (used for auto scope to search deltas)
+        top_k: Maximum results per tier
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            return _scoped_search_impl(
+                conn,
+                query,
+                scope=scope,
+                repo_identity=repo_identity,
+                branch=branch,
+                session_id=session_id,
+                top_k=top_k,
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        return _safe_error(e, "memory_scoped_search")
+
+
+@mcp.tool()
+async def branch_state_get(
+    repo_identity: str,
+    branch: str,
+) -> Dict[str, Any]:
+    """Get the current branch state snapshot.
+
+    Args:
+        repo_identity: Canonical repo ID
+        branch: Git branch name
+    """
+    err = _require_session_backend()
+    if err:
+        return err
+    try:
+        conn = connect()
+        try:
+            result = _branch_state_get(conn, repo_identity, branch)
+            if result is None:
+                return {"snapshot": None, "message": "No state for this branch"}
+            return result
+        finally:
+            conn.close()
+    except Exception as e:
+        return _safe_error(e, "branch_state_get")
 
 
 # Graph functions moved to memora/graph/ module

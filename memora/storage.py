@@ -2812,6 +2812,34 @@ def export_memories(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     return exported
 
 
+def export_sessions(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Export session tables (sessions, session_deltas, branch_state).
+
+    Separate from export_memories to avoid breaking the existing export/import contract.
+    """
+    result = {"sessions": [], "session_deltas": [], "branch_state": []}
+
+    has_sessions = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
+    ).fetchone()
+    if not has_sessions:
+        return result
+
+    session_rows = conn.execute("SELECT * FROM sessions ORDER BY started_at").fetchall()
+    session_cols = [desc[0] for desc in conn.execute("SELECT * FROM sessions LIMIT 0").description]
+    result["sessions"] = [dict(zip(session_cols, r)) for r in session_rows]
+
+    delta_rows = conn.execute("SELECT * FROM session_deltas ORDER BY id").fetchall()
+    delta_cols = [desc[0] for desc in conn.execute("SELECT * FROM session_deltas LIMIT 0").description]
+    result["session_deltas"] = [dict(zip(delta_cols, r)) for r in delta_rows]
+
+    state_rows = conn.execute("SELECT * FROM branch_state").fetchall()
+    state_cols = [desc[0] for desc in conn.execute("SELECT * FROM branch_state LIMIT 0").description]
+    result["branch_state"] = [dict(zip(state_cols, r)) for r in state_rows]
+
+    return result
+
+
 def import_memories(
     conn: sqlite3.Connection,
     data: List[Dict[str, Any]],

@@ -219,6 +219,15 @@ class StorageBackend(ABC):
         """Return diagnostic information about the backend."""
         pass
 
+    @property
+    def supports_sessions(self) -> bool:
+        """Whether this backend supports session memory tables.
+
+        Session memory requires local SQLite with transaction support,
+        foreign keys, and no cloud sync on every write.
+        """
+        return False
+
 
 class LocalSQLiteBackend(StorageBackend):
     """Local file-based SQLite backend (original behavior)."""
@@ -258,6 +267,10 @@ class LocalSQLiteBackend(StorageBackend):
             "exists": self.db_path.exists(),
             "size_bytes": self.db_path.stat().st_size if self.db_path.exists() else 0,
         }
+
+    @property
+    def supports_sessions(self) -> bool:
+        return True
 
 
 class CloudSQLiteBackend(StorageBackend):
