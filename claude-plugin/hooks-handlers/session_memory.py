@@ -442,8 +442,12 @@ def handle_session_start(payload: dict):
     # Check if we already have a session for this claude_session_id
     existing = _load_state(claude_sid)
     if existing and source == "resume":
-        # --continue: reuse existing session
-        return
+        # Verify the session is still open before reusing
+        session_info = _call_memora("session_get", session_id=existing["memora_session_id"])
+        if session_info and session_info.get("state") == "open":
+            return
+        # Session was closed (manually or by another process) — fall through to create new one
+        existing = None
 
     # Auto-close previous session: fast structured close + async LLM upgrade
     if existing:
@@ -695,11 +699,41 @@ def handle_prompt(payload: dict):
     _save_state(claude_sid, state)
 
 
+def _is_session_enabled() -> bool:
+    """Check MEMORA_SESSION_ENABLED in env or .mcp.json. Defaults to False."""
+    # Check env first (set by MCP server or explicitly)
+    env_val = os.environ.get("MEMORA_SESSION_ENABLED", "")
+    if env_val:
+        return env_val.lower() in ("true", "1", "yes")
+
+    # Check .mcp.json
+    for mcp_path in [
+        WORKTREE / ".mcp.json",
+        WORKTREE.parent.parent / ".mcp.json",
+    ]:
+        if mcp_path.exists():
+            try:
+                config = json.loads(mcp_path.read_text())
+                env = config.get("mcpServers", {}).get("memory", {}).get("env", {})
+                val = env.get("MEMORA_SESSION_ENABLED", "")
+                if val:
+                    return val.lower() in ("true", "1", "yes")
+            except Exception:
+                pass
+    return False
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
     except Exception:
+        print(json.dumps({}))
         sys.exit(0)
+
+    # Feature flag — disabled by default
+    if not _is_session_enabled():
+        print(json.dumps({}))
+        return
 
     event = payload.get("hook_event_name", "")
     output = {}
