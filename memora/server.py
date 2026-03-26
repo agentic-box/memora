@@ -1703,6 +1703,7 @@ def _session_error(msg: str) -> Dict[str, str]:
 
 def _require_session_backend() -> Optional[Dict[str, str]]:
     """Check if the backend supports sessions. Returns error dict or None."""
+    from .storage import STORAGE_BACKEND
     if not STORAGE_BACKEND.supports_sessions:
         return _session_error(
             "Session memory requires local SQLite backend. "
