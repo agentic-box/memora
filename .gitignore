@@ -17,6 +17,9 @@ lib/
 uv.lock
 data/
 
+# Worktrees
+.worktrees/
+
 # Build artifacts
 dist/
 .wrangler/
