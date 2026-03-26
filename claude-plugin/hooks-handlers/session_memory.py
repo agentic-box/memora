@@ -273,7 +273,8 @@ def _background_llm_compress(memora_session_id: str):
     })
 
     script = """
-import json, sys, sqlite3, os
+import json, sys, os
+from pathlib import Path
 from memora.sessions import session_get
 from memora.storage import connect
 
@@ -281,7 +282,7 @@ data = json.load(sys.stdin)
 session_id = data["session_id"]
 llm_config = data["llm_config"]
 
-# Get deltas
+# Get session with deltas
 with connect() as conn:
     result = session_get(conn, session_id)
 
@@ -290,25 +291,60 @@ if not result or len(result.get("deltas", [])) < 2:
 
 deltas = result["deltas"]
 
-# Build transcript
-lines = []
-for d in deltas:
-    facts = d.get("structured_facts", {})
-    if "user_prompt" in facts:
-        lines.append(f"User: {facts['user_prompt']}")
-    if "assistant_hint" in facts:
-        lines.append(f"Claude: {facts['assistant_hint']}")
-    if "files" in facts:
-        lines.append(f"Files: {', '.join(facts['files'])}")
-    if "todos" in facts:
-        lines.append(f"TODOs: {', '.join(facts['todos'])}")
+# Try reading the full transcript JSONL first (richest source)
+transcript = ""
+transcript_path = result.get("transcript_path")
+if transcript_path:
+    tp = Path(os.path.expanduser(transcript_path))
+    if tp.exists():
+        try:
+            lines = []
+            for raw_line in tp.read_text().splitlines():
+                try:
+                    entry = json.loads(raw_line)
+                    role = entry.get("role", "")
+                    content = entry.get("content", "")
+                    if isinstance(content, list):
+                        # Extract text from content blocks
+                        content = " ".join(
+                            b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text"
+                        )
+                    if role in ("user", "assistant") and content:
+                        speaker = "User" if role == "user" else "Claude"
+                        lines.append(f"{speaker}: {content[:500]}")
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if lines:
+                transcript = "\\n".join(lines)
+        except Exception:
+            pass
 
-if not lines:
+# Fall back to deltas if no transcript
+if not transcript:
+    lines = []
+    for d in deltas:
+        facts = d.get("structured_facts", {})
+        if "user_prompt" in facts:
+            lines.append(f"User: {facts['user_prompt']}")
+        if "assistant_message" in facts:
+            lines.append(f"Claude: {facts['assistant_message']}")
+        elif "assistant_hint" in facts:
+            lines.append(f"Claude: {facts['assistant_hint']}")
+        if "files" in facts:
+            lines.append(f"Files: {', '.join(facts['files'])}")
+        if "decisions" in facts:
+            lines.append(f"Decisions: {', '.join(facts['decisions'])}")
+        if "error_hint" in facts:
+            lines.append(f"Error: {facts['error_hint']}")
+    transcript = "\\n".join(lines)
+
+if not transcript:
     sys.exit(0)
 
-transcript = "\\n".join(lines)
-if len(transcript) > 3000:
-    transcript = transcript[:3000] + "\\n... (truncated)"
+# Cap to ~6000 chars (more budget since we have richer content now)
+if len(transcript) > 6000:
+    transcript = transcript[:6000] + "\\n... (truncated)"
 
 prompt = f\"\"\"Summarize this coding session. Return JSON with exactly these fields:
 - "summary": One sentence (max 150 chars) describing what was accomplished
@@ -316,6 +352,7 @@ prompt = f\"\"\"Summarize this coding session. Return JSON with exactly these fi
 - "open_todos": Array of unfinished items (empty array if none)
 - "touched_files": Array of files mentioned (empty array if none)
 - "decisions": Array of key decisions made (empty array if none)
+- "errors_encountered": Array of errors hit during the session (empty array if none)
 
 Session transcript:
 {transcript}
@@ -331,7 +368,7 @@ try:
     response = client.chat.completions.create(
         model=llm_config["model"],
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=300,
+        max_tokens=400,
         temperature=0,
     )
     text = response.choices[0].message.content.strip()
@@ -353,6 +390,8 @@ if llm_result.get("touched_files"):
     snapshot["touched_files"] = llm_result["touched_files"]
 if llm_result.get("decisions"):
     snapshot["decisions"] = llm_result["decisions"]
+if llm_result.get("errors_encountered"):
+    snapshot["errors_encountered"] = llm_result["errors_encountered"]
 
 with connect() as conn:
     conn.execute(
@@ -360,16 +399,14 @@ with connect() as conn:
         (summary, outcome, session_id),
     )
     if snapshot:
-        # Update branch_state snapshot with LLM-extracted data
         row = conn.execute(
             "SELECT repo_identity, branch FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if row:
-            import json as j
             conn.execute(
                 "UPDATE branch_state SET snapshot = ? WHERE repo_identity = ? AND branch = ?",
-                (j.dumps(snapshot), row[0], row[1]),
+                (json.dumps(snapshot), row[0], row[1]),
             )
     conn.commit()
 """
@@ -439,12 +476,15 @@ def handle_session_start(payload: dict):
         except Exception:
             pass
 
+    transcript_path = payload.get("transcript_path")
+
     result = _call_memora(
         "session_start",
         repo_identity=repo_id,
         branch=git["branch"],
         head_commit=git["head_commit"],
         claude_session_id=claude_sid,
+        transcript_path=transcript_path,
     )
 
     if result and "session_id" in result:
@@ -453,6 +493,7 @@ def handle_session_start(payload: dict):
             "repo_identity": repo_id,
             "branch": git["branch"],
             "delta_seq": 0,
+            "transcript_path": transcript_path,
         })
 
     # Build context to inject into Claude's system prompt
@@ -518,6 +559,54 @@ def _build_session_context(repo_identity: str, branch: str) -> str:
     ])
 
 
+def _extract_file_paths(text: str) -> list:
+    """Extract file paths mentioned in text."""
+    import re
+    patterns = [
+        r'`([a-zA-Z0-9_./\-]+\.[a-zA-Z]{1,10})`',      # `path/to/file.ext`
+        r'(?:^|\s)(\S+/\S+\.[a-zA-Z]{1,10})(?:\s|$|:)',  # path/to/file.ext
+    ]
+    files = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            path = match.group(1)
+            # Filter out URLs and very short matches
+            if not path.startswith(("http", "//")) and "/" in path and len(path) > 3:
+                files.add(path)
+    return sorted(files)[:20]  # Cap at 20
+
+
+def _extract_git_ops(text: str) -> list:
+    """Extract git operations mentioned in text."""
+    import re
+    ops = []
+    git_patterns = [
+        (r'git commit.*?-m\s*["\'](.+?)["\']', "commit"),
+        (r'git push\s+(\S+)', "push"),
+        (r'git merge\s+(\S+)', "merge"),
+        (r'git checkout\s+(\S+)', "checkout"),
+        (r'committed.*?`([a-f0-9]{7,})`', "commit"),
+    ]
+    for pattern, op_type in git_patterns:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            ops.append({"op": op_type, "detail": match.group(1)[:80]})
+    return ops[:10]
+
+
+def _extract_decisions(text: str) -> list:
+    """Extract decision-like statements from text."""
+    import re
+    decisions = []
+    # Look for decision indicators
+    for pattern in [
+        r"(?:decided|choosing|going with|using|switched to|changed to)\s+(.{10,80}?)(?:\.|$)",
+        r"(?:instead of|rather than)\s+(.{10,80}?)(?:,|\.|$)",
+    ]:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            decisions.append(match.group(1).strip())
+    return decisions[:5]
+
+
 def handle_stop(payload: dict):
     """Write a delta on Stop (Claude finished a turn)."""
     claude_sid = payload.get("session_id", "")
@@ -528,21 +617,39 @@ def handle_stop(payload: dict):
     memora_sid = state["memora_session_id"]
     last_msg = payload.get("last_assistant_message", "")
 
-    # Extract structured facts from the assistant message
+    if not last_msg:
+        return
+
+    # Extract rich structured facts from the full assistant message
     facts = {}
 
-    # Detect file references
     cwd = payload.get("cwd", "")
     if cwd:
         facts["cwd"] = cwd
 
-    # Keep a short summary of what Claude said (truncated)
-    if last_msg:
-        # First 200 chars as a hint
-        facts["assistant_hint"] = last_msg[:200]
+    # Full response (up to 2000 chars for LLM compression at close)
+    facts["assistant_message"] = last_msg[:2000]
 
-    if not facts:
-        return
+    # Extracted structure
+    files = _extract_file_paths(last_msg)
+    if files:
+        facts["files"] = files
+
+    git_ops = _extract_git_ops(last_msg)
+    if git_ops:
+        facts["git_ops"] = git_ops
+
+    decisions = _extract_decisions(last_msg)
+    if decisions:
+        facts["decisions"] = decisions
+
+    # Detect errors/failures
+    if any(kw in last_msg.lower() for kw in ["error", "failed", "traceback", "exception"]):
+        # Extract first error-like line
+        for line in last_msg.split("\n"):
+            if any(kw in line.lower() for kw in ["error", "failed", "traceback"]):
+                facts["error_hint"] = line.strip()[:200]
+                break
 
     state["delta_seq"] += 1
     delta_id = f"{claude_sid[:8]}:{state['delta_seq']}"
@@ -568,14 +675,20 @@ def handle_prompt(payload: dict):
     if not prompt:
         return
 
-    # Write prompt as a delta too
     state["delta_seq"] += 1
     delta_id = f"{claude_sid[:8]}:{state['delta_seq']}"
+
+    facts = {"user_prompt": prompt[:500]}
+
+    # Extract file references from user prompt too
+    files = _extract_file_paths(prompt)
+    if files:
+        facts["files_mentioned"] = files
 
     _call_memora(
         "session_delta",
         session_id=state["memora_session_id"],
-        structured_facts={"user_prompt": prompt[:300]},
+        structured_facts=facts,
         delta_id=delta_id,
     )
 
