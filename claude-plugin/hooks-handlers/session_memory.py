@@ -453,8 +453,14 @@ with connect() as conn:
     ).fetchone()
     if row and snapshot:
         conn.execute(
-            "UPDATE branch_state SET snapshot = ? WHERE repo_identity = ? AND branch = ?",
-            (json.dumps(snapshot), row[0], row[1]),
+            \"\"\"INSERT INTO branch_state (repo_identity, branch, snapshot, snapshot_revision, session_id, updated_at)
+            VALUES (?, ?, ?, 1, ?, datetime('now'))
+            ON CONFLICT(repo_identity, branch) DO UPDATE SET
+                snapshot = excluded.snapshot,
+                snapshot_revision = snapshot_revision + 1,
+                session_id = excluded.session_id,
+                updated_at = excluded.updated_at\"\"\",
+            (row[0], row[1], json.dumps(snapshot), session_id),
         )
 
     # Store episodic memory for long-term search
