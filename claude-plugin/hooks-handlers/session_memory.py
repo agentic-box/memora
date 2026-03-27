@@ -366,9 +366,32 @@ if not transcript:
 if len(transcript) > 6000:
     transcript = transcript[:6000] + "\\n... (truncated)"
 
-prompt = f\"\"\"Summarize this coding session. Return JSON with exactly these fields:
+prompt = f\"\"\"Analyze this coding session and produce TWO outputs in a single JSON object.
+
+**Output 1: "snapshot"** — A compact branch state for cold-starting the next session. Max 40 lines of markdown. Use this exact structure:
+
+## What Just Happened
+1-2 sentences. What was accomplished, any reframe.
+
+## In Progress
+Active items with status. Only what needs continuation. Omit if nothing is in progress.
+
+## Decisions Made
+Bullet list — the "why" alongside the "what". Most valuable field.
+
+## Next Session
+"Start with:" verb + object. "Also ready:" other unblocked items. Omit if unclear.
+
+## Open Questions
+Unresolved items carrying forward. Omit if none.
+
+**Output 2: "episodic"** — A detailed session summary for long-term search. No line limit. Include rationale, tradeoffs considered, dead ends, error context, and anything useful for future recall.
+
+Return JSON with these fields:
 - "summary": One sentence (max 150 chars) describing what was accomplished
 - "outcome": One sentence on the result/status
+- "snapshot_md": The branch state markdown (max 40 lines, structured as above)
+- "episodic_md": The detailed session narrative (no limit)
 - "open_todos": Array of unfinished items (empty array if none)
 - "touched_files": Array of files mentioned (empty array if none)
 - "decisions": Array of key decisions made (empty array if none)
@@ -388,7 +411,7 @@ try:
     response = client.chat.completions.create(
         model=llm_config["model"],
         messages=[{"role": "user", "content": prompt}],
-        max_tokens=400,
+        max_tokens=1000,
         temperature=0,
     )
     text = response.choices[0].message.content.strip()
@@ -403,7 +426,13 @@ except Exception:
 # Update the closed session with LLM summary
 summary = llm_result.get("summary", "")[:200]
 outcome = llm_result.get("outcome", "")[:200]
+snapshot_md = llm_result.get("snapshot_md", "")
+episodic_md = llm_result.get("episodic_md", "")
+
+# Build structured snapshot for branch_state
 snapshot = {}
+if snapshot_md:
+    snapshot["narrative"] = snapshot_md
 if llm_result.get("open_todos"):
     snapshot["open_todos"] = llm_result["open_todos"]
 if llm_result.get("touched_files"):
@@ -418,16 +447,31 @@ with connect() as conn:
         "UPDATE sessions SET summary = ?, outcome = ? WHERE id = ?",
         (summary, outcome, session_id),
     )
-    if snapshot:
-        row = conn.execute(
-            "SELECT repo_identity, branch FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if row:
-            conn.execute(
-                "UPDATE branch_state SET snapshot = ? WHERE repo_identity = ? AND branch = ?",
-                (json.dumps(snapshot), row[0], row[1]),
-            )
+    row = conn.execute(
+        "SELECT repo_identity, branch FROM sessions WHERE id = ?",
+        (session_id,),
+    ).fetchone()
+    if row and snapshot:
+        conn.execute(
+            "UPDATE branch_state SET snapshot = ? WHERE repo_identity = ? AND branch = ?",
+            (json.dumps(snapshot), row[0], row[1]),
+        )
+
+    # Store episodic memory for long-term search
+    if episodic_md and row:
+        from memora.storage import add_memory
+        episodic_content = f"## Session: {summary}\\n\\n{episodic_md}"
+        add_memory(
+            conn,
+            content=episodic_content,
+            tags=["memora/sessions"],
+            metadata={
+                "memory_kind": "episodic",
+                "session_id": session_id,
+                "repo_identity": row[0],
+                "branch": row[1],
+            },
+        )
     conn.commit()
 """
     try:
@@ -534,20 +578,26 @@ def _build_session_context(repo_identity: str, branch: str) -> str:
         snap = state["snapshot"]
         parts.append("## Current Branch State")
         parts.append(f"Branch: `{branch}` (revision {state.get('snapshot_revision', '?')})")
-        if snap.get("open_todos"):
-            parts.append("**Open TODOs:**")
-            for t in snap["open_todos"]:
-                parts.append(f"  - {t}")
-        if snap.get("active_bug"):
-            parts.append(f"**Active bug:** {snap['active_bug']}")
-        if snap.get("touched_files"):
-            parts.append(f"**Recently touched:** {', '.join(snap['touched_files'][:10])}")
-        if snap.get("constraints"):
-            parts.append("**Constraints:**")
-            for c in snap["constraints"]:
-                parts.append(f"  - {c}")
-        if snap.get("objective"):
-            parts.append(f"**Last objective:** {snap['objective']}")
+        # If we have a narrative snapshot from LLM compression, use it directly
+        if snap.get("narrative"):
+            parts.append("")
+            parts.append(snap["narrative"])
+        else:
+            # Fallback to structured fields
+            if snap.get("open_todos"):
+                parts.append("**Open TODOs:**")
+                for t in snap["open_todos"]:
+                    parts.append(f"  - {t}")
+            if snap.get("active_bug"):
+                parts.append(f"**Active bug:** {snap['active_bug']}")
+            if snap.get("touched_files"):
+                parts.append(f"**Recently touched:** {', '.join(snap['touched_files'][:10])}")
+            if snap.get("constraints"):
+                parts.append("**Constraints:**")
+                for c in snap["constraints"]:
+                    parts.append(f"  - {c}")
+            if snap.get("objective"):
+                parts.append(f"**Last objective:** {snap['objective']}")
 
     # 2. Recent closed sessions (last 5)
     sessions = _call_memora(
