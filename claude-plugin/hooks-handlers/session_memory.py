@@ -164,40 +164,111 @@ def _load_llm_config() -> dict | None:
     return None
 
 
-def _llm_compress(deltas: list, llm_config: dict) -> dict | None:
-    """Use LLM to compress session deltas into a summary + snapshot."""
-    try:
-        import openai
-    except ImportError:
+def _build_transcript(session_result: dict) -> str:
+    """Build transcript string from session data. Tries raw JSONL first, falls back to deltas."""
+    transcript = ""
+    transcript_path = session_result.get("transcript_path")
+    if transcript_path:
+        tp = Path(os.path.expanduser(transcript_path))
+        if tp.exists():
+            try:
+                lines = []
+                for raw_line in tp.read_text().splitlines():
+                    try:
+                        entry = json.loads(raw_line)
+                        role = entry.get("role", "")
+                        content = entry.get("content", "")
+                        if isinstance(content, list):
+                            content = " ".join(
+                                b.get("text", "") for b in content
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                        if role in ("user", "assistant") and content:
+                            speaker = "User" if role == "user" else "Claude"
+                            lines.append(f"{speaker}: {content[:2000]}")
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if lines:
+                    transcript = "\n".join(lines)
+            except Exception:
+                pass
+
+    # Fall back to deltas if no transcript
+    if not transcript:
+        deltas = session_result.get("deltas", [])
+        lines = []
+        for d in deltas:
+            facts = d.get("structured_facts", {})
+            if "user_prompt" in facts:
+                lines.append(f"User: {facts['user_prompt']}")
+            if "assistant_message" in facts:
+                lines.append(f"Claude: {facts['assistant_message']}")
+            elif "assistant_hint" in facts:
+                lines.append(f"Claude: {facts['assistant_hint']}")
+            if "files" in facts:
+                lines.append(f"Files: {', '.join(facts['files'])}")
+            if "decisions" in facts:
+                lines.append(f"Decisions: {', '.join(facts['decisions'])}")
+            if "error_hint" in facts:
+                lines.append(f"Error: {facts['error_hint']}")
+        transcript = "\n".join(lines)
+
+    # Cap to ~12000 chars for richer LLM compression input
+    if len(transcript) > 12000:
+        transcript = transcript[:12000] + "\n... (truncated)"
+
+    return transcript
+
+
+def _llm_compress_sync(session_id: str, llm_config: dict) -> dict | None:
+    """Synchronous LLM compression. Returns dict with summary, snapshot, episodic fields or None."""
+    # Need memora imports — add to path if needed
+    if str(WORKTREE) not in sys.path:
+        sys.path.insert(0, str(WORKTREE))
+
+    from memora.sessions import session_get
+    from memora.storage import connect
+
+    with connect() as conn:
+        result = session_get(conn, session_id)
+
+    if not result or len(result.get("deltas", [])) < 2:
         return None
 
-    # Build conversation transcript from deltas
-    lines = []
-    for d in deltas:
-        facts = d.get("structured_facts", {})
-        if "user_prompt" in facts:
-            lines.append(f"User: {facts['user_prompt']}")
-        if "assistant_hint" in facts:
-            lines.append(f"Claude: {facts['assistant_hint']}")
-        if "files" in facts:
-            lines.append(f"Files: {', '.join(facts['files'])}")
-        if "todos" in facts:
-            lines.append(f"TODOs: {', '.join(facts['todos'])}")
-
-    if not lines:
+    transcript = _build_transcript(result)
+    if not transcript:
         return None
 
-    transcript = "\n".join(lines)
-    # Cap transcript to ~3000 chars to keep token cost low
-    if len(transcript) > 3000:
-        transcript = transcript[:3000] + "\n... (truncated)"
+    prompt = f"""Analyze this coding session and produce TWO outputs in a single JSON object.
 
-    prompt = f"""Summarize this coding session. Return JSON with exactly these fields:
+**Output 1: "snapshot"** — A compact branch state for cold-starting the next session. Max 40 lines of markdown. Use this exact structure:
+
+## What Just Happened
+1-2 sentences. What was accomplished, any reframe.
+
+## In Progress
+Active items with status. Only what needs continuation. Omit if nothing is in progress.
+
+## Decisions Made
+Bullet list — the "why" alongside the "what". Most valuable field.
+
+## Next Session
+"Start with:" verb + object. "Also ready:" other unblocked items. Omit if unclear.
+
+## Open Questions
+Unresolved items carrying forward. Omit if none.
+
+**Output 2: "episodic"** — A detailed session summary for long-term search. No line limit. Include rationale, tradeoffs considered, dead ends, error context, and anything useful for future recall.
+
+Return JSON with these fields:
 - "summary": One sentence (max 150 chars) describing what was accomplished
 - "outcome": One sentence on the result/status
+- "snapshot_md": The branch state markdown (max 40 lines, structured as above)
+- "episodic_md": The detailed session narrative (no limit)
 - "open_todos": Array of unfinished items (empty array if none)
 - "touched_files": Array of files mentioned (empty array if none)
 - "decisions": Array of key decisions made (empty array if none)
+- "errors_encountered": Array of errors hit during the session (empty array if none)
 
 Session transcript:
 {transcript}
@@ -205,19 +276,18 @@ Session transcript:
 Return ONLY valid JSON, no markdown fences."""
 
     try:
+        import openai
         client_kwargs = {"api_key": llm_config["api_key"]}
         if llm_config.get("base_url"):
             client_kwargs["base_url"] = llm_config["base_url"]
         client = openai.OpenAI(**client_kwargs)
-
         response = client.chat.completions.create(
             model=llm_config["model"],
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
+            max_tokens=1000,
             temperature=0,
         )
         text = response.choices[0].message.content.strip()
-        # Strip markdown fences if present
         if text.startswith("```"):
             text = text.split("\n", 1)[1] if "\n" in text else text[3:]
         if text.endswith("```"):
@@ -225,6 +295,68 @@ Return ONLY valid JSON, no markdown fences."""
         return json.loads(text.strip())
     except Exception:
         return None
+
+
+def _apply_llm_result(session_id: str, llm_result: dict):
+    """Write LLM compression result to DB (session summary + branch_state + episodic memory)."""
+    if str(WORKTREE) not in sys.path:
+        sys.path.insert(0, str(WORKTREE))
+
+    from memora.storage import connect
+
+    summary = llm_result.get("summary", "")[:200]
+    outcome = llm_result.get("outcome", "")[:200]
+    snapshot_md = llm_result.get("snapshot_md", "")
+    episodic_md = llm_result.get("episodic_md", "")
+
+    snapshot = {}
+    if snapshot_md:
+        snapshot["narrative"] = snapshot_md
+    if llm_result.get("open_todos"):
+        snapshot["open_todos"] = llm_result["open_todos"]
+    if llm_result.get("touched_files"):
+        snapshot["touched_files"] = llm_result["touched_files"]
+    if llm_result.get("decisions"):
+        snapshot["decisions"] = llm_result["decisions"]
+    if llm_result.get("errors_encountered"):
+        snapshot["errors_encountered"] = llm_result["errors_encountered"]
+
+    with connect() as conn:
+        conn.execute(
+            "UPDATE sessions SET summary = ?, outcome = ? WHERE id = ?",
+            (summary, outcome, session_id),
+        )
+        row = conn.execute(
+            "SELECT repo_identity, branch FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row and snapshot:
+            conn.execute(
+                """INSERT INTO branch_state (repo_identity, branch, snapshot, snapshot_revision, session_id, updated_at)
+                VALUES (?, ?, ?, 1, ?, datetime('now'))
+                ON CONFLICT(repo_identity, branch) DO UPDATE SET
+                    snapshot = excluded.snapshot,
+                    snapshot_revision = snapshot_revision + 1,
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at""",
+                (row[0], row[1], json.dumps(snapshot), session_id),
+            )
+
+        if episodic_md and row:
+            from memora.storage import add_memory
+            episodic_content = f"## Session: {summary}\n\n{episodic_md}"
+            add_memory(
+                conn,
+                content=episodic_content,
+                tags=["memora/sessions"],
+                metadata={
+                    "memory_kind": "episodic",
+                    "session_id": session_id,
+                    "repo_identity": row[0],
+                    "branch": row[1],
+                },
+            )
+        conn.commit()
 
 
 def _build_close_summary_structured(memora_session_id: str) -> dict:
@@ -274,226 +406,23 @@ def _build_close_summary_structured(memora_session_id: str) -> dict:
     return {"summary": summary, "snapshot": snapshot or None}
 
 
-def _background_llm_compress(memora_session_id: str):
-    """Fire LLM compression in background process. Updates session summary after close."""
+def _llm_compress_and_apply(memora_session_id: str) -> bool:
+    """Run LLM compression synchronously. Returns True if successful."""
     llm_config = _load_llm_config()
     if not llm_config:
-        return
+        return False
 
-    env = os.environ.copy()
-    env["PYTHONPATH"] = str(WORKTREE)
-    env["MEMORA_DB_PATH"] = _resolve_db_path()
-    env["MEMORA_EMBEDDING_MODEL"] = os.environ.get("MEMORA_EMBEDDING_MODEL", "tfidf")
-    env["MEMORA_ALLOW_ANY_TAG"] = "1"
+    # Set env vars for memora storage
+    os.environ.setdefault("MEMORA_DB_PATH", _resolve_db_path())
+    os.environ.setdefault("MEMORA_EMBEDDING_MODEL", "tfidf")
+    os.environ.setdefault("MEMORA_ALLOW_ANY_TAG", "1")
 
-    # Pass LLM config + session ID to a background script
-    script_data = json.dumps({
-        "session_id": memora_session_id,
-        "llm_config": llm_config,
-    })
+    llm_result = _llm_compress_sync(memora_session_id, llm_config)
+    if not llm_result:
+        return False
 
-    script = """
-import json, sys, os
-from pathlib import Path
-from memora.sessions import session_get
-from memora.storage import connect
-
-data = json.load(sys.stdin)
-session_id = data["session_id"]
-llm_config = data["llm_config"]
-
-# Get session with deltas
-with connect() as conn:
-    result = session_get(conn, session_id)
-
-if not result or len(result.get("deltas", [])) < 2:
-    sys.exit(0)
-
-deltas = result["deltas"]
-
-# Try reading the full transcript JSONL first (richest source)
-transcript = ""
-transcript_path = result.get("transcript_path")
-if transcript_path:
-    tp = Path(os.path.expanduser(transcript_path))
-    if tp.exists():
-        try:
-            lines = []
-            for raw_line in tp.read_text().splitlines():
-                try:
-                    entry = json.loads(raw_line)
-                    role = entry.get("role", "")
-                    content = entry.get("content", "")
-                    if isinstance(content, list):
-                        # Extract text from content blocks
-                        content = " ".join(
-                            b.get("text", "") for b in content
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        )
-                    if role in ("user", "assistant") and content:
-                        speaker = "User" if role == "user" else "Claude"
-                        lines.append(f"{speaker}: {content[:500]}")
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if lines:
-                transcript = "\\n".join(lines)
-        except Exception:
-            pass
-
-# Fall back to deltas if no transcript
-if not transcript:
-    lines = []
-    for d in deltas:
-        facts = d.get("structured_facts", {})
-        if "user_prompt" in facts:
-            lines.append(f"User: {facts['user_prompt']}")
-        if "assistant_message" in facts:
-            lines.append(f"Claude: {facts['assistant_message']}")
-        elif "assistant_hint" in facts:
-            lines.append(f"Claude: {facts['assistant_hint']}")
-        if "files" in facts:
-            lines.append(f"Files: {', '.join(facts['files'])}")
-        if "decisions" in facts:
-            lines.append(f"Decisions: {', '.join(facts['decisions'])}")
-        if "error_hint" in facts:
-            lines.append(f"Error: {facts['error_hint']}")
-    transcript = "\\n".join(lines)
-
-if not transcript:
-    sys.exit(0)
-
-# Cap to ~6000 chars (more budget since we have richer content now)
-if len(transcript) > 6000:
-    transcript = transcript[:6000] + "\\n... (truncated)"
-
-prompt = f\"\"\"Analyze this coding session and produce TWO outputs in a single JSON object.
-
-**Output 1: "snapshot"** — A compact branch state for cold-starting the next session. Max 40 lines of markdown. Use this exact structure:
-
-## What Just Happened
-1-2 sentences. What was accomplished, any reframe.
-
-## In Progress
-Active items with status. Only what needs continuation. Omit if nothing is in progress.
-
-## Decisions Made
-Bullet list — the "why" alongside the "what". Most valuable field.
-
-## Next Session
-"Start with:" verb + object. "Also ready:" other unblocked items. Omit if unclear.
-
-## Open Questions
-Unresolved items carrying forward. Omit if none.
-
-**Output 2: "episodic"** — A detailed session summary for long-term search. No line limit. Include rationale, tradeoffs considered, dead ends, error context, and anything useful for future recall.
-
-Return JSON with these fields:
-- "summary": One sentence (max 150 chars) describing what was accomplished
-- "outcome": One sentence on the result/status
-- "snapshot_md": The branch state markdown (max 40 lines, structured as above)
-- "episodic_md": The detailed session narrative (no limit)
-- "open_todos": Array of unfinished items (empty array if none)
-- "touched_files": Array of files mentioned (empty array if none)
-- "decisions": Array of key decisions made (empty array if none)
-- "errors_encountered": Array of errors hit during the session (empty array if none)
-
-Session transcript:
-{transcript}
-
-Return ONLY valid JSON, no markdown fences.\"\"\"
-
-try:
-    import openai
-    client_kwargs = {"api_key": llm_config["api_key"]}
-    if llm_config.get("base_url"):
-        client_kwargs["base_url"] = llm_config["base_url"]
-    client = openai.OpenAI(**client_kwargs)
-    response = client.chat.completions.create(
-        model=llm_config["model"],
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1000,
-        temperature=0,
-    )
-    text = response.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.split("\\n", 1)[1] if "\\n" in text else text[3:]
-    if text.endswith("```"):
-        text = text[:-3]
-    llm_result = json.loads(text.strip())
-except Exception:
-    sys.exit(0)
-
-# Update the closed session with LLM summary
-summary = llm_result.get("summary", "")[:200]
-outcome = llm_result.get("outcome", "")[:200]
-snapshot_md = llm_result.get("snapshot_md", "")
-episodic_md = llm_result.get("episodic_md", "")
-
-# Build structured snapshot for branch_state
-snapshot = {}
-if snapshot_md:
-    snapshot["narrative"] = snapshot_md
-if llm_result.get("open_todos"):
-    snapshot["open_todos"] = llm_result["open_todos"]
-if llm_result.get("touched_files"):
-    snapshot["touched_files"] = llm_result["touched_files"]
-if llm_result.get("decisions"):
-    snapshot["decisions"] = llm_result["decisions"]
-if llm_result.get("errors_encountered"):
-    snapshot["errors_encountered"] = llm_result["errors_encountered"]
-
-with connect() as conn:
-    conn.execute(
-        "UPDATE sessions SET summary = ?, outcome = ? WHERE id = ?",
-        (summary, outcome, session_id),
-    )
-    row = conn.execute(
-        "SELECT repo_identity, branch FROM sessions WHERE id = ?",
-        (session_id,),
-    ).fetchone()
-    if row and snapshot:
-        conn.execute(
-            \"\"\"INSERT INTO branch_state (repo_identity, branch, snapshot, snapshot_revision, session_id, updated_at)
-            VALUES (?, ?, ?, 1, ?, datetime('now'))
-            ON CONFLICT(repo_identity, branch) DO UPDATE SET
-                snapshot = excluded.snapshot,
-                snapshot_revision = snapshot_revision + 1,
-                session_id = excluded.session_id,
-                updated_at = excluded.updated_at\"\"\",
-            (row[0], row[1], json.dumps(snapshot), session_id),
-        )
-
-    # Store episodic memory for long-term search
-    if episodic_md and row:
-        from memora.storage import add_memory
-        episodic_content = f"## Session: {summary}\\n\\n{episodic_md}"
-        add_memory(
-            conn,
-            content=episodic_content,
-            tags=["memora/sessions"],
-            metadata={
-                "memory_kind": "episodic",
-                "session_id": session_id,
-                "repo_identity": row[0],
-                "branch": row[1],
-            },
-        )
-    conn.commit()
-"""
-    try:
-        # Fire and forget — subprocess runs in background
-        proc = subprocess.Popen(
-            [str(VENV_PYTHON), "-c", script],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            env=env,
-            start_new_session=True,
-        )
-        proc.stdin.write(script_data.encode())
-        proc.stdin.close()
-    except Exception:
-        pass
+    _apply_llm_result(memora_session_id, llm_result)
+    return True
 
 
 def handle_session_start(payload: dict):
@@ -519,7 +448,7 @@ def handle_session_start(payload: dict):
         # Session was closed (manually or by another process) — fall through to create new one
         existing = None
 
-    # Auto-close previous session: fast structured close + async LLM upgrade
+    # Auto-close previous session: structured close + sync LLM compression
     if existing:
         memora_sid = existing["memora_session_id"]
         close_data = _build_close_summary_structured(memora_sid)
@@ -530,8 +459,8 @@ def handle_session_start(payload: dict):
             snapshot=close_data.get("snapshot"),
         )
         _state_path(claude_sid).unlink(missing_ok=True)
-        # Background LLM compression — upgrades summary after ~10s
-        _background_llm_compress(memora_sid)
+        # Sync LLM compression — snapshot is fresh before context injection
+        _llm_compress_and_apply(memora_sid)
 
     # Also close any other open sessions for this repo+branch (orphan cleanup)
     for state_file in STATE_DIR.glob("*.json"):
@@ -546,7 +475,8 @@ def handle_session_start(payload: dict):
                         summary="Auto-closed: orphaned session",
                     )
                     state_file.unlink(missing_ok=True)
-                    _background_llm_compress(orphan_sid)
+                    # Orphans get sync compression too — ensures fresh snapshot
+                    _llm_compress_and_apply(orphan_sid)
         except Exception:
             pass
 
@@ -758,7 +688,7 @@ def handle_prompt(payload: dict):
     state["delta_seq"] += 1
     delta_id = f"{claude_sid[:8]}:{state['delta_seq']}"
 
-    facts = {"user_prompt": prompt[:500]}
+    facts = {"user_prompt": prompt[:1000]}
 
     # Extract file references from user prompt too
     files = _extract_file_paths(prompt)
