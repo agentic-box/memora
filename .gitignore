@@ -8,7 +8,7 @@ config/allowed_tags.json
 !.claude/skills/
 
 # Local config
-.mcp.json
+.mcp*
 
 # Vendored libs
 lib/
