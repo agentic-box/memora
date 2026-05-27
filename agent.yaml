@@ -1,0 +1,60 @@
+spec_version: "0.1.0"
+name: memora
+version: 0.2.29
+description: >
+  Memora is a lightweight MCP (Model Context Protocol) server that gives AI agents
+  persistent memory across sessions. It provides semantic storage backed by SQLite,
+  a knowledge-graph with typed edges and cluster detection, full-text and vector
+  embedding search (TF-IDF, sentence-transformers, OpenAI), LLM-powered
+  deduplication and insight analysis, structured document storage with searchable
+  fragment trees, cross-session event notifications, an interactive knowledge-graph
+  visualiser, and optional cloud sync (S3, R2, Cloudflare D1). Designed as a
+  drop-in MCP server for Claude Code and any OpenAI-compatible agent runtime.
+license: MIT
+model:
+  preferred: anthropic:claude-sonnet-4-6
+  adapters:
+    - claude-code
+    - system-prompt
+    - mcp
+runtime:
+  max_turns: 100
+  transport: stdio          # also supports streamable-http
+  entry: memora-server
+skills:
+  - name: memory_add
+    description: Store a new memory with content, tags, section, and metadata.
+  - name: memory_search
+    description: Full-text, semantic (vector), or hybrid search over stored memories.
+  - name: memory_get
+    description: Retrieve a specific memory by ID.
+  - name: memory_update
+    description: Update an existing memory's content or metadata.
+  - name: memory_delete
+    description: Delete a memory (requires force=true for document fragments).
+  - name: memory_list
+    description: List memories with optional tag/section filters and pagination.
+  - name: memory_link
+    description: Create or remove typed edges between memories for knowledge-graph traversal.
+  - name: memory_merge
+    description: LLM-powered merging of duplicate memories with configurable strategy.
+  - name: memory_find_duplicates
+    description: Detect near-duplicate memories using cross-references and LLM comparison.
+  - name: memory_insights
+    description: Analyze stored memories and surface activity summary, stale items, consolidation candidates, and LLM-powered pattern insights.
+  - name: memory_store_document
+    description: Parse and store a structured markdown document as a searchable fragment tree (claims, plan items, references, risks).
+  - name: memory_get_document
+    description: Retrieve a stored document or specific fragment types by document key.
+  - name: memory_create_todo
+    description: Create a TODO memory with status, priority, and category.
+  - name: memory_create_issue
+    description: Create an issue memory with severity and component.
+  - name: memory_poll_events
+    description: Poll for inter-agent event notifications (e.g., memory created/updated by another agent).
+  - name: memory_graph_server
+    description: Launch an interactive HTTP knowledge-graph visualiser with Mermaid rendering and chat panel.
+compliance:
+  risk_tier: standard
+  supervision:
+    human_in_the_loop: none
