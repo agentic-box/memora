@@ -311,7 +311,9 @@ function render() {
   engineStopped = false; clearTimeout(idleTimer); loopOn = true;   // new sim: keep rendering until it settles
   graphEl.innerHTML = "";
   const gd = applyFilters(freshGraphData());
-  statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${raw.dupeCount} dupes`;
+  const dupPairs = raw.duplicatePairCount;
+  const dupTxt = dupPairs != null ? `${dupPairs} dup pairs · ${raw.dupeCount} mem` : `${raw.dupeCount} dupes`;
+  statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${dupTxt}`;
 
   if (mode === "3d") {
     if (typeof ForceGraph3D !== "function") { statsEl.innerHTML = `<span id="err">3D lib failed to load</span>`; return; }
