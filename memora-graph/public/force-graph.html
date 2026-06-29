@@ -47,8 +47,8 @@
   #tlhead { display: flex; gap: 8px; align-items: center; padding: 12px; border-bottom: 1px solid #21262d; }
   #tlhead h2 { margin: 0; font-size: 14px; color: #a855f7; flex: 1; }
   /* ---- timeline controls: year + month + order dropdowns ---- */
-  #tlctrls { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #21262d; }
-  #tlctrls select { flex: 1; min-width: 0; }
+  #tlctrls { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #21262d; }
+  #tlctrls select { flex: 1 1 calc(50% - 3px); min-width: 0; }
   #tllist { flex: 1; overflow: auto; padding: 0 12px 40px; }
   .mh { position: sticky; top: 0; background: #0d1117; color: #a855f7; font-size: 12px;
     padding: 8px 0 4px; border-bottom: 1px solid #21262d; margin-top: 12px; z-index: 2; }
@@ -112,6 +112,7 @@
   <div id="tlctrls">
     <select id="tlyear" title="year"></select>
     <select id="tlmonth" title="month"></select>
+    <select id="tltype" title="type"></select>
     <select id="tlorder"><option value="desc">newest</option><option value="asc">oldest</option></select>
   </div>
   <div id="tllist">loading…</div>
@@ -485,15 +486,25 @@ function populateMonths(all) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
+function populateTypes(all) {
+  const cnt = {};
+  for (const m of all) { const t = typeOf(m); cnt[t] = (cnt[t] || 0) + 1; }
+  const types = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]);
+  const sel = el("tltype"), cur = sel.value;
+  sel.innerHTML = `<option value="">All types</option>` + types.map(t => `<option value="${t}">${t} (${cnt[t]})</option>`).join("");
+  sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
+}
+
 function drawTimeline() {
   if (!mems) return;
   const order = el("tlorder").value;
   let all = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
   if (order === "asc") all.reverse();
 
-  populateYears(all); populateMonths(all);
-  const yr = el("tlyear").value, mo = el("tlmonth").value;
-  const rows = all.filter(m => (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo));
+  populateYears(all); populateMonths(all); populateTypes(all);
+  const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
+  const rows = all.filter(m =>
+    (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) && (!ty || typeOf(m) === ty));
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
@@ -532,6 +543,7 @@ el("bcl").onclick = () => { showClusters = !showClusters; el("bcl").classList.to
 el("btl").onclick = () => toggleTimeline();
 el("tlyear").onchange = () => { el("tlmonth").value = ""; drawTimeline(); };
 el("tlmonth").onchange = drawTimeline;
+el("tltype").onchange = drawTimeline;
 el("tlorder").onchange = drawTimeline;
 el("db").onchange = load;
 let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
