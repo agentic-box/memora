@@ -46,9 +46,25 @@
   body.timeline-open #timeline { transform: none; }
   #tlhead { display: flex; gap: 8px; align-items: center; padding: 12px; border-bottom: 1px solid #21262d; }
   #tlhead h2 { margin: 0; font-size: 14px; color: #a855f7; flex: 1; }
-  #tlhist { display: flex; align-items: flex-end; gap: 2px; height: 48px; padding: 6px 12px 0; overflow-x: auto; }
-  #tlhist .b { min-width: 6px; flex: 1; background: #6e40c9; border-radius: 2px 2px 0 0; cursor: pointer; }
-  #tlhist .b:hover { background: #a855f7; }
+  /* ---- month navigator (replaces the bar histogram) ---- */
+  #tlnav { max-height: 150px; overflow-y: auto; padding: 6px 8px; border-bottom: 1px solid #21262d;
+    display: flex; flex-direction: column; gap: 2px; }
+  .mnav { position: relative; display: flex; align-items: center; gap: 8px; padding: 5px 9px 7px;
+    border-radius: 6px; cursor: pointer; overflow: hidden; }
+  .mnav:hover { background: #161b22; }
+  .mnav.active { background: #1c2230; }
+  .mnav.focused { background: #1f2937; box-shadow: inset 2px 0 0 #a855f7; }
+  .mnav .mlabel { flex: 1; color: #e6edf3; font-size: 12px; white-space: nowrap; }
+  .mnav .mcount { color: #7d8590; font-size: 11px; min-width: 22px; text-align: right; }
+  .mnav .mfocus { background: none; border: none; color: #6e7681; padding: 0 2px; font-size: 12px;
+    cursor: pointer; line-height: 1; opacity: .55; }
+  .mnav .mfocus:hover, .mnav.focused .mfocus { opacity: 1; color: #a855f7; }
+  .mnav .mvol { position: absolute; left: 0; bottom: 0; height: 2px; background: #6e40c9; opacity: .55; }
+  #tlclear { display: none; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 6px 12px; background: #1f2937; color: #c9d1d9; font-size: 11px; cursor: pointer;
+    border-bottom: 1px solid #30363d; }
+  body.tl-focused #tlclear { display: flex; }
+  #tlclear b { color: #a855f7; }
   #tllist { flex: 1; overflow: auto; padding: 0 12px 40px; }
   .mh { position: sticky; top: 0; background: #0d1117; color: #a855f7; font-size: 12px;
     padding: 8px 0 4px; border-bottom: 1px solid #21262d; margin-top: 12px; z-index: 2; }
@@ -109,7 +125,8 @@
     <select id="tlorder"><option value="desc">newest</option><option value="asc">oldest</option></select>
     <button class="close" onclick="toggleTimeline(false)">✕</button>
   </div>
-  <div id="tlhist"></div>
+  <div id="tlnav"></div>
+  <div id="tlclear" onclick="clearFocus()"><span>focused on <b id="tlclabel"></b></span><span>✕ show all</span></div>
   <div id="tllist">loading…</div>
 </div>
 
@@ -121,6 +138,7 @@ const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
 let raw = null, mode = "3d", fg = null;
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
+let focusMonth = null, monthIO = null;   // timeline: focus-filter + scroll-spy observer
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 let mdReady = false;
@@ -461,23 +479,75 @@ async function loadMems() {
     drawTimeline();
   } catch (e) { el("tllist").innerHTML = `<span id="err">load failed: ${esc(e.message)}</span>`; }
 }
+const monthLabel = (k) => new Date(k + "-01T00:00:00Z").toLocaleString(undefined, { year: "numeric", month: "long" });
+window.clearFocus = () => { focusMonth = null; document.body.classList.remove("tl-focused"); drawTimeline(); };
+function jumpToMonth(k) { const h = document.getElementById("tmh-" + k); if (h) h.scrollIntoView({ behavior: "smooth", block: "start" }); }
+function toggleFocus(k) { focusMonth = (focusMonth === k) ? null : k; document.body.classList.toggle("tl-focused", !!focusMonth); drawTimeline(); }
+
+function buildMonthNav(monthsOrdered, byMonth, maxCount) {
+  const nav = el("tlnav"); nav.innerHTML = "";
+  for (const k of monthsOrdered) {
+    const row = document.createElement("div");
+    row.className = "mnav" + (focusMonth === k ? " focused" : "");
+    row.id = "mnav-" + k;
+    row.innerHTML =
+      `<span class="mlabel">${monthLabel(k)}</span><span class="mcount">${byMonth[k]}</span>` +
+      `<button class="mfocus" title="show only this month">${focusMonth === k ? "✕" : "⊙"}</button>` +
+      `<div class="mvol" style="width:${Math.max(8, 100 * byMonth[k] / maxCount)}%"></div>`;
+    // label/count → jump (in full view); focus button → isolate that month
+    row.onclick = (e) => { if (e.target.closest(".mfocus")) { toggleFocus(k); } else { if (focusMonth) clearFocus(); jumpToMonth(k); } };
+    nav.appendChild(row);
+  }
+}
+
+function setupScrollSpy() {
+  if (monthIO) { monthIO.disconnect(); monthIO = null; }
+  if (focusMonth) return;                       // no spy while a single month is isolated
+  const list = el("tllist");
+  const headers = [...list.querySelectorAll(".mh")];
+  if (!headers.length) return;
+  monthIO = new IntersectionObserver((entries) => {
+    // pick the header nearest the top of the list viewport
+    let top = null, topY = Infinity;
+    for (const h of headers) {
+      const y = h.getBoundingClientRect().top - list.getBoundingClientRect().top;
+      if (y <= 40 && y > -h.offsetHeight && Math.abs(y) < Math.abs(topY)) { top = h; topY = y; }
+    }
+    if (!top) { // fallback: first header below the top edge
+      for (const h of headers) { const y = h.getBoundingClientRect().top - list.getBoundingClientRect().top; if (y >= 0) { top = h; break; } }
+    }
+    if (top) {
+      const k = top.id.replace("tmh-", "");
+      el("tlnav").querySelectorAll(".mnav.active").forEach(n => n.classList.remove("active"));
+      const nav = document.getElementById("mnav-" + k);
+      if (nav) nav.classList.add("active");
+    }
+  }, { root: list, threshold: [0, 1], rootMargin: "0px 0px -85% 0px" });
+  headers.forEach(h => monthIO.observe(h));
+}
+
 function drawTimeline() {
   if (!mems) return;
-  let rows = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
-  if (el("tlorder").value === "asc") rows.reverse();
-  el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
+  const order = el("tlorder").value;
+  let all = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
+  if (order === "asc") all.reverse();
 
-  const byMonth = {};
-  for (const m of rows) { const k = m.created.slice(0, 7); byMonth[k] = (byMonth[k] || 0) + 1; }
-  const months = Object.keys(byMonth).sort(), max = Math.max(1, ...Object.values(byMonth));
-  el("tlhist").innerHTML = months.map(k => `<div class="b" style="height:${Math.max(4, 100 * byMonth[k] / max)}%" title="${k}: ${byMonth[k]}" data-m="${k}"></div>`).join("");
-  el("tlhist").querySelectorAll(".b").forEach(b => b.onclick = () => { const h = document.getElementById("tmh-" + b.dataset.m); if (h) h.scrollIntoView({ behavior: "smooth", block: "start" }); });
+  // month counts + display order from the FULL set (navigator always shows every month)
+  const byMonth = {}, monthsOrdered = [], seen = new Set();
+  for (const m of all) { const k = m.created.slice(0, 7); byMonth[k] = (byMonth[k] || 0) + 1; if (!seen.has(k)) { seen.add(k); monthsOrdered.push(k); } }
+  const maxCount = Math.max(1, ...Object.values(byMonth));
+  buildMonthNav(monthsOrdered, byMonth, maxCount);
+
+  // list rows (apply focus filter)
+  const rows = focusMonth ? all.filter(m => m.created.slice(0, 7) === focusMonth) : all;
+  el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
+  if (focusMonth) el("tlclabel").textContent = monthLabel(focusMonth);
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
   for (const m of rows) {
     const mon = m.created.slice(0, 7);
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
-      h.textContent = new Date(mon + "-01T00:00:00Z").toLocaleString(undefined, { year: "numeric", month: "long" }); list.appendChild(h); }
+      h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
     row.innerHTML = `<div class="l1"><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}</div>`;
@@ -485,6 +555,7 @@ function drawTimeline() {
     row.onclick = () => selectMemory(m.id, m._dupe, m);
     list.appendChild(row);
   }
+  setupScrollSpy();
   if (pendingHighlight != null) highlightTimeline(pendingHighlight);
 }
 
