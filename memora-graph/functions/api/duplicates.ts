@@ -1,10 +1,9 @@
 /**
- * GET /api/duplicates - Returns paginated duplicate candidate pairs.
+ * GET /api/duplicates - Returns paginated duplicate pairs.
  *
- * Computes duplicates directly from D1 (memories + memories_crossrefs)
- * without invoking the Python find_duplicate_candidates path. This avoids
- * the edge_type filter bug in the Python version and keeps the request
- * fully serverless.
+ * Computes canonical duplicates directly from D1 (memories +
+ * memories_crossrefs) using the same pair definition as
+ * memora.storage.find_duplicate_pairs.
  *
  * Query params:
  *   db=memora|ob1     — database selection (default: env.DEFAULT_DB or "memora")
@@ -22,6 +21,7 @@
  *       tier: "high" | "candidate"
  *     }],
  *     total: N,
+ *     affected_node_count: N,
  *     thresholds: { high: 0.92, candidate: 0.85 },
  *     min_similarity: N,
  *     limit: N,
@@ -101,10 +101,8 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
 }
 
 function isExcludedType(metadata: Record<string, unknown> | null): boolean {
-  // Mirror graph.ts: hide section placeholders and document fragments
-  // (the document_root stays visible).
   const t = metadata?.type;
-  return t === "section" || t === "document_fragment";
+  return t === "section" || t === "document_fragment" || t === "document_root";
 }
 
 function buildPreview(content: string): string {
@@ -142,6 +140,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     return Response.json({
       pairs: [],
       total: 0,
+      affected_node_count: 0,
       thresholds: { high: HIGH_THRESHOLD, candidate: CANDIDATE_THRESHOLD },
       min_similarity: minSimilarity,
       limit,
@@ -167,6 +166,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     return Response.json({
       pairs: [],
       total: 0,
+      affected_node_count: 0,
       thresholds: { high: HIGH_THRESHOLD, candidate: CANDIDATE_THRESHOLD },
       min_similarity: minSimilarity,
       limit,
@@ -222,6 +222,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     : sorted;
 
   const total = filtered.length;
+  const affectedNodeIds = new Set<number>();
+  for (const p of filtered) {
+    affectedNodeIds.add(p.lo);
+    affectedNodeIds.add(p.hi);
+  }
   const page = filtered.slice(offset, offset + limit);
 
   const pairs: DuplicatePair[] = [];
@@ -254,6 +259,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   return Response.json({
     pairs,
     total,
+    affected_node_count: affectedNodeIds.size,
     thresholds: { high: HIGH_THRESHOLD, candidate: CANDIDATE_THRESHOLD },
     min_similarity: minSimilarity,
     limit,

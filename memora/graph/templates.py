@@ -1255,7 +1255,7 @@ def build_static_html(
     css = get_full_css()
     js = get_full_js()
 
-    # Build duplicates legend HTML if there are duplicates
+    # Build duplicate-memory legend HTML if there are duplicates
     import json
     duplicate_ids = json.loads(duplicate_ids_json)
     duplicates_legend_html = ""
@@ -1263,7 +1263,7 @@ def build_static_html(
         duplicates_legend_html = f'''<div id="duplicates-legend">
 <div class="legend-item" onclick="filterByDuplicates()">
 <span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>
-Duplicates ({len(duplicate_ids)})</div></div>'''
+Duplicate memories ({len(duplicate_ids)})</div></div>'''
 
     return f'''<!DOCTYPE html>
 <html>
@@ -1387,4 +1387,3 @@ Duplicates ({len(duplicate_ids)})</div></div>'''
     </script>
 </body>
 </html>'''
-

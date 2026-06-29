@@ -251,6 +251,14 @@ function isDocumentFragment(metadata: Record<string, unknown> | null): boolean {
   return metadata?.type === "document_fragment";
 }
 
+function isDocumentRoot(metadata: Record<string, unknown> | null): boolean {
+  return metadata?.type === "document_root";
+}
+
+function isDuplicateExcluded(metadata: Record<string, unknown> | null): boolean {
+  return isSection(metadata) || isDocumentFragment(metadata) || isDocumentRoot(metadata);
+}
+
 function isIssue(metadata: Record<string, unknown> | null): boolean {
   return metadata?.type === "issue";
 }
@@ -339,9 +347,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     connectionCounts.set(edge.to, (connectionCounts.get(edge.to) || 0) + 1);
   }
 
-  // Find duplicates (exclude sections and document fragments).
-  // Filter rules — must match find_duplicate_candidates() in storage.py
+  // Find duplicate memories from canonical duplicate pairs.
+  // Filter rules must match find_duplicate_pairs() in storage.py
   // and the /api/duplicates endpoint:
+  //   - exclude structural memories (section, document_fragment,
+  //     document_root).
   //   - skip typed link entries (supersedes, references, extends, ...) —
   //     `related_to` is allowed because compute_crossrefs uses it as the
   //     default tag for score-based refs.
@@ -349,20 +359,24 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   //     with hardcoded 1.0, not real cosine matches. Cosine of non-
   //     identical vectors is mathematically always < 1.0.
   const memoryIds = new Set(memories.filter(m => {
-    const meta = parseJson<Record<string, unknown>>(m.metadata, null);
-    return !isSection(meta) && !isDocumentFragment(meta);
+    const meta = parseJson<Record<string, unknown> | null>(m.metadata, null);
+    return !isDuplicateExcluded(meta);
   }).map(m => m.id));
   const duplicateIds = new Set<number>();
+  const duplicatePairKeys = new Set<string>();
 
   for (const m of memories) {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
-    if (isSection(meta) || isDocumentFragment(meta)) continue;
+    if (isDuplicateExcluded(meta)) continue;
 
     const refs = crossrefsMap.get(m.id) || [];
     for (const ref of refs) {
-      if (ref.edge_type && ref.edge_type !== "related_to") continue;
+      if (ref.edge_type !== undefined && ref.edge_type !== null && ref.edge_type !== "related_to") continue;
+      if (typeof ref.score !== "number") continue;
       if (ref.score >= 0.9999) continue;
+      if (ref.id === m.id) continue;
       if (ref.score >= DUPLICATE_THRESHOLD && memoryIds.has(ref.id)) {
+        duplicatePairKeys.add([Math.min(m.id, ref.id), Math.max(m.id, ref.id)].join("-"));
         duplicateIds.add(m.id);
         duplicateIds.add(ref.id);
       }
@@ -552,6 +566,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     todoStatusToNodes,
     todoCategoryToNodes,
     duplicateIds: Array.from(duplicateIds),
+    duplicatePairCount: duplicatePairKeys.size,
     nodeTimestamps,
     minDate,
     maxDate,

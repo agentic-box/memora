@@ -1424,27 +1424,73 @@ def _clamp_offset(offset: Optional[int]) -> Optional[int]:
     return max(0, int(offset))
 
 
-def find_duplicate_candidates(
+_DUPLICATE_EXCLUDED_TYPES = {"section", "document_fragment", "document_root"}
+
+
+def _metadata_type_from_json(metadata_json: Optional[str]) -> Optional[str]:
+    if not metadata_json:
+        return None
+    try:
+        metadata = json.loads(metadata_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    meta_type = metadata.get("type")
+    return str(meta_type) if meta_type is not None else None
+
+
+def _row_value(row: Any, key: str, index: int) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return row[index]
+
+
+def find_duplicate_pairs(
     conn: "sqlite3.Connection",
     min_similarity: float = DUPLICATE_THRESHOLD,
-    limit: int = 50,
-) -> List[Dict[str, Any]]:
-    """Find memory pairs with similarity >= threshold that are likely duplicates.
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Find canonical duplicate memory pairs from crossrefs.
 
-    Uses the same threshold as the graph UI duplicate detection.
-    Returns list of pairs with their similarity scores, highest first.
+    Canonical duplicate definition:
+    - unordered memory pair
+    - both endpoints are non-structural memories
+    - crossref score is >= min_similarity and < 0.9999
+    - edge_type is missing/null or related_to
+
+    Returns the optionally-limited pair list plus total pair and affected-node
+    counts computed before applying the limit.
     """
+    existing_ids: set[int] = set()
+    excluded_ids: set[int] = set()
+    for row in conn.execute("SELECT id, metadata FROM memories"):
+        try:
+            memory_id = int(_row_value(row, "id", 0))
+        except (ValueError, TypeError):
+            continue
+        existing_ids.add(memory_id)
+        if _metadata_type_from_json(_row_value(row, "metadata", 1)) in _DUPLICATE_EXCLUDED_TYPES:
+            excluded_ids.add(memory_id)
+
     cursor = conn.execute(
         "SELECT memory_id, related FROM memories_crossrefs WHERE related IS NOT NULL"
     )
 
-    pairs_seen = set()
-    candidates = []
+    pair_scores: Dict[tuple[int, int], float] = {}
 
     for row in cursor:
-        memory_id = row[0]
         try:
-            related = json.loads(row[1]) if row[1] else []
+            memory_id = int(_row_value(row, "memory_id", 0))
+        except (ValueError, TypeError):
+            continue
+        if memory_id not in existing_ids or memory_id in excluded_ids:
+            continue
+
+        try:
+            related_json = _row_value(row, "related", 1)
+            related = json.loads(related_json) if related_json else []
         except json.JSONDecodeError:
             continue
 
@@ -1467,7 +1513,11 @@ def find_duplicate_candidates(
             # always < 1.0, so score >= 0.9999 means it's an absorb link,
             # not a real duplicate candidate. Skip it.
             edge_type = rel.get("edge_type")
-            if edge_type and edge_type != "related_to":
+            if edge_type is not None and edge_type != "related_to":
+                continue
+            try:
+                score = float(score)
+            except (ValueError, TypeError):
                 continue
             if score >= 0.9999:
                 continue
@@ -1478,33 +1528,47 @@ def find_duplicate_candidates(
             except (ValueError, TypeError):
                 continue
 
+            if related_id == memory_id:
+                continue
+            if related_id not in existing_ids or related_id in excluded_ids:
+                continue
+
             if score >= min_similarity:
-                pair_key = tuple(sorted([memory_id, related_id]))
-                if pair_key not in pairs_seen:
-                    pairs_seen.add(pair_key)
-                    candidates.append({
-                        "memory_a_id": pair_key[0],
-                        "memory_b_id": pair_key[1],
-                        "similarity_score": score,
-                    })
+                pair_key = tuple(sorted((memory_id, related_id)))
+                if score > pair_scores.get(pair_key, -1.0):
+                    pair_scores[pair_key] = score
 
-    candidates.sort(key=lambda x: x["similarity_score"], reverse=True)
+    pairs = [
+        {
+            "memory_a_id": pair_key[0],
+            "memory_b_id": pair_key[1],
+            "similarity_score": score,
+        }
+        for pair_key, score in pair_scores.items()
+    ]
+    pairs.sort(key=lambda x: x["similarity_score"], reverse=True)
 
-    # Exclude document fragments/roots BEFORE truncation so we don't
-    # lose valid candidates that would have been within the limit.
-    if candidates:
-        doc_ids: set[int] = set()
-        all_ids = {c["memory_a_id"] for c in candidates} | {c["memory_b_id"] for c in candidates}
-        for mid in all_ids:
-            if _get_metadata_type(conn, mid) in _DOCUMENT_TYPES:
-                doc_ids.add(mid)
-        if doc_ids:
-            candidates = [
-                c for c in candidates
-                if c["memory_a_id"] not in doc_ids and c["memory_b_id"] not in doc_ids
-            ]
+    affected_ids = {
+        memory_id
+        for pair in pairs
+        for memory_id in (pair["memory_a_id"], pair["memory_b_id"])
+    }
+    limited_pairs = pairs[:limit] if limit is not None else pairs
 
-    return candidates[:limit]
+    return {
+        "pairs": limited_pairs,
+        "total_pairs": len(pairs),
+        "affected_node_count": len(affected_ids),
+    }
+
+
+def find_duplicate_candidates(
+    conn: "sqlite3.Connection",
+    min_similarity: float = DUPLICATE_THRESHOLD,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Backward-compatible wrapper around canonical duplicate-pair detection."""
+    return find_duplicate_pairs(conn, min_similarity, limit)["pairs"]
 
 
 # ---------------------------------------------------------------------------

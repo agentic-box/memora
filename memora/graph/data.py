@@ -20,6 +20,7 @@ STALE_DAYS = int(os.getenv("MEMORA_STALE_DAYS", "30"))
 from ..storage import (  # noqa: E402
     connect,
     detect_clusters,
+    find_duplicate_pairs,
     get_crossrefs,
     get_memory,
     list_memories,
@@ -101,23 +102,18 @@ def _find_duplicate_ids(conn, memories: List[Dict]) -> set:
 
     A memory is marked as duplicate if it has a cross-reference with
     score >= DUPLICATE_THRESHOLD to another memory in the current view.
-    Section memories and document fragments are excluded from duplicate detection.
+    Structural memories are excluded by storage.find_duplicate_pairs.
     """
-    # Exclude section memories and document fragments from duplicate detection
-    non_section_memories = [
-        m for m in memories
-        if not is_section(m.get("metadata")) and not _is_document_fragment(m.get("metadata"))
-    ]
-    memory_ids = {m["id"] for m in non_section_memories}
+    memory_ids = {m["id"] for m in memories}
     duplicate_ids = set()
+    duplicate_result = find_duplicate_pairs(conn, DUPLICATE_THRESHOLD, None)
 
-    for m in non_section_memories:
-        for ref in get_crossrefs(conn, m["id"]):
-            if ref.get("score", 0) >= DUPLICATE_THRESHOLD:
-                # Only mark if the related memory is also in our view
-                if ref["id"] in memory_ids:
-                    duplicate_ids.add(m["id"])
-                    duplicate_ids.add(ref["id"])
+    for pair in duplicate_result["pairs"]:
+        a_id = pair["memory_a_id"]
+        b_id = pair["memory_b_id"]
+        if a_id in memory_ids and b_id in memory_ids:
+            duplicate_ids.add(a_id)
+            duplicate_ids.add(b_id)
 
     return duplicate_ids
 
@@ -514,7 +510,7 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
         edges = _build_edges(conn, memories, min_score)
         connection_counts = _count_connections(edges)
 
-        # Find duplicates (similarity >= 0.7)
+        # Find duplicate memories from canonical duplicate pairs.
         duplicate_ids = _find_duplicate_ids(conn, memories)
 
         tag_colors = _build_tag_colors(memories)
@@ -601,7 +597,7 @@ def export_graph_html(
         edges = _build_edges(conn, memories, min_score)
         connection_counts = _count_connections(edges)
 
-        # Find duplicates (similarity >= 0.7)
+        # Find duplicate memories from canonical duplicate pairs.
         duplicate_ids = _find_duplicate_ids(conn, memories)
 
         tag_colors = _build_tag_colors(memories)
