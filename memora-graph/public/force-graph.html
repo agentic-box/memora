@@ -63,8 +63,8 @@
   .trow .type { font-size: 9px; border: 1px solid #30363d; border-radius: 10px; padding: 0 5px; color: #9da7b3; flex:none }
   .trow .ttl { color: #e6edf3; font-size: 11px; min-width: 0; overflow: hidden;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; }
-  .trow.dupe .ttl::after { content: " · dup"; color: #f85149; font-size: 9px; }
   .trow .day { color: #7d8590; font-size: 10px; }
+  .trow .day .dup { color: #f85149; }
 
   /* ---- detail pane (sits left of the drawer when it's open) ---- */
   /* hidden fully off-screen via `right` (not transform — a width-relative transform
@@ -533,7 +533,7 @@ function drawTimeline() {
       h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
     row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
-      `<div class="day">${m.created.slice(0, 10)} · #${m.id}</div>`;
+      `<div class="day">${m.created.slice(0, 10)} · #${m.id}${m._dupe ? ' · <span class="dup">dup</span>' : ''}</div>`;
     rowById[m.id] = row;
     row.querySelector(".star").onclick = (e) => { e.stopPropagation(); toggleFav(m, row); };
     row.onclick = () => selectMemory(m.id, m._dupe, m);
