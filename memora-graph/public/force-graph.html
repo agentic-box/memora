@@ -312,7 +312,7 @@ function render() {
   graphEl.innerHTML = "";
   const gd = applyFilters(freshGraphData());
   const dupPairs = raw.duplicatePairCount;
-  const dupTxt = dupPairs != null ? `${dupPairs} dup pairs · ${raw.dupeCount} dup memories` : `${raw.dupeCount} dup memories`;
+  const dupTxt = dupPairs != null ? `${dupPairs}/${raw.dupeCount} dup pairs/memories` : `${raw.dupeCount} dup memories`;
   statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${dupTxt}`;
 
   if (mode === "3d") {
