@@ -57,7 +57,8 @@
   .trow.active { background: #1f2937; box-shadow: inset 3px 0 0 #a855f7; padding-left: 6px; }
   .trow .l1 { display: flex; gap: 6px; align-items: baseline; }
   .trow .type { font-size: 9px; border: 1px solid #30363d; border-radius: 10px; padding: 0 5px; color: #9da7b3; flex:none }
-  .trow .ttl { color: #e6edf3; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trow .ttl { color: #e6edf3; font-size: 11px; min-width: 0; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; }
   .trow.dupe .ttl::after { content: " · dup"; color: #f85149; font-size: 9px; }
   .trow .day { color: #7d8590; font-size: 10px; }
 
@@ -146,7 +147,7 @@ function renderMd(s) {
 }
 const typeOf = (m) => (m.metadata && m.metadata.type) || (m.metadata && m.metadata.severity ? "issue"
   : m.metadata && (m.metadata.priority || m.metadata.status) ? "todo" : "memory");
-const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 80) || ("#" + m.id);
+const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 120) || ("#" + m.id);
 function webglOK() { try { const c = document.createElement("canvas");
   return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
 
