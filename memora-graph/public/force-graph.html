@@ -1,0 +1,463 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Memora · Force Graph (prototype)</title>
+<!--
+  PROTOTYPE: vasturiano force-graph (2D) + 3d-force-graph (three.js/WebGL), with a
+  TIMELINE DRAWER (right) and a DETAIL pane. Graph is the main view; the Timeline
+  button slides a month-grouped memory list in from the right; clicking an entry
+  focuses that node in the graph and opens its markdown detail just left of the
+  drawer. Consumes /api/graph + /api/memories (same-origin). 3D needs WebGL; the
+  2D graph, timeline, and detail are pure canvas/DOM (work in LibreWolf).
+-->
+<script src="https://cdn.jsdelivr.net/npm/force-graph@1.43.5/dist/force-graph.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/3d-force-graph@1.73.4/dist/3d-force-graph.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
+    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
+  #graph { position: fixed; inset: 0; transition: right .18s; }
+  /* shrink the graph canvas to the area NOT covered by the right drawers,
+     so force-graph recenters the layout into the visible region */
+  body.panel-open:not(.timeline-open) #graph { right: 380px; }
+  body.timeline-open:not(.panel-open) #graph { right: 360px; }
+  body.timeline-open.panel-open #graph { right: 740px; }
+  @media (max-width: 900px) { body.timeline-open.panel-open #graph { right: 0; } }
+  #bar { position: fixed; top: 12px; left: 12px; z-index: 30; display: flex; gap: 8px;
+    align-items: center; flex-wrap: wrap; max-width: calc(100vw - 24px); }
+  .pill { background: #161b22cc; border: 1px solid #30363d; border-radius: 8px;
+    padding: 6px 10px; backdrop-filter: blur(6px); display: flex; gap: 8px; align-items: center; }
+  button, select, input { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
+    border-radius: 6px; padding: 5px 9px; font: inherit; cursor: pointer; }
+  button.active { background: #a855f7; border-color: #a855f7; color: #fff; }
+  input { cursor: text; min-width: 160px; }
+  a.nav { color: #79c0ff; text-decoration: none; }
+  #stats { color: #7d8590; } #err { color: #f85149; }
+
+  /* ---- timeline drawer (right) ---- */
+  #timeline { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 31;
+    background: #0d1117f7; border-left: 1px solid #30363d; backdrop-filter: blur(8px);
+    transform: translateX(100%); transition: transform .18s; display: flex; flex-direction: column; }
+  body.timeline-open #timeline { transform: none; }
+  #tlhead { display: flex; gap: 8px; align-items: center; padding: 12px; border-bottom: 1px solid #21262d; }
+  #tlhead h2 { margin: 0; font-size: 14px; color: #a855f7; flex: 1; }
+  #tlhist { display: flex; align-items: flex-end; gap: 2px; height: 48px; padding: 6px 12px 0; overflow-x: auto; }
+  #tlhist .b { min-width: 6px; flex: 1; background: #6e40c9; border-radius: 2px 2px 0 0; cursor: pointer; }
+  #tlhist .b:hover { background: #a855f7; }
+  #tllist { flex: 1; overflow: auto; padding: 0 12px 40px; }
+  .mh { position: sticky; top: 0; background: #0d1117; color: #a855f7; font-size: 12px;
+    padding: 8px 0 4px; border-bottom: 1px solid #21262d; margin-top: 12px; z-index: 2; }
+  .trow { padding: 7px 0; border-bottom: 1px solid #161b22; cursor: pointer; }
+  .trow:hover { background: #161b2266; }
+  .trow.active { background: #1f2937; box-shadow: inset 3px 0 0 #a855f7; padding-left: 6px; }
+  .trow .l1 { display: flex; gap: 6px; align-items: baseline; }
+  .trow .type { font-size: 9px; border: 1px solid #30363d; border-radius: 10px; padding: 0 5px; color: #9da7b3; flex:none }
+  .trow .ttl { color: #e6edf3; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .trow.dupe .ttl::after { content: " · dup"; color: #f85149; font-size: 9px; }
+  .trow .day { color: #7d8590; font-size: 10px; }
+
+  /* ---- detail pane (sits left of the drawer when it's open) ---- */
+  /* hidden fully off-screen via `right` (not transform — a width-relative transform
+     didn't clear the viewport once the panel was shifted left of the timeline, so it
+     covered the drawer and stole clicks). pointer-events off while hidden. */
+  #panel { position: fixed; top: 0; right: -440px; bottom: 0; width: 380px; z-index: 32;
+    background: #0d1117f7; border-left: 1px solid #30363d; backdrop-filter: blur(8px);
+    padding: 16px; overflow: auto; transition: right .2s; pointer-events: none; }
+  body.panel-open #panel { right: 0; pointer-events: auto; }
+  body.panel-open.timeline-open #panel { right: 360px; }
+  #panel h2 { margin: 0 0 2px; font-size: 15px; color: #a855f7; }
+  #panel .meta { color: #7d8590; font-size: 11px; margin-bottom: 10px; }
+  #panel .close, #tlhead .close { padding: 2px 8px; }
+  #panel .close { position: absolute; top: 12px; right: 12px; }
+  #panel .dupe { color: #f85149; font-weight: bold; }
+  .tags span { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 10px;
+    padding: 1px 8px; margin: 0 4px 4px 0; font-size: 11px; color: #9da7b3; }
+  /* rendered markdown */
+  .md { font: 13px/1.55 -apple-system, system-ui, sans-serif; color: #c9d1d9; }
+  .md h1,.md h2,.md h3 { color: #e6edf3; margin: 12px 0 6px; } .md h1{font-size:17px}.md h2{font-size:15px}.md h3{font-size:14px}
+  .md p { margin: 7px 0; } .md ul,.md ol { margin: 7px 0; padding-left: 20px; } .md a { color: #79c0ff; }
+  .md code { background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 1px 5px;
+    font: 12px ui-monospace,monospace; color: #ffa657; }
+  .md pre { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 10px; overflow:auto }
+  .md pre code { background: none; border: none; padding: 0; color: #c9d1d9; }
+  .md blockquote { border-left: 3px solid #30363d; margin: 7px 0; padding: 2px 12px; color: #9da7b3; }
+  .md img { max-width: 100%; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <div class="pill"><button id="b2d">2D</button><button id="b3d" class="active">3D</button></div>
+  <div class="pill"><label>DB <select id="db"><option value="memora">memora</option><option value="ob1">ob1</option></select></label></div>
+  <div class="pill"><input id="search" placeholder="search label / #id …" /></div>
+  <div class="pill"><label><input type="checkbox" id="dupes" style="min-width:auto" /> dupes only</label></div>
+  <div class="pill"><button id="bcl" class="active">◉ Clusters</button></div>
+  <div class="pill"><button id="btl">☰ Timeline</button></div>
+  <div class="pill" id="stats">loading…</div>
+</div>
+
+<div id="graph"></div>
+
+<!-- timeline drawer -->
+<div id="timeline">
+  <div id="tlhead">
+    <h2>Timeline</h2>
+    <select id="tlorder"><option value="desc">newest</option><option value="asc">oldest</option></select>
+    <button class="close" onclick="toggleTimeline(false)">✕</button>
+  </div>
+  <div id="tlhist"></div>
+  <div id="tllist">loading…</div>
+</div>
+
+<!-- detail pane -->
+<div id="panel"></div>
+
+<script>
+const el = (id) => document.getElementById(id);
+const graphEl = el("graph"), statsEl = el("stats");
+let raw = null, mode = "3d", fg = null;
+let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
+
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+function renderMd(s) { try { if (window.marked && window.DOMPurify)
+  return DOMPurify.sanitize(marked.parse(String(s || ""), { breaks: true })); } catch (e) {} return `<pre>${esc(s)}</pre>`; }
+const typeOf = (m) => (m.metadata && m.metadata.type) || (m.metadata && m.metadata.severity ? "issue"
+  : m.metadata && (m.metadata.priority || m.metadata.status) ? "todo" : "memory");
+const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 80) || ("#" + m.id);
+function webglOK() { try { const c = document.createElement("canvas");
+  return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
+
+/* ---------------- graph ---------------- */
+function freshGraphData() {
+  const dupes = new Set(raw.duplicateIds || []);
+  const nodes = raw.nodes.map(n => ({
+    id: n.id, label: n.label || ("#" + n.id), title: n.title || "",
+    val: Math.max(1, (n.size || 12) / 6),
+    color: typeof n.color === "string" ? n.color : (n.color?.background || "#a855f7"),
+    dupe: dupes.has(n.id),
+  }));
+  const present = new Set(nodes.map(n => n.id));
+  const links = (raw.edges || []).filter(e => present.has(e.from) && present.has(e.to))
+    .map(e => ({ source: e.from, target: e.to }));
+  return { nodes, links };
+}
+function applyFilters(gd) {
+  const q = el("search").value.trim().toLowerCase();
+  const dupesOnly = el("dupes").checked;
+  let nodes = gd.nodes;
+  if (dupesOnly) nodes = nodes.filter(n => n.dupe);
+  if (q) nodes = nodes.filter(n => n.label.toLowerCase().includes(q) || ("#" + n.id).includes(q));
+  const keep = new Set(nodes.map(n => n.id));
+  return { nodes, links: gd.links.filter(l => keep.has(l.source) && keep.has(l.target)) };
+}
+/* ---- clusters (Louvain communities from /api/graph) ---- */
+let showClusters = true, clusterToNodes = {}, clusterColors = {}, clusterOf = {};
+function buildClusters() {
+  clusterToNodes = raw.clusterToNodes || {};
+  clusterColors = raw.clusterColors || {};
+  clusterOf = {};
+  for (const cid in clusterToNodes) for (const id of clusterToNodes[cid]) clusterOf[id] = cid;
+}
+// convex-hull blob helpers (ported from the original index.html cluster hulls)
+function cross(O, A, B) { return (A.x - O.x) * (B.y - O.y) - (A.y - O.y) * (B.x - O.x); }
+function convexHull(points) {
+  if (points.length <= 2) return points.slice();
+  points.sort((a, b) => a.x - b.x || a.y - b.y);
+  const lower = [];
+  for (const p of points) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+  const upper = [];
+  for (let i = points.length - 1; i >= 0; i--) { const p = points[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+  upper.pop(); lower.pop(); return lower.concat(upper);
+}
+function expandHull(hull, pad) {
+  if (hull.length < 3) return hull;
+  let cx = 0, cy = 0; for (const h of hull) { cx += h.x; cy += h.y; } cx /= hull.length; cy /= hull.length;
+  return hull.map(h => { const dx = h.x - cx, dy = h.y - cy, d = Math.hypot(dx, dy) || 1; return { x: h.x + dx / d * pad, y: h.y + dy / d * pad }; });
+}
+function drawSmoothClosed(ctx, hull) {
+  const n = hull.length; if (n < 3) return; ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const p0 = hull[(i - 1 + n) % n], p1 = hull[i], p2 = hull[(i + 1) % n], p3 = hull[(i + 2) % n], t = 6;
+    const cp1x = p1.x + (p2.x - p0.x) / t, cp1y = p1.y + (p2.y - p0.y) / t;
+    const cp2x = p2.x - (p3.x - p1.x) / t, cp2y = p2.y - (p3.y - p1.y) / t;
+    if (i === 0) ctx.moveTo(p1.x, p1.y);
+    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, p2.x, p2.y);
+  }
+  ctx.closePath();
+}
+// Hull shapes are in GRAPH coords — they only change when the layout moves, NOT when
+// you zoom/pan. So compute once and cache; recompute only when the sim ticks. This
+// keeps zoom/pan cheap (just re-stroke cached paths) instead of re-running the hull
+// algorithm every frame (which made zooming stutter).
+let hullCache = null, hullsDirty = true;
+function computeHulls() {
+  const out = []; if (!fg) return out;
+  const nodes = fg.graphData().nodes; if (!nodes.length) return out;
+  const pos = {}; for (const n of nodes) pos[n.id] = n;
+  for (const cid in clusterToNodes) {
+    const members = clusterToNodes[cid]; if (!members || members.length < 3) continue;
+    const pts = [];
+    for (const id of members) { const n = pos[id]; if (n && isFinite(n.x) && isFinite(n.y)) pts.push({ x: n.x, y: n.y }); }
+    if (pts.length < 3) continue;
+    let hull = convexHull(pts); if (hull.length < 3) continue;
+    out.push({ hull: expandHull(hull, 45), color: clusterColors[cid] || "#8b949e" });
+  }
+  return out;
+}
+function drawHulls2D(ctx, scale) {
+  if (hullsDirty || !hullCache) { hullCache = computeHulls(); hullsDirty = false; }
+  for (const h of hullCache) {
+    ctx.save(); drawSmoothClosed(ctx, h.hull);
+    ctx.fillStyle = h.color + "14"; ctx.fill();
+    ctx.strokeStyle = h.color + "55"; ctx.lineWidth = 2 / scale; ctx.stroke();
+    ctx.restore();
+  }
+}
+
+/* ---- highlight / dim on selection ---- */
+let selectedId = null, hlNodes = new Set(), adj = new Map();
+const sid = (x) => (x && typeof x === "object") ? x.id : x;
+function buildAdj() {
+  adj = new Map();
+  for (const e of (raw.edges || [])) {
+    if (!adj.has(e.from)) adj.set(e.from, new Set());
+    if (!adj.has(e.to)) adj.set(e.to, new Set());
+    adj.get(e.from).add(e.to); adj.get(e.to).add(e.from);
+  }
+}
+// blend a hex color toward the dark bg (13,17,23): keep ~16% brightness
+function dim(c) {
+  const m = /^#?([0-9a-f]{6})$/i.exec(c); if (!m) return c;
+  const n = parseInt(m[1], 16), f = 0.16;
+  const r = Math.round(((n >> 16) & 255) * f + 13 * (1 - f));
+  const g = Math.round(((n >> 8) & 255) * f + 17 * (1 - f));
+  const b = Math.round((n & 255) * f + 23 * (1 - f));
+  return `rgb(${r},${g},${b})`;
+}
+const baseColor = (n) => n.dupe ? "#f85149"
+  : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color);
+const nodeColor = (n) => {
+  if (!selectedId) return baseColor(n);
+  if (n.id === selectedId) return "#ffffff";          // focal memory: white + larger (stands out from neighbors)
+  if (hlNodes.has(n.id)) return baseColor(n);         // neighbors: keep full color
+  return dim(baseColor(n));                            // everything else: dimmed
+};
+const linkIncident = (l) => selectedId && (sid(l.source) === selectedId || sid(l.target) === selectedId);
+const linkColor = (l) => !selectedId ? (mode === "3d" ? "#30363d" : "#21262d")
+  : (linkIncident(l) ? "#a855f7" : (mode === "3d" ? "#11151b" : "#11151a"));
+const linkWidth = (l) => linkIncident(l) ? 2.5 : 0.5;
+// selected node is drawn much bigger so it stands out from its (also-bright) neighbors
+const nodeSize = (n) => n.id === selectedId ? n.val * 3.2 : n.val;
+function applyHighlight() {
+  if (!fg) return;
+  if (mode === "3d") fg.nodeColor(nodeColor).nodeVal(nodeSize).linkColor(linkColor);
+  else fg.nodeColor(nodeColor).nodeVal(nodeSize).linkColor(linkColor).linkWidth(linkWidth);
+  wake();
+}
+function setHighlight(id) { selectedId = id; hlNodes = new Set([id, ...(adj.get(id) || [])]); applyHighlight(); }
+function clearHighlight() { selectedId = null; hlNodes = new Set(); applyHighlight(); }
+
+function render() {
+  if (fg && fg._destructor) { try { fg._destructor(); } catch (e) {} }
+  hullsDirty = true;
+  graphEl.innerHTML = "";
+  const gd = applyFilters(freshGraphData());
+  statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${raw.dupeCount} dupes`;
+
+  if (mode === "3d") {
+    if (typeof ForceGraph3D !== "function") { statsEl.innerHTML = `<span id="err">3D lib failed to load</span>`; return; }
+    if (!webglOK()) {
+      statsEl.innerHTML = `<span id="err">WebGL disabled — 3D unavailable</span>`;
+      graphEl.innerHTML = `<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;padding:40px">
+        <div style="max-width:520px;background:#161b22;border:1px solid #30363d;border-radius:10px;padding:24px">
+        <h2 style="color:#f85149;margin:0 0 8px">WebGL is disabled in this browser</h2>
+        <p style="color:#9da7b3">The 3D view needs WebGL. 2D + timeline work without it.</p>
+        <p style="color:#9da7b3"><b>LibreWolf/Firefox:</b> <code style="color:#79c0ff">about:config</code> →
+        <code style="color:#79c0ff">webgl.disabled = false</code>, then reload.</p></div></div>`;
+      return;
+    }
+    fg = ForceGraph3D()(graphEl).backgroundColor("#0d1117")
+      .nodeLabel(n => n.title.replace(/\n/g, "<br>"))
+      .nodeColor(nodeColor).nodeVal(nodeSize).nodeRelSize(5).nodeResolution(12).nodeOpacity(0.92)
+      .linkColor(linkColor).linkOpacity(0.45)
+      .cooldownTime(12000)
+      .onNodeClick(n => selectMemory(n.id, n.dupe)).onBackgroundClick(() => deselect()).graphData(gd);
+  } else {
+    fg = ForceGraph()(graphEl).backgroundColor("#0d1117").nodeId("id").nodeColor(nodeColor).nodeVal(nodeSize)
+      .onRenderFramePre((ctx, scale) => { if (showClusters) drawHulls2D(ctx, scale); })
+      .nodeLabel(n => n.title.replace(/\n/g, "<br>")).linkColor(linkColor).linkWidth(linkWidth)
+      .nodeCanvasObjectMode(() => "after")
+      .nodeCanvasObject((n, ctx, scale) => {
+        if (n.id === selectedId) {
+          ctx.beginPath(); ctx.arc(n.x, n.y, Math.sqrt(n.val) * 4 + 3, 0, 6.2832);
+          ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 / scale; ctx.stroke();
+        }
+        if (scale < 1.5) return;
+        ctx.fillStyle = (selectedId && !hlNodes.has(n.id)) ? "#484f58" : "#c9d1d9";
+        ctx.font = `${10 / scale}px ui-monospace`; ctx.fillText(n.label, n.x + 6 / scale, n.y + 3 / scale);
+      })
+      .cooldownTime(12000).onEngineTick(() => { hullsDirty = true; })
+      .onNodeClick(n => selectMemory(n.id, n.dupe)).onBackgroundClick(() => deselect()).graphData(gd);
+  }
+}
+
+// ---- render-loop control ----
+// Keep rendering while the tab is visible (a timer-based idle pause broke zoom/pan).
+// Only pause when the tab is hidden — that can never interfere with interaction.
+function pauseRender() { if (fg && fg.pauseAnimation) { try { fg.pauseAnimation(); } catch (e) {} } }
+function wake() { if (fg && fg.resumeAnimation) { try { fg.resumeAnimation(); } catch (e) {} } }
+
+// Resize the graph canvas to its (now-smaller) container so force-graph recenters
+// the layout into the visible left area. Runs after the drawer CSS transition.
+function relayout() {
+  setTimeout(() => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); wake(); } }, 200);
+}
+addEventListener("resize", () => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); } });
+
+// open detail + sync the timeline row + recenter the node AFTER the canvas resizes
+function selectMemory(id, dupe, mem) {
+  openDetail(id, dupe, mem);
+  setHighlight(id);
+  highlightTimeline(id);
+  setTimeout(() => focusInGraph(id), 230);
+}
+
+// point the timeline at a memory: mark its row active + scroll to it (if open)
+function highlightTimeline(id) {
+  pendingHighlight = id;
+  if (!mems) return;                       // applied after loadMems/drawTimeline
+  if (activeRow) activeRow.classList.remove("active");
+  const row = rowById[id];
+  if (row) {
+    row.classList.add("active"); activeRow = row;
+    if (document.body.classList.contains("timeline-open"))
+      row.scrollIntoView({ behavior: "smooth", block: "center" });
+  } else { activeRow = null; }             // memory not in the timeline set
+}
+
+function focusInGraph(id) {
+  if (!fg) return false;
+  wake();   // camera/zoom transition needs the render loop running
+  const node = (fg.graphData().nodes || []).find(n => n.id === id);
+  if (!node) return false;
+  if (mode === "3d") {
+    // DON'T move the camera (no zoom change) — keep its current position and only
+    // re-aim the lookAt at the node so it slides to the center at the current scale.
+    const cam = fg.cameraPosition();
+    fg.cameraPosition({ x: cam.x, y: cam.y, z: cam.z }, node, 800);
+  } else {
+    fg.centerAt(node.x, node.y, 600);
+    if (fg.zoom() < 1.2) fg.zoom(1.5, 600);   // gently center; only nudge in if very zoomed-out (never slam in)
+  }
+  return true;
+}
+
+/* ---------------- detail pane ---------------- */
+// ✕ closes ONLY the detail pane — the graph highlight + timeline selection stay.
+window.closePane = () => { document.body.classList.remove("panel-open"); relayout(); };
+// full deselect (background click / Esc): close pane + clear graph + timeline.
+window.deselect = () => {
+  document.body.classList.remove("panel-open"); clearHighlight();
+  if (activeRow) { activeRow.classList.remove("active"); activeRow = null; }
+  pendingHighlight = null;
+  relayout();
+};
+async function openDetail(id, dupe, preMem) {
+  document.body.classList.add("panel-open");
+  relayout();
+  const panel = el("panel");
+  panel.innerHTML = `<button class="close" onclick="closePane()">✕</button><h2>#${id}</h2><div class="meta">loading…</div>`;
+  let m = preMem || byId[id];
+  try {
+    if (!m) { const r = await fetch(`/api/memories/${id}?db=${el("db").value}`); if (!r.ok) throw new Error("HTTP " + r.status); m = await r.json(); }
+    const tags = (m.tags || []).map(t => `<span>${esc(t)}</span>`).join("");
+    panel.innerHTML =
+      `<button class="close" onclick="closePane()">✕</button>` +
+      `<h2>#${m.id}${dupe ? ' <span class="dupe">· DUPLICATE</span>' : ''}</h2>` +
+      `<div class="meta">${esc(typeOf(m))} · created ${(m.created || '').slice(0, 10)}${m.updated ? ' · updated ' + m.updated.slice(0, 10) : ''}</div>` +
+      `<div class="tags">${tags}</div><div class="md" style="margin-top:10px">${renderMd(m.content || "")}</div>`;
+    panel.scrollTop = 0;
+  } catch (e) { panel.querySelector(".meta").innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`; }
+}
+
+/* ---------------- timeline drawer ---------------- */
+window.toggleTimeline = (force) => {
+  const open = force === undefined ? !document.body.classList.contains("timeline-open") : force;
+  document.body.classList.toggle("timeline-open", open);
+  el("btl").classList.toggle("active", open);
+  relayout();
+  if (open && !memsLoaded) loadMems();
+};
+async function loadMems() {
+  memsLoaded = true; el("tllist").textContent = "loading…";
+  try {
+    const r = await fetch(`/api/memories?db=${el("db").value}&sort=created&limit=1000`);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const dupes = new Set(raw?.duplicateIds || []);
+    mems = ((await r.json()).memories || []).map(m => ({ ...m, _dupe: dupes.has(m.id) }));
+    byId = {}; for (const m of mems) byId[m.id] = m;
+    drawTimeline();
+  } catch (e) { el("tllist").innerHTML = `<span id="err">load failed: ${esc(e.message)}</span>`; }
+}
+function drawTimeline() {
+  if (!mems) return;
+  let rows = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
+  if (el("tlorder").value === "asc") rows.reverse();
+
+  const byMonth = {};
+  for (const m of rows) { const k = m.created.slice(0, 7); byMonth[k] = (byMonth[k] || 0) + 1; }
+  const months = Object.keys(byMonth).sort(), max = Math.max(1, ...Object.values(byMonth));
+  el("tlhist").innerHTML = months.map(k => `<div class="b" style="height:${Math.max(4, 100 * byMonth[k] / max)}%" title="${k}: ${byMonth[k]}" data-m="${k}"></div>`).join("");
+  el("tlhist").querySelectorAll(".b").forEach(b => b.onclick = () => { const h = document.getElementById("tmh-" + b.dataset.m); if (h) h.scrollIntoView({ behavior: "smooth", block: "start" }); });
+
+  const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
+  for (const m of rows) {
+    const mon = m.created.slice(0, 7);
+    if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
+      h.textContent = new Date(mon + "-01T00:00:00Z").toLocaleString(undefined, { year: "numeric", month: "long" }); list.appendChild(h); }
+    const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
+    row.innerHTML = `<div class="l1"><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
+      `<div class="day">${m.created.slice(0, 10)} · #${m.id}</div>`;
+    rowById[m.id] = row;
+    row.onclick = () => selectMemory(m.id, m._dupe, m);
+    list.appendChild(row);
+  }
+  if (pendingHighlight != null) highlightTimeline(pendingHighlight);
+}
+
+/* ---------------- load ---------------- */
+async function load() {
+  statsEl.textContent = "loading…";
+  try {
+    const r = await fetch(`/api/graph?db=${encodeURIComponent(el("db").value)}`);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    raw = await r.json(); raw.dupeCount = (raw.duplicateIds || []).length;
+    buildAdj(); buildClusters();
+    render();
+    if (selectedId) applyHighlight();
+    memsLoaded = false; mems = null;
+    if (document.body.classList.contains("timeline-open")) loadMems();
+  } catch (e) { statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`; }
+}
+
+el("b2d").onclick = () => { mode = "2d"; el("b2d").classList.add("active"); el("b3d").classList.remove("active"); render(); };
+el("b3d").onclick = () => { mode = "3d"; el("b3d").classList.add("active"); el("b2d").classList.remove("active"); render(); };
+el("bcl").onclick = () => { showClusters = !showClusters; el("bcl").classList.toggle("active", showClusters); applyHighlight(); };
+el("btl").onclick = () => toggleTimeline();
+el("tlorder").onchange = drawTimeline;
+el("db").onchange = load;
+let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
+el("dupes").onchange = render;
+addEventListener("keydown", e => { if (e.key === "Escape") { deselect(); } });
+// pause the render loop only while the tab is hidden (saves CPU in the background)
+document.addEventListener("visibilitychange", () => { if (document.hidden) pauseRender(); else wake(); });
+// defaults: timeline drawer open (3D + clusters are set on the mode/state + buttons)
+document.body.classList.add("timeline-open"); el("btl").classList.add("active");
+load();
+</script>
+</body>
+</html>
