@@ -436,13 +436,27 @@ window.toggleTimeline = (force) => {
   relayout();
   if (open && !memsLoaded) loadMems();
 };
+const isStructural = (m) => { const t = (m.metadata || {}).type; return t === "section" || t === "document_fragment" || t === "document_root"; };
 async function loadMems() {
   memsLoaded = true; el("tllist").textContent = "loading…";
   try {
-    const r = await fetch(`/api/memories?db=${el("db").value}&sort=created&limit=1000`);
-    if (!r.ok) throw new Error("HTTP " + r.status);
+    const db = el("db").value;
+    // /api/memories caps at 200 per request — page through with offset to get them all.
+    let fetched = [], offset = 0, total = Infinity;
+    while (offset < total && offset < 20000) {
+      const r = await fetch(`/api/memories?db=${db}&sort=created&limit=200&offset=${offset}`);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const d = await r.json();
+      total = (typeof d.total === "number") ? d.total : fetched.length;
+      const batch = d.memories || [];
+      fetched.push(...batch);
+      if (batch.length < 200) break;
+      offset += 200;
+    }
     const dupes = new Set(raw?.duplicateIds || []);
-    mems = ((await r.json()).memories || []).map(m => ({ ...m, _dupe: dupes.has(m.id) }));
+    // exclude structural entries (doc fragments/sections) so the timeline matches the
+    // graph's real memories — every row then maps to a node we can focus.
+    mems = fetched.filter(m => !isStructural(m)).map(m => ({ ...m, _dupe: dupes.has(m.id) }));
     byId = {}; for (const m of mems) byId[m.id] = m;
     drawTimeline();
   } catch (e) { el("tllist").innerHTML = `<span id="err">load failed: ${esc(e.message)}</span>`; }
@@ -451,6 +465,7 @@ function drawTimeline() {
   if (!mems) return;
   let rows = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
   if (el("tlorder").value === "asc") rows.reverse();
+  el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const byMonth = {};
   for (const m of rows) { const k = m.created.slice(0, 7); byMonth[k] = (byMonth[k] || 0) + 1; }
