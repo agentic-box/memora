@@ -180,10 +180,10 @@ function webglOK() { try { const c = document.createElement("canvas");
 function freshGraphData() {
   const dupes = new Set(raw.duplicateIds || []);
   const nodes = raw.nodes.map(n => ({
-    id: n.id, label: n.label || ("#" + n.id), title: n.title || "",
-    val: Math.max(1, (n.size || 12) / 6),
+    id: n.id, label: n.frag ? "" : (n.label || ("#" + n.id)), title: n.title || "",
+    val: n.frag ? 2.2 : Math.max(1, (n.size || 12) / 6),
     color: typeof n.color === "string" ? n.color : (n.color?.background || "#a855f7"),
-    dupe: dupes.has(n.id),
+    dupe: dupes.has(n.id), frag: !!n.frag,
   }));
   const present = new Set(nodes.map(n => n.id));
   const links = (raw.edges || []).filter(e => present.has(e.from) && present.has(e.to))
@@ -285,7 +285,8 @@ function dim(c) {
   return `rgb(${r},${g},${b})`;
 }
 const baseColor = (n) => n.dupe ? "#f85149"
-  : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color);
+  : (n.frag ? "#58a6ff"
+  : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color));
 const nodeColor = (n) => {
   if (!selectedId) return baseColor(n);
   if (n.id === selectedId) return "#ffffff";          // focal memory: white + larger (stands out from neighbors)

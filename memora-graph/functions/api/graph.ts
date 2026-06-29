@@ -40,6 +40,7 @@ interface GraphNode {
   mass: number;
   borderWidth?: number;
   shape?: string;
+  frag?: boolean;
 }
 
 interface GraphEdge {
@@ -467,11 +468,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       node.borderWidth = 3;
     }
 
-    // Document fragments: small muted nodes (they cluster around their doc root)
+    // Document fragments: smaller distinct nodes (they cluster around their doc root)
     if (isFrag) {
+      node.frag = true;
       node.shape = "dot";
-      node.color = "#444c56";
-      node.size = 7;
+      node.color = "#58a6ff";
+      node.size = 9;
       node.mass = 0.4;
       const heading = typeof meta.section_heading === "string" ? meta.section_heading : "";
       const dk = typeof meta.document_key === "string" ? meta.document_key : "";
