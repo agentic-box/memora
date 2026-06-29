@@ -2440,12 +2440,13 @@ async def memory_find_duplicates(
 async def _find_duplicates_impl(
     min_similarity: float, max_similarity: float, limit: int, use_llm: bool
 ) -> Dict[str, Any]:
-    from .storage import compare_memories_llm, connect, find_duplicate_candidates
+    from .storage import compare_memories_llm, connect, find_duplicate_pairs
 
     with connect() as conn:
-        candidates = find_duplicate_candidates(conn, min_similarity, limit * 2)
+        duplicate_result = find_duplicate_pairs(conn, min_similarity, limit * 2)
+        candidates = duplicate_result["pairs"]
 
-    total_candidates = len(candidates)
+    total_candidates = duplicate_result["total_pairs"]
     pairs = []
     llm_available = False
 
@@ -2492,6 +2493,7 @@ async def _find_duplicates_impl(
     return {
         "pairs": pairs,
         "total_candidates": total_candidates,
+        "affected_node_count": duplicate_result["affected_node_count"],
         "analyzed": len(pairs),
         "llm_available": llm_available,
     }

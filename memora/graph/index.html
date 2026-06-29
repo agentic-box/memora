@@ -531,7 +531,7 @@ div.vis-tooltip {
         <div id="panel-tabs">
             <span class="tab active" onclick="switchTab('detail')">Details</span>
             <span class="tab" onclick="switchTab('timeline')">Timeline</span>
-            <span class="tab" onclick="switchTab('duplicates')">Duplicates <span id="duplicates-badge" class="tab-badge" style="display:none;"></span></span>
+            <span class="tab" onclick="switchTab('duplicates')">Duplicate pairs <span id="duplicates-badge" class="tab-badge" style="display:none;"></span></span>
             <span class="tab" onclick="switchTab('issues')">Issues <span id="issues-badge" class="tab-badge" style="display:none;"></span></span>
             <span class="tab" onclick="switchTab('history')">History</span>
         </div>
@@ -1454,7 +1454,7 @@ div.vis-tooltip {
             duplicatesLoading = true;
             var listEl = document.getElementById('duplicates-list');
             var sumEl = document.getElementById('duplicates-summary');
-            listEl.innerHTML = '<div class="dup-loading">Loading duplicate candidates&hellip;</div>';
+            listEl.innerHTML = '<div class="dup-loading">Loading duplicate pairs&hellip;</div>';
             sumEl.textContent = '';
             var dbp = getDbParam();
             var sep = dbp ? dbp + '&' : '?';
@@ -1489,12 +1489,12 @@ div.vis-tooltip {
             var pairs = (data && data.pairs) || [];
             var total = (data && data.total) || 0;
             if (pairs.length === 0) {
-                listEl.innerHTML = '<div class="dup-empty">No duplicate candidates above threshold ' + (data && data.min_similarity || 0.85) + '.</div>';
+                listEl.innerHTML = '<div class="dup-empty">No duplicate pairs above threshold ' + (data && data.min_similarity || 0.85) + '.</div>';
                 sumEl.textContent = '';
                 return;
             }
             var highCount = pairs.filter(function(p) { return p.tier === 'high'; }).length;
-            sumEl.textContent = total + ' pair' + (total === 1 ? '' : 's') + ' (' + highCount + ' high-confidence)';
+            sumEl.textContent = 'Duplicate pairs: ' + total + ' (' + highCount + ' high-confidence)';
             var html = '';
             for (var i = 0; i < pairs.length; i++) {
                 var p = pairs[i];
@@ -2651,7 +2651,7 @@ div.vis-tooltip {
             // Build duplicates legend
             var duplicatesHtml = '';
             if (graphData.duplicateIds && graphData.duplicateIds.length > 0) {
-                duplicatesHtml = '<div id="duplicates-legend"><div class="legend-item" onclick="filterByDuplicates()"><span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>Duplicates (' + graphData.duplicateIds.length + ')</div></div>';
+                duplicatesHtml = '<div id="duplicates-legend"><div class="legend-item" onclick="filterByDuplicates()"><span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>Duplicate memories (' + graphData.duplicateIds.length + ')</div></div>';
             }
             document.getElementById('duplicates-legend-items').innerHTML = duplicatesHtml;
 
@@ -3155,7 +3155,7 @@ div.vis-tooltip {
             // Update duplicates legend
             var duplicatesHtml = '';
             if (graphData.duplicateIds && graphData.duplicateIds.length > 0) {
-                duplicatesHtml = '<div id="duplicates-legend"><div class="legend-item" onclick="filterByDuplicates()"><span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>Duplicates (' + graphData.duplicateIds.length + ')</div></div>';
+                duplicatesHtml = '<div id="duplicates-legend"><div class="legend-item" onclick="filterByDuplicates()"><span class="legend-color" style="background:#a855f7;border:2px solid #f85149;"></span>Duplicate memories (' + graphData.duplicateIds.length + ')</div></div>';
             }
             document.getElementById('duplicates-legend-items').innerHTML = duplicatesHtml;
 

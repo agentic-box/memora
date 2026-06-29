@@ -4,6 +4,63 @@ import memora
 import memora.storage as storage
 
 
+def test_find_duplicate_pairs_uses_canonical_filters(local_db):
+    """Duplicate counts should ignore structural memories and non-cosine links."""
+    import json
+
+    with storage.connect() as conn:
+        a = storage.add_memory(conn, content="Alpha duplicate memory one", tags=["test"])
+        b = storage.add_memory(conn, content="Alpha duplicate memory two", tags=["test"])
+        typed = storage.add_memory(conn, content="Typed relation memory", tags=["test"])
+        absorb = storage.add_memory(conn, content="Absorb link memory", tags=["test"])
+        root = storage.add_memory(
+            conn,
+            content="Document root memory",
+            tags=["test"],
+            metadata={"type": "document_root"},
+        )
+        section = storage.add_memory(
+            conn,
+            content="Section placeholder memory",
+            tags=["test"],
+            metadata={"type": "section"},
+        )
+
+        conn.execute("DELETE FROM memories_crossrefs")
+        conn.execute(
+            "INSERT INTO memories_crossrefs(memory_id, related) VALUES (?, ?)",
+            (
+                a["id"],
+                json.dumps([
+                    {"id": b["id"], "score": 0.90, "edge_type": "related_to"},
+                    {"id": typed["id"], "score": 0.97, "edge_type": "supersedes"},
+                    {"id": absorb["id"], "score": 1.0, "edge_type": "related_to"},
+                    {"id": root["id"], "score": 0.96, "edge_type": "related_to"},
+                    {"id": section["id"], "score": 0.96, "edge_type": "related_to"},
+                ]),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO memories_crossrefs(memory_id, related) VALUES (?, ?)",
+            (
+                b["id"],
+                json.dumps([
+                    {"id": a["id"], "score": 0.91},
+                ]),
+            ),
+        )
+
+        result = storage.find_duplicate_pairs(conn, min_similarity=0.85, limit=None)
+
+        assert result["total_pairs"] == 1
+        assert result["affected_node_count"] == 2
+        assert result["pairs"] == [{
+            "memory_a_id": min(a["id"], b["id"]),
+            "memory_b_id": max(a["id"], b["id"]),
+            "similarity_score": 0.91,
+        }]
+
+
 def test_add_memory_crud(local_db):
     """Basic create/read/update/delete cycle."""
     with storage.connect() as conn:
