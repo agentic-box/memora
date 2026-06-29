@@ -294,6 +294,7 @@ function getTodoStatus(metadata: Record<string, unknown>): string {
 export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
+  const includeDocs = url.searchParams.get("docs") === "1";   // include document fragments as nodes, linked to their doc root
   const db = getDatabase(env, dbName);
   const minScore = parseFloat(env.MIN_EDGE_SCORE || "0.40");
 
@@ -394,12 +395,21 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   }
 
   // Build nodes
+  // Map document_key -> document_root node id so fragments can link to their root.
+  const rootByDocKey = new Map<string, number>();
+  for (const m of memories) {
+    const meta = parseJson<Record<string, unknown>>(m.metadata, {});
+    if (isDocumentRoot(meta) && typeof meta.document_key === "string") rootByDocKey.set(meta.document_key, m.id);
+  }
+
   const nodes: GraphNode[] = [];
   for (const m of memories) {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
 
-    // Skip section memories and document fragments
-    if (isSection(meta) || isDocumentFragment(meta)) continue;
+    // Skip sections always; include document fragments only when ?docs=1
+    if (isSection(meta)) continue;
+    const isFrag = isDocumentFragment(meta);
+    if (isFrag && !includeDocs) continue;
 
     const tags = parseJson<string[]>(m.tags, []);
     const primaryTag = tags[0] || "untagged";
@@ -457,7 +467,46 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       node.borderWidth = 3;
     }
 
+    // Document fragments: small muted nodes (they cluster around their doc root)
+    if (isFrag) {
+      node.shape = "dot";
+      node.color = "#444c56";
+      node.size = 7;
+      node.mass = 0.4;
+      const heading = typeof meta.section_heading === "string" ? meta.section_heading : "";
+      const dk = typeof meta.document_key === "string" ? meta.document_key : "";
+      node.title = `#${m.id} - fragment\n${heading || dk}`;
+      node.label = "";
+    }
+
     nodes.push(node);
+  }
+
+  // Link each included fragment to its document root (fragments skip crossrefs);
+  // chain by ordinal when the doc has no root node.
+  if (includeDocs) {
+    const byDoc = new Map<string, Array<{ id: number; ord: number }>>();
+    for (const m of memories) {
+      const meta = parseJson<Record<string, unknown>>(m.metadata, {});
+      if (!isDocumentFragment(meta)) continue;
+      const dk = typeof meta.document_key === "string" ? meta.document_key : "";
+      if (!dk) continue;
+      const ord = typeof meta.ordinal === "number" ? meta.ordinal : 0;
+      const arr = byDoc.get(dk) || [];
+      arr.push({ id: m.id, ord });
+      byDoc.set(dk, arr);
+    }
+    const addEdge = (a: number, b: number) => {
+      if (a === b) return;
+      const k = [Math.min(a, b), Math.max(a, b)].join("-");
+      if (!seen.has(k)) { seen.add(k); edges.push({ id: edgeId++, from: a, to: b }); }
+    };
+    byDoc.forEach((frags, dk) => {
+      frags.sort((a, b) => a.ord - b.ord);
+      const rootId = rootByDocKey.get(dk);
+      if (rootId !== undefined) frags.forEach(f => addEdge(f.id, rootId));
+      else for (let i = 1; i < frags.length; i++) addEdge(frags[i - 1].id, frags[i].id);
+    });
   }
 
   // Build mappings

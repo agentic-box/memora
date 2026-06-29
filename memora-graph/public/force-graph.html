@@ -106,6 +106,7 @@
   <div class="pill"><input id="search" placeholder="search label / #id …" /></div>
   <div class="pill"><label><input type="checkbox" id="dupes" style="min-width:auto" /> dupes only</label></div>
   <div class="pill"><button id="bcl" class="active">◉ Clusters</button></div>
+  <div class="pill"><button id="bdoc">◫ Docs</button></div>
   <div class="pill"><button id="btl">☰ Timeline</button></div>
   <div class="pill" id="stats">loading…</div>
 </div>
@@ -200,6 +201,7 @@ function applyFilters(gd) {
 }
 /* ---- clusters (Louvain communities from /api/graph) ---- */
 let showClusters = true, clusterToNodes = {}, clusterColors = {}, clusterOf = {};
+let showDocs = false;   // include document fragments in the graph (?docs=1); timeline always excludes them
 function buildClusters() {
   clusterToNodes = raw.clusterToNodes || {};
   clusterColors = raw.clusterColors || {};
@@ -578,7 +580,7 @@ window.doRefresh = async () => { hideRefresh(); await load(); };
 async function load() {
   statsEl.textContent = "loading…";
   try {
-    const r = await fetch(`/api/graph?db=${encodeURIComponent(el("db").value)}`);
+    const r = await fetch(`/api/graph?db=${encodeURIComponent(el("db").value)}${showDocs ? "&docs=1" : ""}`);
     if (!r.ok) throw new Error("HTTP " + r.status);
     raw = await r.json(); raw.dupeCount = (raw.duplicateIds || []).length;
     buildAdj(); buildClusters();
@@ -593,6 +595,7 @@ async function load() {
 el("b2d").onclick = () => { mode = "2d"; el("b2d").classList.add("active"); el("b3d").classList.remove("active"); render(); };
 el("b3d").onclick = () => { mode = "3d"; el("b3d").classList.add("active"); el("b2d").classList.remove("active"); render(); };
 el("bcl").onclick = () => { showClusters = !showClusters; el("bcl").classList.toggle("active", showClusters); applyHighlight(); };
+el("bdoc").onclick = () => { showDocs = !showDocs; el("bdoc").classList.toggle("active", showDocs); load(); };
 el("btl").onclick = () => toggleTimeline();
 el("tlyear").onchange = () => { el("tlmonth").value = ""; drawTimeline(); };
 el("tlmonth").onchange = drawTimeline;
