@@ -78,8 +78,8 @@
   .tags span { display: inline-block; background: #21262d; border: 1px solid #30363d; border-radius: 10px;
     padding: 1px 8px; margin: 0 4px 4px 0; font-size: 11px; color: #9da7b3; }
   /* rendered markdown */
-  .md { font: 13px/1.55 -apple-system, system-ui, sans-serif; color: #c9d1d9; }
-  .md h1,.md h2,.md h3 { color: #e6edf3; margin: 12px 0 6px; } .md h1{font-size:17px}.md h2{font-size:15px}.md h3{font-size:14px}
+  .md { font: 11.5px/1.5 -apple-system, system-ui, sans-serif; color: #c9d1d9; }
+  .md h1,.md h2,.md h3 { color: #e6edf3; margin: 10px 0 5px; } .md h1{font-size:14px}.md h2{font-size:13px}.md h3{font-size:12px}
   .md p { margin: 7px 0; } .md ul,.md ol { margin: 7px 0; padding-left: 20px; } .md a { color: #79c0ff; }
   .md code { background: #161b22; border: 1px solid #30363d; border-radius: 4px; padding: 1px 5px;
     font: 12px ui-monospace,monospace; color: #ffa657; }
@@ -123,8 +123,24 @@ let raw = null, mode = "3d", fg = null;
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-function renderMd(s) { try { if (window.marked && window.DOMPurify)
-  return DOMPurify.sanitize(marked.parse(String(s || ""), { breaks: true })); } catch (e) {} return `<pre>${esc(s)}</pre>`; }
+let mdReady = false;
+function renderMd(s) {
+  try {
+    if (window.marked && window.DOMPurify) {
+      if (!mdReady) {
+        // Render raw HTML in the markdown as LITERAL text. Memory content is full of
+        // CLI placeholders like <name>/<id>/<repo-or-dir>; without this marked emits
+        // them as HTML tags and DOMPurify strips them (the text vanishes).
+        const r = new marked.Renderer();
+        r.html = (t) => esc(typeof t === "string" ? t : (t && (t.text || t.raw)) || "");
+        marked.use({ renderer: r, breaks: true });
+        mdReady = true;
+      }
+      return DOMPurify.sanitize(marked.parse(String(s || "")));
+    }
+  } catch (e) {}
+  return `<pre>${esc(s)}</pre>`;
+}
 const typeOf = (m) => (m.metadata && m.metadata.type) || (m.metadata && m.metadata.severity ? "issue"
   : m.metadata && (m.metadata.priority || m.metadata.status) ? "todo" : "memory");
 const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 80) || ("#" + m.id);
