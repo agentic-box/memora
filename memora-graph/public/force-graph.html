@@ -280,6 +280,7 @@ function clearHighlight() { selectedId = null; hlNodes = new Set(); applyHighlig
 function render() {
   if (fg && fg._destructor) { try { fg._destructor(); } catch (e) {} }
   hullsDirty = true;
+  engineStopped = false; clearTimeout(idleTimer); loopOn = true;   // new sim: keep rendering until it settles
   graphEl.innerHTML = "";
   const gd = applyFilters(freshGraphData());
   statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${raw.dupeCount} dupes`;
@@ -300,8 +301,19 @@ function render() {
       .nodeLabel(n => n.title.replace(/\n/g, "<br>"))
       .nodeColor(nodeColor).nodeVal(nodeSize).nodeRelSize(5).nodeResolution(12).nodeOpacity(0.92)
       .linkColor(linkColor).linkOpacity(0.45)
-      .cooldownTime(12000)
+      .cooldownTime(5000).onEngineStop(() => { engineStopped = true; wake(); })
       .onNodeClick(n => selectMemory(n.id, n.dupe)).onBackgroundClick(() => deselect()).graphData(gd);
+    // resume the loop while the camera is moving (OrbitControls), pause shortly after
+    try {
+      const c = fg.controls();
+      if (c) {
+        // kill inertia so 'change' stops the instant you release → loop idles promptly.
+        // 3d-force-graph defaults to TrackballControls (staticMoving); also cover OrbitControls.
+        if ("staticMoving" in c) c.staticMoving = true;
+        if ("enableDamping" in c) c.enableDamping = false;
+        if (c.addEventListener) ["start", "change", "end"].forEach(ev => c.addEventListener(ev, () => wake()));
+      }
+    } catch (e) {}
   } else {
     fg = ForceGraph()(graphEl).backgroundColor("#0d1117").nodeId("id").nodeColor(nodeColor).nodeVal(nodeSize)
       .onRenderFramePre((ctx, scale) => { if (showClusters) drawHulls2D(ctx, scale); })
@@ -316,21 +328,37 @@ function render() {
         ctx.fillStyle = (selectedId && !hlNodes.has(n.id)) ? "#484f58" : "#c9d1d9";
         ctx.font = `${10 / scale}px ui-monospace`; ctx.fillText(n.label, n.x + 6 / scale, n.y + 3 / scale);
       })
-      .cooldownTime(12000).onEngineTick(() => { hullsDirty = true; })
+      .cooldownTime(5000).onEngineTick(() => { hullsDirty = true; }).onEngineStop(() => { engineStopped = true; wake(); })
+      .onZoom(() => wake()).onZoomEnd(() => wake()).onNodeDrag(() => wake()).onNodeDragEnd(() => wake())
       .onNodeClick(n => selectMemory(n.id, n.dupe)).onBackgroundClick(() => deselect()).graphData(gd);
   }
 }
 
-// ---- render-loop control ----
-// Keep rendering while the tab is visible (a timer-based idle pause broke zoom/pan).
-// Only pause when the tab is hidden — that can never interfere with interaction.
-function pauseRender() { if (fg && fg.pauseAnimation) { try { fg.pauseAnimation(); } catch (e) {} } }
-function wake() { if (fg && fg.resumeAnimation) { try { fg.resumeAnimation(); } catch (e) {} } }
+// ---- render-on-demand (CPU saver) ----
+// The render loop runs only during/just-after interaction, then pauses. CRITICAL:
+// pausing also freezes the force simulation, so we NEVER pause until the engine has
+// settled (engineStopped). Resume is driven by the libraries' own interaction events
+// (3D OrbitControls change/start/end, 2D onZoom/onZoomEnd/onNodeDrag) + pointer events;
+// discrete inputs force-resume to dodge any stale state.
+let idleTimer = null, loopOn = true, engineStopped = false;
+function resumeLoop() { if (fg && fg.resumeAnimation) { try { fg.resumeAnimation(); } catch (e) {} } loopOn = true; }
+function pauseLoop() {
+  if (!engineStopped) return;                     // never freeze the layout mid-settle
+  if (fg && fg.pauseAnimation) { try { fg.pauseAnimation(); } catch (e) {} }
+  loopOn = false;
+}
+function pauseRender() { if (fg && fg.pauseAnimation) { try { fg.pauseAnimation(); } catch (e) {} } loopOn = false; }
+function wake(ms) {
+  if (!loopOn) resumeLoop();
+  clearTimeout(idleTimer);
+  if (engineStopped) idleTimer = setTimeout(pauseLoop, ms || 1500);
+}
+function forceWake(ms) { resumeLoop(); clearTimeout(idleTimer); if (engineStopped) idleTimer = setTimeout(pauseLoop, ms || 1500); }
 
 // Resize the graph canvas to its (now-smaller) container so force-graph recenters
 // the layout into the visible left area. Runs after the drawer CSS transition.
 function relayout() {
-  setTimeout(() => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); wake(); } }, 200);
+  setTimeout(() => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); wake(1000); } }, 200);
 }
 addEventListener("resize", () => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); } });
 
@@ -357,7 +385,7 @@ function highlightTimeline(id) {
 
 function focusInGraph(id) {
   if (!fg) return false;
-  wake();   // camera/zoom transition needs the render loop running
+  wake(1400);   // keep the loop alive through the ~800ms camera/zoom transition
   const node = (fg.graphData().nodes || []).find(n => n.id === id);
   if (!node) return false;
   if (mode === "3d") {
@@ -469,8 +497,12 @@ el("db").onchange = load;
 let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
 el("dupes").onchange = render;
 addEventListener("keydown", e => { if (e.key === "Escape") { deselect(); } });
-// pause the render loop only while the tab is hidden (saves CPU in the background)
-document.addEventListener("visibilitychange", () => { if (document.hidden) pauseRender(); else wake(); });
+// resume the loop on graph interaction; discrete inputs force-resume (dodge stale
+// state), pointermove just keeps it awake. Pauses again after the trailing idle.
+["pointerdown", "wheel", "touchstart"].forEach(ev =>
+  graphEl.addEventListener(ev, () => forceWake(), { passive: true }));
+graphEl.addEventListener("pointermove", () => wake(), { passive: true });
+document.addEventListener("visibilitychange", () => { if (document.hidden) pauseRender(); else forceWake(); });
 // defaults: timeline drawer open (3D + clusters are set on the mode/state + buttons)
 document.body.classList.add("timeline-open"); el("btl").classList.add("active");
 load();
