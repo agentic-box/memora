@@ -46,6 +46,10 @@
   body.timeline-open #timeline { transform: none; }
   #tlhead { display: flex; gap: 8px; align-items: center; padding: 12px; border-bottom: 1px solid #21262d; }
   #tlhead h2 { margin: 0; font-size: 14px; color: #a855f7; flex: 1; }
+  #tlfav { background: none; border: 1px solid #30363d; color: #6e7681; padding: 2px 9px; border-radius: 6px; cursor: pointer; }
+  #tlfav.active { color: #e3b341; border-color: #e3b341; }
+  .trow .star { color: #4d535b; cursor: pointer; flex: none; font-size: 12px; }
+  .trow .star.on, .trow .star:hover { color: #e3b341; }
   /* ---- timeline controls: year + month + order dropdowns ---- */
   #tlctrls { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #21262d; }
   #tlctrls select { flex: 1 1 calc(50% - 3px); min-width: 0; }
@@ -107,6 +111,7 @@
 <div id="timeline">
   <div id="tlhead">
     <h2>Timeline</h2>
+    <button id="tlfav" title="favorites only">★</button>
     <button class="close" onclick="toggleTimeline(false)">✕</button>
   </div>
   <div id="tlctrls">
@@ -149,6 +154,18 @@ function renderMd(s) {
 const typeOf = (m) => (m.metadata && m.metadata.type) || (m.metadata && m.metadata.severity ? "issue"
   : m.metadata && (m.metadata.priority || m.metadata.status) ? "todo" : "memory");
 const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 120) || ("#" + m.id);
+const isFav = (m) => { const f = (m.metadata || {}).favorite; return f === true || f === 1 || f === "true"; };
+async function toggleFav(m, row) {
+  const next = !isFav(m);
+  try {
+    const r = await fetch(`/api/memories/${m.id}?db=${el("db").value}`, {
+      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ favorite: next }) });
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    m.metadata = m.metadata || {}; if (next) m.metadata.favorite = true; else delete m.metadata.favorite;
+    const s = row && row.querySelector(".star"); if (s) s.classList.toggle("on", next);
+    if (el("tlfav").classList.contains("active") && !next) drawTimeline();   // dropped out of favorites view
+  } catch (e) { /* leave state unchanged on failure */ }
+}
 function webglOK() { try { const c = document.createElement("canvas");
   return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
 
@@ -503,8 +520,10 @@ function drawTimeline() {
 
   populateYears(all); populateMonths(all); populateTypes(all);
   const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
+  const favOnly = el("tlfav").classList.contains("active");
   const rows = all.filter(m =>
-    (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) && (!ty || typeOf(m) === ty));
+    (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
+    (!ty || typeOf(m) === ty) && (!favOnly || isFav(m)));
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
@@ -513,9 +532,10 @@ function drawTimeline() {
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
       h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
-    row.innerHTML = `<div class="l1"><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
+    row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}</div>`;
     rowById[m.id] = row;
+    row.querySelector(".star").onclick = (e) => { e.stopPropagation(); toggleFav(m, row); };
     row.onclick = () => selectMemory(m.id, m._dupe, m);
     list.appendChild(row);
   }
@@ -545,6 +565,7 @@ el("tlyear").onchange = () => { el("tlmonth").value = ""; drawTimeline(); };
 el("tlmonth").onchange = drawTimeline;
 el("tltype").onchange = drawTimeline;
 el("tlorder").onchange = drawTimeline;
+el("tlfav").onclick = () => { el("tlfav").classList.toggle("active"); drawTimeline(); };
 el("db").onchange = load;
 let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
 el("dupes").onchange = render;
