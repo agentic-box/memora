@@ -22,6 +22,11 @@
   html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
   #graph { position: fixed; inset: 0; transition: right .18s; }
+  /* live-update badge (polls for changes; click to pull them in) */
+  #refresh { display: none; position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 40; background: #a855f7; color: #fff; border: 1px solid #c084fc; border-radius: 8px;
+    padding: 7px 14px; cursor: pointer; font-size: 13px; box-shadow: 0 4px 16px #0008; }
+  #refresh:hover { background: #c084fc; }
   /* shrink the graph canvas to the area NOT covered by the right drawers,
      so force-graph recenters the layout into the visible region */
   body.panel-open:not(.timeline-open) #graph { right: 380px; }
@@ -105,6 +110,7 @@
   <div class="pill" id="stats">loading…</div>
 </div>
 
+<div id="refresh" onclick="doRefresh()"></div>
 <div id="graph"></div>
 
 <!-- timeline drawer -->
@@ -542,6 +548,30 @@ function drawTimeline() {
   if (pendingHighlight != null) highlightTimeline(pendingHighlight);
 }
 
+/* ---------------- live-update polling (non-disruptive badge) ---------------- */
+let pollTimer = null, baseSig = null;
+async function fetchSignal() {
+  const r = await fetch(`/api/memories?db=${el("db").value}&limit=1&sort=created`);
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const d = await r.json();
+  return { total: d.total, maxId: (d.memories[0] && d.memories[0].id) || 0 };
+}
+function hideRefresh() { el("refresh").style.display = "none"; }
+async function captureBaseline() { try { baseSig = await fetchSignal(); } catch (e) {} hideRefresh(); }
+function startPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(checkUpdates, 20000); }
+async function checkUpdates() {
+  if (document.hidden || !baseSig) return;
+  try {
+    const s = await fetchSignal();
+    if (s.total !== baseSig.total || s.maxId !== baseSig.maxId) {
+      const n = s.total - baseSig.total;
+      el("refresh").textContent = `🔄 ${n > 0 ? n + " new" : "updated"} — refresh`;
+      el("refresh").style.display = "block";
+    }
+  } catch (e) {}
+}
+window.doRefresh = async () => { hideRefresh(); await load(); };
+
 /* ---------------- load ---------------- */
 async function load() {
   statsEl.textContent = "loading…";
@@ -554,6 +584,7 @@ async function load() {
     if (selectedId) applyHighlight();
     memsLoaded = false; mems = null;
     if (document.body.classList.contains("timeline-open")) loadMems();
+    captureBaseline(); startPolling();   // reset the live-update baseline + keep polling
   } catch (e) { statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`; }
 }
 
