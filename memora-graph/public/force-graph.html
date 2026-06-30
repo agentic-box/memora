@@ -110,7 +110,7 @@
   <div class="pill"><input id="search" placeholder="search label / #id …" /></div>
   <div class="pill"><label><input type="checkbox" id="dupes" style="min-width:auto" /> dupes only</label></div>
   <div class="pill"><button id="bcl" class="active">◉ Clusters</button></div>
-  <div class="pill"><button id="bdoc">◫ Docs</button></div>
+  <div class="pill"><button id="bdoc" class="active">◫ Docs</button></div>
   <div class="pill"><button id="btl">☰ Timeline</button></div>
   <div class="pill" id="stats">loading…</div>
 </div>
@@ -221,7 +221,7 @@ function applyFilters(gd) {
 }
 /* ---- clusters (Louvain communities from /api/graph) ---- */
 let showClusters = true, clusterToNodes = {}, clusterColors = {}, clusterOf = {};
-let showDocs = false;   // include document fragments in the graph (?docs=1); timeline always excludes them
+let showDocs = true;   // include document fragments in the graph (?docs=1) by default; timeline always excludes them
 function buildClusters() {
   clusterToNodes = raw.clusterToNodes || {};
   clusterColors = raw.clusterColors || {};
