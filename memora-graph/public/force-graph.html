@@ -278,7 +278,7 @@ function buildAdj() {
 // blend a hex color toward the dark bg (13,17,23): keep ~16% brightness
 function dim(c) {
   const m = /^#?([0-9a-f]{6})$/i.exec(c); if (!m) return c;
-  const n = parseInt(m[1], 16), f = 0.16;
+  const n = parseInt(m[1], 16), f = 0.42;   // keep ~42% brightness so de-emphasized nodes stay visible
   const r = Math.round(((n >> 16) & 255) * f + 13 * (1 - f));
   const g = Math.round(((n >> 8) & 255) * f + 17 * (1 - f));
   const b = Math.round((n & 255) * f + 23 * (1 - f));
@@ -295,7 +295,7 @@ const nodeColor = (n) => {
 };
 const linkIncident = (l) => selectedId && (sid(l.source) === selectedId || sid(l.target) === selectedId);
 const linkColor = (l) => !selectedId ? (mode === "3d" ? "#30363d" : "#21262d")
-  : (linkIncident(l) ? "#a855f7" : (mode === "3d" ? "#11151b" : "#11151a"));
+  : (linkIncident(l) ? "#a855f7" : "#1c222b");
 const linkWidth = (l) => linkIncident(l) ? 2.5 : 0.5;
 // selected node is drawn much bigger so it stands out from its (also-bright) neighbors
 const nodeSize = (n) => n.id === selectedId ? n.val * 3.2 : n.val;
