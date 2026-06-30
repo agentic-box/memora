@@ -97,6 +97,10 @@
   .md pre code { background: none; border: none; padding: 0; color: #c9d1d9; }
   .md blockquote { border-left: 3px solid #30363d; margin: 7px 0; padding: 2px 12px; color: #9da7b3; }
   .md img { max-width: 100%; border-radius: 6px; }
+  #panel .imgs { margin-top: 12px; border-top: 1px solid #21262d; padding-top: 10px; }
+  #panel .imgs figure { margin: 0 0 10px; }
+  #panel .imgs img { max-width: 100%; border-radius: 6px; border: 1px solid #30363d; display: block; }
+  #panel .imgs figcaption { font-size: 11px; color: #7d8590; text-align: center; margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -162,6 +166,22 @@ const typeOf = (m) => (m.metadata && m.metadata.type) || (m.metadata && m.metada
   : m.metadata && (m.metadata.priority || m.metadata.status) ? "todo" : "memory");
 const labelOf = (m) => (m.content || "").split("\n")[0].replace(/^#+\s*/, "").replace(/[`*_]/g, "").trim().slice(0, 120) || ("#" + m.id);
 const isFav = (m) => { const f = (m.metadata || {}).favorite; return f === true || f === 1 || f === "true"; };
+// Render a memory's attached images (metadata.images). The API already rewrites r2://
+// to the /api/r2/ proxy; we just append ?db= for the right bucket.
+function renderImages(m) {
+  const imgs = (m.metadata && m.metadata.images) || [];
+  if (!Array.isArray(imgs) || !imgs.length) return "";
+  const db = el("db").value;
+  const fix = (src) => {
+    if (!src) return "";
+    if (src.startsWith("r2://")) src = "/api/r2/" + src.slice(5);
+    if (src.startsWith("/api/r2/") && !src.includes("?")) src += "?db=" + encodeURIComponent(db);
+    return src;
+  };
+  return `<div class="imgs">` + imgs.map(im =>
+    `<figure><img src="${esc(fix(im.src))}" loading="lazy" alt="${esc(im.caption || "")}">` +
+    (im.caption ? `<figcaption>${esc(im.caption)}</figcaption>` : "") + `</figure>`).join("") + `</div>`;
+}
 async function toggleFav(m, row) {
   const next = !isFav(m);
   try {
@@ -456,7 +476,8 @@ async function openDetail(id, dupe, preMem) {
       `<button class="close" onclick="closePane()">✕</button>` +
       `<h2>#${m.id}${dupe ? ' <span class="dupe">· DUPLICATE</span>' : ''}</h2>` +
       `<div class="meta">${esc(typeOf(m))} · created ${(m.created || '').slice(0, 10)}${m.updated ? ' · updated ' + m.updated.slice(0, 10) : ''}</div>` +
-      `<div class="tags">${tags}</div><div class="md" style="margin-top:10px">${renderMd(m.content || "")}</div>`;
+      `<div class="tags">${tags}</div><div class="md" style="margin-top:10px">${renderMd(m.content || "")}</div>` +
+      renderImages(m);
     panel.scrollTop = 0;
   } catch (e) { panel.querySelector(".meta").innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`; }
 }
