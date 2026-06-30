@@ -197,6 +197,38 @@ function webglOK() { try { const c = document.createElement("canvas");
   return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
 
 /* ---------------- graph ---------------- */
+// Deterministic per-id jitter so the layout is stable across reloads.
+function jit(id, salt) { const h = ((id * 2654435761) ^ (salt * 40503)) >>> 0; return (h % 200) - 100; }
+// Place each Louvain cluster at a ring position and start its members near that
+// center (3D adds a z offset). The force sim then refines — but communities begin
+// grouped instead of randomly tangled, so the result is tighter and more stable.
+function seedClusterPositions(nodes) {
+  const ckeys = Object.keys(clusterToNodes);
+  const nC = ckeys.length || 1;
+  const radius = 240 + nC * 38;
+  const centers = {};
+  ckeys.forEach((cid, i) => { const a = (2 * Math.PI * i) / nC;
+    centers[cid] = { x: Math.cos(a) * radius, y: Math.sin(a) * radius, z: Math.sin(a * 1.7) * radius * 0.55 }; });
+  for (const n of nodes) {
+    const c = clusterOf[n.id] != null ? centers[clusterOf[n.id]] : null;
+    if (c) { n.x = c.x + jit(n.id, 1) * 0.6; n.y = c.y + jit(n.id, 2) * 0.6; n.z = c.z + jit(n.id, 3) * 0.6; }
+    else { n.x = jit(n.id, 4) * 2.4; n.y = jit(n.id, 5) * 2.4; n.z = jit(n.id, 6) * 2.4; }
+  }
+}
+// Spread the hairball: stronger but range-limited repulsion + longer links.
+function tuneForces() {
+  if (!fg || !fg.d3Force) return;
+  try {
+    const charge = fg.d3Force("charge");
+    if (charge && charge.strength) { charge.strength(-110); if (charge.distanceMax) charge.distanceMax(420); }
+    const link = fg.d3Force("link");
+    if (link && link.distance) link.distance(44);
+  } catch (e) {}
+  // fresh graphData() already starts a hot simulation, so the new force params take
+  // effect on the next tick — no explicit reheat needed (reheating here races the
+  // not-yet-initialized simulation and throws).
+}
+
 function freshGraphData() {
   const dupes = new Set(raw.duplicateIds || []);
   const nodes = raw.nodes.map(n => ({
@@ -208,6 +240,7 @@ function freshGraphData() {
   const present = new Set(nodes.map(n => n.id));
   const links = (raw.edges || []).filter(e => present.has(e.from) && present.has(e.to))
     .map(e => ({ source: e.from, target: e.to }));
+  seedClusterPositions(nodes);
   return { nodes, links };
 }
 function applyFilters(gd) {
@@ -385,6 +418,7 @@ function render() {
       .onZoom(() => wake()).onZoomEnd(() => wake()).onNodeDrag(() => wake()).onNodeDragEnd(() => wake())
       .onNodeClick(n => selectMemory(n.id, n.dupe)).onBackgroundClick(() => deselect()).graphData(gd);
   }
+  tuneForces();
 }
 
 // ---- render-on-demand (CPU saver) ----
