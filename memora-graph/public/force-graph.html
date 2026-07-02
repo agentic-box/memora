@@ -205,7 +205,7 @@ function jit(id, salt) { const h = ((id * 2654435761) ^ (salt * 40503)) >>> 0; r
 function seedClusterPositions(nodes) {
   const ckeys = Object.keys(clusterToNodes);
   const nC = ckeys.length || 1;
-  const radius = 240 + nC * 38;
+  const radius = Math.min(320, 120 + nC * 14);   // capped — was uncapped (240+nC*38), sprawled badly with many clusters
   const centers = {};
   ckeys.forEach((cid, i) => { const a = (2 * Math.PI * i) / nC;
     centers[cid] = { x: Math.cos(a) * radius, y: Math.sin(a) * radius, z: Math.sin(a * 1.7) * radius * 0.55 }; });
@@ -220,9 +220,9 @@ function tuneForces() {
   if (!fg || !fg.d3Force) return;
   try {
     const charge = fg.d3Force("charge");
-    if (charge && charge.strength) { charge.strength(-110); if (charge.distanceMax) charge.distanceMax(420); }
+    if (charge && charge.strength) { charge.strength(-55); if (charge.distanceMax) charge.distanceMax(220); }
     const link = fg.d3Force("link");
-    if (link && link.distance) link.distance(44);
+    if (link && link.distance) link.distance(32);
   } catch (e) {}
   // fresh graphData() already starts a hot simulation, so the new force params take
   // effect on the next tick — no explicit reheat needed (reheating here races the
