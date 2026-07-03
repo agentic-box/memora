@@ -129,6 +129,7 @@
     <select id="tlyear" title="year"></select>
     <select id="tlmonth" title="month"></select>
     <select id="tltype" title="type"></select>
+    <select id="tlstatus" title="issue status" style="display:none"><option value="">All status</option><option value="open">open</option><option value="closed">closed</option></select>
     <select id="tlorder"><option value="desc">newest</option><option value="asc">oldest</option></select>
   </div>
   <div id="tllist">loading…</div>
@@ -566,6 +567,13 @@ function populateTypes(all) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
+// Normalize an issue's status the way the server does: legacy in_progress
+// (and a missing status) count as open; resolved/wontfix count as closed.
+const issueStatus = (m) => {
+  const s = (m.metadata || {}).status;
+  return (s === "closed" || s === "resolved" || s === "wontfix") ? "closed" : "open";
+};
+
 function drawTimeline() {
   if (!mems) return;
   const order = el("tlorder").value;
@@ -574,10 +582,15 @@ function drawTimeline() {
 
   populateYears(all); populateMonths(all); populateTypes(all);
   const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
+  // The status sub-select only applies to (and only shows for) type=issue.
+  const stSel = el("tlstatus");
+  stSel.style.display = ty === "issue" ? "" : "none";
+  if (ty !== "issue" && stSel.value) stSel.value = "";
+  const st = ty === "issue" ? stSel.value : "";
   const favOnly = el("tlfav").classList.contains("active");
   const rows = all.filter(m =>
     (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
-    (!ty || typeOf(m) === ty) && (!favOnly || isFav(m)));
+    (!ty || typeOf(m) === ty) && (!st || issueStatus(m) === st) && (!favOnly || isFav(m)));
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
@@ -586,7 +599,8 @@ function drawTimeline() {
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
       h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
-    row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeOf(m))}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
+    const typeLabel = typeOf(m) === "issue" ? `issue · ${issueStatus(m)}` : typeOf(m);
+    row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeLabel)}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}${m._dupe ? ' · <span class="dup">dup</span>' : ''}</div>`;
     rowById[m.id] = row;
     row.querySelector(".star").onclick = (e) => { e.stopPropagation(); toggleFav(m, row); };
@@ -644,6 +658,7 @@ el("btl").onclick = () => toggleTimeline();
 el("tlyear").onchange = () => { el("tlmonth").value = ""; drawTimeline(); };
 el("tlmonth").onchange = drawTimeline;
 el("tltype").onchange = drawTimeline;
+el("tlstatus").onchange = drawTimeline;
 el("tlorder").onchange = drawTimeline;
 el("tlfav").onclick = () => { el("tlfav").classList.toggle("active"); drawTimeline(); };
 el("db").onchange = load;

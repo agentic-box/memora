@@ -179,6 +179,15 @@ div.vis-tooltip {
 #timeline-filter .filter-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 3px 10px; border-radius: 12px; font-size: 11px; cursor: pointer; }
 #timeline-filter .filter-btn:hover { background: #21262d; color: #c9d1d9; }
 #timeline-filter .filter-btn.active { background: #30363d; color: #e3b341; border-color: #e3b341; }
+#timeline-issue-status { display: none; gap: 4px; padding: 6px 10px; border-bottom: 1px solid #30363d; align-items: center; }
+#timeline-issue-status.visible { display: flex; }
+#timeline-issue-status .status-label { color: #8b949e; font-size: 11px; margin-right: 2px; }
+#timeline-issue-status .filter-btn { background: none; border: 1px solid #30363d; color: #8b949e; padding: 2px 9px; border-radius: 12px; font-size: 11px; cursor: pointer; }
+#timeline-issue-status .filter-btn:hover { background: #21262d; color: #c9d1d9; }
+#timeline-issue-status .filter-btn.active { background: #30363d; color: #58a6ff; border-color: #58a6ff; }
+#timeline-list .issue-status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 5px; flex-shrink: 0; }
+#timeline-list .issue-status-dot.open { background: #3fb950; }
+#timeline-list .issue-status-dot.closed { background: #6e7681; }
 #history-list { max-height: calc(100vh - 120px); overflow-y: auto; }
 #history-list .action-item { padding: 8px 10px; border-bottom: 1px solid #30363d; display: flex; align-items: flex-start; gap: 8px; font-size: 12px; }
 #history-list .action-icon { flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
@@ -561,7 +570,8 @@ div.vis-tooltip {
             <div class="content" id="panel-content"></div>
         </div>
         <div id="tab-timeline">
-            <div id="timeline-filter"><button class="filter-btn" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" onclick="filterTimeline('all')">Show All</button></div>
+            <div id="timeline-filter"><button class="filter-btn" data-mode="favorites" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" data-mode="all" onclick="filterTimeline('all')">Show All</button><button class="filter-btn" data-mode="issues" onclick="filterTimeline('issues')">&#9679; Issues</button></div>
+            <div id="timeline-issue-status"><span class="status-label">Status:</span><button class="filter-btn status-btn active" data-st="all" onclick="setTimelineIssueStatus('all', this)">All</button><button class="filter-btn status-btn" data-st="open" onclick="setTimelineIssueStatus('open', this)">Open</button><button class="filter-btn status-btn" data-st="closed" onclick="setTimelineIssueStatus('closed', this)">Closed</button></div>
             <div id="timeline-list"></div>
         </div>
         <div id="tab-duplicates">
@@ -1782,6 +1792,10 @@ div.vis-tooltip {
                     selectEl.classList.remove('saving');
                     selectEl.disabled = false;
                     if (typeof memoryCache !== 'undefined') delete memoryCache[memId];
+                    // Invalidate the timeline's issue caches so its Open/Closed
+                    // sub-filter reflects this status change immediately.
+                    issuesTimelineCache = {};
+                    if (timelineFilter === 'issues') loadIssuesTimeline();
                     // Reload list — closed rows should disappear from Open filter.
                     loadIssues(true);
                     if (typeof reloadGraphData === 'function') reloadGraphData();
@@ -1880,12 +1894,59 @@ div.vis-tooltip {
         var favoritesCache = null;
         var favoritesLoading = false;
 
+        // Issue-mode state: status sub-filter + per-status server-side cache.
+        // Cached results are invalidated whenever an issue's status is
+        // changed via the issues tab so the timeline can't show stale state.
+        var timelineIssueStatus = 'all';
+        var issuesTimelineCache = {};
+        var issuesTimelineLoading = false;
+
+        function setTimelineIssueStatus(st, el) {
+            timelineIssueStatus = st;
+            document.querySelectorAll('#timeline-issue-status .filter-btn').forEach(function(btn) {
+                btn.classList.toggle('active', btn.dataset.st === st);
+            });
+            loadIssuesTimeline();
+        }
+
+        function loadIssuesTimeline() {
+            var st = timelineIssueStatus;
+            if (issuesTimelineCache[st]) {
+                renderTimelineList(issuesTimelineCache[st]);
+                return;
+            }
+            if (issuesTimelineLoading) return;
+            issuesTimelineLoading = true;
+            document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading issues…</div>';
+            var dbp = getDbParam();
+            var sep = dbp ? dbp + '&' : '?';
+            var url = '/api/memories' + sep + 'type=issue&limit=500' + (st === 'all' ? '' : '&status=' + st);
+            fetch(url)
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    issuesTimelineLoading = false;
+                    issuesTimelineCache[st] = data.memories || [];
+                    // User may have switched mode/status while in flight.
+                    if (timelineFilter === 'issues' && timelineIssueStatus === st) {
+                        renderTimelineList(issuesTimelineCache[st]);
+                    }
+                })
+                .catch(function() {
+                    issuesTimelineLoading = false;
+                    document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading issues</div>';
+                });
+        }
+
         function filterTimeline(mode) {
             timelineFilter = mode;
             document.querySelectorAll('#timeline-filter .filter-btn').forEach(function(btn) {
-                btn.classList.toggle('active', btn.textContent.indexOf(mode === 'favorites' ? 'Favorites' : 'Show All') !== -1);
+                btn.classList.toggle('active', btn.dataset.mode === mode);
             });
-            if (mode === 'favorites') {
+            // The status sub-selection only applies to (and only shows for) issue mode.
+            document.getElementById('timeline-issue-status').classList.toggle('visible', mode === 'issues');
+            if (mode === 'issues') {
+                loadIssuesTimeline();
+            } else if (mode === 'favorites') {
                 // Server-side authoritative fetch so page-N favorites are
                 // included. Use cached result if fresh; otherwise fetch.
                 if (favoritesCache) {
@@ -1945,9 +2006,20 @@ div.vis-tooltip {
                 var isFav = mem.metadata && mem.metadata.favorite;
                 var starClass = 'favorite-star' + (isFav ? ' active' : '');
                 var starIcon = isFav ? '\u2605' : '\u2606';
+                // In issue mode, prefix each row with an open/closed dot so
+                // status is scannable without opening details. Legacy statuses
+                // normalize the same way the server does (in_progress=open;
+                // resolved/wontfix=closed; missing status counts as open).
+                var statusDot = '';
+                if (timelineFilter === 'issues') {
+                    var rawSt = (mem.metadata && mem.metadata.status) || 'open';
+                    var isClosed = (rawSt === 'closed' || rawSt === 'resolved' || rawSt === 'wontfix');
+                    var dotCls = isClosed ? 'closed' : 'open';
+                    statusDot = '<span class="issue-status-dot ' + dotCls + '" title="' + (isClosed ? 'closed' : 'open') + '"></span>';
+                }
                 return '<div class="memory-item' + selectedClass + '" data-id="' + mem.id + '" onclick="highlightMemoryInGraph(' + mem.id + ')">' +
                     '<div class="memory-header">' +
-                        '<div class="memory-title"><span class="' + starClass + '" onclick="toggleFavorite(' + mem.id + ', this); event.stopPropagation();">' + starIcon + '</span><span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span></div>' +
+                        '<div class="memory-title"><span class="' + starClass + '" onclick="toggleFavorite(' + mem.id + ', this); event.stopPropagation();">' + starIcon + '</span>' + statusDot + '<span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span></div>' +
                         '<div class="memory-actions">' +
                             '<span class="memory-date">' + mem.created + '</span>' +
                             '<button class="details-btn" onclick="showMemoryDetails(' + mem.id + '); event.stopPropagation();">Details</button>' +
@@ -1956,7 +2028,9 @@ div.vis-tooltip {
                     '<div class="memory-preview">' + escapeHtmlText(preview) + '</div>' +
                 '</div>';
             }).join('');
-            var emptyMsg = timelineFilter === 'favorites' ? 'No favorites yet \u2014 click \u2606 to star a memory' : 'No memories';
+            var emptyMsg = timelineFilter === 'favorites' ? 'No favorites yet \u2014 click \u2606 to star a memory'
+                : timelineFilter === 'issues' ? ('No ' + (timelineIssueStatus === 'all' ? '' : timelineIssueStatus + ' ') + 'issues')
+                : 'No memories';
             var hasMore = timelineFilter === 'all' && timelineOffset < timelineTotal;
             var loadMoreBtn = hasMore
                 ? '<div style="padding:12px 20px;text-align:center;"><button onclick="loadTimelinePage()" style="background:#238636;color:#fff;border:none;border-radius:6px;padding:6px 16px;cursor:pointer;font-size:13px;">Load more (' + (timelineTotal - timelineOffset) + ' remaining)</button></div>'
