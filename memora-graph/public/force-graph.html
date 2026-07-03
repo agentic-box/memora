@@ -567,12 +567,13 @@ function populateTypes(all) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
-// Normalize an issue's status the way the server does: legacy in_progress
-// (and a missing status) count as open; resolved/wontfix count as closed.
-const issueStatus = (m) => {
-  const s = (m.metadata || {}).status;
-  return (s === "closed" || s === "resolved" || s === "wontfix") ? "closed" : "open";
-};
+// Normalize an issue's OR todo's status to open/closed. Closed covers every
+// terminal spelling across both vocabularies (issues: closed/resolved/wontfix;
+// todos: closed/completed/done/cancelled); in_progress and a missing status
+// count as open. Types that carry a status (issue, todo) get the sub-filter.
+const CLOSED_STATUSES = new Set(["closed", "resolved", "wontfix", "completed", "done", "cancelled", "canceled"]);
+const statusOf = (m) => CLOSED_STATUSES.has((m.metadata || {}).status) ? "closed" : "open";
+const hasStatusFilter = (t) => t === "issue" || t === "todo";
 
 function drawTimeline() {
   if (!mems) return;
@@ -582,15 +583,17 @@ function drawTimeline() {
 
   populateYears(all); populateMonths(all); populateTypes(all);
   const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
-  // The status sub-select only applies to (and only shows for) type=issue.
+  // The status sub-select only applies to (and only shows for) status-bearing
+  // types (issue, todo).
   const stSel = el("tlstatus");
-  stSel.style.display = ty === "issue" ? "" : "none";
-  if (ty !== "issue" && stSel.value) stSel.value = "";
-  const st = ty === "issue" ? stSel.value : "";
+  const showStatus = hasStatusFilter(ty);
+  stSel.style.display = showStatus ? "" : "none";
+  if (!showStatus && stSel.value) stSel.value = "";
+  const st = showStatus ? stSel.value : "";
   const favOnly = el("tlfav").classList.contains("active");
   const rows = all.filter(m =>
     (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
-    (!ty || typeOf(m) === ty) && (!st || issueStatus(m) === st) && (!favOnly || isFav(m)));
+    (!ty || typeOf(m) === ty) && (!st || statusOf(m) === st) && (!favOnly || isFav(m)));
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
@@ -599,7 +602,7 @@ function drawTimeline() {
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
       h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
-    const typeLabel = typeOf(m) === "issue" ? `issue · ${issueStatus(m)}` : typeOf(m);
+    const typeLabel = hasStatusFilter(typeOf(m)) ? `${typeOf(m)} · ${statusOf(m)}` : typeOf(m);
     row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeLabel)}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}${m._dupe ? ' · <span class="dup">dup</span>' : ''}</div>`;
     rowById[m.id] = row;

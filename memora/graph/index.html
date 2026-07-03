@@ -570,7 +570,7 @@ div.vis-tooltip {
             <div class="content" id="panel-content"></div>
         </div>
         <div id="tab-timeline">
-            <div id="timeline-filter"><button class="filter-btn" data-mode="favorites" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" data-mode="all" onclick="filterTimeline('all')">Show All</button><button class="filter-btn" data-mode="issues" onclick="filterTimeline('issues')">&#9679; Issues</button></div>
+            <div id="timeline-filter"><button class="filter-btn" data-mode="favorites" onclick="filterTimeline('favorites')">&#9733; Favorites</button><button class="filter-btn active" data-mode="all" onclick="filterTimeline('all')">Show All</button><button class="filter-btn" data-mode="issues" onclick="filterTimeline('issues')">&#9679; Issues</button><button class="filter-btn" data-mode="todos" onclick="filterTimeline('todos')">&#9679; Todos</button></div>
             <div id="timeline-issue-status"><span class="status-label">Status:</span><button class="filter-btn status-btn active" data-st="all" onclick="setTimelineIssueStatus('all', this)">All</button><button class="filter-btn status-btn" data-st="open" onclick="setTimelineIssueStatus('open', this)">Open</button><button class="filter-btn status-btn" data-st="closed" onclick="setTimelineIssueStatus('closed', this)">Closed</button></div>
             <div id="timeline-list"></div>
         </div>
@@ -1792,10 +1792,10 @@ div.vis-tooltip {
                     selectEl.classList.remove('saving');
                     selectEl.disabled = false;
                     if (typeof memoryCache !== 'undefined') delete memoryCache[memId];
-                    // Invalidate the timeline's issue caches so its Open/Closed
+                    // Invalidate the timeline's status caches so its Open/Closed
                     // sub-filter reflects this status change immediately.
-                    issuesTimelineCache = {};
-                    if (timelineFilter === 'issues') loadIssuesTimeline();
+                    statusTimelineCache = { issues: {}, todos: {} };
+                    if (timelineFilter === 'issues' || timelineFilter === 'todos') loadStatusTimeline();
                     // Reload list — closed rows should disappear from Open filter.
                     loadIssues(true);
                     if (typeof reloadGraphData === 'function') reloadGraphData();
@@ -1894,46 +1894,54 @@ div.vis-tooltip {
         var favoritesCache = null;
         var favoritesLoading = false;
 
-        // Issue-mode state: status sub-filter + per-status server-side cache.
-        // Cached results are invalidated whenever an issue's status is
-        // changed via the issues tab so the timeline can't show stale state.
+        // Status-bearing modes (issues, todos): status sub-filter + a
+        // per-mode, per-status server-side cache. Caches are invalidated
+        // whenever a memory's status changes via the issues tab so the
+        // timeline can't show stale state.
         var timelineIssueStatus = 'all';
-        var issuesTimelineCache = {};
-        var issuesTimelineLoading = false;
+        // Nested cache keyed [mode][status] so issues and todos don't collide.
+        var statusTimelineCache = { issues: {}, todos: {} };
+        var statusTimelineLoading = false;
 
         function setTimelineIssueStatus(st, el) {
             timelineIssueStatus = st;
             document.querySelectorAll('#timeline-issue-status .filter-btn').forEach(function(btn) {
                 btn.classList.toggle('active', btn.dataset.st === st);
             });
-            loadIssuesTimeline();
+            loadStatusTimeline();
         }
 
-        function loadIssuesTimeline() {
+        // Serves both the 'issues' and 'todos' timeline modes — they differ only
+        // in the type= filter passed to the API; the open/closed sub-status
+        // semantics are identical (the server normalizes terminal statuses).
+        function loadStatusTimeline() {
+            var mode = timelineFilter;               // 'issues' | 'todos'
+            var apiType = mode === 'todos' ? 'todo' : 'issue';
             var st = timelineIssueStatus;
-            if (issuesTimelineCache[st]) {
-                renderTimelineList(issuesTimelineCache[st]);
+            var cache = statusTimelineCache[mode] || (statusTimelineCache[mode] = {});
+            if (cache[st]) {
+                renderTimelineList(cache[st]);
                 return;
             }
-            if (issuesTimelineLoading) return;
-            issuesTimelineLoading = true;
-            document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading issues…</div>';
+            if (statusTimelineLoading) return;
+            statusTimelineLoading = true;
+            document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading ' + mode + '…</div>';
             var dbp = getDbParam();
             var sep = dbp ? dbp + '&' : '?';
-            var url = '/api/memories' + sep + 'type=issue&limit=500' + (st === 'all' ? '' : '&status=' + st);
+            var url = '/api/memories' + sep + 'type=' + apiType + '&limit=500' + (st === 'all' ? '' : '&status=' + st);
             fetch(url)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
-                    issuesTimelineLoading = false;
-                    issuesTimelineCache[st] = data.memories || [];
+                    statusTimelineLoading = false;
+                    cache[st] = data.memories || [];
                     // User may have switched mode/status while in flight.
-                    if (timelineFilter === 'issues' && timelineIssueStatus === st) {
-                        renderTimelineList(issuesTimelineCache[st]);
+                    if (timelineFilter === mode && timelineIssueStatus === st) {
+                        renderTimelineList(cache[st]);
                     }
                 })
                 .catch(function() {
-                    issuesTimelineLoading = false;
-                    document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading issues</div>';
+                    statusTimelineLoading = false;
+                    document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading ' + mode + '</div>';
                 });
         }
 
@@ -1942,10 +1950,12 @@ div.vis-tooltip {
             document.querySelectorAll('#timeline-filter .filter-btn').forEach(function(btn) {
                 btn.classList.toggle('active', btn.dataset.mode === mode);
             });
-            // The status sub-selection only applies to (and only shows for) issue mode.
-            document.getElementById('timeline-issue-status').classList.toggle('visible', mode === 'issues');
-            if (mode === 'issues') {
-                loadIssuesTimeline();
+            // The status sub-selection applies to (and only shows for) the
+            // status-bearing modes: issues and todos.
+            var statusMode = (mode === 'issues' || mode === 'todos');
+            document.getElementById('timeline-issue-status').classList.toggle('visible', statusMode);
+            if (statusMode) {
+                loadStatusTimeline();
             } else if (mode === 'favorites') {
                 // Server-side authoritative fetch so page-N favorites are
                 // included. Use cached result if fresh; otherwise fetch.
@@ -2006,14 +2016,17 @@ div.vis-tooltip {
                 var isFav = mem.metadata && mem.metadata.favorite;
                 var starClass = 'favorite-star' + (isFav ? ' active' : '');
                 var starIcon = isFav ? '\u2605' : '\u2606';
-                // In issue mode, prefix each row with an open/closed dot so
-                // status is scannable without opening details. Legacy statuses
-                // normalize the same way the server does (in_progress=open;
-                // resolved/wontfix=closed; missing status counts as open).
+                // In issues/todos mode, prefix each row with an open/closed dot
+                // so status is scannable without opening details. Terminal
+                // spellings across both vocabularies normalize to closed the
+                // same way the server does (issues: closed/resolved/wontfix;
+                // todos: closed/completed/done/cancelled); in_progress and a
+                // missing status count as open.
                 var statusDot = '';
-                if (timelineFilter === 'issues') {
+                if (timelineFilter === 'issues' || timelineFilter === 'todos') {
                     var rawSt = (mem.metadata && mem.metadata.status) || 'open';
-                    var isClosed = (rawSt === 'closed' || rawSt === 'resolved' || rawSt === 'wontfix');
+                    var isClosed = (rawSt === 'closed' || rawSt === 'resolved' || rawSt === 'wontfix'
+                        || rawSt === 'completed' || rawSt === 'done' || rawSt === 'cancelled' || rawSt === 'canceled');
                     var dotCls = isClosed ? 'closed' : 'open';
                     statusDot = '<span class="issue-status-dot ' + dotCls + '" title="' + (isClosed ? 'closed' : 'open') + '"></span>';
                 }
@@ -2029,7 +2042,7 @@ div.vis-tooltip {
                 '</div>';
             }).join('');
             var emptyMsg = timelineFilter === 'favorites' ? 'No favorites yet \u2014 click \u2606 to star a memory'
-                : timelineFilter === 'issues' ? ('No ' + (timelineIssueStatus === 'all' ? '' : timelineIssueStatus + ' ') + 'issues')
+                : (timelineFilter === 'issues' || timelineFilter === 'todos') ? ('No ' + (timelineIssueStatus === 'all' ? '' : timelineIssueStatus + ' ') + timelineFilter)
                 : 'No memories';
             var hasMore = timelineFilter === 'all' && timelineOffset < timelineTotal;
             var loadMoreBtn = hasMore

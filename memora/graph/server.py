@@ -288,11 +288,12 @@ def start_graph_server(host: str, port: int) -> None:
             sort_param = params.get("sort")
 
             is_issue_query = type_filter == "issue"
+            is_todo_query = type_filter == "todo"
 
             if favorites_only:
                 default_limit = 500
                 max_limit = 500
-            elif is_issue_query:
+            elif is_issue_query or is_todo_query:
                 default_limit = 200
                 max_limit = 500
             else:
@@ -314,6 +315,11 @@ def start_graph_server(host: str, port: int) -> None:
                     "(json_extract(metadata, '$.type') = 'issue' "
                     "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'memora/issues'))"
                 )
+            elif is_todo_query:
+                clauses.append(
+                    "(json_extract(metadata, '$.type') = 'todo' "
+                    "OR EXISTS (SELECT 1 FROM json_each(memories.tags) WHERE value = 'memora/todos'))"
+                )
 
             if status_filter == "open":
                 clauses.append(
@@ -321,8 +327,11 @@ def start_graph_server(host: str, port: int) -> None:
                     "OR json_extract(metadata, '$.status') IS NULL)"
                 )
             elif status_filter == "closed":
+                # Terminal spellings across both vocabularies (issues:
+                # closed/resolved/wontfix; todos: closed/completed/done/cancelled).
                 clauses.append(
-                    "(json_extract(metadata, '$.status') IN ('closed', 'resolved', 'wontfix'))"
+                    "(json_extract(metadata, '$.status') IN "
+                    "('closed', 'resolved', 'wontfix', 'completed', 'done', 'cancelled', 'canceled'))"
                 )
 
             if severity_filter in ("critical", "major", "minor"):
