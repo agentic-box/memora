@@ -16,6 +16,11 @@ binding = "DB_OB1"
 database_name = "ob1-graph"
 database_id = "d194a6e6-44fa-437d-bfd7-1196c6dc9955"
 
+[[d1_databases]]
+binding = "DB_BESTATION"
+database_name = "bestation-graph"
+database_id = "49dc1f1d-f486-469d-abf8-b3aa0d331e5d"
+
 # R2 Buckets - multiple buckets for images
 [[r2_buckets]]
 binding = "R2_MEMORA"
@@ -25,6 +30,10 @@ bucket_name = "memora"
 binding = "R2_OB1"
 bucket_name = "ob1"
 
+[[r2_buckets]]
+binding = "R2_BESTATION"
+bucket_name = "bestation"
+
 [vars]
 # Graph settings
 MIN_EDGE_SCORE = "0.40"
@@ -33,7 +42,7 @@ WS_WORKER_URL = "https://memora-graph-sync.cloudflare-strategic612.workers.dev"
 # Default database
 DEFAULT_DB = "memora"
 # Database config (JSON) - maps db name to binding suffix
-DB_CONFIG = '{"memora": "MEMORA", "ob1": "OB1"}'
+DB_CONFIG = '{"memora": "MEMORA", "ob1": "OB1", "bestation": "BESTATION"}'
 # Chat LLM model (via OpenRouter). Set OPENROUTER_API_KEY as a secret.
 CHAT_MODEL = "x-ai/grok-4.20-beta"
 # Model for query rewriting (fast, cheap). Falls back to CHAT_MODEL if unset.
