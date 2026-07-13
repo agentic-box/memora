@@ -106,7 +106,7 @@
 <body>
 <div id="bar">
   <div class="pill"><button id="b2d">2D</button><button id="b3d" class="active">3D</button></div>
-  <div class="pill"><label>DB <select id="db"><option value="memora">memora</option><option value="ob1">ob1</option><option value="bestation">bestation</option></select></label></div>
+  <div class="pill"><label>DB <select id="db" disabled><option value="">loading...</option></select></label></div>
   <div class="pill"><input id="search" placeholder="search label / #id …" /></div>
   <div class="pill"><label><input type="checkbox" id="dupes" style="min-width:auto" /> dupes only</label></div>
   <div class="pill"><button id="bcl" class="active">◉ Clusters</button></div>
@@ -141,6 +141,7 @@
 <script>
 const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
+const DATABASE_STORAGE_KEY = "memora-graph.database";
 let raw = null, mode = "3d", fg = null;
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
 
@@ -186,7 +187,7 @@ function renderImages(m) {
 async function toggleFav(m, row) {
   const next = !isFav(m);
   try {
-    const r = await fetch(`/api/memories/${m.id}?db=${el("db").value}`, {
+    const r = await fetch(`/api/memories/${m.id}?db=${encodeURIComponent(el("db").value)}`, {
       method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ favorite: next }) });
     if (!r.ok) throw new Error("HTTP " + r.status);
     m.metadata = m.metadata || {}; if (next) m.metadata.favorite = true; else delete m.metadata.favorite;
@@ -493,7 +494,7 @@ async function openDetail(id, dupe, preMem) {
   panel.innerHTML = `<button class="close" onclick="closePane()">✕</button><h2>#${id}</h2><div class="meta">loading…</div>`;
   let m = preMem || byId[id];
   try {
-    if (!m) { const r = await fetch(`/api/memories/${id}?db=${el("db").value}`); if (!r.ok) throw new Error("HTTP " + r.status); m = await r.json(); }
+    if (!m) { const r = await fetch(`/api/memories/${id}?db=${encodeURIComponent(el("db").value)}`); if (!r.ok) throw new Error("HTTP " + r.status); m = await r.json(); }
     const tags = (m.tags || []).map(t => `<span>${esc(t)}</span>`).join("");
     panel.innerHTML =
       `<button class="close" onclick="closePane()">✕</button>` +
@@ -521,7 +522,7 @@ async function loadMems() {
     // /api/memories caps at 200 per request — page through with offset to get them all.
     let fetched = [], offset = 0, total = Infinity;
     while (offset < total && offset < 20000) {
-      const r = await fetch(`/api/memories?db=${db}&sort=created&limit=200&offset=${offset}`);
+      const r = await fetch(`/api/memories?db=${encodeURIComponent(db)}&sort=created&limit=200&offset=${offset}`);
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
       total = (typeof d.total === "number") ? d.total : fetched.length;
@@ -616,7 +617,7 @@ function drawTimeline() {
 /* ---------------- live-update polling (non-disruptive badge) ---------------- */
 let pollTimer = null, baseSig = null;
 async function fetchSignal() {
-  const r = await fetch(`/api/memories?db=${el("db").value}&limit=1&sort=created`);
+  const r = await fetch(`/api/memories?db=${encodeURIComponent(el("db").value)}&limit=1&sort=created`);
   if (!r.ok) throw new Error("HTTP " + r.status);
   const d = await r.json();
   return { total: d.total, maxId: (d.memories[0] && d.memories[0].id) || 0 };
@@ -638,7 +639,46 @@ async function checkUpdates() {
 window.doRefresh = async () => { hideRefresh(); await load(); };
 
 /* ---------------- load ---------------- */
+function storedDatabase() {
+  try { return localStorage.getItem(DATABASE_STORAGE_KEY) || ""; }
+  catch (e) { return ""; }
+}
+function rememberDatabase(name) {
+  try { localStorage.setItem(DATABASE_STORAGE_KEY, name); }
+  catch (e) {}
+}
+async function initializeDatabases() {
+  const select = el("db");
+  const previous = select.value || storedDatabase();
+  try {
+    const response = await fetch("/api/databases");
+    if (!response.ok) throw new Error("HTTP " + response.status);
+    const payload = await response.json();
+    const configured = Array.isArray(payload) ? payload : payload.databases;
+    const databases = [...new Set((Array.isArray(configured) ? configured : [])
+      .filter(name => typeof name === "string" && name.length > 0))];
+    if (!databases.length) throw new Error("no configured databases");
+
+    const preferred = databases.includes(previous) ? previous
+      : (databases.includes(payload.default) ? payload.default : databases[0]);
+    const options = databases.map(name => {
+      const option = document.createElement("option");
+      option.value = name;
+      option.textContent = name;
+      return option;
+    });
+    select.replaceChildren(...options);
+    select.value = preferred;
+    select.disabled = false;
+    rememberDatabase(preferred);
+    await load();
+  } catch (e) {
+    statsEl.innerHTML = `<span id="err">database config failed: ${esc(e.message)}</span>`;
+  }
+}
+
 async function load() {
+  if (!el("db").value) return;
   statsEl.textContent = "loading…";
   try {
     const r = await fetch(`/api/graph?db=${encodeURIComponent(el("db").value)}${showDocs ? "&docs=1" : ""}`);
@@ -664,7 +704,7 @@ el("tltype").onchange = drawTimeline;
 el("tlstatus").onchange = drawTimeline;
 el("tlorder").onchange = drawTimeline;
 el("tlfav").onclick = () => { el("tlfav").classList.toggle("active"); drawTimeline(); };
-el("db").onchange = load;
+el("db").onchange = () => { rememberDatabase(el("db").value); load(); };
 let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
 el("dupes").onchange = render;
 addEventListener("keydown", e => { if (e.key === "Escape") { deselect(); } });
@@ -676,7 +716,7 @@ graphEl.addEventListener("pointermove", () => wake(), { passive: true });
 document.addEventListener("visibilitychange", () => { if (document.hidden) pauseRender(); else forceWake(); });
 // defaults: timeline drawer open (3D + clusters are set on the mode/state + buttons)
 document.body.classList.add("timeline-open"); el("btl").classList.add("active");
-load();
+initializeDatabases();
 </script>
 </body>
 </html>

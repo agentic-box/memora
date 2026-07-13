@@ -1,19 +1,11 @@
 /**
  * GET /api/memories/:id - Returns a single memory by ID
- * Supports ?db=memora or ?db=ob1 parameter to select database
+ * Supports ?db=<configured name> to select a database
  */
 
-interface Env {
-  DB_MEMORA: D1Database;
-  DB_OB1: D1Database;
-  DEFAULT_DB?: string;
-}
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "../_db";
 
-function getDatabase(env: Env, dbName: string | null): D1Database {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.DB_OB1;
-  return env.DB_MEMORA;
-}
+interface Env extends DatabaseEnv {}
 
 interface Memory {
   id: number;
@@ -85,7 +77,9 @@ function toMemoryResponse(result: Memory): MemoryResponse {
 export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
 
   const id = parseInt(params.id as string, 10);
   if (isNaN(id)) {
@@ -154,7 +148,9 @@ export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request 
 export const onRequestGet: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
 
   const id = parseInt(params.id as string, 10);
 

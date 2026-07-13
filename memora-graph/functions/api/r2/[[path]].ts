@@ -1,23 +1,20 @@
 /**
  * GET /api/r2/* - Proxy images from R2 storage
- * Supports ?db=memora or ?db=ob1 parameter to select bucket
+ * Supports ?db=<configured name> to select a bucket
  *
  * Handles paths like:
  *   /api/r2/memora/images/123/0.jpg
  *   /api/r2/images/123/0.jpg?db=ob1
  */
 
-interface Env {
-  R2_MEMORA: R2Bucket;
-  R2_OB1: R2Bucket;
-  DEFAULT_DB?: string;
-}
+import {
+  databaseConfig,
+  resolveBucket,
+  selectionErrorResponse,
+  type DatabaseEnv,
+} from "../_db";
 
-function getBucket(env: Env, dbName: string | null): R2Bucket {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.R2_OB1;
-  return env.R2_MEMORA;
-}
+interface Env extends DatabaseEnv {}
 
 export const onRequestGet: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);
@@ -40,16 +37,17 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
   // Handle both bucket-prefixed and non-prefixed paths
   // R2 stores files like: images/123/0.jpg
   // URLs might come as: memora/images/123/0.jpg or images/123/0.jpg
-  let bucket: R2Bucket;
-  if (objectKey.startsWith("memora/")) {
-    objectKey = objectKey.slice(7); // Remove "memora/" prefix
-    bucket = env.R2_MEMORA;
-  } else if (objectKey.startsWith("ob1/")) {
-    objectKey = objectKey.slice(4); // Remove "ob1/" prefix
-    bucket = env.R2_OB1;
-  } else {
-    bucket = getBucket(env, dbName);
+  // A configured db name may prefix the key (e.g. "bestation/images/..").
+  // Strip it and pick that db's bucket; otherwise fall back to ?db=.
+  const prefixDb = Object.keys(databaseConfig(env)).find((n) =>
+    objectKey.startsWith(n + "/")
+  );
+  if (prefixDb) {
+    objectKey = objectKey.slice(prefixDb.length + 1);
   }
+  const selection = resolveBucket(env, prefixDb || dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const bucket = selection.binding;
 
   // After db prefix stripping, require images/ prefix
   if (!objectKey.startsWith("images/")) {

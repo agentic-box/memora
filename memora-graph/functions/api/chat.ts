@@ -3,23 +3,16 @@
  * Uses semantic search (embeddings) + keyword search for memory retrieval.
  * Supports create/update/delete memories via OpenAI-style tool calling.
  * Requires OPENROUTER_API_KEY secret and optionally CHAT_MODEL env var.
- * Supports ?db=memora or ?db=ob1 parameter to select database.
+ * Supports ?db=<configured name> to select a database.
  */
 
-interface Env {
-  DB_MEMORA: D1Database;
-  DB_OB1: D1Database;
-  DEFAULT_DB?: string;
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+
+interface Env extends DatabaseEnv {
   OPENROUTER_API_KEY?: string;
   CHAT_MODEL?: string;
   EMBEDDING_MODEL?: string;
   REWRITE_MODEL?: string;
-}
-
-function getDatabase(env: Env, dbName: string | null): D1Database {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.DB_OB1;
-  return env.DB_MEMORA;
 }
 
 interface MemoryRow {
@@ -739,7 +732,9 @@ export const onRequestPost: PagesFunction<Env> = async ({
 }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
 
   const apiKey = env.OPENROUTER_API_KEY;
   if (!apiKey) {

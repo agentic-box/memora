@@ -6,7 +6,7 @@
  * memora.storage.find_duplicate_pairs.
  *
  * Query params:
- *   db=memora|ob1     — database selection (default: env.DEFAULT_DB or "memora")
+ *   db=<configured>   — database selection (default: env.DEFAULT_DB or first configured)
  *   min_similarity=N  — score floor (default 0.85)
  *   limit=N           — max pairs returned (default 50, max 200)
  *   offset=N          — pagination offset (default 0)
@@ -33,11 +33,9 @@
  *   - candidate : 0.85 <= score < 0.92  (yellow, needs review)
  */
 
-interface Env {
-  DB_MEMORA: D1Database;
-  DB_OB1: D1Database;
-  DEFAULT_DB?: string;
-}
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+
+interface Env extends DatabaseEnv {}
 
 interface MemoryRow {
   id: number;
@@ -85,12 +83,6 @@ const CANDIDATE_THRESHOLD = 0.85;
 const MAX_LIMIT = 200;
 const PREVIEW_CHARS = 200;
 
-function getDatabase(env: Env, dbName: string | null): D1Database {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.DB_OB1;
-  return env.DB_MEMORA;
-}
-
 function parseJson<T>(str: string | null, defaultValue: T): T {
   if (!str) return defaultValue;
   try {
@@ -114,7 +106,9 @@ function buildPreview(content: string): string {
 export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
 
   const minSimRaw = parseFloat(url.searchParams.get("min_similarity") || "");
   const minSimilarity = Number.isFinite(minSimRaw) && minSimRaw > 0

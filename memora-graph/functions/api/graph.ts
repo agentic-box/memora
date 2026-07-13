@@ -1,20 +1,12 @@
 /**
  * GET /api/graph - Returns graph nodes, edges, and metadata for visualization
- * Supports ?db=memora or ?db=ob1 parameter to select database
+ * Supports ?db=<configured name> to select a database
  */
 
-interface Env {
-  DB_MEMORA: D1Database;
-  DB_OB1: D1Database;
-  MIN_EDGE_SCORE?: string;
-  DEFAULT_DB?: string;
-  DB_CONFIG?: string;
-}
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
 
-function getDatabase(env: Env, dbName: string | null): D1Database {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.DB_OB1;
-  return env.DB_MEMORA;
+interface Env extends DatabaseEnv {
+  MIN_EDGE_SCORE?: string;
 }
 
 interface Memory {
@@ -296,7 +288,9 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
   const includeDocs = url.searchParams.get("docs") === "1";   // include document fragments as nodes, linked to their doc root
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
   const minScore = parseFloat(env.MIN_EDGE_SCORE || "0.40");
 
   // Fetch all memories

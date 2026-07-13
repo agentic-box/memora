@@ -1,6 +1,6 @@
 /**
  * GET /api/memories - Returns memories with optional filters (timeline, issues, favorites).
- * Supports ?db=memora or ?db=ob1 parameter to select database.
+ * Supports ?db=<configured name> to select a database.
  *
  * Query params:
  *   favorites=1              → only favorited memories (legacy)
@@ -13,17 +13,9 @@
  *   limit, offset            → pagination
  */
 
-interface Env {
-  DB_MEMORA: D1Database;
-  DB_OB1: D1Database;
-  DEFAULT_DB?: string;
-}
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
 
-function getDatabase(env: Env, dbName: string | null): D1Database {
-  const name = dbName || env.DEFAULT_DB || "memora";
-  if (name === "ob1") return env.DB_OB1;
-  return env.DB_MEMORA;
-}
+interface Env extends DatabaseEnv {}
 
 interface Memory {
   id: number;
@@ -74,7 +66,9 @@ function toIsoUtc(ts: string | null | undefined): string | null {
 export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const url = new URL(request.url);
   const dbName = url.searchParams.get("db");
-  const db = getDatabase(env, dbName);
+  const selection = resolveDatabase(env, dbName);
+  if (!selection.ok) return selectionErrorResponse(selection);
+  const db = selection.binding;
 
   // Collect filters
   const favoritesOnly = url.searchParams.get("favorites") === "1";
