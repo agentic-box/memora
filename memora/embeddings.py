@@ -124,27 +124,51 @@ def _compute_embedding_sentence_transformers(text: str) -> Dict[str, float]:
         return _compute_embedding_tfidf(text)
 
 
+def _embedding_credentials() -> tuple:
+    """Credentials for the EMBEDDING endpoint, which need not be the LLM's.
+
+    The LLM client (storage.get_llm_client) reads OPENAI_API_KEY/OPENAI_BASE_URL
+    directly, so a deployment that routes chat through one provider and
+    embeddings through another had no way to express that: pointing OPENAI_* at
+    an embedding host silently broke absorption, and leaving it broke embeddings.
+    MEMORA_EMBEDDING_* overrides that split, falling back to OPENAI_* so existing
+    single-provider installs keep working untouched.
+    """
+    api_key = os.getenv("MEMORA_EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
+    base_url = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+    return api_key, base_url
+
+
+def _embedding_client(openai_module):
+    """Build (and cache) the embedding client on its own credentials."""
+    if "openai_client" not in _embedding_model_cache:
+        api_key, base_url = _embedding_credentials()
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        _embedding_model_cache["openai_client"] = openai_module.OpenAI(**kwargs)
+    return _embedding_model_cache["openai_client"]
+
+
 def _compute_embedding_openai(text: str) -> Dict[str, float]:
     """Use OpenAI embeddings API."""
     try:
         import openai
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key, _ = _embedding_credentials()
         if not api_key:
             if _strict_mode():
                 raise RuntimeError(
-                    "MEMORA_EMBEDDING_STRICT=1 and OPENAI_API_KEY is not set"
+                    "MEMORA_EMBEDDING_STRICT=1 and no embedding API key is set "
+                    "(MEMORA_EMBEDDING_API_KEY or OPENAI_API_KEY)"
                 )
             _warn_once(
                 "openai:no-api-key",
-                "OPENAI_API_KEY is not set",
+                "no embedding API key (MEMORA_EMBEDDING_API_KEY / OPENAI_API_KEY)",
             )
             return _compute_embedding_tfidf(text)
 
-        if "openai_client" not in _embedding_model_cache:
-            _embedding_model_cache["openai_client"] = openai.OpenAI(api_key=api_key)
-
-        client = _embedding_model_cache["openai_client"]
+        client = _embedding_client(openai)
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         response = client.embeddings.create(
@@ -222,22 +246,20 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
     try:
         import openai
 
-        api_key = os.getenv("OPENAI_API_KEY")
+        api_key, _ = _embedding_credentials()
         if not api_key:
             if _strict_mode():
                 raise RuntimeError(
-                    "MEMORA_EMBEDDING_STRICT=1 and OPENAI_API_KEY is not set"
+                    "MEMORA_EMBEDDING_STRICT=1 and no embedding API key is set "
+                    "(MEMORA_EMBEDDING_API_KEY or OPENAI_API_KEY)"
                 )
             _warn_once(
                 "openai-batch:no-api-key",
-                "OPENAI_API_KEY is not set",
+                "no embedding API key (MEMORA_EMBEDDING_API_KEY / OPENAI_API_KEY)",
             )
             return [_compute_embedding_tfidf(t) for t in texts]
 
-        if "openai_client" not in _embedding_model_cache:
-            _embedding_model_cache["openai_client"] = openai.OpenAI(api_key=api_key)
-
-        client = _embedding_model_cache["openai_client"]
+        client = _embedding_client(openai)
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         max_chunk = 2048  # OpenAI batch limit
