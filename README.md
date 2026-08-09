@@ -193,10 +193,10 @@ Add to `~/.codex/config.toml`:
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
 | `MEMORA_EMBEDDING_API_KEY` | Embedding provider API key (atomic with base URL — see below)           |
 | `MEMORA_EMBEDDING_BASE_URL` | Embedding provider base URL (atomic with API key — see below)          |
-| `MEMORA_EMBEDDING_STRICT` | `1` to fail fast on embedding errors instead of falling back to TF-IDF |
-| `OPENAI_API_KEY`       | LLM API key (dedup/chat). Also used for embeddings only when **both** `MEMORA_EMBEDDING_*` vars are unset |
-| `OPENAI_BASE_URL`      | LLM base URL (OpenRouter, Azure, etc.). Same fallback rule as the key   |
-| `OPENAI_EMBEDDING_MODEL` | Embedding model id for the openai backend (default: `text-embedding-3-small`) |
+| `MEMORA_EMBEDDING_STRICT` | **Recommend `1`.** Fail hard on embedding errors instead of silent TF-IDF. Without it a broken endpoint keeps answering while every vector becomes a keyword bag (how 756 memories degraded unnoticed). |
+| `OPENAI_API_KEY`       | **LLM only** (dedup/chat) when `MEMORA_EMBEDDING_*` is set. Embeddings fall back to this key only if **both** `MEMORA_EMBEDDING_API_KEY` and `MEMORA_EMBEDDING_BASE_URL` are unset |
+| `OPENAI_BASE_URL`      | **LLM** base URL (OpenRouter, Azure, etc.). Same atomic fallback rule as the key — not an embeddings URL when you use a split config |
+| `OPENAI_EMBEDDING_MODEL` | Model id for the openai embedding backend. Must exist on the **embedding** host (default `text-embedding-3-small` is OpenAI-only; Cloudflare needs e.g. `@cf/baai/bge-m3`) |
 | `MEMORA_LLM_ENABLED`   | Enable LLM-powered deduplication comparison (`true`/`false`, default: `true`) |
 | `MEMORA_LLM_MODEL`     | Model for deduplication comparison (default: `gpt-4o-mini`)                |
 | `CHAT_MODEL`           | Model for the chat panel (default: `deepseek/deepseek-chat`, falls back to `MEMORA_LLM_MODEL`) |
@@ -217,15 +217,22 @@ Memora supports three embedding backends:
 | `sentence-transformers` | `pip install memora[local]` | Good, runs offline | Medium |
 | `tfidf` | Included | Basic keyword matching | Fast |
 
-**Embeddings vs LLM credentials (important):**  
-`OPENAI_API_KEY` / `OPENAI_BASE_URL` drive the **LLM** (dedup, chat). Embeddings can use a **different** provider via the atomic pair:
+**Embeddings and the LLM are configured separately.**
 
-- `MEMORA_EMBEDDING_API_KEY` + `MEMORA_EMBEDDING_BASE_URL` — both must be set together (or both unset). Memora will not mix one field from `MEMORA_*` with the other from `OPENAI_*` (that would send one provider’s secret to another host).
-- When **both** `MEMORA_EMBEDDING_*` vars are unset, embeddings fall back to the full `OPENAI_*` pair.
+| Role | Variables |
+|------|-----------|
+| LLM (dedup, chat) | `OPENAI_API_KEY` + `OPENAI_BASE_URL` |
+| Embeddings | `MEMORA_EMBEDDING_API_KEY` + `MEMORA_EMBEDDING_BASE_URL` (**both or neither** — atomic pair) |
+| Fallback | If **both** `MEMORA_EMBEDDING_*` are unset, embeddings use the full `OPENAI_*` pair |
 
-**OpenRouter has no embeddings endpoint.** If the LLM uses OpenRouter (`OPENAI_BASE_URL=https://openrouter.ai/api/v1`), point embeddings elsewhere (e.g. Cloudflare AI Gateway, OpenAI, or a local OpenAI-compatible host). Otherwise every embed call 404s and Memora silently falls back to TF-IDF keyword bags unless `MEMORA_EMBEDDING_STRICT=1`.
+A partial split (only one `MEMORA_EMBEDDING_*` set) is **rejected** so one provider’s secret is never sent to another host.
 
-Split example (LLM on OpenRouter, embeddings on a real embeddings host):
+**Trap — OpenRouter has no embeddings endpoint.** OpenRouter’s catalogue is chat/multimodal only (no embedding models). Do **not** point the embedding path at OpenRouter via `OPENAI_BASE_URL` (or a MEMORA base URL). That combination 404s every embed call; without `MEMORA_EMBEDDING_STRICT=1` Memora falls back to TF-IDF and keeps answering, so the store fills with keyword bags while looking healthy. OpenRouter remains fine for the **LLM** only.
+
+**Worked example (LLM via OpenRouter, embeddings via Cloudflare Workers AI):**  
+`@cf/baai/bge-m3` is 1024-dimensional. Token needs Workers AI permission. Endpoint shape:
+
+`https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1`
 
 ```json
 {
@@ -234,23 +241,28 @@ Split example (LLM on OpenRouter, embeddings on a real embeddings host):
     "OPENAI_API_KEY": "<openrouter-key>",
     "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
     "MEMORA_LLM_MODEL": "deepseek/deepseek-chat",
-    "MEMORA_EMBEDDING_API_KEY": "<embeddings-provider-key>",
-    "MEMORA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
-    "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+    "MEMORA_EMBEDDING_API_KEY": "<cloudflare-api-token-with-workers-ai>",
+    "MEMORA_EMBEDDING_BASE_URL": "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
+    "OPENAI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
     "MEMORA_EMBEDDING_STRICT": "1"
   }
 }
 ```
 
+What this fix does (no oversell): embeddings and LLM can use different providers; a partial split is rejected; strict mode turns silent degradation into a hard, named failure.
+
 **Automatic:** Embeddings and cross-references are computed automatically when you `memory_create`, `memory_update`, or `memory_create_batch`.
 
-**Manual rebuild required** when:
-- Changing `MEMORA_EMBEDDING_MODEL`, embedding provider, or `OPENAI_EMBEDDING_MODEL` after memories exist
-- Switching to a different sentence-transformers model
-- The store fingerprint changes (backend + model name + vector kind/dims) — e.g. after a period of silent TF-IDF fallback under an `openai` label
+**Manual rebuild required** when the store fingerprint changes — not only `MEMORA_EMBEDDING_MODEL`, but also:
+- Embedding **endpoint** (`MEMORA_EMBEDDING_BASE_URL` / host)
+- Actual model id (`OPENAI_EMBEDDING_MODEL`, e.g. switching to `@cf/baai/bge-m3`)
+- Vector **kind or dimensions** (word-key TF-IDF bags vs dense 1024-d; or 384 vs 1024)
+- Mixed store (some rows dense, some sparse) — cosine similarity only shares keys, so mixed kinds yield **0.0** recall for old rows
+
+Fingerprint form: `backend|model|repr` (e.g. `openai|@cf/baai/bge-m3|dense:1024`). Legacy meta value `openai` alone is treated as a mismatch.
 
 ```bash
-# After changing embedding model, rebuild all embeddings
+# After changing embedding model/endpoint, rebuild all embeddings
 memory_rebuild_embeddings
 
 # Then rebuild cross-references to update the knowledge graph
@@ -407,7 +419,7 @@ memory_merge(source_id=123, target_id=456, merge_strategy="append")
 - `reasoning`: Brief explanation
 - `suggested_action`: "merge", "keep_both", or "review"
 
-Works with any OpenAI-compatible API (OpenAI, OpenRouter, Azure, etc.) via `OPENAI_BASE_URL`.
+Works with any OpenAI-compatible **chat** API (OpenAI, OpenRouter, Azure, etc.) via `OPENAI_BASE_URL`. OpenRouter is fine for this LLM path; it does **not** provide embeddings — configure embeddings separately (see Semantic Search & Embeddings).
 
 </details>
 

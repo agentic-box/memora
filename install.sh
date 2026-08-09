@@ -74,12 +74,12 @@ if [ "$MCP_FOUND" = false ]; then
         "args": ["--no-graph"],
         "env": {
           "MEMORA_EMBEDDING_MODEL": "openai",
-          "OPENAI_API_KEY": "<llm-provider-key>",
+          "OPENAI_API_KEY": "<openrouter-key>",
           "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
           "MEMORA_LLM_MODEL": "deepseek/deepseek-chat",
-          "MEMORA_EMBEDDING_API_KEY": "<embeddings-provider-key>",
-          "MEMORA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
-          "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+          "MEMORA_EMBEDDING_API_KEY": "<cloudflare-api-token-with-workers-ai>",
+          "MEMORA_EMBEDDING_BASE_URL": "https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1",
+          "OPENAI_EMBEDDING_MODEL": "@cf/baai/bge-m3",
           "MEMORA_EMBEDDING_STRICT": "1"
         }
       }
@@ -87,10 +87,14 @@ if [ "$MCP_FOUND" = false ]; then
   }
 EXAMPLE
     echo ""
-    echo "  Note: OpenRouter has no embeddings API. Set MEMORA_EMBEDDING_API_KEY +"
-    echo "  MEMORA_EMBEDDING_BASE_URL as an atomic pair (both or neither) so the LLM"
-    echo "  key is never sent to the embeddings host. See README.md."
+    echo "  IMPORTANT: OpenRouter has NO embeddings endpoint. Do not use an openai/"
+    echo "  prefixed model for embeddings. The example splits LLM (OpenRouter) from"
+    echo "  embeddings (Cloudflare Workers AI @cf/baai/bge-m3, 1024-d). Set BOTH"
+    echo "  MEMORA_EMBEDDING_API_KEY and MEMORA_EMBEDDING_BASE_URL (atomic pair)."
+    echo "  MEMORA_EMBEDDING_STRICT=1 is recommended so a broken endpoint fails loud"
+    echo "  instead of silently filling the store with TF-IDF keyword bags."
     echo "  For cloud storage (D1/R2), add MEMORA_STORAGE_URI and credentials."
+    echo "  See README.md (Semantic Search & Embeddings)."
 fi
 
 echo ""

@@ -56,10 +56,18 @@ def _warn_once(backend_reason: str, detail: str) -> None:
 
 def _strict_raise(backend: str, exc: BaseException) -> None:
     """Raise when MEMORA_EMBEDDING_STRICT=1 so configuration drift surfaces
-    immediately instead of silently degrading to TF-IDF."""
-    raise RuntimeError(
-        f"MEMORA_EMBEDDING_STRICT=1 and {backend} embedding failed: "
-        f"{type(exc).__name__}: {exc}"
+    immediately instead of silently degrading to TF-IDF.
+
+    Includes endpoint hint so operators see a provider outage, not an internal bug (N6).
+    """
+    endpoint = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or "(default host)"
+    model = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    raise EmbeddingStrictError(
+        f"MEMORA_EMBEDDING_STRICT=1 hard-stop (no TF-IDF fallback): "
+        f"backend={backend} endpoint={endpoint} model={model} — "
+        f"{type(exc).__name__}: {exc}. "
+        f"This is an embedding-provider/config failure, not a memora bug. "
+        f"Fix the provider or unset MEMORA_EMBEDDING_STRICT to allow TF-IDF fallback."
     ) from exc
 
 
@@ -135,6 +143,14 @@ def _compute_embedding_sentence_transformers(text: str) -> Dict[str, float]:
 
 class EmbeddingCredentialError(ValueError):
     """Raised when embedding credentials are incomplete or cross-paired."""
+
+
+class EmbeddingStrictError(RuntimeError):
+    """MEMORA_EMBEDDING_STRICT=1 hard-stopped embedding (no silent TF-IDF).
+
+    Callers should surface this as a provider/config failure, not as an
+    internal memora bug. Message always starts with MEMORA_EMBEDDING_STRICT=1.
+    """
 
 
 def _env_is_set(name: str) -> bool:
@@ -328,14 +344,17 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
             api_key, base_url = _embedding_credentials()
         except EmbeddingCredentialError as exc:
             if _strict_mode():
-                raise RuntimeError(
-                    f"MEMORA_EMBEDDING_STRICT=1 and openai credentials invalid: {exc}"
+                raise EmbeddingStrictError(
+                    f"MEMORA_EMBEDDING_STRICT=1 hard-stop: incomplete embedding credentials "
+                    f"({exc}). Not a memora bug — fix MEMORA_EMBEDDING_* / OPENAI_* config."
                 ) from exc
             _warn_once("openai:credentials", str(exc))
             return _compute_embedding_tfidf(text)
 
         # Construct client only after credentials resolved (N1: fail before construct).
         client = _embedding_client(openai)
+        # Default is OpenAI's small model; Cloudflare / other hosts need OPENAI_EMBEDDING_MODEL
+        # set explicitly (e.g. @cf/baai/bge-m3). A wrong default 404s on non-OpenAI endpoints.
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         response = client.embeddings.create(
@@ -353,10 +372,9 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
             "package not installed (pip install openai)",
         )
         return _compute_embedding_tfidf(text)
+    except EmbeddingStrictError:
+        raise
     except Exception as exc:
-        # Re-raise our own strict credential errors unchanged.
-        if isinstance(exc, RuntimeError) and str(exc).startswith("MEMORA_EMBEDDING_STRICT"):
-            raise
         if _strict_mode():
             _strict_raise("openai", exc)
         _warn_once(
@@ -378,9 +396,10 @@ def compute_embedding(
     if embedding_model not in _KNOWN_BACKENDS:
         # N2: reject unknown backend under strict (typo must not silently TF-IDF).
         if _strict_mode():
-            raise RuntimeError(
-                f"MEMORA_EMBEDDING_STRICT=1 and unknown embedding backend {embedding_model!r}; "
-                f"known: {sorted(_KNOWN_BACKENDS)}"
+            raise EmbeddingStrictError(
+                f"MEMORA_EMBEDDING_STRICT=1 hard-stop: unknown embedding backend "
+                f"{embedding_model!r}; known: {sorted(_KNOWN_BACKENDS)}. "
+                f"Not a memora bug — fix MEMORA_EMBEDDING_MODEL."
             )
         _warn_once(
             f"unknown-backend:{embedding_model}",
@@ -415,9 +434,10 @@ def compute_embeddings_batch(
 
     if embedding_model not in _KNOWN_BACKENDS:
         if _strict_mode():
-            raise RuntimeError(
-                f"MEMORA_EMBEDDING_STRICT=1 and unknown embedding backend {embedding_model!r}; "
-                f"known: {sorted(_KNOWN_BACKENDS)}"
+            raise EmbeddingStrictError(
+                f"MEMORA_EMBEDDING_STRICT=1 hard-stop: unknown embedding backend "
+                f"{embedding_model!r}; known: {sorted(_KNOWN_BACKENDS)}. "
+                f"Not a memora bug — fix MEMORA_EMBEDDING_MODEL."
             )
         _warn_once(
             f"unknown-backend:{embedding_model}",
@@ -460,13 +480,15 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
             _embedding_credentials()  # validate before construct
         except EmbeddingCredentialError as exc:
             if _strict_mode():
-                raise RuntimeError(
-                    f"MEMORA_EMBEDDING_STRICT=1 and openai-batch credentials invalid: {exc}"
+                raise EmbeddingStrictError(
+                    f"MEMORA_EMBEDDING_STRICT=1 hard-stop: incomplete embedding credentials "
+                    f"({exc}). Not a memora bug — fix MEMORA_EMBEDDING_* / OPENAI_* config."
                 ) from exc
             _warn_once("openai-batch:credentials", str(exc))
             return [_compute_embedding_tfidf(t) for t in texts]
 
         client = _embedding_client(openai)
+        # See single-path note: override OPENAI_EMBEDDING_MODEL for non-OpenAI hosts.
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
         max_chunk = 2048  # OpenAI batch limit
@@ -503,9 +525,9 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
             "package not installed (pip install openai)",
         )
         return [_compute_embedding_tfidf(t) for t in texts]
+    except EmbeddingStrictError:
+        raise
     except Exception as exc:
-        if isinstance(exc, RuntimeError) and str(exc).startswith("MEMORA_EMBEDDING_STRICT"):
-            raise
         if _strict_mode():
             _strict_raise("openai-batch", exc)
         _warn_once(
@@ -649,6 +671,45 @@ def sample_embedding_vector(conn: sqlite3.Connection) -> Optional[Dict[str, floa
     return json_to_embedding(row["embedding"])
 
 
+def sample_embedding_kinds(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 500,
+) -> Set[str]:
+    """Scan stored vectors and return kind tags: {'dense'}, {'sparse'}, or both (N7).
+
+    Dense = numeric keys (openai / sentence-transformers). Sparse = word bags (TF-IDF).
+    A store containing BOTH is corrupt for cosine search (shared-key similarity → 0.0)
+    and must force rebuild regardless of memories_meta.
+    """
+    kinds: Set[str] = set()
+    rows = conn.execute(
+        "SELECT embedding FROM memories_embeddings WHERE embedding IS NOT NULL LIMIT ?",
+        (limit,),
+    ).fetchall()
+    for row in rows:
+        vec = json_to_embedding(row["embedding"])
+        rep = _vector_representation(vec)
+        if rep == "empty":
+            continue
+        if rep.startswith("dense"):
+            kinds.add("dense")
+            # also track dims for mixed-dim dense
+            kinds.add(rep)  # dense:N
+        else:
+            kinds.add("sparse")
+    return kinds
+
+
+def store_has_mixed_embeddings(conn: sqlite3.Connection) -> bool:
+    """True when dense and sparse vectors coexist, or dense dims disagree (N7)."""
+    kinds = sample_embedding_kinds(conn)
+    if "sparse" in kinds and any(k.startswith("dense") for k in kinds):
+        return True
+    dense_dims = {k for k in kinds if k.startswith("dense:")}
+    return len(dense_dims) > 1
+
+
 def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
     """Get the embedding model fingerprint (or legacy name) stored in the database."""
     row = conn.execute(
@@ -669,76 +730,83 @@ def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
     conn.commit()
 
 
-def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
-    """Check if current embedding fingerprint differs from stored fingerprint.
+def current_embedding_fingerprint(current_model: str) -> str:
+    """Fingerprint for the configured embedding endpoint (backend|model|target-kind).
 
-    Uses backend + actual model name + observed vector representation so a
-    store full of word-key bags labelled \"openai\" still triggers rebuild when
-    dense openai embeddings are configured (N5).
+    Includes the actual model name (OPENAI_EMBEDDING_MODEL / ST model), not just
+    MEMORA_EMBEDDING_MODEL=\"openai\", so endpoint/model changes force rebuild (N5/N7).
     """
-    stored = get_stored_embedding_model(conn)
-    sample = sample_embedding_vector(conn)
-    # Fingerprint of what we WOULD write now (target representation for backend).
-    if current_model == "tfidf":
-        target_repr_vector: Optional[Dict[str, float]] = {"_": 1.0}  # sparse marker
-        # Use a synthetic sparse so fingerprint says sparse
-        current_fp = embedding_fingerprint(current_model, observed_vector={"token": 1.0})
-    elif current_model == "openai":
-        # Target is dense; if we don't know dims yet, use dense:unknown so any
-        # sparse store mismatches, and legacy stored "openai" also mismatches.
-        current_fp = embedding_fingerprint(
-            current_model,
-            observed_vector={str(i): 0.0 for i in range(1)},  # dense:1 placeholder kind
-        )
-        # Normalize placeholder to dense:target so we compare kind not exact dim
-        # until first real vector is observed — compare structural mismatch below.
-        current_fp = embedding_fingerprint(current_model, observed_vector=None)
-        # Prefer: backend|model|dense as intended target
+    if current_model == "openai":
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        current_fp = f"openai|{model_name}|dense"
-    elif current_model == "sentence-transformers":
+        return f"openai|{model_name}|dense"
+    if current_model == "sentence-transformers":
         model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-        current_fp = f"sentence-transformers|{model_name}|dense"
-    else:
-        current_fp = embedding_fingerprint(current_model, observed_vector=sample)
+        return f"sentence-transformers|{model_name}|dense"
+    if current_model == "tfidf":
+        return "tfidf|tfidf|sparse"
+    return embedding_fingerprint(current_model)
 
-    if stored is None:
-        count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
-        if count > 0:
-            return True
+
+def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
+    """True when stored embeddings are incompatible with the configured backend (N5/N7).
+
+    Rebuild is required when any of:
+    - memories_meta fingerprint ≠ configured backend|model|kind
+    - legacy bare name in meta (e.g. \"openai\") — too coarse to trust
+    - MIXED store: sparse word-keys coexist with dense vectors (cosine → 0.0)
+    - mixed dense dimensions (e.g. 384 and 1024)
+    - sample kind is sparse while current backend is dense (or vice versa)
+    """
+    count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
+    if count == 0:
         return False
 
-    # Legacy: stored is bare backend name ("openai") — always mismatch against
-    # the richer fingerprint so a post-outage TF-IDF store forces rebuild.
+    # N7: mixed representation is always corrupt for cosine search.
+    if store_has_mixed_embeddings(conn):
+        return True
+
+    stored = get_stored_embedding_model(conn)
+    sample = sample_embedding_vector(conn)
+    current_fp = current_embedding_fingerprint(current_model)
+
+    if stored is None:
+        return True
+
+    # Legacy bare backend name never equals rich fingerprint.
     if "|" not in stored:
         return True
 
-    # If store has sample vectors, refine current with observed dims when kinds match.
+    # Data kind vs configured target
     if sample is not None:
-        stored_kind = stored.rsplit("|", 1)[-1]
         sample_kind = _vector_representation(sample)
-        if stored_kind.startswith("dense") and sample_kind.startswith("dense"):
-            # Same kind family — mismatch if model/backend part differs or dims differ
-            stored_prefix = stored.rsplit("|", 1)[0]
-            current_prefix = current_fp.rsplit("|", 1)[0]
-            if stored_prefix != current_prefix:
-                return True
-            return stored_kind != sample_kind  # e.g. dense:384 vs dense:1024
-        if stored_kind != sample_kind and sample_kind != "empty":
-            # Stored fingerprint claims one kind but data is another → rebuild
-            return True
-        # Compare full fingerprint including sample kind
-        refined = embedding_fingerprint(current_model, observed_vector=sample)
-        # For openai/st targets we store as backend|model|dense:N after rebuild
         if current_model in ("openai", "sentence-transformers"):
-            model_name = (
-                os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-                if current_model == "openai"
-                else os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-            )
-            refined = f"{current_model}|{model_name}|{sample_kind}"
-            return stored != refined
-        return stored != refined
+            if sample_kind == "sparse":
+                return True
+            if sample_kind.startswith("dense:"):
+                # Refine current with observed dims; mismatch if dims or model differ
+                model_name = (
+                    os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+                    if current_model == "openai"
+                    else os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
+                )
+                refined = f"{current_model}|{model_name}|{sample_kind}"
+                # If stored claims different dims or model, rebuild
+                if stored != refined and stored != current_fp:
+                    # stored may be openai|model|dense without dims — still check prefix
+                    stored_prefix = "|".join(stored.split("|")[:2])
+                    current_prefix = f"{current_model}|{model_name}"
+                    if stored_prefix != current_prefix:
+                        return True
+                    stored_kind = stored.rsplit("|", 1)[-1]
+                    if stored_kind.startswith("dense:") and stored_kind != sample_kind:
+                        return True
+                    if stored_kind == "dense" and sample_kind.startswith("dense:"):
+                        # stored without dims, data has dims — ok until model changes
+                        return False
+                    return stored != refined
+                return False
+        if current_model == "tfidf" and sample_kind.startswith("dense"):
+            return True
 
     return stored != current_fp
 

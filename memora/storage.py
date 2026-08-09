@@ -3371,7 +3371,10 @@ def absorb_memory(
         if secrets:
             fact = redacted_fact
 
-        # Search for similar existing memories
+        # Search for similar existing memories.
+        # N6: initialize vector before try so a strict embedding failure cannot
+        # leave UnboundLocalError on pending_creates.append(..., vector, ...).
+        vector = None
         try:
             vector = _compute_embedding(fact, None, [])
             if not vector:
@@ -3383,8 +3386,21 @@ def absorb_memory(
                 conn, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
             )
         except Exception as e:
+            # N6: strict mode must fail cleanly (named provider error), not as
+            # UnboundLocalError after matches=[] falls through to pending_creates.
+            from memora.embeddings import EmbeddingStrictError
+            if isinstance(e, EmbeddingStrictError) or (
+                isinstance(e, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(e)
+            ):
+                raise
             logger.warning("Absorb search failed for fact: %s — %s", fact[:50], e, exc_info=True)
-            matches = []
+            decisions.append({
+                "fact": fact[:80],
+                "action": "skipped",
+                "reason": f"embedding/search failed: {type(e).__name__}: {e}",
+            })
+            counts["skipped"] += 1
+            continue
 
         # Exclude document fragments/roots — they are structural, not standalone
         matches = [
@@ -3394,7 +3410,7 @@ def absorb_memory(
             )
         ]
 
-        # No similar memories — queue for creation
+        # No similar memories — queue for creation (vector is guaranteed set here)
         if not matches:
             pending_creates.append((fact, vector, None, []))
             continue

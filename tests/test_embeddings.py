@@ -327,14 +327,14 @@ def test_n2_strict_raises_on_bad_batch(fake_openai, monkeypatch, bad_factory, ma
 
 def test_n2_strict_unknown_backend(monkeypatch):
     monkeypatch.setenv("MEMORA_EMBEDDING_STRICT", "1")
-    with pytest.raises(RuntimeError, match="unknown embedding backend"):
+    with pytest.raises(emb.EmbeddingStrictError, match="unknown embedding backend"):
         emb.compute_embedding("x", None, [], "not-a-real-backend")
 
 
 def test_n2_strict_missing_key(fake_openai, monkeypatch):
     monkeypatch.setenv("MEMORA_EMBEDDING_STRICT", "1")
     # neither MEMORA nor OPENAI keys
-    with pytest.raises(RuntimeError, match="MEMORA_EMBEDDING_STRICT"):
+    with pytest.raises(emb.EmbeddingStrictError, match="MEMORA_EMBEDDING_STRICT"):
         emb.compute_embedding("x", None, [], "openai")
     assert FakeOpenAI.instances == []
 
@@ -350,7 +350,7 @@ def test_n2_strict_endpoint_error(fake_openai, monkeypatch):
         self.queue_error(RuntimeError("404 no embeddings"))
 
     monkeypatch.setattr(FakeOpenAI, "__init__", init_q)
-    with pytest.raises(RuntimeError, match="MEMORA_EMBEDDING_STRICT"):
+    with pytest.raises(emb.EmbeddingStrictError, match="MEMORA_EMBEDDING_STRICT=1 hard-stop"):
         emb.compute_embedding("x", None, [], "openai")
 
 
@@ -415,6 +415,53 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
     emb.set_stored_embedding_model(conn, "openai|text-embedding-3-small|dense:8")
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is False
+
+
+def test_n7_mixed_dense_sparse_forces_rebuild(tmp_path, monkeypatch):
+    """N7: dense + word-key rows → mismatch even if meta claims matching fingerprint."""
+    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
+    conn = _meta_conn(tmp_path)
+    emb.set_stored_embedding_model(conn, "openai|@cf/baai/bge-m3|dense:1024")
+    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(1024)})
+    emb.upsert_embedding(conn, 2, {"ure": 0.2, "xdg": 0.3, "zig": 0.5})
+    conn.commit()
+    assert emb.store_has_mixed_embeddings(conn) is True
+    assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_n7_model_change_same_backend_name_forces_rebuild(tmp_path, monkeypatch):
+    """N7: still backend openai but model/endpoint fingerprint changed."""
+    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
+    conn = _meta_conn(tmp_path)
+    # Old dense 384 under different model id, meta still only said openai historically
+    emb.set_stored_embedding_model(conn, "openai|text-embedding-3-small|dense:384")
+    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(384)})
+    conn.commit()
+    assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_n6_absorb_strict_failure_is_clean_not_unboundlocal(monkeypatch, tmp_path):
+    """N6: absorb_memory must re-raise EmbeddingStrictError, not UnboundLocalError."""
+    import memora.storage as storage
+    from memora.backends import LocalSQLiteBackend
+
+    monkeypatch.setenv("MEMORA_EMBEDDING_STRICT", "1")
+    backend = LocalSQLiteBackend(tmp_path / "absorb.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "openai")
+
+    def boom(*a, **k):
+        raise emb.EmbeddingStrictError(
+            "MEMORA_EMBEDDING_STRICT=1 hard-stop: backend=openai endpoint=https://x "
+            "model=@cf/baai/bge-m3 — RuntimeError: 503. "
+            "This is an embedding-provider/config failure, not a memora bug."
+        )
+
+    monkeypatch.setattr(storage, "_compute_embedding", boom)
+
+    with storage.connect() as conn:
+        with pytest.raises(emb.EmbeddingStrictError, match="hard-stop|provider"):
+            storage.absorb_memory(conn, facts=["a fact long enough to absorb"])
 
 
 # ---------------------------------------------------------------------------
