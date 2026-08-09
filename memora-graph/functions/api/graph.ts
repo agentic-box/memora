@@ -329,6 +329,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   // Fetch all crossrefs (table may not exist on some D1 databases).
   // Fail CLOSED for lineage: unknown must not present as "all current".
   const crossrefsMap = new Map<number, CrossRefEntry[]>();
+  // G6: crossrefsAvailable covers lineage, dups, associations, clusters — same query.
+  let crossrefsAvailable = true;
   let lineageAvailable = true;
   let lineageDegradedReason: string | null = null;
   const corruptCrossrefRows: number[] = [];
@@ -343,6 +345,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
         // One corrupt row must not silently drop that memory's supersession evidence
         // and paint it as current with no banner (F1 second fail-open).
         lineageAvailable = false;
+        crossrefsAvailable = false;
         lineageDegradedReason = lineageDegradedReason || `corrupt_crossref:${parsed.reason}`;
         corruptCrossrefRows.push(cr.memory_id);
         continue;
@@ -351,12 +354,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     }
   } catch {
     lineageAvailable = false;
+    crossrefsAvailable = false;
     lineageDegradedReason = "crossrefs_query_failed";
   }
 
   // Lineage: normalize BOTH halves (supersedes + superseded_by) into canonical
-  // newer→older, then dedupe. Association edges are separate and never directed
-  // for lineage styling (only edge_type === "supersedes" is lineage).
+  // newer→older, then dedupe. Associations use SEMANTIC endpoints (G2).
   const lineage = lineageAvailable
     ? buildLineageMaps(crossrefsMap.entries())
     : {
@@ -364,23 +367,19 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
         supersedesMap: new Map<number, Set<number>>(),
         supersedesEdges: [],
         conflicts: [],
+        authorityUnknown: new Set<number>(),
       };
   const supersededBy = lineage.supersededBy;
   const supersedesMap = lineage.supersedesMap;
 
-  const edges: GraphEdge[] = [];
+  // Provisional edge lists — connectionCounts computed AFTER dangling partition (G5).
+  const provisionalLineageEdges: GraphEdge[] = [];
+  const provisionalAssocEdges: GraphEdge[] = [];
   let edgeId = 0;
-  const edgeSeen = new Set<string>();
 
-  // Association edges can still render when lineage is unavailable (similarity layout).
-  // Lineage edges only when lineageAvailable.
   if (lineageAvailable) {
-    // Drawable lineage edges are filtered to real nodes later (F4); provisional list first.
     for (const le of lineage.supersedesEdges) {
-      const key = `sup-${le.from}->${le.to}`;
-      if (edgeSeen.has(key)) continue;
-      edgeSeen.add(key);
-      edges.push({
+      provisionalLineageEdges.push({
         id: edgeId++,
         from: le.from,
         to: le.to,
@@ -390,26 +389,22 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       });
     }
   }
-  for (const ae of buildAssociationEdges(crossrefsMap.entries(), minScore)) {
-    const key = `rel-${Math.min(ae.from, ae.to)}-${Math.max(ae.from, ae.to)}-${ae.edge_type}`;
-    if (edgeSeen.has(key)) continue;
-    edgeSeen.add(key);
-    edges.push({
-      id: edgeId++,
-      from: ae.from,
-      to: ae.to,
-      edge_type: ae.edge_type,
-      score: ae.score,
-      directed: false,
-    });
+  // Associations only when crossrefs available (else we would claim exact link counts).
+  if (crossrefsAvailable) {
+    for (const ae of buildAssociationEdges(crossrefsMap.entries(), minScore)) {
+      provisionalAssocEdges.push({
+        id: edgeId++,
+        from: ae.from,
+        to: ae.to,
+        edge_type: ae.edge_type,
+        score: ae.score,
+        directed: ae.directed,
+      });
+    }
   }
 
-  // Count connections per node (include lineage for layout weight)
+  // Placeholder counts — recomputed from final drawable edges after nodes exist (G5).
   const connectionCounts = new Map<number, number>();
-  for (const edge of edges) {
-    connectionCounts.set(edge.from, (connectionCounts.get(edge.from) || 0) + 1);
-    connectionCounts.set(edge.to, (connectionCounts.get(edge.to) || 0) + 1);
-  }
 
   // Find duplicate memories from canonical duplicate pairs.
   // Filter rules must match find_duplicate_pairs() in storage.py
@@ -494,7 +489,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     else if (isTodo(meta)) typeLabel = " - TODO";
 
     const isSuperseded = lineageAvailable && supersededBy.has(m.id);
-    const authorityUnknown = !lineageAvailable;
+    const authorityUnknown =
+      !lineageAvailable || (lineageAvailable && lineage.authorityUnknown.has(m.id));
     const supersededByIds: number[] | undefined = isSuperseded
       ? Array.from(supersededBy.get(m.id) as Set<number>)
       : undefined;
@@ -566,10 +562,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     nodes.push(node);
   }
 
-  // Link each included fragment to its document root (fragments skip crossrefs);
-  // chain by ordinal when the doc has no root node.
+  // Document structural edges (always drawable among included nodes).
+  const docEdges: GraphEdge[] = [];
   if (includeDocs) {
     const byDoc = new Map<string, Array<{ id: number; ord: number }>>();
+    const docSeen = new Set<string>();
     for (const m of memories) {
       const meta = parseJson<Record<string, unknown>>(m.metadata, {});
       if (!isDocumentFragment(meta)) continue;
@@ -583,9 +580,15 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     const addEdge = (a: number, b: number) => {
       if (a === b) return;
       const k = `doc-${Math.min(a, b)}-${Math.max(a, b)}`;
-      if (!edgeSeen.has(k)) {
-        edgeSeen.add(k);
-        edges.push({ id: edgeId++, from: a, to: b, edge_type: "document", directed: false });
+      if (!docSeen.has(k)) {
+        docSeen.add(k);
+        docEdges.push({
+          id: edgeId++,
+          from: a,
+          to: b,
+          edge_type: "document",
+          directed: false,
+        });
       }
     };
     byDoc.forEach((frags, dk) => {
@@ -697,8 +700,14 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     lineage.supersedesEdges,
     nodeIdSet,
   );
-  // Rebuild edges array: drop provisional supersedes that dangle, keep associations + docs.
-  const nonLineageEdges = edges.filter(e => e.edge_type !== "supersedes");
+  // Associations: only if both ends are present nodes.
+  const drawableAssoc = provisionalAssocEdges.filter(
+    e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to),
+  );
+  const drawableDocs = docEdges.filter(
+    e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to),
+  );
+
   const finalEdges: GraphEdge[] = [
     ...drawableLineage.map((le, i) => ({
       id: i,
@@ -708,8 +717,33 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       score: le.score,
       directed: true as const,
     })),
-    ...nonLineageEdges.map((e, i) => ({ ...e, id: drawableLineage.length + i })),
+    ...drawableAssoc.map((e, i) => ({
+      ...e,
+      id: drawableLineage.length + i,
+    })),
+    ...drawableDocs.map((e, i) => ({
+      ...e,
+      id: drawableLineage.length + drawableAssoc.length + i,
+    })),
   ];
+
+  // G5: node size/mass from FINAL drawable edges only (not dangling).
+  connectionCounts.clear();
+  for (const edge of finalEdges) {
+    connectionCounts.set(edge.from, (connectionCounts.get(edge.from) || 0) + 1);
+    connectionCounts.set(edge.to, (connectionCounts.get(edge.to) || 0) + 1);
+  }
+  for (const n of nodes) {
+    const connections = connectionCounts.get(n.id) || 0;
+    const nodeSize = 12 + Math.min(28, Math.floor(Math.log1p(connections) * 8));
+    const nodeMass = 0.5 + Math.min(2.5, Math.log1p(connections) * 0.8);
+    if (n.superseded || n.authority_unknown) {
+      n.size = Math.max(8, Math.floor(nodeSize * 0.7));
+    } else if (!n.frag) {
+      n.size = nodeSize;
+    }
+    if (!n.frag) n.mass = nodeMass;
+  }
 
   // O(S) with Set — not O(S×N) linear scan per key.
   // When lineage is unavailable, do NOT emit empty supersededIds/count (clients
@@ -717,6 +751,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const supersededIds = lineageAvailable
     ? Array.from(supersededBy.keys()).filter(id => nodeIdSet.has(id))
     : null;
+
+  // G6: null exact counts when crossrefs degraded.
+  const dupIdsOut = crossrefsAvailable ? Array.from(duplicateIds) : null;
+  const dupPairOut = crossrefsAvailable ? duplicatePairKeys.size : null;
 
   return Response.json({
     nodes,
@@ -729,9 +767,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     issueCategoryToNodes,
     todoStatusToNodes,
     todoCategoryToNodes,
-    duplicateIds: Array.from(duplicateIds),
-    duplicatePairCount: duplicatePairKeys.size,
-    /** False when crossrefs could not be read/parsed — UI must not treat as "all current". */
+    duplicateIds: dupIdsOut,
+    duplicatePairCount: dupPairOut,
+    /** False when crossrefs query/parse failed — dups/associations/clusters also untrustworthy. */
+    crossrefsAvailable,
+    /** False when lineage cannot certify currentness (subset of crossrefs failure or corrupt rows). */
     lineageAvailable,
     lineageDegradedReason,
     corruptCrossrefRows: corruptCrossrefRows.length ? corruptCrossrefRows : undefined,
@@ -747,8 +787,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     nodeTimestamps,
     minDate,
     maxDate,
-    clusterToNodes: clusterData.clusterToNodes,
-    clusterColors: clusterData.clusterColors,
-    clusterMeta: clusterData.clusterMeta,
+    clusterToNodes: crossrefsAvailable ? clusterData.clusterToNodes : {},
+    clusterColors: crossrefsAvailable ? clusterData.clusterColors : {},
+    clusterMeta: crossrefsAvailable ? clusterData.clusterMeta : {},
   });
 };

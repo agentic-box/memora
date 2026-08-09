@@ -454,8 +454,12 @@ function render() {
     statsEl.textContent = "no graph loaded";
     return;
   }
-  const dupPairs = raw.duplicatePairCount;
-  const dupTxt = dupPairs != null ? `${dupPairs}/${raw.dupeCount} dup pairs/memories` : `${raw.dupeCount} dup memories`;
+  // G6: never claim exact "0/0 dup" when crossrefs are degraded (same principle as F1).
+  const dupTxt = raw.crossrefsAvailable === false
+    ? "DUPS UNAVAILABLE"
+    : (raw.duplicatePairCount != null
+      ? `${raw.duplicatePairCount}/${raw.dupeCount} dup pairs/memories`
+      : `${raw.dupeCount || 0} dup memories`);
   // F1: never say "0 superseded" when lineage is unavailable.
   const lineageTxt = formatLineageStats(raw, showLineage());
   statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${dupTxt} · ${lineageTxt}`;
@@ -941,6 +945,7 @@ async function load() {
   const db = el("db").value;
   const dbChanged = loadDb !== "" && loadDb !== db;
   const prevSelected = selectedId;
+  const panelWasOpen = document.body.classList.contains("panel-open");
   loadDb = db;
   const gen = ++loadGen;
   if (loadAbort) try { loadAbort.abort(); } catch (e) {}
@@ -955,6 +960,17 @@ async function load() {
     el("tllist").textContent = "loading…";
   } else {
     statsEl.textContent = "loading…";
+    // G1: abort in-flight detail must not leave "loading…" forever.
+    // If the panel is open we will re-openDetail after commit; mark it refreshing now
+    // so an AbortError mid-fetch cannot strand the shell on a permanent "loading…".
+    if (panelWasOpen) {
+      const panel = el("panel");
+      if (panel) {
+        panel.innerHTML =
+          `<button class="close" onclick="closePane()">✕</button>` +
+          `<h2>#${prevSelected}</h2><div class="meta">refreshing…</div>`;
+      }
+    }
   }
 
   try {
@@ -965,24 +981,52 @@ async function load() {
     if (!r.ok) throw new Error("HTTP " + r.status);
     const data = await r.json();
     if (gen !== loadGen || el("db").value !== db) return; // stale response
-    raw = data; raw.dupeCount = (raw.duplicateIds || []).length;
+    raw = data;
+    raw.dupeCount = Array.isArray(raw.duplicateIds) ? raw.duplicateIds.length : 0;
     setLineageUiState(raw.lineageAvailable !== false);
+    // G6: surface non-exact dups when crossrefs degraded
+    if (raw.crossrefsAvailable === false) {
+      const w = el("lineage-warn");
+      if (w && raw.lineageAvailable !== false) {
+        w.style.display = "block";
+        w.textContent = "Crossrefs degraded — duplicate/link counts not certified.";
+      }
+    }
     buildAdj(); buildClusters();
     render();
-    // F3: restore selection on same-DB reload if id still present
+    // F3 + G1: restore selection on same-DB reload; re-derive panel from NEW graph status
+    // (do not keep stale SUPERSEDED/current markup).
     if (!dbChanged && prevSelected != null) {
-      const still = (raw.nodes || []).some(n => n.id === prevSelected);
-      if (still) setHighlight(prevSelected);
-      else clearSelectionState();
+      const graphNode = (raw.nodes || []).find(n => n.id === prevSelected);
+      if (graphNode) {
+        setHighlight(prevSelected);
+        if (panelWasOpen) {
+          // G1: re-derive panel from NEW graph status + fresh memory fetch (preMem=null).
+          const isDupe = Array.isArray(raw.duplicateIds) && raw.duplicateIds.includes(prevSelected);
+          openDetail(prevSelected, isDupe, null, !!graphNode.superseded);
+        }
+      } else {
+        clearSelectionState();
+      }
     }
     if (document.body.classList.contains("timeline-open")) loadMems(gen);
     if (gen === loadGen) { captureBaseline(gen, db); startPolling(); }
   } catch (e) {
-    if (e && e.name === "AbortError") return;
+    if (e && e.name === "AbortError") return; // newer load owns the panel
     if (gen !== loadGen) return;
     // F2: on failed load after DB switch, do not leave previous graph labelled as new DB
     if (dbChanged) clearCanvasForSwitch(`failed to load ${db}`);
     statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`;
+    // G1: same-DB failure must not leave panel on "refreshing…" forever
+    if (!dbChanged && panelWasOpen && prevSelected != null) {
+      const panel = el("panel");
+      if (panel) {
+        panel.innerHTML =
+          `<button class="close" onclick="closePane()">✕</button>` +
+          `<h2>#${prevSelected}</h2>` +
+          `<div class="meta"><span id="err">refresh failed — selection kept, panel stale</span></div>`;
+      }
+    }
   }
 }
 
