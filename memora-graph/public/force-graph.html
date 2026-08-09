@@ -70,6 +70,12 @@
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; line-clamp: 2; }
   .trow .day { color: #7d8590; font-size: 10px; }
   .trow .day .dup { color: #f85149; }
+  .trow .day .sup { color: #d29922; }
+  .trow.superseded-row { opacity: 0.72; }
+  .trow.superseded-row .ttl { color: #b8a078; }
+  #lineage-warn { display: none; position: fixed; top: 52px; left: 12px; z-index: 40;
+    background: #3d2e00; color: #ffe08a; border: 1px solid #d29922; border-radius: 8px;
+    padding: 6px 12px; font-size: 12px; max-width: 420px; }
 
   /* ---- detail pane (sits left of the drawer when it's open) ---- */
   /* hidden fully off-screen via `right` (not transform — a width-relative transform
@@ -120,6 +126,7 @@
 </div>
 
 <div id="refresh" onclick="doRefresh()"></div>
+<div id="lineage-warn">Lineage unavailable — cannot confirm which memories are current</div>
 <div id="graph"></div>
 
 <!-- timeline drawer -->
@@ -148,6 +155,8 @@ const graphEl = el("graph"), statsEl = el("stats");
 const DATABASE_STORAGE_KEY = "memora-graph.database";
 let raw = null, mode = "3d", fg = null;
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
+// M4: monotonic load generation + AbortController so DB switches cannot paint A onto B.
+let loadGen = 0, loadAbort = null, loadDb = "";
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 let mdReady = false;
@@ -263,7 +272,8 @@ function freshGraphData() {
       source: e.from,
       target: e.to,
       edge_type: e.edge_type || "related_to",
-      directed: !!e.directed || e.edge_type === "supersedes",
+      // M1: only supersedes is lineage — never treat other typed edges as directed lineage.
+      directed: e.edge_type === "supersedes",
       score: e.score,
     }));
   seedClusterPositions(nodes);
@@ -368,19 +378,23 @@ function dim(c) {
 }
 // Superseded lineage nodes: always muted amber (structure still visible, not "current").
 const SUPERSEDED_COLOR = "#6e5a2e";
+const SUPERSEDED_SELECTED = "#c4a35a"; // brighter amber when selected — still not "current white"
 const SUPERSEDES_LINK = "#d29922";
 const baseColor = (n) => n.superseded ? SUPERSEDED_COLOR
   : (n.dupe ? "#f85149"
   : (n.frag ? "#58a6ff"
   : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color)));
+// S1: selection is ADDITIVE (size/halo). Never repaint superseded fill as current white.
 const nodeColor = (n) => {
-  if (!selectedId) return baseColor(n);
-  if (n.id === selectedId) return "#ffffff";          // focal memory: white + larger (stands out from neighbors)
-  if (hlNodes.has(n.id)) return baseColor(n);         // neighbors: keep full color
-  return dim(baseColor(n));                            // everything else: dimmed
+  const base = baseColor(n);
+  if (!selectedId) return base;
+  if (n.id === selectedId) return n.superseded ? SUPERSEDED_SELECTED : "#ffffff";
+  if (hlNodes.has(n.id)) return base;
+  return dim(base);
 };
 const linkIncident = (l) => selectedId && (sid(l.source) === selectedId || sid(l.target) === selectedId);
-const isSupersedesLink = (l) => l.edge_type === "supersedes" || l.directed;
+// M1: lineage styling keys ONLY on edge_type === "supersedes"
+const isSupersedesLink = (l) => l.edge_type === "supersedes";
 const linkColor = (l) => {
   if (isSupersedesLink(l)) {
     if (!selectedId) return SUPERSEDES_LINK;
@@ -394,7 +408,12 @@ const linkWidth = (l) => {
   return linkIncident(l) ? 2.5 : 0.5;
 };
 // selected node is drawn much bigger so it stands out from its (also-bright) neighbors
-const nodeSize = (n) => n.id === selectedId ? n.val * 3.2 : n.val;
+const nodeSize = (n) => {
+  if (n.id === selectedId) return n.val * 3.2;
+  // 3D has no canvas ring — keep superseded slightly smaller as a persistent cue
+  if (n.superseded) return Math.max(0.8, n.val * 0.75);
+  return n.val;
+};
 function applyHighlight() {
   if (!fg) return;
   if (mode === "3d") fg.nodeColor(nodeColor).nodeVal(nodeSize).linkColor(linkColor);
@@ -459,20 +478,28 @@ function render() {
       .linkLineDash(l => isSupersedesLink(l) ? [4, 3] : null)
       .nodeCanvasObjectMode(() => "after")
       .nodeCanvasObject((n, ctx, scale) => {
+        // S1: selection halo is additive — draw alongside superseded ring, not instead of it.
+        if (n.superseded) {
+          ctx.beginPath(); ctx.arc(n.x, n.y, Math.sqrt(n.val) * 4 + 1.5, 0, 6.2832);
+          ctx.strokeStyle = SUPERSEDES_LINK; ctx.lineWidth = 1.2 / scale;
+          ctx.setLineDash([3 / scale, 2 / scale]); ctx.stroke(); ctx.setLineDash([]);
+        }
         if (n.id === selectedId) {
           ctx.beginPath(); ctx.arc(n.x, n.y, Math.sqrt(n.val) * 4 + 3, 0, 6.2832);
-          ctx.strokeStyle = "#fff"; ctx.lineWidth = 2 / scale; ctx.stroke();
-        } else if (n.superseded) {
-          ctx.beginPath(); ctx.arc(n.x, n.y, Math.sqrt(n.val) * 4 + 1.5, 0, 6.2832);
-          ctx.strokeStyle = SUPERSEDES_LINK; ctx.lineWidth = 1.2 / scale; ctx.setLineDash([3 / scale, 2 / scale]);
-          ctx.stroke(); ctx.setLineDash([]);
+          ctx.strokeStyle = n.superseded ? SUPERSEDES_LINK : "#fff";
+          ctx.lineWidth = 2 / scale; ctx.stroke();
+        }
+        // Always show ⟂ for superseded (not only when zoomed in)
+        if (n.superseded) {
+          ctx.fillStyle = SUPERSEDES_LINK;
+          ctx.font = `bold ${11 / scale}px ui-monospace`;
+          ctx.fillText("⟂", n.x - 4 / scale, n.y - Math.sqrt(n.val) * 4 - 4 / scale);
         }
         if (scale < 1.5) return;
         ctx.fillStyle = n.superseded ? "#8b7355"
           : ((selectedId && !hlNodes.has(n.id)) ? "#484f58" : "#c9d1d9");
         ctx.font = `${10 / scale}px ui-monospace`;
-        const text = n.superseded ? (n.label ? n.label + " ⟂" : "#" + n.id + " ⟂") : n.label;
-        ctx.fillText(text, n.x + 6 / scale, n.y + 3 / scale);
+        ctx.fillText(n.label || ("#" + n.id), n.x + 6 / scale, n.y + 3 / scale);
       })
       .cooldownTime(5000).onEngineTick(() => { hullsDirty = true; })
       .onZoom(() => wake()).onZoomEnd(() => wake()).onNodeDrag(() => wake()).onNodeDragEnd(() => wake())
@@ -584,14 +611,26 @@ window.toggleTimeline = (force) => {
   if (open && !memsLoaded) loadMems();
 };
 const isStructural = (m) => { const t = (m.metadata || {}).type; return t === "section" || t === "document_fragment" || t === "document_root"; };
-async function loadMems() {
+
+/** Single source of truth for superseded ids from the graph response. */
+function supersededSetFromRaw() {
+  const s = new Set(raw?.supersededIds || []);
+  for (const n of (raw?.nodes || [])) if (n.superseded) s.add(n.id);
+  return s;
+}
+
+async function loadMems(expectedGen) {
+  const gen = expectedGen != null ? expectedGen : loadGen;
+  const db = el("db").value;
   memsLoaded = true; el("tllist").textContent = "loading…";
   try {
-    const db = el("db").value;
     // /api/memories caps at 200 per request — page through with offset to get them all.
     let fetched = [], offset = 0, total = Infinity;
     while (offset < total && offset < 20000) {
-      const r = await fetch(`/api/memories?db=${encodeURIComponent(db)}&sort=created&limit=200&offset=${offset}`);
+      if (gen !== loadGen || db !== el("db").value) return; // M4: stale pager
+      const r = await fetch(`/api/memories?db=${encodeURIComponent(db)}&sort=created&limit=200&offset=${offset}`, {
+        signal: loadAbort ? loadAbort.signal : undefined,
+      });
       if (!r.ok) throw new Error("HTTP " + r.status);
       const d = await r.json();
       total = (typeof d.total === "number") ? d.total : fetched.length;
@@ -600,13 +639,24 @@ async function loadMems() {
       if (batch.length < 200) break;
       offset += 200;
     }
+    if (gen !== loadGen || db !== el("db").value) return;
     const dupes = new Set(raw?.duplicateIds || []);
+    const supers = supersededSetFromRaw();
     // exclude structural entries (doc fragments/sections) so the timeline matches the
     // graph's real memories — every row then maps to a node we can focus.
-    mems = fetched.filter(m => !isStructural(m)).map(m => ({ ...m, _dupe: dupes.has(m.id) }));
+    // M2: attach _superseded the same way _dupe is attached.
+    mems = fetched.filter(m => !isStructural(m)).map(m => ({
+      ...m,
+      _dupe: dupes.has(m.id),
+      _superseded: supers.has(m.id),
+    }));
     byId = {}; for (const m of mems) byId[m.id] = m;
     drawTimeline();
-  } catch (e) { el("tllist").innerHTML = `<span id="err">load failed: ${esc(e.message)}</span>`; }
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (gen !== loadGen) return;
+    el("tllist").innerHTML = `<span id="err">load failed: ${esc(e.message)}</span>`;
+  }
 }
 const monthLabel = (k) => new Date(k + "-01T00:00:00Z").toLocaleString(undefined, { year: "numeric", month: "long" });
 const MON = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -661,7 +711,12 @@ function drawTimeline() {
   if (!showStatus && stSel.value) stSel.value = "";
   const st = showStatus ? stSel.value : "";
   const favOnly = el("tlfav").classList.contains("active");
-  const rows = all.filter(m =>
+  // M2: re-sync _superseded from graph raw (covers load race + toggle), filter when lineage off.
+  const supers = supersededSetFromRaw();
+  for (const m of all) m._superseded = supers.has(m.id);
+  let pool = all;
+  if (!showLineage()) pool = pool.filter(m => !m._superseded);
+  const rows = pool.filter(m =>
     (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
     (!ty || typeOf(m) === ty) && (!st || statusOf(m) === st) && (!favOnly || isFav(m)));
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
@@ -671,13 +726,18 @@ function drawTimeline() {
     const mon = m.created.slice(0, 7);
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
       h.textContent = monthLabel(mon); list.appendChild(h); }
-    const row = document.createElement("div"); row.className = "trow" + (m._dupe ? " dupe" : "");
+    const row = document.createElement("div");
+    row.className = "trow" + (m._dupe ? " dupe" : "") + (m._superseded ? " superseded-row" : "");
     const typeLabel = hasStatusFilter(typeOf(m)) ? `${typeOf(m)} · ${statusOf(m)}` : typeOf(m);
+    const badges =
+      (m._dupe ? ' · <span class="dup">dup</span>' : "") +
+      (m._superseded ? ' · <span class="sup">superseded</span>' : "");
     row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeLabel)}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
-      `<div class="day">${m.created.slice(0, 10)} · #${m.id}${m._dupe ? ' · <span class="dup">dup</span>' : ''}</div>`;
+      `<div class="day">${m.created.slice(0, 10)} · #${m.id}${badges}</div>`;
     rowById[m.id] = row;
     row.querySelector(".star").onclick = (e) => { e.stopPropagation(); toggleFav(m, row); };
-    row.onclick = () => selectMemory(m.id, m._dupe, m);
+    // Pass superseded explicitly — do not rely on openDetail fallback after paint.
+    row.onclick = () => selectMemory(m.id, m._dupe, m, !!m._superseded);
     list.appendChild(row);
   }
   if (pendingHighlight != null) highlightTimeline(pendingHighlight);
@@ -746,20 +806,51 @@ async function initializeDatabases() {
   }
 }
 
+function clearSelectionState() {
+  selectedId = null; hlNodes = new Set();
+  document.body.classList.remove("panel-open");
+  if (activeRow) { activeRow.classList.remove("active"); activeRow = null; }
+  pendingHighlight = null;
+  el("panel").innerHTML = "";
+}
+
+function setLineageWarn(available) {
+  const w = el("lineage-warn");
+  if (!w) return;
+  w.style.display = available === false ? "block" : "none";
+}
+
 async function load() {
   if (!el("db").value) return;
+  const db = el("db").value;
+  loadDb = db;
+  const gen = ++loadGen;
+  if (loadAbort) try { loadAbort.abort(); } catch (e) {}
+  loadAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
+  // M4: clear selection/detail/timeline synchronously on switch so A cannot paint onto B.
+  clearSelectionState();
+  mems = null; memsLoaded = false; byId = {}; rowById = {};
+  el("tllist").textContent = "loading…";
   statsEl.textContent = "loading…";
   try {
-    const r = await fetch(`/api/graph?db=${encodeURIComponent(el("db").value)}${showDocs ? "&docs=1" : ""}`);
+    const r = await fetch(
+      `/api/graph?db=${encodeURIComponent(db)}${showDocs ? "&docs=1" : ""}`,
+      { signal: loadAbort ? loadAbort.signal : undefined },
+    );
     if (!r.ok) throw new Error("HTTP " + r.status);
-    raw = await r.json(); raw.dupeCount = (raw.duplicateIds || []).length;
+    const data = await r.json();
+    if (gen !== loadGen || el("db").value !== db) return; // stale response
+    raw = data; raw.dupeCount = (raw.duplicateIds || []).length;
+    setLineageWarn(raw.lineageAvailable !== false);
     buildAdj(); buildClusters();
     render();
-    if (selectedId) applyHighlight();
-    memsLoaded = false; mems = null;
-    if (document.body.classList.contains("timeline-open")) loadMems();
-    captureBaseline(); startPolling();   // reset the live-update baseline + keep polling
-  } catch (e) { statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`; }
+    if (document.body.classList.contains("timeline-open")) loadMems(gen);
+    if (gen === loadGen) { captureBaseline(); startPolling(); }
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (gen !== loadGen) return;
+    statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`;
+  }
 }
 
 el("b2d").onclick = () => { mode = "2d"; el("b2d").classList.add("active"); el("b3d").classList.remove("active"); render(); };
@@ -776,7 +867,8 @@ el("tlfav").onclick = () => { el("tlfav").classList.toggle("active"); drawTimeli
 el("db").onchange = () => { rememberDatabase(el("db").value); load(); };
 let t; el("search").oninput = () => { clearTimeout(t); t = setTimeout(render, 200); };
 el("dupes").onchange = render;
-el("lineage").onchange = () => { buildAdj(); render(); };
+// M2: redraw timeline on lineage toggle (not just the canvas).
+el("lineage").onchange = () => { buildAdj(); render(); if (mems) drawTimeline(); };
 addEventListener("keydown", e => { if (e.key === "Escape") { deselect(); } });
 // resume the loop on graph interaction; discrete inputs force-resume (dodge stale
 // state), pointermove just keeps it awake. Pauses again after the trailing idle.

@@ -4,6 +4,7 @@
  */
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+import { buildAssociationEdges, buildLineageMaps } from "./_lineage";
 
 interface Env extends DatabaseEnv {
   MIN_EDGE_SCORE?: string;
@@ -316,8 +317,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   const memories = memoriesResult.results;
 
-  // Fetch all crossrefs (table may not exist on some D1 databases)
+  // Fetch all crossrefs (table may not exist on some D1 databases).
+  // Fail CLOSED for lineage: unknown must not present as "all current".
   const crossrefsMap = new Map<number, Array<{ id: number; score: number; edge_type?: string }>>();
+  let lineageAvailable = true;
   try {
     const crossrefsResult = await db.prepare(
       "SELECT memory_id, related FROM memories_crossrefs"
@@ -328,72 +331,48 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       crossrefsMap.set(cr.memory_id, related);
     }
   } catch {
-    // Table doesn't exist yet — proceed without crossrefs
+    lineageAvailable = false;
   }
 
-  // Build edges. Lineage (supersedes) is first-class and DIRECTED:
-  //   from = newer memory, to = older memory it replaces.
-  // Similarity / related_to edges stay undirected. Other typed edges
-  // (references, extends, …) are included with edge_type for the UI.
-  //
-  // Previously supersedes edges either collapsed into undirected
-  // similarity links (no edge_type) or were only mentioned when
-  // filtering DUPLICATE pairs — so the graph could not render lineage.
+  // Lineage: normalize BOTH halves (supersedes + superseded_by) into canonical
+  // newer→older, then dedupe. Association edges are separate and never directed
+  // for lineage styling (only edge_type === "supersedes" is lineage).
+  const lineage = lineageAvailable
+    ? buildLineageMaps(crossrefsMap.entries())
+    : { supersededBy: new Map(), supersedesMap: new Map(), supersedesEdges: [] };
+  const supersededBy = lineage.supersededBy;
+  const supersedesMap = lineage.supersedesMap;
+
   const edges: GraphEdge[] = [];
-  const seen = new Set<string>();
   let edgeId = 0;
-  const supersededBy = new Map<number, Set<number>>(); // older -> set(newer)
-  const supersedesMap = new Map<number, Set<number>>(); // newer -> set(older)
+  const edgeSeen = new Set<string>();
 
-  for (const m of memories) {
-    const refs = crossrefsMap.get(m.id) || [];
-    for (const ref of refs) {
-      if (!ref || typeof ref.id !== "number" || ref.id === m.id) continue;
-      const edgeType = ref.edge_type || "related_to";
-      const score = typeof ref.score === "number" ? ref.score : 0;
-
-      // Lineage: record on the side that holds edge_type === "supersedes"
-      // (storage writes bidirectional supersedes / superseded_by).
-      if (edgeType === "supersedes") {
-        if (!supersedesMap.has(m.id)) supersedesMap.set(m.id, new Set());
-        supersedesMap.get(m.id)!.add(ref.id);
-        if (!supersededBy.has(ref.id)) supersededBy.set(ref.id, new Set());
-        supersededBy.get(ref.id)!.add(m.id);
-        const dirKey = `sup-${m.id}->${ref.id}`;
-        if (!seen.has(dirKey)) {
-          seen.add(dirKey);
-          edges.push({
-            id: edgeId++,
-            from: m.id,
-            to: ref.id,
-            edge_type: "supersedes",
-            score,
-            directed: true,
-          });
-        }
-        continue;
-      }
-      if (edgeType === "superseded_by") {
-        // Mirror of supersedes; avoid double-counting directed edges.
-        continue;
-      }
-
-      // Similarity / association edges (and other typed non-lineage links).
-      if (edgeType === "related_to" || !ref.edge_type) {
-        if (score <= minScore) continue;
-      }
-      const edgeKey = `rel-${Math.min(m.id, ref.id)}-${Math.max(m.id, ref.id)}-${edgeType}`;
-      if (!seen.has(edgeKey)) {
-        seen.add(edgeKey);
-        edges.push({
-          id: edgeId++,
-          from: m.id,
-          to: ref.id,
-          edge_type: edgeType,
-          score,
-          directed: edgeType !== "related_to",
-        });
-      }
+  if (lineageAvailable) {
+    for (const le of lineage.supersedesEdges) {
+      const key = `sup-${le.from}->${le.to}`;
+      if (edgeSeen.has(key)) continue;
+      edgeSeen.add(key);
+      edges.push({
+        id: edgeId++,
+        from: le.from,
+        to: le.to,
+        edge_type: "supersedes",
+        score: le.score,
+        directed: true,
+      });
+    }
+    for (const ae of buildAssociationEdges(crossrefsMap.entries(), minScore)) {
+      const key = `rel-${Math.min(ae.from, ae.to)}-${Math.max(ae.from, ae.to)}-${ae.edge_type}`;
+      if (edgeSeen.has(key)) continue;
+      edgeSeen.add(key);
+      edges.push({
+        id: edgeId++,
+        from: ae.from,
+        to: ae.to,
+        edge_type: ae.edge_type,
+        score: ae.score,
+        directed: false,
+      });
     }
   }
 
@@ -487,8 +466,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     else if (isTodo(meta)) typeLabel = " - TODO";
 
     const isSuperseded = supersededBy.has(m.id);
-    const supersededByIds = isSuperseded ? Array.from(supersededBy.get(m.id)!) : undefined;
-    const supersedesIds = supersedesMap.has(m.id) ? Array.from(supersedesMap.get(m.id)!) : undefined;
+    const supersededByIds: number[] | undefined = isSuperseded
+      ? Array.from(supersededBy.get(m.id) as Set<number>)
+      : undefined;
+    const supersedesIds: number[] | undefined = supersedesMap.has(m.id)
+      ? Array.from(supersedesMap.get(m.id) as Set<number>)
+      : undefined;
     const lineageLabel = isSuperseded
       ? " - SUPERSEDED"
       : (supersedesIds && supersedesIds.length ? " - supersedes older" : "");
@@ -566,8 +549,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     }
     const addEdge = (a: number, b: number) => {
       if (a === b) return;
-      const k = [Math.min(a, b), Math.max(a, b)].join("-");
-      if (!seen.has(k)) { seen.add(k); edges.push({ id: edgeId++, from: a, to: b }); }
+      const k = `doc-${Math.min(a, b)}-${Math.max(a, b)}`;
+      if (!edgeSeen.has(k)) {
+        edgeSeen.add(k);
+        edges.push({ id: edgeId++, from: a, to: b, edge_type: "document", directed: false });
+      }
     };
     byDoc.forEach((frags, dk) => {
       frags.sort((a, b) => a.ord - b.ord);
@@ -669,11 +655,11 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   // Build cluster data using Louvain on crossrefs
   const nodeIds = nodes.map(n => n.id);
+  const nodeIdSet = new Set(nodeIds);
   const clusterData = buildClusterData(crossrefsMap, nodeIds, 0.4, 3);
 
-  const supersededIds = Array.from(supersededBy.keys()).filter(id =>
-    nodes.some(n => n.id === id)
-  );
+  // O(S) with Set — not O(S×N) linear scan per key.
+  const supersededIds = Array.from(supersededBy.keys()).filter(id => nodeIdSet.has(id));
 
   return Response.json({
     nodes,
@@ -688,12 +674,14 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     todoCategoryToNodes,
     duplicateIds: Array.from(duplicateIds),
     duplicatePairCount: duplicatePairKeys.size,
+    /** False when crossrefs could not be read — UI must not treat as "all current". */
+    lineageAvailable,
     /** Node ids that are not current (have a supersedes successor). */
     supersededIds,
     supersededCount: supersededIds.length,
     /** Directed lineage edges only (from=newer, to=older). */
-    supersedesEdges: edges
-      .filter(e => e.edge_type === "supersedes")
+    supersedesEdges: lineage.supersedesEdges
+      .filter(e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to))
       .map(e => ({ from: e.from, to: e.to, score: e.score })),
     nodeTimestamps,
     minDate,
