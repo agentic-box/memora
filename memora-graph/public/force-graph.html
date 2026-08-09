@@ -1011,19 +1011,53 @@ function clearCanvasForSwitch(msg) {
   statsEl.textContent = msg || "loading…";
 }
 
+/**
+ * J1: pure decision after raw commits — reconcile CURRENT selection, not a start snapshot.
+ * Covers: kept selection, A→B mid-refresh, none→B, deselect, panel closed, B deleted,
+ * and B's authority changed (panel re-derived from NEW graphNode + forceFetch).
+ * panelOpen is "is the panel open RIGHT NOW", not whether it was open at request start.
+ */
+function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds) {
+  if (curSelectedId == null) return { type: "none" };
+  const graphNode = (nodes || []).find(n => n.id === curSelectedId);
+  if (!graphNode) return { type: "clear" };
+  return {
+    type: "refresh",
+    id: curSelectedId,
+    openDetail: !!panelOpenNow,
+    isDupe: Array.isArray(duplicateIds) && duplicateIds.includes(curSelectedId),
+    superseded: !!graphNode.superseded,
+    authority_unknown: !!graphNode.authority_unknown,
+  };
+}
+
+/** Apply J1 plan against live UI state (call only after raw = new graph). */
+function applySelectionReconcile(plan) {
+  if (!plan || plan.type === "none") return;
+  if (plan.type === "clear") {
+    clearSelectionState();
+    return;
+  }
+  // type === "refresh"
+  setHighlight(plan.id);
+  if (plan.openDetail) {
+    openDetail(plan.id, plan.isDupe, null, plan.superseded, { forceFetch: true });
+  }
+}
+
 async function load() {
   if (!el("db").value) return;
   const db = el("db").value;
   const dbChanged = loadDb !== "" && loadDb !== db;
-  const prevSelected = selectedId;
-  const panelWasOpen = document.body.classList.contains("panel-open");
+  // Snapshot only for the in-flight "refreshing…" shell — NOT for post-commit restore (J1).
+  const startSelected = selectedId;
+  const startPanelOpen = document.body.classList.contains("panel-open");
   loadDb = db;
   const gen = ++loadGen;
   if (loadAbort) try { loadAbort.abort(); } catch (e) {}
   loadAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
 
-  // F2/F3: on DB change, clear canvas + selection so A cannot show under B's name.
-  // On same-DB reload, keep selection if the id survives the new payload.
+  // F2: on DB change, clear canvas + selection so A cannot show under B's name.
   if (dbChanged) {
     clearSelectionState();
     clearCanvasForSwitch(`loading ${db}…`);
@@ -1031,15 +1065,14 @@ async function load() {
     el("tllist").textContent = "loading…";
   } else {
     statsEl.textContent = "loading…";
-    // G1: abort in-flight detail must not leave "loading…" forever.
-    // If the panel is open we will re-openDetail after commit; mark it refreshing now
-    // so an AbortError mid-fetch cannot strand the shell on a permanent "loading…".
-    if (panelWasOpen) {
+    // G1: if panel is open at start, mark refreshing so abort cannot strand "loading…".
+    // A selection made DURING the request will open its own panel and then J1 re-derives it.
+    if (startPanelOpen && startSelected != null) {
       const panel = el("panel");
       if (panel) {
         panel.innerHTML =
           `<button class="close" onclick="closePane()">✕</button>` +
-          `<h2>#${prevSelected}</h2><div class="meta">refreshing…</div>`;
+          `<h2>#${startSelected}</h2><div class="meta">refreshing…</div>`;
       }
     }
   }
@@ -1054,29 +1087,23 @@ async function load() {
     if (gen !== loadGen || el("db").value !== db) return; // stale response
     raw = data;
     raw.dupeCount = Array.isArray(raw.duplicateIds) ? raw.duplicateIds.length : 0;
-    // H4: one combined integrity banner from BOTH flags (crossrefs path was unreachable)
+    // H4: one combined integrity banner from BOTH flags
     setIntegrityUiState(
       raw.lineageAvailable !== false,
       raw.crossrefsAvailable !== false,
     );
     buildAdj(); buildClusters();
     render();
-    // F3 + G1 + H3: restore selection only if user still has the SAME selection and
-    // (for panel re-open) the panel is still open — do not stomp a mid-refresh deselect
-    // or a newer selection. forceFetch so content is not stale byId.
-    if (!dbChanged && prevSelected != null && selectedId === prevSelected) {
-      const graphNode = (raw.nodes || []).find(n => n.id === prevSelected);
-      if (graphNode) {
-        setHighlight(prevSelected);
-        const panelStillOpen = document.body.classList.contains("panel-open");
-        if (panelWasOpen && panelStillOpen) {
-          const isDupe = Array.isArray(raw.duplicateIds) && raw.duplicateIds.includes(prevSelected);
-          openDetail(prevSelected, isDupe, null, !!graphNode.superseded, { forceFetch: true });
-        }
-      } else {
-        clearSelectionState();
-      }
-    }
+    // J1: reconcile CURRENT selection after commit (read NOW — not start snapshot).
+    // One rule covers kept A, A→B mid-flight, none→B, deselect, panel closed, B deleted,
+    // and authority change on the open panel (the measured fail case).
+    const plan = planSelectionReconcile(
+      selectedId,
+      document.body.classList.contains("panel-open"),
+      raw.nodes || [],
+      raw.duplicateIds,
+    );
+    applySelectionReconcile(plan);
     if (document.body.classList.contains("timeline-open")) loadMems(gen);
     if (gen === loadGen) { captureBaseline(gen, db); startPolling(); }
   } catch (e) {
@@ -1085,13 +1112,13 @@ async function load() {
     // F2: on failed load after DB switch, do not leave previous graph labelled as new DB
     if (dbChanged) clearCanvasForSwitch(`failed to load ${db}`);
     statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`;
-    // G1: same-DB failure must not leave panel on "refreshing…" forever
-    if (!dbChanged && panelWasOpen && prevSelected != null) {
+    // Same-DB failure: if panel is open RIGHT NOW, surface failure (do not invent restore).
+    if (!dbChanged && document.body.classList.contains("panel-open") && selectedId != null) {
       const panel = el("panel");
       if (panel) {
         panel.innerHTML =
           `<button class="close" onclick="closePane()">✕</button>` +
-          `<h2>#${prevSelected}</h2>` +
+          `<h2>#${selectedId}</h2>` +
           `<div class="meta"><span id="err">refresh failed — selection kept, panel stale</span></div>`;
       }
     }

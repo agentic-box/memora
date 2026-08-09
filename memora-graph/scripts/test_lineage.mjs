@@ -217,15 +217,95 @@ function timelineRowClass(flags) {
   assert(/authorityUnknownSetFromRaw/.test(html), "H2 source: authorityUnknownSetFromRaw helper");
 }
 
-// --- H3: forceFetch + restore race ---
+// --- H3: forceFetch still required for content freshness ---
 {
   assert(/forceFetch/.test(html), "H3: openDetail supports forceFetch");
-  assert(/selectedId\s*===\s*prevSelected/.test(html), "H3: restore only if selectedId still prevSelected");
-  assert(/panelStillOpen|panel-open/.test(html) && /panelWasOpen\s*&&\s*panelStillOpen/.test(html),
-    "H3: restore panel only if still open");
-  assert(/forceFetch:\s*true/.test(html), "H3: same-DB re-open uses forceFetch:true");
+  assert(/forceFetch:\s*true/.test(html), "H3: reconcile openDetail uses forceFetch:true");
   assert(/delete byId\[id\]/.test(html) || /delete byId\[/.test(html),
     "H3: forceFetch clears byId entry");
+}
+
+// --- J1: reconcile CURRENT selection after raw commit (decision table) ---
+// Mirrors planSelectionReconcile in force-graph.html — must stay identical.
+function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds) {
+  if (curSelectedId == null) return { type: "none" };
+  const graphNode = (nodes || []).find(n => n.id === curSelectedId);
+  if (!graphNode) return { type: "clear" };
+  return {
+    type: "refresh",
+    id: curSelectedId,
+    openDetail: !!panelOpenNow,
+    isDupe: Array.isArray(duplicateIds) && duplicateIds.includes(curSelectedId),
+    superseded: !!graphNode.superseded,
+    authority_unknown: !!graphNode.authority_unknown,
+  };
+}
+
+{
+  const nodesBefore = [
+    { id: 1, superseded: false },
+    { id: 3, superseded: false, supersedes: [2] },
+  ];
+  const nodesAfterAuth = [
+    { id: 1, superseded: false },
+    { id: 3, superseded: true, superseded_by: [5] }, // #5 supersedes #3 mid-refresh
+  ];
+  const nodesWithout3 = [
+    { id: 1, superseded: false },
+    { id: 5, superseded: false },
+  ];
+
+  // Case 1: none→B during refresh — selection made mid-flight must reconcile
+  {
+    const plan = planSelectionReconcile(3, true, nodesAfterAuth, []);
+    assert(plan.type === "refresh" && plan.id === 3 && plan.openDetail === true,
+      "J1 none→B: refresh open panel for B");
+    assert(plan.superseded === true, "J1 none→B: authority from NEW graph (superseded)");
+  }
+
+  // Case 2: A→B during refresh — do not require selectedId === start snapshot
+  {
+    // start had #1; mid-flight user picked #3; after commit cur=3
+    const plan = planSelectionReconcile(3, true, nodesAfterAuth, []);
+    assert(plan.type === "refresh" && plan.id === 3,
+      "J1 A→B: reconciles CURRENT id 3 (not start snapshot 1)");
+    assert(plan.openDetail === true && plan.superseded === true,
+      "J1 A→B: panel re-opens with NEW superseded=true (measured fail case)");
+  }
+
+  // Case 3: B deleted during refresh
+  {
+    const plan = planSelectionReconcile(3, true, nodesWithout3, []);
+    assert(plan.type === "clear", "J1 B deleted: clear selection when id gone from new graph");
+  }
+
+  // Case 4: B's authority CHANGED during refresh (leader repro: #3 becomes superseded)
+  {
+    const before = planSelectionReconcile(3, true, nodesBefore, []);
+    const after = planSelectionReconcile(3, true, nodesAfterAuth, []);
+    assert(before.superseded === false, "J1 authority: before refresh #3 not superseded");
+    assert(after.superseded === true, "J1 authority: after refresh #3 superseded from NEW node");
+    assert(after.openDetail === true && after.type === "refresh",
+      "J1 authority: open panel is re-derived (not left on stale 'Supersedes older')");
+  }
+
+  // Extra: deselect mid-refresh → none
+  assert(planSelectionReconcile(null, false, nodesAfterAuth, []).type === "none",
+    "J1 deselect: no reconcile when selectedId is null");
+  // Extra: selection kept, panel closed → highlight only
+  {
+    const plan = planSelectionReconcile(3, false, nodesAfterAuth, []);
+    assert(plan.type === "refresh" && plan.openDetail === false,
+      "J1 panel closed: setHighlight only, do not force-open panel");
+  }
+
+  // Source: load uses planSelectionReconcile(selectedId, …) — not start-snapshot equality
+  assert(/function planSelectionReconcile\s*\(/.test(html), "J1 source: planSelectionReconcile defined");
+  assert(/planSelectionReconcile\(\s*selectedId/.test(html),
+    "J1 source: load reads selectedId NOW after commit");
+  assert(!/selectedId\s*===\s*prevSelected/.test(html),
+    "J1 source: no start-snapshot selectedId===prevSelected guard");
+  assert(/applySelectionReconcile/.test(html), "J1 source: applySelectionReconcile applies plan");
 }
 
 // --- H4: combined integrity warning + link counts ---
@@ -277,9 +357,11 @@ function timelineRowClass(flags) {
   assert(isLineageEdgeType("supersedes") && !isLineageEdgeType("references"), "M1 lineage type gate");
 }
 
-// --- G1 retained: panel re-derive ---
+// --- G1 retained: panel re-derive (via J1 reconcile, not start snapshot) ---
 {
-  assert(/openDetail\(\s*prevSelected/.test(html), "G1: re-calls openDetail on same-DB");
+  assert(/applySelectionReconcile\(plan\)/.test(html), "G1/J1: applySelectionReconcile after raw commit");
+  assert(/openDetail\(plan\.id/.test(html) || /openDetail\(plan\.id,/.test(html),
+    "G1/J1: openDetail from plan.id (current selection)");
   assert(/refreshing…/.test(html), "G1: refreshing shell on abort");
 }
 
