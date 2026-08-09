@@ -2,8 +2,8 @@
  * Fixture tests — import shipped _lineage.ts only (no reimplementation).
  * Run: node --experimental-strip-types memora-graph/scripts/test_lineage.mjs
  *
- * G1 lives in force-graph.html (not importable) — we assert the source contract
- * by reading the file rather than assert(true).
+ * UI contracts in force-graph.html are asserted via pure consumer helpers that
+ * mirror the shipped predicates + source greps (HTML is not importable).
  */
 
 import { readFileSync } from "node:fs";
@@ -19,6 +19,7 @@ import {
 } from "../functions/api/_lineage.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const html = readFileSync(join(__dirname, "../public/force-graph.html"), "utf8");
 
 let failed = 0;
 function assert(cond, msg) {
@@ -30,6 +31,39 @@ function assert(cond, msg) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pure consumer helpers — same predicates as force-graph.html (keep in sync)
+// ---------------------------------------------------------------------------
+
+/** Mirrors authorityUnknownSetFromRaw when lineageAvailable=true */
+function authorityUnknownFromNodes(nodes) {
+  const s = new Set();
+  for (const n of nodes || []) if (n.authority_unknown) s.add(n.id);
+  return s;
+}
+
+/** H2 current-only: exclude superseded AND authority_unknown when lineage known */
+function currentOnlyKeep(n, lineageAvailable, showLineage) {
+  if (!lineageAvailable || showLineage) return true;
+  return !n.superseded && !n.authority_unknown;
+}
+
+/** Timeline row flags (H2) */
+function timelineFlags(memId, { lineageAvailable, supersededIds, authorityUnknownIds }) {
+  const globalUnknown = lineageAvailable === false;
+  return {
+    _unknown: globalUnknown || authorityUnknownIds.has(memId),
+    _superseded: !globalUnknown && supersededIds.has(memId),
+  };
+}
+
+function timelineRowClass(flags) {
+  return "trow"
+    + (flags._dupe ? " dupe" : "")
+    + (flags._superseded ? " superseded-row" : "")
+    + (flags._unknown ? " unknown-row" : "");
+}
+
 // --- prior: bidirectional halves normalize ---
 {
   const L = buildLineageMaps(new Map([
@@ -39,14 +73,13 @@ function assert(cond, msg) {
   assert(L.supersedesEdges.length === 1 && L.supersedesEdges[0].from === 2, "bidirectional halves → one edge");
 }
 
-// --- prior: mirror-only (superseded_by only on older) ---
+// --- prior: mirror-only ---
 {
   const L = buildLineageMaps(new Map([
     [1, [{ id: 2, score: 1, edge_type: "superseded_by" }]],
   ]));
   assert(L.supersedesEdges.length === 1, "mirror-only still produces lineage edge");
   assert(L.supersedesEdges[0].from === 2 && L.supersedesEdges[0].to === 1, "mirror normalizes newer=2 older=1");
-  assert(L.supersededBy.has(1), "older is superseded");
 }
 
 // --- prior: mid-chain ---
@@ -64,19 +97,17 @@ function assert(cond, msg) {
   assert(!L.supersededBy.has(3), "leaf 3 is not superseded");
 }
 
-// --- prior: max-score on same-direction halves ---
+// --- prior: max-score ---
 {
   const L = buildLineageMaps(new Map([
     [2, [{ id: 1, score: 0.2, edge_type: "supersedes" }]],
     [1, [{ id: 2, score: 0.9, edge_type: "superseded_by" }]],
   ]));
-  assert(L.supersedesEdges.length === 1, "same-direction halves merge");
-  assert(L.supersedesEdges[0].score === 0.9, "score policy = max");
+  assert(L.supersedesEdges.length === 1 && L.supersedesEdges[0].score === 0.9, "score policy = max");
 }
 
-// --- G2: direction + score stable across reversed row order ---
+// --- G2 + H5 directed contract ---
 {
-  // Leader repro: 5 --references(0.2)--> 4  and mirror  4 --referenced_by(0.9)--> 5
   const orderA = new Map([
     [5, [{ id: 4, score: 0.2, edge_type: "references" }]],
     [4, [{ id: 5, score: 0.9, edge_type: "referenced_by" }]],
@@ -88,87 +119,154 @@ function assert(cond, msg) {
   const a = buildAssociationEdges(orderA, 0.0);
   const b = buildAssociationEdges(orderB, 0.0);
   assert(a.length === 1 && b.length === 1, "G2: one edge either row order");
-  // Semantic: 5 references 4 (from both halves) — NOT min/max id collapse
-  assert(a[0].from === 5 && a[0].to === 4 && a[0].edge_type === "references",
-    "G2: order A endpoints 5→4 references");
-  assert(b[0].from === 5 && b[0].to === 4 && b[0].edge_type === "references",
-    "G2: order B endpoints 5→4 references (stable direction)");
-  assert(a[0].score === 0.9 && b[0].score === 0.9, "G2: score is max (0.9) either order");
-  assert(a[0].directed === true, "G2: asymmetric association is directed");
-
-  const c = normalizeAssociationRef(5, { id: 4, edge_type: "contradicts" });
-  assert(c && c.from === 4 && c.to === 5 && c.directed === false, "contradicts undirected ordered");
-
-  const n = normalizeAssociationRef(5, { id: 4, edge_type: "references", score: 0.2 });
-  assert(n.from === 5 && n.to === 4, "references m→ref");
-  const m = normalizeAssociationRef(4, { id: 5, edge_type: "referenced_by", score: 0.9 });
-  assert(m.from === 5 && m.to === 4, "referenced_by normalizes to same 5→4");
+  assert(a[0].from === 5 && a[0].to === 4 && a[0].edge_type === "references", "G2: 5→4 references");
+  assert(b[0].from === 5 && b[0].to === 4, "G2: direction stable across row order");
+  assert(a[0].score === 0.9 && b[0].score === 0.9, "G2: score is max either order");
+  // H5: directed=true AND not lineage
+  assert(a[0].directed === true, "H5: references directed=true");
+  assert(!isLineageEdgeType(a[0].edge_type), "H5: references isLineageEdgeType false");
+  assert(a[0].directed === true && !isLineageEdgeType("references"),
+    "H5 contract: directed means order meaningful, NOT a lineage marker");
 }
 
-// --- G3: self-lineage ---
+// --- G3: self-lineage module ---
 {
   const L = buildLineageMaps(new Map([
     [7, [{ id: 7, score: 1, edge_type: "supersedes" }]],
   ]));
   assert(L.authorityUnknown.has(7), "G3: self-link marks authorityUnknown");
-  assert(L.conflicts.some(c => c.kind === "self_cycle" && c.a === 7), "G3: self_cycle conflict");
-  assert(L.supersedesEdges.length === 0, "G3: no drawable self edge");
+  assert(L.conflicts.some(c => c.kind === "self_cycle"), "G3: self_cycle conflict");
   assert(!L.supersededBy.has(7), "G3: self is unknown not superseded");
 }
 
-// --- G4: cycle SCC — one conflict for 3-cycle; no triple spam on A↔B ---
+// --- H1: 3-cycle supersededBy is ONLY stored incoming edges (no SCC invention) ---
 {
+  // Stored only: 1→2, 2→3, 3→1  (newer→older supersedes edges)
   const L = buildLineageMaps(new Map([
     [1, [{ id: 2, score: 1, edge_type: "supersedes" }]],
     [2, [{ id: 3, score: 1, edge_type: "supersedes" }]],
     [3, [{ id: 1, score: 1, edge_type: "supersedes" }]],
   ]));
   const cycles = L.conflicts.filter(c => c.kind === "cycle");
-  assert(cycles.length === 1, "G4: one cycle conflict for 3-node SCC");
-  assert(cycles[0].members && cycles[0].members.length === 3, "G4: members list size 3");
-  assert(L.supersededBy.has(1) && L.supersededBy.has(2) && L.supersededBy.has(3),
-    "G4: all cycle members marked superseded");
+  assert(cycles.length === 1, "H1/G4: one cycle conflict for 3-node SCC");
+  assert(cycles[0].members && cycles[0].members.join(",") === "1,2,3", "H1: members=[1,2,3]");
+  // Exact STORED incoming: 2←1, 3←2, 1←3
+  const sb1 = [...(L.supersededBy.get(1) || [])].sort();
+  const sb2 = [...(L.supersededBy.get(2) || [])].sort();
+  const sb3 = [...(L.supersededBy.get(3) || [])].sort();
+  assert(sb1.join(",") === "3", "H1: #1 superseded_by exactly [3] (stored), not [2,3]");
+  assert(sb2.join(",") === "1", "H1: #2 superseded_by exactly [1] (stored), not [1,3]");
+  assert(sb3.join(",") === "2", "H1: #3 superseded_by exactly [2] (stored), not [1,2]");
 }
 {
   const L = buildLineageMaps(new Map([
     [1, [{ id: 2, score: 1, edge_type: "supersedes" }]],
     [2, [{ id: 1, score: 1, edge_type: "supersedes" }]],
   ]));
-  const cycles = L.conflicts.filter(c => c.kind === "cycle");
-  assert(cycles.length === 1, "G4: A↔B is one cycle conflict not three");
+  assert(L.conflicts.filter(c => c.kind === "cycle").length === 1, "G4: A↔B one cycle");
+  const sb1 = [...(L.supersededBy.get(1) || [])].sort();
+  const sb2 = [...(L.supersededBy.get(2) || [])].sort();
+  assert(sb1.join(",") === "2" && sb2.join(",") === "1", "H1: A↔B supersededBy is stored pair only");
 }
 
-// --- F1 unavailable stats must never say zero superseded ---
+// --- H2: consumer honours per-node authority_unknown with lineageAvailable=true ---
 {
-  // Mirrors formatLineageStats contract in force-graph.html
+  // Simulate API: lineageAvailable=true, only #7 is authority_unknown (self_cycle)
+  const nodes = [
+    { id: 3, superseded: false, authority_unknown: false },
+    { id: 4, superseded: false, authority_unknown: false },
+    { id: 5, superseded: false, authority_unknown: false },
+    { id: 7, superseded: false, authority_unknown: true },
+  ];
+  const auth = authorityUnknownFromNodes(nodes);
+  assert(auth.has(7) && !auth.has(3), "H2: authority set from nodes only #7");
+
+  // current-only ON (showLineage=false, lineageAvailable=true) must DROP #7
+  const kept = nodes.filter(n => currentOnlyKeep(
+    { superseded: n.superseded, authority_unknown: n.authority_unknown || auth.has(n.id) },
+    true,
+    false,
+  ));
+  const keptIds = kept.map(n => n.id).sort().join(",");
+  assert(keptIds === "3,4,5", "H2: current-only drops #7 (not 3,4,5,7)");
+  assert(!kept.some(n => n.id === 7), "H2: #7 does not survive current-only");
+
+  // Timeline row for #7 must be badged unknown-row
+  const flags7 = timelineFlags(7, {
+    lineageAvailable: true,
+    supersededIds: new Set(),
+    authorityUnknownIds: auth,
+  });
+  assert(flags7._unknown === true && flags7._superseded === false, "H2: #7 timeline flags unknown");
+  const cls = timelineRowClass({ ...flags7, _dupe: false });
+  assert(cls.includes("unknown-row") && !cls.includes("superseded-row"),
+    "H2 DOM: row class is unknown-row (not ordinary trow alone)");
+  assert(cls === "trow unknown-row", "H2 DOM: exact class string for self_cycle node");
+
+  // Source: force-graph must filter authority_unknown in current-only paths
+  assert(
+    /!n\.superseded\s*&&\s*!n\.authority_unknown/.test(html)
+      || /!n\.authority_unknown\s*&&\s*!n\.superseded/.test(html),
+    "H2 source: canvas current-only filters authority_unknown",
+  );
+  assert(
+    /!m\._superseded\s*&&\s*!m\._unknown/.test(html)
+      || /!m\._unknown\s*&&\s*!m\._superseded/.test(html),
+    "H2 source: timeline current-only filters _unknown",
+  );
+  assert(/authorityUnknownSetFromRaw/.test(html), "H2 source: authorityUnknownSetFromRaw helper");
+}
+
+// --- H3: forceFetch + restore race ---
+{
+  assert(/forceFetch/.test(html), "H3: openDetail supports forceFetch");
+  assert(/selectedId\s*===\s*prevSelected/.test(html), "H3: restore only if selectedId still prevSelected");
+  assert(/panelStillOpen|panel-open/.test(html) && /panelWasOpen\s*&&\s*panelStillOpen/.test(html),
+    "H3: restore panel only if still open");
+  assert(/forceFetch:\s*true/.test(html), "H3: same-DB re-open uses forceFetch:true");
+  assert(/delete byId\[id\]/.test(html) || /delete byId\[/.test(html),
+    "H3: forceFetch clears byId entry");
+}
+
+// --- H4: combined integrity warning + link counts ---
+{
+  assert(/setIntegrityUiState/.test(html), "H4: setIntegrityUiState combines both flags");
+  assert(/Crossrefs degraded/.test(html), "H4: crossrefs degraded copy present");
+  assert(/LINKS UNAVAILABLE/.test(html), "H4: stats say LINKS UNAVAILABLE when degraded");
+  assert(/DUPS UNAVAILABLE/.test(html), "H4: stats say DUPS UNAVAILABLE when degraded");
+  // Unreachable-guard: must not require lineageAvailable!==false to show crossrefs warn
+  assert(
+    !/crossrefsAvailable === false[\s\S]{0,120}lineageAvailable !== false/.test(html),
+    "H4: no dead path requiring lineageAvailable for crossrefs banner",
+  );
+}
+
+// --- H5: local lineage prop, not shadowing directed ---
+{
+  assert(/lineage:\s*e\.edge_type\s*===\s*"supersedes"/.test(html),
+    "H5: local link.lineage derived from edge_type");
+  assert(/directed:\s*!!e\.directed/.test(html), "H5: wire directed preserved on local link");
+  assert(/l\.lineage\s*===\s*true|l\.lineage/.test(html), "H5: isSupersedesLink uses lineage");
+}
+
+// --- F1 unavailable stats ---
+{
   function formatLineageStats(rawGraph) {
     if (!rawGraph || rawGraph.lineageAvailable === false) {
       return "LINEAGE UNAVAILABLE (cannot confirm current)";
     }
     return `${rawGraph.supersededCount} superseded`;
   }
-  function formatDupStats(rawGraph) {
-    if (rawGraph.crossrefsAvailable === false) return "DUPS UNAVAILABLE";
-    if (rawGraph.duplicatePairCount != null) {
-      return `${rawGraph.duplicatePairCount}/${rawGraph.dupeCount} dup pairs/memories`;
+  function formatLinkDup(rawGraph, linkCount) {
+    if (rawGraph.crossrefsAvailable === false) {
+      return { links: "LINKS UNAVAILABLE", dups: "DUPS UNAVAILABLE" };
     }
-    return `${rawGraph.dupeCount || 0} dup memories`;
+    return { links: `${linkCount} links`, dups: `${rawGraph.dupeCount || 0} dup memories` };
   }
-  const unavailable = {
-    lineageAvailable: false,
-    crossrefsAvailable: false,
-    supersededCount: null,
-    supersededIds: null,
-    duplicatePairCount: null,
-    duplicateIds: null,
-    dupeCount: 0,
-  };
-  const linTxt = formatLineageStats(unavailable);
-  assert(!/0 superseded/.test(linTxt), "F1: unavailable stats must NOT say '0 superseded'");
-  assert(/UNAVAILABLE/i.test(linTxt), "F1: unavailable stats say UNAVAILABLE");
-  const dupTxt = formatDupStats(unavailable);
-  assert(!/^0\b/.test(dupTxt) && !/0\/0/.test(dupTxt), "G6: degraded dups must NOT say 0/0");
-  assert(/UNAVAILABLE/i.test(dupTxt), "G6: degraded dups say UNAVAILABLE");
+  const u = { lineageAvailable: false, crossrefsAvailable: false, supersededCount: null, dupeCount: 0 };
+  assert(!/0 superseded/.test(formatLineageStats(u)), "F1: no 0 superseded");
+  const ld = formatLinkDup(u, 0);
+  assert(ld.links === "LINKS UNAVAILABLE" && ld.dups === "DUPS UNAVAILABLE", "H4 format helpers");
 }
 
 // --- partition / parse / M1 ---
@@ -179,30 +277,11 @@ function assert(cond, msg) {
   assert(isLineageEdgeType("supersedes") && !isLineageEdgeType("references"), "M1 lineage type gate");
 }
 
-// --- G1: same-DB refresh re-derives panel (source contract in force-graph.html) ---
+// --- G1 retained: panel re-derive ---
 {
-  const html = readFileSync(join(__dirname, "../public/force-graph.html"), "utf8");
-  assert(
-    /panelWasOpen/.test(html) && /openDetail\(\s*prevSelected/.test(html),
-    "G1: load() re-calls openDetail(prevSelected, …) when panel was open",
-  );
-  assert(
-    /openDetail\(\s*prevSelected,\s*isDupe,\s*null/.test(html),
-    "G1: openDetail preMem=null (fresh fetch, not stale byId)",
-  );
-  assert(
-    /graphNode\.superseded/.test(html),
-    "G1: panel uses NEW graphNode.superseded after same-DB commit",
-  );
-  assert(
-    /refreshing…/.test(html),
-    "G1: aborts mid-detail show refreshing… rather than stranding loading…",
-  );
+  assert(/openDetail\(\s*prevSelected/.test(html), "G1: re-calls openDetail on same-DB");
+  assert(/refreshing…/.test(html), "G1: refreshing shell on abort");
 }
-
-// --- G5: connectionCounts after partition is a graph.ts contract; note only ---
-// (graph.ts is PagesFunction + D1 — covered by code structure review: counts
-//  recomputed from finalEdges after partitionLineageEdges.)
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);

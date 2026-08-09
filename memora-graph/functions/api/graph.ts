@@ -58,7 +58,12 @@ interface GraphEdge {
   edge_type?: string;
   /** Cosine or link score when available. */
   score?: number;
-  /** True for lineage edges (supersedes): from = newer, to = older. */
+  /**
+   * directed means source/target ORDER IS MEANINGFUL — not a lineage marker.
+   * True for every semantically asymmetric relation (supersedes, references,
+   * implements, extends, …). Lineage is edge_type === "supersedes", full stop.
+   * Clients must not re-derive semantic direction after reverse-half normalisation.
+   */
   directed?: boolean;
 }
 

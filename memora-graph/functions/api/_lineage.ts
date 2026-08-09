@@ -34,7 +34,11 @@ export type AssociationEdge = {
   to: number;
   edge_type: string;
   score: number;
-  /** True for asymmetric relations (references/implements/extends). False for related_to/contradicts. */
+  /**
+   * directed means source/target ORDER IS MEANINGFUL (asymmetric relation).
+   * It is NOT a lineage marker. Lineage is edge_type === "supersedes", full stop.
+   * True for references/implements/extends; false for related_to/contradicts.
+   */
   directed: boolean;
 };
 
@@ -173,16 +177,13 @@ function finalizeLineageConflicts(maps: LineageMaps): void {
     if (!outs.has(e.from)) outs.set(e.from, []);
     outs.get(e.from)!.push(e.to);
   }
+  // H1: SCC detection emits ONE conflict with members[] only.
+  // Do NOT mutate supersededBy — that invents "X superseded by Y" provenance
+  // that was never stored. Every SCC member already has a real incoming edge,
+  // so currentness already fails closed without summarising the component.
   const cycleConflicts: LineageConflict[] = [];
   for (const comp of stronglyConnectedComponents(nodes, outs)) {
     if (comp.length < 2) continue;
-    // Conservative: every member is superseded by something in the cycle (or itself).
-    for (const id of comp) {
-      if (!maps.supersededBy.has(id)) maps.supersededBy.set(id, new Set());
-      for (const other of comp) {
-        if (other !== id) maps.supersededBy.get(id)!.add(other);
-      }
-    }
     const sorted = [...comp].sort((a, b) => a - b);
     cycleConflicts.push({
       a: sorted[0],

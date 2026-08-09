@@ -258,36 +258,57 @@ function showLineage() {
   return el("lineage") ? el("lineage").checked : true;
 }
 
+/** Per-node authority-unknown ids from API (self_cycle etc.) — not only global fail. */
+function authorityUnknownSetFromRaw() {
+  const s = new Set();
+  if (!raw || !raw.nodes) return s;
+  if (raw.lineageAvailable === false) {
+    for (const n of raw.nodes) s.add(n.id);
+    return s;
+  }
+  for (const n of raw.nodes) {
+    if (n.authority_unknown) s.add(n.id);
+  }
+  return s;
+}
+
 function freshGraphData() {
   if (!raw || !raw.nodes) return { nodes: [], links: [] };
   const dupes = new Set(raw.duplicateIds || []);
-  const unknown = !lineageAvailable();
+  const globalUnknown = !lineageAvailable();
   const superseded = new Set(
     Array.isArray(raw.supersededIds) ? raw.supersededIds : [],
   );
   for (const n of (raw.nodes || [])) {
     if (n.superseded) superseded.add(n.id);
   }
+  const authUnknown = authorityUnknownSetFromRaw();
   let nodes = raw.nodes.map(n => ({
     id: n.id, label: n.frag ? "" : (n.label || ("#" + n.id)), title: n.title || "",
     val: n.frag ? 2.2 : Math.max(1, (n.size || 12) / 6),
     color: typeof n.color === "string" ? n.color : (n.color?.background || "#a855f7"),
     dupe: dupes.has(n.id), frag: !!n.frag,
-    superseded: !unknown && (superseded.has(n.id) || !!n.superseded),
-    authority_unknown: unknown || !!n.authority_unknown,
+    superseded: !globalUnknown && (superseded.has(n.id) || !!n.superseded),
+    // H2: per-node authority_unknown even when lineageAvailable is true
+    authority_unknown: globalUnknown || authUnknown.has(n.id) || !!n.authority_unknown,
     superseded_by: n.superseded_by || [],
     supersedes: n.supersedes || [],
   }));
-  // Mode (a): hide superseded when lineage toggle is off — only if lineage is known.
-  if (lineageAvailable() && !showLineage()) nodes = nodes.filter(n => !n.superseded);
+  // Mode (a): hide non-current when lineage toggle is off — only if lineage is known.
+  // H2: exclude BOTH superseded and authority_unknown from "current-state only".
+  if (lineageAvailable() && !showLineage()) {
+    nodes = nodes.filter(n => !n.superseded && !n.authority_unknown);
+  }
   const present = new Set(nodes.map(n => n.id));
   const links = (raw.edges || []).filter(e => present.has(e.from) && present.has(e.to))
     .map(e => ({
       source: e.from,
       target: e.to,
       edge_type: e.edge_type || "related_to",
-      // M1: only supersedes is lineage — never treat other typed edges as directed lineage.
-      directed: e.edge_type === "supersedes",
+      // H5: wire `directed` = semantic order meaningful; do NOT shadow with lineage.
+      // Local `lineage` is the M1 styling marker (edge_type === "supersedes" only).
+      directed: !!e.directed,
+      lineage: e.edge_type === "supersedes",
       score: e.score,
     }));
   seedClusterPositions(nodes);
@@ -415,8 +436,9 @@ const nodeColor = (n) => {
   return dim(base);
 };
 const linkIncident = (l) => selectedId && (sid(l.source) === selectedId || sid(l.target) === selectedId);
-// M1: lineage styling keys ONLY on edge_type === "supersedes"
-const isSupersedesLink = (l) => l.edge_type === "supersedes";
+// M1/H5: lineage styling keys on local `lineage` (derived from edge_type === "supersedes").
+// Wire `directed` means order is meaningful — never treat it as a lineage marker.
+const isSupersedesLink = (l) => l.lineage === true || l.edge_type === "supersedes";
 const linkColor = (l) => {
   if (isSupersedesLink(l)) {
     if (!selectedId) return SUPERSEDES_LINK;
@@ -454,15 +476,18 @@ function render() {
     statsEl.textContent = "no graph loaded";
     return;
   }
-  // G6: never claim exact "0/0 dup" when crossrefs are degraded (same principle as F1).
-  const dupTxt = raw.crossrefsAvailable === false
+  // G6/H4: never claim exact counts when crossrefs are degraded (same principle as F1).
+  const xrefsOk = raw.crossrefsAvailable !== false;
+  const dupTxt = !xrefsOk
     ? "DUPS UNAVAILABLE"
     : (raw.duplicatePairCount != null
       ? `${raw.duplicatePairCount}/${raw.dupeCount} dup pairs/memories`
       : `${raw.dupeCount || 0} dup memories`);
+  // H4: link count without crossrefs is not the full graph (docs-only edges would look exact).
+  const linkTxt = !xrefsOk ? "LINKS UNAVAILABLE" : `${gd.links.length} links`;
   // F1: never say "0 superseded" when lineage is unavailable.
   const lineageTxt = formatLineageStats(raw, showLineage());
-  statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${dupTxt} · ${lineageTxt}`;
+  statsEl.textContent = `${gd.nodes.length} nodes · ${linkTxt} · ${dupTxt} · ${lineageTxt}`;
 
   if (mode === "3d") {
     if (typeof ForceGraph3D !== "function") { statsEl.innerHTML = `<span id="err">3D lib failed to load</span>`; return; }
@@ -600,14 +625,21 @@ window.deselect = () => {
   pendingHighlight = null;
   relayout();
 };
-async function openDetail(id, dupe, preMem, superseded) {
+/**
+ * Open detail panel. opts.forceFetch skips preMem/byId and always GETs /api/memories/:id
+ * so same-DB refresh cannot render stale content (H3).
+ */
+async function openDetail(id, dupe, preMem, superseded, opts) {
   document.body.classList.add("panel-open");
   relayout();
   const panel = el("panel");
   const gen = loadGen;
   const db = el("db").value;
+  const forceFetch = !!(opts && opts.forceFetch);
   panel.innerHTML = `<button class="close" onclick="closePane()">✕</button><h2>#${id}</h2><div class="meta">loading…</div>`;
-  let m = preMem || byId[id];
+  // H3: forceFetch / skipCache — do not resolve stale byId when re-deriving after load.
+  if (forceFetch && byId && byId[id]) delete byId[id];
+  let m = forceFetch ? null : (preMem || byId[id]);
   const graphNode = (raw && raw.nodes || []).find(n => n.id === id);
   const unknown = !lineageAvailable() || !!(graphNode && graphNode.authority_unknown);
   const isSup = !unknown && (superseded != null ? superseded : !!(graphNode && graphNode.superseded));
@@ -621,11 +653,15 @@ async function openDetail(id, dupe, preMem, superseded) {
       if (gen !== loadGen || el("db").value !== db) return; // F2: stale detail
       if (!r.ok) throw new Error("HTTP " + r.status);
       m = await r.json();
+      if (byId) byId[id] = m; // refresh cache for timeline
     }
     if (gen !== loadGen || el("db").value !== db) return;
     const tags = (m.tags || []).map(t => `<span>${esc(t)}</span>`).join("");
+    const unknownWhy = !lineageAvailable()
+      ? "lineage unavailable; do not treat as current"
+      : "authority not certified (self-cycle or integrity); do not treat as current";
     const lineage = unknown
-      ? `<div class="meta" style="color:#8b949e">AUTHORITY UNKNOWN — lineage unavailable; do not treat as current</div>`
+      ? `<div class="meta" style="color:#8b949e">AUTHORITY UNKNOWN — ${unknownWhy}</div>`
       : isSup
         ? `<div class="meta superseded">SUPERSEDED by ${byIds.map(i => "#" + i).join(", ") || "(unknown)"} — not current authority</div>`
         : (supIds.length
@@ -707,15 +743,17 @@ async function loadMems(expectedGen) {
     if (gen !== loadGen || db !== el("db").value) return;
     const dupes = new Set(raw?.duplicateIds || []);
     const supers = supersededSetFromRaw();
-    const unknown = raw && raw.lineageAvailable === false;
+    // H2: per-node authority_unknown (self_cycle) even when lineageAvailable is true
+    const authUnknown = authorityUnknownSetFromRaw();
+    const globalUnknown = raw && raw.lineageAvailable === false;
     // exclude structural entries (doc fragments/sections) so the timeline matches the
     // graph's real memories — every row then maps to a node we can focus.
     // M2: attach _superseded the same way _dupe is attached.
     mems = fetched.filter(m => !isStructural(m)).map(m => ({
       ...m,
       _dupe: dupes.has(m.id),
-      _superseded: !unknown && supers.has(m.id),
-      _unknown: !!unknown,
+      _superseded: !globalUnknown && supers.has(m.id),
+      _unknown: !!globalUnknown || authUnknown.has(m.id),
     }));
     byId = {}; for (const m of mems) byId[m.id] = m;
     drawTimeline();
@@ -778,16 +816,20 @@ function drawTimeline() {
   if (!showStatus && stSel.value) stSel.value = "";
   const st = showStatus ? stSel.value : "";
   const favOnly = el("tlfav").classList.contains("active");
-  // M2: re-sync _superseded from graph raw (covers load race + toggle), filter when lineage off.
+  // M2/H2: re-sync flags from graph raw (covers load race + toggle), filter when lineage off.
   const supers = supersededSetFromRaw();
-  const unknown = !lineageAvailable();
+  const authUnknown = authorityUnknownSetFromRaw();
+  const globalUnknown = !lineageAvailable();
   for (const m of all) {
-    m._unknown = unknown;
-    m._superseded = !unknown && supers.has(m.id);
+    m._unknown = globalUnknown || authUnknown.has(m.id);
+    m._superseded = !globalUnknown && supers.has(m.id);
   }
   let pool = all;
   // F1: when lineage unavailable, never pretend current-only filtering works.
-  if (lineageAvailable() && !showLineage()) pool = pool.filter(m => !m._superseded);
+  // H2: current-only excludes BOTH superseded and per-node authority_unknown.
+  if (lineageAvailable() && !showLineage()) {
+    pool = pool.filter(m => !m._superseded && !m._unknown);
+  }
   const rows = pool.filter(m =>
     (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
     (!ty || typeOf(m) === ty) && (!st || statusOf(m) === st) && (!favOnly || isFav(m)));
@@ -907,26 +949,55 @@ function clearSelectionState() {
   el("panel").innerHTML = "";
 }
 
-function setLineageUiState(available) {
+/**
+ * H4: combine lineage + crossrefs degradation into one warning surface.
+ * Both flags fail together on the wire today, but disclosure must cover either.
+ */
+function setIntegrityUiState(lineageOk, crossrefsOk) {
   const w = el("lineage-warn");
   const toggle = el("lineage");
+  const parts = [];
+  if (!lineageOk) {
+    parts.push(
+      "Lineage unavailable — cannot confirm which memories are current. "
+      + "Current-only mode disabled. Nodes/rows show as authority-unknown (not current).",
+    );
+  }
+  if (!crossrefsOk) {
+    parts.push(
+      "Crossrefs degraded — duplicate, link, and cluster counts are not certified.",
+    );
+  }
   if (w) {
-    if (available === false) {
+    if (parts.length) {
       w.style.display = "block";
-      w.textContent = "Lineage unavailable — cannot confirm which memories are current. "
-        + "Current-only mode disabled. Nodes/rows show as authority-unknown (not current).";
+      w.textContent = parts.join(" ");
     } else {
       w.style.display = "none";
     }
   }
   if (toggle) {
-    // F1: cannot deliver current-only without lineage — disable toggle, keep checked for "show all as unknown"
-    toggle.disabled = available === false;
-    if (available === false) {
+    // F1: cannot deliver current-only without lineage — disable toggle
+    toggle.disabled = !lineageOk;
+    if (!lineageOk) {
       toggle.checked = true;
       toggle.title = "Disabled: lineage unavailable, so current-only cannot be guaranteed";
     } else {
-      toggle.title = "Default: show lineage — dim superseded nodes and draw supersedes edges. Uncheck to hide superseded (current-state only).";
+      toggle.title = "Default: show lineage — dim superseded nodes and draw supersedes edges. "
+        + "Uncheck to hide superseded and authority-unknown (current-state only).";
+    }
+  }
+  // H4: cluster toggle is not meaningful over empty/uncertified cluster data
+  const bcl = el("bcl");
+  if (bcl) {
+    if (!crossrefsOk) {
+      bcl.disabled = true;
+      bcl.title = "Clusters unavailable — crossrefs degraded";
+      bcl.classList.remove("active");
+      showClusters = false;
+    } else {
+      bcl.disabled = false;
+      bcl.title = "Toggle cluster hulls";
     }
   }
 }
@@ -983,27 +1054,24 @@ async function load() {
     if (gen !== loadGen || el("db").value !== db) return; // stale response
     raw = data;
     raw.dupeCount = Array.isArray(raw.duplicateIds) ? raw.duplicateIds.length : 0;
-    setLineageUiState(raw.lineageAvailable !== false);
-    // G6: surface non-exact dups when crossrefs degraded
-    if (raw.crossrefsAvailable === false) {
-      const w = el("lineage-warn");
-      if (w && raw.lineageAvailable !== false) {
-        w.style.display = "block";
-        w.textContent = "Crossrefs degraded — duplicate/link counts not certified.";
-      }
-    }
+    // H4: one combined integrity banner from BOTH flags (crossrefs path was unreachable)
+    setIntegrityUiState(
+      raw.lineageAvailable !== false,
+      raw.crossrefsAvailable !== false,
+    );
     buildAdj(); buildClusters();
     render();
-    // F3 + G1: restore selection on same-DB reload; re-derive panel from NEW graph status
-    // (do not keep stale SUPERSEDED/current markup).
-    if (!dbChanged && prevSelected != null) {
+    // F3 + G1 + H3: restore selection only if user still has the SAME selection and
+    // (for panel re-open) the panel is still open — do not stomp a mid-refresh deselect
+    // or a newer selection. forceFetch so content is not stale byId.
+    if (!dbChanged && prevSelected != null && selectedId === prevSelected) {
       const graphNode = (raw.nodes || []).find(n => n.id === prevSelected);
       if (graphNode) {
         setHighlight(prevSelected);
-        if (panelWasOpen) {
-          // G1: re-derive panel from NEW graph status + fresh memory fetch (preMem=null).
+        const panelStillOpen = document.body.classList.contains("panel-open");
+        if (panelWasOpen && panelStillOpen) {
           const isDupe = Array.isArray(raw.duplicateIds) && raw.duplicateIds.includes(prevSelected);
-          openDetail(prevSelected, isDupe, null, !!graphNode.superseded);
+          openDetail(prevSelected, isDupe, null, !!graphNode.superseded, { forceFetch: true });
         }
       } else {
         clearSelectionState();
