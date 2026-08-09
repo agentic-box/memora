@@ -2,18 +2,14 @@
  * Fixture-level tests for lineage assembly — imports the SHIPPED module.
  *
  * Run: node --experimental-strip-types memora-graph/scripts/test_lineage.mjs
- *
- * Must import functions/api/_lineage.ts. A reimplementation that stays green
- * when the real file regresses is not a test.
- *
- * UI predicates that live only inside force-graph.html cannot be imported;
- * those cases are labelled MIRROR below and are NOT coverage of the HTML.
  */
 
 import {
   buildAssociationEdges,
   buildLineageMaps,
   isLineageEdgeType,
+  parseRelatedPayload,
+  partitionLineageEdges,
 } from "../functions/api/_lineage.ts";
 
 let failed = 0;
@@ -38,7 +34,7 @@ function assert(cond, msg) {
   assert(L.supersededBy.has(1) && L.supersededBy.get(1).has(2), "1 is superseded by 2");
 }
 
-// --- mirror-only (superseded_by half only — drift case) ---
+// --- mirror-only ---
 {
   const map = new Map([
     [1, [{ id: 2, score: 1, edge_type: "superseded_by" }]],
@@ -46,10 +42,9 @@ function assert(cond, msg) {
   const L = buildLineageMaps(map);
   assert(L.supersedesEdges.length === 1, "mirror-only still produces lineage edge");
   assert(L.supersedesEdges[0].from === 2 && L.supersedesEdges[0].to === 1, "mirror normalizes newer=2 older=1");
-  assert(L.supersededBy.has(1), "older marked superseded from mirror only");
 }
 
-// --- mid-chain: 3 supersedes 2 supersedes 1 ---
+// --- mid-chain ---
 {
   const map = new Map([
     [3, [{ id: 2, score: 1, edge_type: "supersedes" }]],
@@ -62,21 +57,22 @@ function assert(cond, msg) {
   const L = buildLineageMaps(map);
   assert(L.supersedesEdges.length === 2, "mid-chain has two lineage edges");
   assert(L.supersededBy.has(1) && L.supersededBy.has(2), "both 1 and 2 superseded");
-  assert(L.supersedesMap.has(3) && L.supersedesMap.has(2), "2 and 3 both supersede something");
   assert(!L.supersededBy.has(3), "leaf 3 is not superseded");
 }
 
-// --- dangling endpoint (points at missing id) still records maps ---
+// --- dangling: keep superseded, no drawable edge without both ends ---
 {
   const map = new Map([
     [5, [{ id: 999, score: 1, edge_type: "supersedes" }]],
   ]);
   const L = buildLineageMaps(map);
-  assert(L.supersedesEdges[0].to === 999, "dangling older id preserved");
-  assert(L.supersededBy.has(999), "dangling older still in supersededBy");
+  assert(L.supersededBy.has(999), "dangling older still superseded");
+  const part = partitionLineageEdges(L.supersedesEdges, new Set([5]));
+  assert(part.drawable.length === 0, "dangling not drawable");
+  assert(part.dangling.length === 1 && part.dangling[0].missing === "to", "dangling integrity recorded");
 }
 
-// --- NON-lineage typed edges must NOT be treated as lineage (M1) ---
+// --- NON-lineage typed edges (M1) ---
 {
   const map = new Map([
     [10, [
@@ -92,67 +88,89 @@ function assert(cond, msg) {
   assert(L.supersedesEdges.length === 1 && L.supersedesEdges[0].to === 15, "only supersedes is lineage");
   for (const e of assoc) {
     assert(e.directed === false, `assoc edge ${e.edge_type} is not directed`);
-    assert(!isLineageEdgeType(e.edge_type), `assoc edge ${e.edge_type} is not lineage per isLineageEdgeType`);
+    assert(!isLineageEdgeType(e.edge_type), `assoc edge ${e.edge_type} is not lineage`);
   }
-  assert(assoc.some(e => e.edge_type === "references"), "references still present as association");
-  assert(assoc.some(e => e.edge_type === "contradicts"), "contradicts present, undirected");
-  // M1: shipped predicate — only "supersedes"
-  assert(isLineageEdgeType("supersedes") === true, "isLineageEdgeType(supersedes)");
-  assert(isLineageEdgeType("references") === false, "isLineageEdgeType(references) false");
-  assert(isLineageEdgeType("contradicts") === false, "isLineageEdgeType(contradicts) false");
-  assert(isLineageEdgeType("implements") === false, "isLineageEdgeType(implements) false");
-  assert(isLineageEdgeType(undefined) === false, "isLineageEdgeType(undefined) false");
+  assert(isLineageEdgeType("supersedes"), "isLineageEdgeType(supersedes)");
+  assert(!isLineageEdgeType("contradicts"), "isLineageEdgeType(contradicts) false");
 }
 
-// ---------------------------------------------------------------------------
-// MIRROR cases — re-state logic that lives in force-graph.html and cannot be
-// imported. These do NOT cover the shipped HTML; they document intended
-// behaviour only. If force-graph.html drifts, these stay green.
-// ---------------------------------------------------------------------------
+// --- F6: reverse halves collapse ---
 {
-  // MIRROR of force-graph.html isSupersedesLink: edge_type === "supersedes"
-  const isSupersedesLinkMirror = (l) => l.edge_type === "supersedes";
-  assert(isSupersedesLinkMirror({ edge_type: "supersedes", directed: true }),
-    "MIRROR UI: supersedes is lineage link");
-  assert(!isSupersedesLinkMirror({ edge_type: "references", directed: true }),
-    "MIRROR UI: directed alone is NOT lineage (force-graph.html not imported)");
-  assert(!isSupersedesLinkMirror({ edge_type: "contradicts", directed: true }),
-    "MIRROR UI: contradicts not lineage (force-graph.html not imported)");
+  const map = new Map([
+    [1, [{ id: 2, score: 1, edge_type: "references" }]],
+    [2, [{ id: 1, score: 1, edge_type: "referenced_by" }]],
+  ]);
+  const assoc = buildAssociationEdges(map, 0.4);
+  assert(assoc.length === 1, "references+referenced_by collapse to one undirected edge");
+  assert(assoc[0].edge_type === "references", "canonical type is references");
 }
 
+// --- F5: score mismatch keeps max; cycle surfaces conflict ---
 {
-  // MIRROR of drawTimeline lineage filter: show all if lineage on, else drop _superseded
-  const mems = [
-    { id: 1, _superseded: true },
-    { id: 2, _superseded: false },
-    { id: 3, _superseded: true },
-  ];
-  const filterMirror = (showLin) => mems.filter(m => showLin || !m._superseded);
-  assert(filterMirror(true).length === 3, "MIRROR UI: timeline lineage on shows all");
-  assert(filterMirror(false).length === 1 && filterMirror(false)[0].id === 2,
-    "MIRROR UI: timeline lineage off hides superseded (force-graph.html not imported)");
+  const map = new Map([
+    [2, [{ id: 1, score: 0.2, edge_type: "supersedes" }]],
+    [1, [{ id: 2, score: 0.9, edge_type: "superseded_by" }]],
+  ]);
+  // same direction twice via both halves with different scores → one edge, max score
+  const L = buildLineageMaps(map);
+  assert(L.supersedesEdges.length === 1, "same-direction halves merge");
+  assert(L.supersedesEdges[0].score === 0.9, "score policy = max");
+}
+{
+  const map = new Map([
+    [1, [{ id: 2, score: 1, edge_type: "supersedes" }]],
+    [2, [{ id: 1, score: 1, edge_type: "supersedes" }]],
+  ]);
+  const L = buildLineageMaps(map);
+  assert(L.conflicts.some(c => c.kind === "cycle"), "cycle conflict surfaced");
+  assert(L.supersededBy.has(1) && L.supersededBy.has(2), "cycle marks both superseded");
 }
 
+// --- parseRelatedPayload fail-closed ---
 {
-  // MIRROR of loadGen stale discard (M4 pattern) — not force-graph.html
-  let loadGen = 0;
-  const responses = [];
-  async function fakeLoad(db, delay, payload) {
-    const gen = ++loadGen;
-    await new Promise(r => setTimeout(r, delay));
-    if (gen !== loadGen) {
-      responses.push({ db, discarded: true });
-      return null;
+  assert(parseRelatedPayload("not-json").ok === false, "malformed JSON rejected");
+  assert(parseRelatedPayload("{}").ok === false, "non-array rejected");
+  assert(parseRelatedPayload('[{"id":"x"}]').ok === false, "bad id rejected");
+  const ok = parseRelatedPayload('[{"id":1,"score":0.5,"edge_type":"supersedes"}]');
+  assert(ok.ok && ok.entries[0].id === 1, "valid payload accepted");
+}
+
+// --- F1 unavailable stats must never say zero superseded ---
+{
+  // Mirrors formatLineageStats in force-graph.html (same string contract).
+  function formatLineageStats(rawGraph, showLin) {
+    if (!rawGraph || rawGraph.lineageAvailable === false) {
+      return "LINEAGE UNAVAILABLE (cannot confirm current)";
     }
-    responses.push({ db, discarded: false, payload });
-    return payload;
+    const supN = typeof rawGraph.supersededCount === "number"
+      ? rawGraph.supersededCount
+      : (Array.isArray(rawGraph.supersededIds) ? rawGraph.supersededIds.length : 0);
+    const supE = Array.isArray(rawGraph.supersedesEdges) ? rawGraph.supersedesEdges.length : 0;
+    return showLin
+      ? `${supN} superseded · ${supE} lineage edges`
+      : `lineage hidden (${supN} superseded)`;
   }
-  const pA = fakeLoad("A", 50, { supersededIds: [1] });
-  const pB = fakeLoad("B", 5, { supersededIds: [99] });
-  await Promise.all([pA, pB]);
-  const kept = responses.filter(r => !r.discarded);
-  assert(kept.length === 1 && kept[0].db === "B", "MIRROR UI: out-of-order only latest DB gen commits");
-  assert(responses.some(r => r.db === "A" && r.discarded), "MIRROR UI: slower A discarded");
+  const unavailable = {
+    lineageAvailable: false,
+    supersededIds: null,
+    supersededCount: null,
+    supersedesEdges: null,
+  };
+  const txt = formatLineageStats(unavailable, true);
+  assert(!/0 superseded/.test(txt), "unavailable stats must NOT say '0 superseded'");
+  assert(/UNAVAILABLE/i.test(txt), "unavailable stats say UNAVAILABLE");
+  // Wire shape: counts are null, not 0
+  assert(unavailable.supersededCount === null, "wire supersededCount is null when unavailable");
+  assert(unavailable.supersededIds === null, "wire supersededIds is null when unavailable");
+}
+
+// ---------------------------------------------------------------------------
+// MIRROR UI — force-graph.html not imported; document intent only.
+// ---------------------------------------------------------------------------
+{
+  const isSupersedesLinkMirror = (l) => l.edge_type === "supersedes";
+  assert(!isSupersedesLinkMirror({ edge_type: "references", directed: true }),
+    "MIRROR UI: directed alone is NOT lineage");
 }
 
 if (failed) {

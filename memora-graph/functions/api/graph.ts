@@ -4,7 +4,13 @@
  */
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
-import { buildAssociationEdges, buildLineageMaps } from "./_lineage";
+import {
+  buildAssociationEdges,
+  buildLineageMaps,
+  parseRelatedPayload,
+  partitionLineageEdges,
+  type CrossRefEntry,
+} from "./_lineage";
 
 interface Env extends DatabaseEnv {
   MIN_EDGE_SCORE?: string;
@@ -36,6 +42,8 @@ interface GraphNode {
   frag?: boolean;
   /** True when another memory supersedes this one (not current). */
   superseded?: boolean;
+  /** True when lineage could not be loaded — not "current", not "superseded". */
+  authority_unknown?: boolean;
   /** Ids of memories that supersede this node (newer leaves). */
   superseded_by?: number[];
   /** Ids of older memories this node supersedes. */
@@ -186,7 +194,7 @@ function louvainCommunities(
 }
 
 function buildClusterData(
-  crossrefsMap: Map<number, Array<{ id: number; score: number }>>,
+  crossrefsMap: Map<number, Array<{ id: number; score?: number; edge_type?: string }>>,
   memoryIds: number[],
   minScore: number = 0.5,
   minClusterSize: number = 3
@@ -207,9 +215,10 @@ function buildClusterData(
   for (const [memId, refs] of crossrefsMap) {
     if (!idSet.has(memId)) continue;
     for (const ref of refs) {
-      if (ref.score < minScore || !idSet.has(ref.id)) continue;
-      adj.get(memId)?.set(ref.id, ref.score);
-      adj.get(ref.id)?.set(memId, ref.score);
+      const score = typeof ref.score === "number" ? ref.score : 0;
+      if (score < minScore || !idSet.has(ref.id)) continue;
+      adj.get(memId)?.set(ref.id, score);
+      adj.get(ref.id)?.set(memId, score);
     }
   }
 
@@ -319,19 +328,30 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   // Fetch all crossrefs (table may not exist on some D1 databases).
   // Fail CLOSED for lineage: unknown must not present as "all current".
-  const crossrefsMap = new Map<number, Array<{ id: number; score: number; edge_type?: string }>>();
+  const crossrefsMap = new Map<number, CrossRefEntry[]>();
   let lineageAvailable = true;
+  let lineageDegradedReason: string | null = null;
+  const corruptCrossrefRows: number[] = [];
   try {
     const crossrefsResult = await db.prepare(
       "SELECT memory_id, related FROM memories_crossrefs"
     ).all<CrossRef>();
 
     for (const cr of crossrefsResult.results || []) {
-      const related = parseJson<Array<{ id: number; score: number; edge_type?: string }>>(cr.related, []);
-      crossrefsMap.set(cr.memory_id, related);
+      const parsed = parseRelatedPayload(cr.related);
+      if (!parsed.ok) {
+        // One corrupt row must not silently drop that memory's supersession evidence
+        // and paint it as current with no banner (F1 second fail-open).
+        lineageAvailable = false;
+        lineageDegradedReason = lineageDegradedReason || `corrupt_crossref:${parsed.reason}`;
+        corruptCrossrefRows.push(cr.memory_id);
+        continue;
+      }
+      crossrefsMap.set(cr.memory_id, parsed.entries);
     }
   } catch {
     lineageAvailable = false;
+    lineageDegradedReason = "crossrefs_query_failed";
   }
 
   // Lineage: normalize BOTH halves (supersedes + superseded_by) into canonical
@@ -339,7 +359,12 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   // for lineage styling (only edge_type === "supersedes" is lineage).
   const lineage = lineageAvailable
     ? buildLineageMaps(crossrefsMap.entries())
-    : { supersededBy: new Map(), supersedesMap: new Map(), supersedesEdges: [] };
+    : {
+        supersededBy: new Map<number, Set<number>>(),
+        supersedesMap: new Map<number, Set<number>>(),
+        supersedesEdges: [],
+        conflicts: [],
+      };
   const supersededBy = lineage.supersededBy;
   const supersedesMap = lineage.supersedesMap;
 
@@ -347,7 +372,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   let edgeId = 0;
   const edgeSeen = new Set<string>();
 
+  // Association edges can still render when lineage is unavailable (similarity layout).
+  // Lineage edges only when lineageAvailable.
   if (lineageAvailable) {
+    // Drawable lineage edges are filtered to real nodes later (F4); provisional list first.
     for (const le of lineage.supersedesEdges) {
       const key = `sup-${le.from}->${le.to}`;
       if (edgeSeen.has(key)) continue;
@@ -361,19 +389,19 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
         directed: true,
       });
     }
-    for (const ae of buildAssociationEdges(crossrefsMap.entries(), minScore)) {
-      const key = `rel-${Math.min(ae.from, ae.to)}-${Math.max(ae.from, ae.to)}-${ae.edge_type}`;
-      if (edgeSeen.has(key)) continue;
-      edgeSeen.add(key);
-      edges.push({
-        id: edgeId++,
-        from: ae.from,
-        to: ae.to,
-        edge_type: ae.edge_type,
-        score: ae.score,
-        directed: false,
-      });
-    }
+  }
+  for (const ae of buildAssociationEdges(crossrefsMap.entries(), minScore)) {
+    const key = `rel-${Math.min(ae.from, ae.to)}-${Math.max(ae.from, ae.to)}-${ae.edge_type}`;
+    if (edgeSeen.has(key)) continue;
+    edgeSeen.add(key);
+    edges.push({
+      id: edgeId++,
+      from: ae.from,
+      to: ae.to,
+      edge_type: ae.edge_type,
+      score: ae.score,
+      directed: false,
+    });
   }
 
   // Count connections per node (include lineage for layout weight)
@@ -465,25 +493,30 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (isIssue(meta)) typeLabel = " - Issue";
     else if (isTodo(meta)) typeLabel = " - TODO";
 
-    const isSuperseded = supersededBy.has(m.id);
+    const isSuperseded = lineageAvailable && supersededBy.has(m.id);
+    const authorityUnknown = !lineageAvailable;
     const supersededByIds: number[] | undefined = isSuperseded
       ? Array.from(supersededBy.get(m.id) as Set<number>)
       : undefined;
-    const supersedesIds: number[] | undefined = supersedesMap.has(m.id)
-      ? Array.from(supersedesMap.get(m.id) as Set<number>)
-      : undefined;
-    const lineageLabel = isSuperseded
-      ? " - SUPERSEDED"
-      : (supersedesIds && supersedesIds.length ? " - supersedes older" : "");
+    const supersedesIds: number[] | undefined =
+      lineageAvailable && supersedesMap.has(m.id)
+        ? Array.from(supersedesMap.get(m.id) as Set<number>)
+        : undefined;
+    const lineageLabel = authorityUnknown
+      ? " - AUTHORITY UNKNOWN"
+      : isSuperseded
+        ? " - SUPERSEDED"
+        : (supersedesIds && supersedesIds.length ? " - supersedes older" : "");
 
     const node: GraphNode = {
       id: m.id,
       label: label.length > 35 ? label + "..." : label,
       title: `#${m.id}${typeLabel}${lineageLabel}\n${headline}`,
-      color: tagColors[primaryTag],
-      size: isSuperseded ? Math.max(8, Math.floor(nodeSize * 0.7)) : nodeSize,
+      color: authorityUnknown ? "#484f58" : tagColors[primaryTag],
+      size: isSuperseded || authorityUnknown ? Math.max(8, Math.floor(nodeSize * 0.7)) : nodeSize,
       mass: nodeMass,
       superseded: isSuperseded || undefined,
+      authority_unknown: authorityUnknown || undefined,
       superseded_by: supersededByIds,
       supersedes: supersedesIds,
     };
@@ -658,12 +691,36 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const nodeIdSet = new Set(nodeIds);
   const clusterData = buildClusterData(crossrefsMap, nodeIds, 0.4, 3);
 
+  // F4: only emit drawable lineage edges when both ends exist as nodes.
+  // Older nodes whose superseder is missing stay superseded (conservative).
+  const { drawable: drawableLineage, dangling } = partitionLineageEdges(
+    lineage.supersedesEdges,
+    nodeIdSet,
+  );
+  // Rebuild edges array: drop provisional supersedes that dangle, keep associations + docs.
+  const nonLineageEdges = edges.filter(e => e.edge_type !== "supersedes");
+  const finalEdges: GraphEdge[] = [
+    ...drawableLineage.map((le, i) => ({
+      id: i,
+      from: le.from,
+      to: le.to,
+      edge_type: "supersedes" as const,
+      score: le.score,
+      directed: true as const,
+    })),
+    ...nonLineageEdges.map((e, i) => ({ ...e, id: drawableLineage.length + i })),
+  ];
+
   // O(S) with Set — not O(S×N) linear scan per key.
-  const supersededIds = Array.from(supersededBy.keys()).filter(id => nodeIdSet.has(id));
+  // When lineage is unavailable, do NOT emit empty supersededIds/count (clients
+  // must not infer "zero superseded" from absence — F1).
+  const supersededIds = lineageAvailable
+    ? Array.from(supersededBy.keys()).filter(id => nodeIdSet.has(id))
+    : null;
 
   return Response.json({
     nodes,
-    edges,
+    edges: finalEdges,
     tagColors,
     tagToNodes,
     sectionToNodes,
@@ -674,15 +731,19 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     todoCategoryToNodes,
     duplicateIds: Array.from(duplicateIds),
     duplicatePairCount: duplicatePairKeys.size,
-    /** False when crossrefs could not be read — UI must not treat as "all current". */
+    /** False when crossrefs could not be read/parsed — UI must not treat as "all current". */
     lineageAvailable,
-    /** Node ids that are not current (have a supersedes successor). */
+    lineageDegradedReason,
+    corruptCrossrefRows: corruptCrossrefRows.length ? corruptCrossrefRows : undefined,
+    /** null when unavailable — never [] that reads as "zero superseded". */
     supersededIds,
-    supersededCount: supersededIds.length,
-    /** Directed lineage edges only (from=newer, to=older). */
-    supersedesEdges: lineage.supersedesEdges
-      .filter(e => nodeIdSet.has(e.from) && nodeIdSet.has(e.to))
-      .map(e => ({ from: e.from, to: e.to, score: e.score })),
+    supersededCount: lineageAvailable ? (supersededIds as number[]).length : null,
+    /** Directed lineage edges only (from=newer, to=older), both ends present. */
+    supersedesEdges: lineageAvailable
+      ? drawableLineage.map(e => ({ from: e.from, to: e.to, score: e.score }))
+      : null,
+    lineageDangling: lineageAvailable && dangling.length ? dangling : undefined,
+    lineageConflicts: lineageAvailable && lineage.conflicts.length ? lineage.conflicts : undefined,
     nodeTimestamps,
     minDate,
     maxDate,

@@ -75,7 +75,10 @@
   .trow.superseded-row .ttl { color: #b8a078; }
   #lineage-warn { display: none; position: fixed; top: 52px; left: 12px; z-index: 40;
     background: #3d2e00; color: #ffe08a; border: 1px solid #d29922; border-radius: 8px;
-    padding: 6px 12px; font-size: 12px; max-width: 420px; }
+    padding: 6px 12px; font-size: 12px; max-width: 480px; }
+  .trow.unknown-row { opacity: 0.65; }
+  .trow.unknown-row .ttl { color: #8b949e; font-style: italic; }
+  .trow .day .unk { color: #8b949e; }
 
   /* ---- detail pane (sits left of the drawer when it's open) ---- */
   /* hidden fully off-screen via `right` (not transform — a width-relative transform
@@ -246,12 +249,22 @@ function tuneForces() {
 
 // Default ON: show lineage (superseded dimmed + supersedes edges).
 // Uncheck = mode (a): hide superseded nodes entirely (current-state only).
-function showLineage() { return el("lineage") ? el("lineage").checked : true; }
+// When lineageAvailable===false the toggle is disabled — current-only is impossible.
+function lineageAvailable() {
+  return raw && raw.lineageAvailable !== false;
+}
+function showLineage() {
+  if (!lineageAvailable()) return true; // show all nodes as unknown, never filter as "current"
+  return el("lineage") ? el("lineage").checked : true;
+}
 
 function freshGraphData() {
+  if (!raw || !raw.nodes) return { nodes: [], links: [] };
   const dupes = new Set(raw.duplicateIds || []);
-  const superseded = new Set(raw.supersededIds || []);
-  // Prefer explicit node.superseded; fall back to supersededIds list from API.
+  const unknown = !lineageAvailable();
+  const superseded = new Set(
+    Array.isArray(raw.supersededIds) ? raw.supersededIds : [],
+  );
   for (const n of (raw.nodes || [])) {
     if (n.superseded) superseded.add(n.id);
   }
@@ -260,12 +273,13 @@ function freshGraphData() {
     val: n.frag ? 2.2 : Math.max(1, (n.size || 12) / 6),
     color: typeof n.color === "string" ? n.color : (n.color?.background || "#a855f7"),
     dupe: dupes.has(n.id), frag: !!n.frag,
-    superseded: superseded.has(n.id) || !!n.superseded,
+    superseded: !unknown && (superseded.has(n.id) || !!n.superseded),
+    authority_unknown: unknown || !!n.authority_unknown,
     superseded_by: n.superseded_by || [],
     supersedes: n.supersedes || [],
   }));
-  // Mode (a): hide superseded when lineage toggle is off.
-  if (!showLineage()) nodes = nodes.filter(n => !n.superseded);
+  // Mode (a): hide superseded when lineage toggle is off — only if lineage is known.
+  if (lineageAvailable() && !showLineage()) nodes = nodes.filter(n => !n.superseded);
   const present = new Set(nodes.map(n => n.id));
   const links = (raw.edges || []).filter(e => present.has(e.from) && present.has(e.to))
     .map(e => ({
@@ -377,18 +391,26 @@ function dim(c) {
   return `rgb(${r},${g},${b})`;
 }
 // Superseded lineage nodes: always muted amber (structure still visible, not "current").
+// Authority-unknown (lineage unavailable): slate — not current purple.
 const SUPERSEDED_COLOR = "#6e5a2e";
 const SUPERSEDED_SELECTED = "#c4a35a"; // brighter amber when selected — still not "current white"
+const UNKNOWN_COLOR = "#484f58";
+const UNKNOWN_SELECTED = "#8b949e";
 const SUPERSEDES_LINK = "#d29922";
-const baseColor = (n) => n.superseded ? SUPERSEDED_COLOR
+const baseColor = (n) => n.authority_unknown ? UNKNOWN_COLOR
+  : (n.superseded ? SUPERSEDED_COLOR
   : (n.dupe ? "#f85149"
   : (n.frag ? "#58a6ff"
-  : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color)));
-// S1: selection is ADDITIVE (size/halo). Never repaint superseded fill as current white.
+  : (showClusters ? (clusterColors[clusterOf[n.id]] || "#8b949e") : n.color))));
+// S1: selection is ADDITIVE (size/halo). Never repaint superseded/unknown fill as current white.
 const nodeColor = (n) => {
   const base = baseColor(n);
   if (!selectedId) return base;
-  if (n.id === selectedId) return n.superseded ? SUPERSEDED_SELECTED : "#ffffff";
+  if (n.id === selectedId) {
+    if (n.authority_unknown) return UNKNOWN_SELECTED;
+    if (n.superseded) return SUPERSEDED_SELECTED;
+    return "#ffffff";
+  }
   if (hlNodes.has(n.id)) return base;
   return dim(base);
 };
@@ -428,13 +450,14 @@ function render() {
   hullsDirty = true;
   graphEl.innerHTML = "";
   const gd = applyFilters(freshGraphData());
+  if (!raw) {
+    statsEl.textContent = "no graph loaded";
+    return;
+  }
   const dupPairs = raw.duplicatePairCount;
   const dupTxt = dupPairs != null ? `${dupPairs}/${raw.dupeCount} dup pairs/memories` : `${raw.dupeCount} dup memories`;
-  const supN = raw.supersededCount != null ? raw.supersededCount : (raw.supersededIds || []).length;
-  const supE = (raw.supersedesEdges || []).length;
-  const lineageTxt = showLineage()
-    ? `${supN} superseded · ${supE} lineage edges`
-    : `lineage hidden (${supN} superseded)`;
+  // F1: never say "0 superseded" when lineage is unavailable.
+  const lineageTxt = formatLineageStats(raw, showLineage());
   statsEl.textContent = `${gd.nodes.length} nodes · ${gd.links.length} links · ${dupTxt} · ${lineageTxt}`;
 
   if (mode === "3d") {
@@ -489,11 +512,11 @@ function render() {
           ctx.strokeStyle = n.superseded ? SUPERSEDES_LINK : "#fff";
           ctx.lineWidth = 2 / scale; ctx.stroke();
         }
-        // Always show ⟂ for superseded (not only when zoomed in)
-        if (n.superseded) {
-          ctx.fillStyle = SUPERSEDES_LINK;
+        // Always show cue for superseded / authority-unknown (not only when zoomed in)
+        if (n.superseded || n.authority_unknown) {
+          ctx.fillStyle = n.authority_unknown ? UNKNOWN_COLOR : SUPERSEDES_LINK;
           ctx.font = `bold ${11 / scale}px ui-monospace`;
-          ctx.fillText("⟂", n.x - 4 / scale, n.y - Math.sqrt(n.val) * 4 - 4 / scale);
+          ctx.fillText(n.authority_unknown ? "?" : "⟂", n.x - 4 / scale, n.y - Math.sqrt(n.val) * 4 - 4 / scale);
         }
         if (scale < 1.5) return;
         ctx.fillStyle = n.superseded ? "#8b7355"
@@ -577,29 +600,49 @@ async function openDetail(id, dupe, preMem, superseded) {
   document.body.classList.add("panel-open");
   relayout();
   const panel = el("panel");
+  const gen = loadGen;
+  const db = el("db").value;
   panel.innerHTML = `<button class="close" onclick="closePane()">✕</button><h2>#${id}</h2><div class="meta">loading…</div>`;
   let m = preMem || byId[id];
-  const graphNode = (raw.nodes || []).find(n => n.id === id);
-  const isSup = superseded != null ? superseded : !!(graphNode && graphNode.superseded);
+  const graphNode = (raw && raw.nodes || []).find(n => n.id === id);
+  const unknown = !lineageAvailable() || !!(graphNode && graphNode.authority_unknown);
+  const isSup = !unknown && (superseded != null ? superseded : !!(graphNode && graphNode.superseded));
   const byIds = (graphNode && graphNode.superseded_by) || [];
   const supIds = (graphNode && graphNode.supersedes) || [];
   try {
-    if (!m) { const r = await fetch(`/api/memories/${id}?db=${encodeURIComponent(el("db").value)}`); if (!r.ok) throw new Error("HTTP " + r.status); m = await r.json(); }
+    if (!m) {
+      const r = await fetch(`/api/memories/${id}?db=${encodeURIComponent(db)}`, {
+        signal: loadAbort ? loadAbort.signal : undefined,
+      });
+      if (gen !== loadGen || el("db").value !== db) return; // F2: stale detail
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      m = await r.json();
+    }
+    if (gen !== loadGen || el("db").value !== db) return;
     const tags = (m.tags || []).map(t => `<span>${esc(t)}</span>`).join("");
-    const lineage = isSup
-      ? `<div class="meta superseded">SUPERSEDED by ${byIds.map(i => "#" + i).join(", ") || "(unknown)"} — not current authority</div>`
-      : (supIds.length
-        ? `<div class="meta" style="color:#d29922">Supersedes older: ${supIds.map(i => "#" + i).join(", ")}</div>`
-        : "");
+    const lineage = unknown
+      ? `<div class="meta" style="color:#8b949e">AUTHORITY UNKNOWN — lineage unavailable; do not treat as current</div>`
+      : isSup
+        ? `<div class="meta superseded">SUPERSEDED by ${byIds.map(i => "#" + i).join(", ") || "(unknown)"} — not current authority</div>`
+        : (supIds.length
+          ? `<div class="meta" style="color:#d29922">Supersedes older: ${supIds.map(i => "#" + i).join(", ")}</div>`
+          : "");
+    const badge = unknown
+      ? ' <span class="superseded" style="color:#8b949e">· UNKNOWN</span>'
+      : (isSup ? ' <span class="superseded">· SUPERSEDED</span>' : "");
     panel.innerHTML =
       `<button class="close" onclick="closePane()">✕</button>` +
-      `<h2>#${m.id}${dupe ? ' <span class="dupe">· DUPLICATE</span>' : ''}${isSup ? ' <span class="superseded">· SUPERSEDED</span>' : ''}</h2>` +
+      `<h2>#${m.id}${dupe ? ' <span class="dupe">· DUPLICATE</span>' : ''}${badge}</h2>` +
       `<div class="meta">${esc(typeOf(m))} · created ${(m.created || m.created_at || '').slice(0, 10)}${m.updated || m.updated_at ? ' · updated ' + (m.updated || m.updated_at).slice(0, 10) : ''}</div>` +
       lineage +
       `<div class="tags">${tags}</div><div class="md" style="margin-top:10px">${renderMd(m.content || "")}</div>` +
       renderImages(m);
     panel.scrollTop = 0;
-  } catch (e) { panel.querySelector(".meta").innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`; }
+  } catch (e) {
+    if (e && e.name === "AbortError") return;
+    if (gen !== loadGen) return;
+    panel.querySelector(".meta").innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`;
+  }
 }
 
 /* ---------------- timeline drawer ---------------- */
@@ -614,9 +657,27 @@ const isStructural = (m) => { const t = (m.metadata || {}).type; return t === "s
 
 /** Single source of truth for superseded ids from the graph response. */
 function supersededSetFromRaw() {
-  const s = new Set(raw?.supersededIds || []);
-  for (const n of (raw?.nodes || [])) if (n.superseded) s.add(n.id);
+  // null/omitted when lineage unavailable — do not treat as empty set of zero.
+  const s = new Set(Array.isArray(raw?.supersededIds) ? raw.supersededIds : []);
+  if (lineageAvailable()) {
+    for (const n of (raw?.nodes || [])) if (n.superseded) s.add(n.id);
+  }
   return s;
+}
+
+/** Format stats lineage fragment — must never claim "0 superseded" when unavailable. */
+function formatLineageStats(rawGraph, showLin) {
+  if (!rawGraph || rawGraph.lineageAvailable === false) {
+    return "LINEAGE UNAVAILABLE (cannot confirm current)";
+  }
+  const supN = typeof rawGraph.supersededCount === "number"
+    ? rawGraph.supersededCount
+    : (Array.isArray(rawGraph.supersededIds) ? rawGraph.supersededIds.length : 0);
+  const supE = Array.isArray(rawGraph.supersedesEdges) ? rawGraph.supersedesEdges.length : 0;
+  const confN = (rawGraph.lineageConflicts || []).length;
+  return showLin
+    ? `${supN} superseded · ${supE} lineage edges${confN ? ` · ${confN} conflicts` : ""}`
+    : `lineage hidden (${supN} superseded)`;
 }
 
 async function loadMems(expectedGen) {
@@ -642,13 +703,15 @@ async function loadMems(expectedGen) {
     if (gen !== loadGen || db !== el("db").value) return;
     const dupes = new Set(raw?.duplicateIds || []);
     const supers = supersededSetFromRaw();
+    const unknown = raw && raw.lineageAvailable === false;
     // exclude structural entries (doc fragments/sections) so the timeline matches the
     // graph's real memories — every row then maps to a node we can focus.
     // M2: attach _superseded the same way _dupe is attached.
     mems = fetched.filter(m => !isStructural(m)).map(m => ({
       ...m,
       _dupe: dupes.has(m.id),
-      _superseded: supers.has(m.id),
+      _superseded: !unknown && supers.has(m.id),
+      _unknown: !!unknown,
     }));
     byId = {}; for (const m of mems) byId[m.id] = m;
     drawTimeline();
@@ -713,9 +776,14 @@ function drawTimeline() {
   const favOnly = el("tlfav").classList.contains("active");
   // M2: re-sync _superseded from graph raw (covers load race + toggle), filter when lineage off.
   const supers = supersededSetFromRaw();
-  for (const m of all) m._superseded = supers.has(m.id);
+  const unknown = !lineageAvailable();
+  for (const m of all) {
+    m._unknown = unknown;
+    m._superseded = !unknown && supers.has(m.id);
+  }
   let pool = all;
-  if (!showLineage()) pool = pool.filter(m => !m._superseded);
+  // F1: when lineage unavailable, never pretend current-only filtering works.
+  if (lineageAvailable() && !showLineage()) pool = pool.filter(m => !m._superseded);
   const rows = pool.filter(m =>
     (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
     (!ty || typeOf(m) === ty) && (!st || statusOf(m) === st) && (!favOnly || isFav(m)));
@@ -727,11 +795,15 @@ function drawTimeline() {
     if (mon !== cur) { cur = mon; const h = document.createElement("div"); h.className = "mh"; h.id = "tmh-" + mon;
       h.textContent = monthLabel(mon); list.appendChild(h); }
     const row = document.createElement("div");
-    row.className = "trow" + (m._dupe ? " dupe" : "") + (m._superseded ? " superseded-row" : "");
+    row.className = "trow"
+      + (m._dupe ? " dupe" : "")
+      + (m._superseded ? " superseded-row" : "")
+      + (m._unknown ? " unknown-row" : "");
     const typeLabel = hasStatusFilter(typeOf(m)) ? `${typeOf(m)} · ${statusOf(m)}` : typeOf(m);
     const badges =
       (m._dupe ? ' · <span class="dup">dup</span>' : "") +
-      (m._superseded ? ' · <span class="sup">superseded</span>' : "");
+      (m._superseded ? ' · <span class="sup">superseded</span>' : "") +
+      (m._unknown ? ' · <span class="unk">authority unknown</span>' : "");
     row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeLabel)}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}${badges}</div>`;
     rowById[m.id] = row;
@@ -744,20 +816,37 @@ function drawTimeline() {
 }
 
 /* ---------------- live-update polling (non-disruptive badge) ---------------- */
-let pollTimer = null, baseSig = null;
-async function fetchSignal() {
-  const r = await fetch(`/api/memories?db=${encodeURIComponent(el("db").value)}&limit=1&sort=created`);
+let pollTimer = null, baseSig = null, baselineGen = 0, baselineDb = "";
+async function fetchSignal(db, gen) {
+  const r = await fetch(`/api/memories?db=${encodeURIComponent(db)}&limit=1&sort=created`, {
+    signal: loadAbort ? loadAbort.signal : undefined,
+  });
   if (!r.ok) throw new Error("HTTP " + r.status);
+  if (gen != null && gen !== loadGen) return null;
+  if (db !== el("db").value) return null;
   const d = await r.json();
   return { total: d.total, maxId: (d.memories[0] && d.memories[0].id) || 0 };
 }
 function hideRefresh() { el("refresh").style.display = "none"; }
-async function captureBaseline() { try { baseSig = await fetchSignal(); } catch (e) {} hideRefresh(); }
+async function captureBaseline(gen, db) {
+  try {
+    const s = await fetchSignal(db != null ? db : el("db").value, gen != null ? gen : loadGen);
+    if (!s) return;
+    if (gen != null && gen !== loadGen) return;
+    if (db != null && db !== el("db").value) return;
+    baseSig = s;
+    baselineGen = loadGen;
+    baselineDb = el("db").value;
+  } catch (e) {}
+  hideRefresh();
+}
 function startPolling() { if (pollTimer) clearInterval(pollTimer); pollTimer = setInterval(checkUpdates, 20000); }
 async function checkUpdates() {
   if (document.hidden || !baseSig) return;
+  if (baselineGen !== loadGen || baselineDb !== el("db").value) return;
   try {
-    const s = await fetchSignal();
+    const s = await fetchSignal(el("db").value, loadGen);
+    if (!s || baselineGen !== loadGen) return;
     if (s.total !== baseSig.total || s.maxId !== baseSig.maxId) {
       const n = s.total - baseSig.total;
       el("refresh").textContent = `🔄 ${n > 0 ? n + " new" : "updated"} — refresh`;
@@ -814,24 +903,60 @@ function clearSelectionState() {
   el("panel").innerHTML = "";
 }
 
-function setLineageWarn(available) {
+function setLineageUiState(available) {
   const w = el("lineage-warn");
-  if (!w) return;
-  w.style.display = available === false ? "block" : "none";
+  const toggle = el("lineage");
+  if (w) {
+    if (available === false) {
+      w.style.display = "block";
+      w.textContent = "Lineage unavailable — cannot confirm which memories are current. "
+        + "Current-only mode disabled. Nodes/rows show as authority-unknown (not current).";
+    } else {
+      w.style.display = "none";
+    }
+  }
+  if (toggle) {
+    // F1: cannot deliver current-only without lineage — disable toggle, keep checked for "show all as unknown"
+    toggle.disabled = available === false;
+    if (available === false) {
+      toggle.checked = true;
+      toggle.title = "Disabled: lineage unavailable, so current-only cannot be guaranteed";
+    } else {
+      toggle.title = "Default: show lineage — dim superseded nodes and draw supersedes edges. Uncheck to hide superseded (current-state only).";
+    }
+  }
+}
+
+function clearCanvasForSwitch(msg) {
+  // F2: do not leave previous graph drawn under the new DB name.
+  raw = null;
+  if (fg && fg._destructor) { try { fg._destructor(); } catch (e) {} }
+  fg = null;
+  graphEl.innerHTML = `<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#7d8590">${esc(msg || "loading…")}</div>`;
+  statsEl.textContent = msg || "loading…";
 }
 
 async function load() {
   if (!el("db").value) return;
   const db = el("db").value;
+  const dbChanged = loadDb !== "" && loadDb !== db;
+  const prevSelected = selectedId;
   loadDb = db;
   const gen = ++loadGen;
   if (loadAbort) try { loadAbort.abort(); } catch (e) {}
   loadAbort = typeof AbortController !== "undefined" ? new AbortController() : null;
-  // M4: clear selection/detail/timeline synchronously on switch so A cannot paint onto B.
-  clearSelectionState();
-  mems = null; memsLoaded = false; byId = {}; rowById = {};
-  el("tllist").textContent = "loading…";
-  statsEl.textContent = "loading…";
+
+  // F2/F3: on DB change, clear canvas + selection so A cannot show under B's name.
+  // On same-DB reload, keep selection if the id survives the new payload.
+  if (dbChanged) {
+    clearSelectionState();
+    clearCanvasForSwitch(`loading ${db}…`);
+    mems = null; memsLoaded = false; byId = {}; rowById = {};
+    el("tllist").textContent = "loading…";
+  } else {
+    statsEl.textContent = "loading…";
+  }
+
   try {
     const r = await fetch(
       `/api/graph?db=${encodeURIComponent(db)}${showDocs ? "&docs=1" : ""}`,
@@ -841,14 +966,22 @@ async function load() {
     const data = await r.json();
     if (gen !== loadGen || el("db").value !== db) return; // stale response
     raw = data; raw.dupeCount = (raw.duplicateIds || []).length;
-    setLineageWarn(raw.lineageAvailable !== false);
+    setLineageUiState(raw.lineageAvailable !== false);
     buildAdj(); buildClusters();
     render();
+    // F3: restore selection on same-DB reload if id still present
+    if (!dbChanged && prevSelected != null) {
+      const still = (raw.nodes || []).some(n => n.id === prevSelected);
+      if (still) setHighlight(prevSelected);
+      else clearSelectionState();
+    }
     if (document.body.classList.contains("timeline-open")) loadMems(gen);
-    if (gen === loadGen) { captureBaseline(); startPolling(); }
+    if (gen === loadGen) { captureBaseline(gen, db); startPolling(); }
   } catch (e) {
     if (e && e.name === "AbortError") return;
     if (gen !== loadGen) return;
+    // F2: on failed load after DB switch, do not leave previous graph labelled as new DB
+    if (dbChanged) clearCanvasForSwitch(`failed to load ${db}`);
     statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`;
   }
 }
