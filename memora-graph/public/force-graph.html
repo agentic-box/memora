@@ -160,10 +160,8 @@ import {
   detailResponseMayWrite,
 } from "./_selection.mjs";
 
-// Detail ownership session (K1) — shared by openDetail / close / deselect / clear.
+// Detail ownership session (K1) — module-private only (never on window — L1a).
 const detailOwner = createDetailOwner();
-// Expose pure helpers for console debug only (not for tests — tests import the module).
-window.MemoraSelection = { planSelectionReconcile, detailResponseMayWrite, detailOwner };
 
 const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
@@ -172,6 +170,19 @@ let raw = null, mode = "3d", fg = null;
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
 // M4: monotonic load generation + AbortController so DB switches cannot paint A onto B.
 let loadGen = 0, loadAbort = null, loadDb = "";
+
+// L1b: read-only console introspection for boss/devtools (getters only — no setters, no methods).
+// Restores pre-module `raw` / `fg` / `selectedId` debugging without re-exposing mutators.
+Object.defineProperty(window, "MemoraDebug", {
+  value: Object.freeze({
+    get raw() { return raw; },
+    get fg() { return fg; },
+    get selectedId() { return selectedId; },
+  }),
+  writable: false,
+  configurable: false,
+  enumerable: true,
+});
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
 let mdReady = false;
