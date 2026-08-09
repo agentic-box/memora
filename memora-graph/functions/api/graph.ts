@@ -33,12 +33,24 @@ interface GraphNode {
   borderWidth?: number;
   shape?: string;
   frag?: boolean;
+  /** True when another memory supersedes this one (not current). */
+  superseded?: boolean;
+  /** Ids of memories that supersede this node (newer leaves). */
+  superseded_by?: number[];
+  /** Ids of older memories this node supersedes. */
+  supersedes?: number[];
 }
 
 interface GraphEdge {
   id: number;
   from: number;
   to: number;
+  /** Crossref edge type when known. Omitted/related_to = similarity/association. */
+  edge_type?: string;
+  /** Cosine or link score when available. */
+  score?: number;
+  /** True for lineage edges (supersedes): from = newer, to = older. */
+  directed?: boolean;
 }
 
 // Tag colors (purple palette)
@@ -319,24 +331,73 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     // Table doesn't exist yet — proceed without crossrefs
   }
 
-  // Build edges
+  // Build edges. Lineage (supersedes) is first-class and DIRECTED:
+  //   from = newer memory, to = older memory it replaces.
+  // Similarity / related_to edges stay undirected. Other typed edges
+  // (references, extends, …) are included with edge_type for the UI.
+  //
+  // Previously supersedes edges either collapsed into undirected
+  // similarity links (no edge_type) or were only mentioned when
+  // filtering DUPLICATE pairs — so the graph could not render lineage.
   const edges: GraphEdge[] = [];
   const seen = new Set<string>();
   let edgeId = 0;
+  const supersededBy = new Map<number, Set<number>>(); // older -> set(newer)
+  const supersedesMap = new Map<number, Set<number>>(); // newer -> set(older)
 
   for (const m of memories) {
     const refs = crossrefsMap.get(m.id) || [];
     for (const ref of refs) {
-      if (ref.score <= minScore) continue;
-      const edgeKey = [Math.min(m.id, ref.id), Math.max(m.id, ref.id)].join("-");
+      if (!ref || typeof ref.id !== "number" || ref.id === m.id) continue;
+      const edgeType = ref.edge_type || "related_to";
+      const score = typeof ref.score === "number" ? ref.score : 0;
+
+      // Lineage: record on the side that holds edge_type === "supersedes"
+      // (storage writes bidirectional supersedes / superseded_by).
+      if (edgeType === "supersedes") {
+        if (!supersedesMap.has(m.id)) supersedesMap.set(m.id, new Set());
+        supersedesMap.get(m.id)!.add(ref.id);
+        if (!supersededBy.has(ref.id)) supersededBy.set(ref.id, new Set());
+        supersededBy.get(ref.id)!.add(m.id);
+        const dirKey = `sup-${m.id}->${ref.id}`;
+        if (!seen.has(dirKey)) {
+          seen.add(dirKey);
+          edges.push({
+            id: edgeId++,
+            from: m.id,
+            to: ref.id,
+            edge_type: "supersedes",
+            score,
+            directed: true,
+          });
+        }
+        continue;
+      }
+      if (edgeType === "superseded_by") {
+        // Mirror of supersedes; avoid double-counting directed edges.
+        continue;
+      }
+
+      // Similarity / association edges (and other typed non-lineage links).
+      if (edgeType === "related_to" || !ref.edge_type) {
+        if (score <= minScore) continue;
+      }
+      const edgeKey = `rel-${Math.min(m.id, ref.id)}-${Math.max(m.id, ref.id)}-${edgeType}`;
       if (!seen.has(edgeKey)) {
         seen.add(edgeKey);
-        edges.push({ id: edgeId++, from: m.id, to: ref.id });
+        edges.push({
+          id: edgeId++,
+          from: m.id,
+          to: ref.id,
+          edge_type: edgeType,
+          score,
+          directed: edgeType !== "related_to",
+        });
       }
     }
   }
 
-  // Count connections per node
+  // Count connections per node (include lineage for layout weight)
   const connectionCounts = new Map<number, number>();
   for (const edge of edges) {
     connectionCounts.set(edge.from, (connectionCounts.get(edge.from) || 0) + 1);
@@ -349,6 +410,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   //   - exclude structural memories (section, document_fragment,
   //     document_root).
   //   - skip typed link entries (supersedes, references, extends, ...) —
+  //     only for DUPLICATE detection, NOT for graph edge assembly.
   //     `related_to` is allowed because compute_crossrefs uses it as the
   //     default tag for score-based refs.
   //   - skip score >= 0.9999 — these are absorb's link_memories writes
@@ -424,13 +486,23 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (isIssue(meta)) typeLabel = " - Issue";
     else if (isTodo(meta)) typeLabel = " - TODO";
 
+    const isSuperseded = supersededBy.has(m.id);
+    const supersededByIds = isSuperseded ? Array.from(supersededBy.get(m.id)!) : undefined;
+    const supersedesIds = supersedesMap.has(m.id) ? Array.from(supersedesMap.get(m.id)!) : undefined;
+    const lineageLabel = isSuperseded
+      ? " - SUPERSEDED"
+      : (supersedesIds && supersedesIds.length ? " - supersedes older" : "");
+
     const node: GraphNode = {
       id: m.id,
       label: label.length > 35 ? label + "..." : label,
-      title: `#${m.id}${typeLabel}\n${headline}`,
+      title: `#${m.id}${typeLabel}${lineageLabel}\n${headline}`,
       color: tagColors[primaryTag],
-      size: nodeSize,
+      size: isSuperseded ? Math.max(8, Math.floor(nodeSize * 0.7)) : nodeSize,
       mass: nodeMass,
+      superseded: isSuperseded || undefined,
+      superseded_by: supersededByIds,
+      supersedes: supersedesIds,
     };
 
     // Apply issue-specific styling
@@ -599,6 +671,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const nodeIds = nodes.map(n => n.id);
   const clusterData = buildClusterData(crossrefsMap, nodeIds, 0.4, 3);
 
+  const supersededIds = Array.from(supersededBy.keys()).filter(id =>
+    nodes.some(n => n.id === id)
+  );
+
   return Response.json({
     nodes,
     edges,
@@ -612,6 +688,13 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     todoCategoryToNodes,
     duplicateIds: Array.from(duplicateIds),
     duplicatePairCount: duplicatePairKeys.size,
+    /** Node ids that are not current (have a supersedes successor). */
+    supersededIds,
+    supersededCount: supersededIds.length,
+    /** Directed lineage edges only (from=newer, to=older). */
+    supersedesEdges: edges
+      .filter(e => e.edge_type === "supersedes")
+      .map(e => ({ from: e.from, to: e.to, score: e.score })),
     nodeTimestamps,
     minDate,
     maxDate,
