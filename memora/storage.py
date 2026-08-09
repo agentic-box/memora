@@ -2938,7 +2938,18 @@ def add_memory(
     content: str,
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
+    embedding: Optional[Dict[str, float]] = None,
+    commit: bool = True,
 ) -> Dict[str, Any]:
+    """Create a memory.
+
+    embedding: optional precomputed vector (absorb phase-3). When provided,
+    embedding is NOT recomputed — avoids double API calls and partial-commit
+    races where phase-3 recompute fails after insert.
+    commit: when False, skip conn.commit() so callers can batch (local SQLite).
+    On D1, each statement auto-commits; compute embedding BEFORE insert so a
+    provider failure cannot leave an orphan row without embedding/FTS.
+    """
     # Validate and normalize content (trim, length check)
     content = _validate_content(content)
 
@@ -2951,37 +2962,40 @@ def add_memory(
     _enforce_tag_whitelist(validated_tags)
     tags_json = json.dumps(validated_tags, ensure_ascii=False)
 
-    # Two-pass approach for images:
-    # 1. Insert memory first to get ID (needed for R2 image keys)
-    # 2. Process metadata with memory_id, then update the record
-
-    # Check if metadata has images that need processing
+    # Prepare metadata without images first so we can embed before any write.
+    # Image two-pass still needs memory_id for R2 keys — embed uses un-uploaded meta.
     has_images = (
         metadata is not None
         and isinstance(metadata.get('images'), list)
         and len(metadata.get('images', [])) > 0
     )
+    prepared_for_embed = _prepare_metadata(
+        {k: v for k, v in (metadata or {}).items() if k != "images"} if has_images else metadata
+    )
+
+    # P1 D1: compute (or accept precomputed) embedding BEFORE insert so a strict
+    # failure cannot leave an orphan row without embedding/FTS/crossrefs.
+    if embedding is not None:
+        vector = embedding
+    else:
+        vector = _compute_embedding(content, prepared_for_embed, validated_tags)
+    if not vector:
+        raise ValueError("embedding is empty; refusing to create memory without a vector")
 
     if has_images:
-        # First pass: insert without processed images to get memory_id
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
         cur = conn.execute(
             "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
             (content, None, tags_json, now),
         )
         memory_id = cur.lastrowid
-
-        # Second pass: process metadata with memory_id (uploads images to R2)
         prepared_metadata = _prepare_metadata(metadata, memory_id=memory_id)
         metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
-
-        # Update the record with processed metadata
         conn.execute(
             "UPDATE memories SET metadata = ? WHERE id = ?",
             (metadata_json, memory_id),
         )
     else:
-        # No images - single pass
         prepared_metadata = _prepare_metadata(metadata)
         metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
         now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -2992,7 +3006,6 @@ def add_memory(
         memory_id = cur.lastrowid
 
     _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-    vector = _compute_embedding(content, prepared_metadata, validated_tags)
     _upsert_embedding(conn, memory_id, vector)
 
     # Compute cross-refs (skip for section memories and document fragments)
@@ -3001,7 +3014,8 @@ def add_memory(
         related = _update_crossrefs_for_memory(conn, memory_id, vector=vector)
 
     _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
-    conn.commit()
+    if commit:
+        conn.commit()
     _emit_event(conn, memory_id, validated_tags)
 
     # Construct result locally (avoids re-fetch and D1 read replica lag)
@@ -3388,8 +3402,8 @@ def absorb_memory(
         except Exception as e:
             # N6: strict mode must fail cleanly (named provider error), not as
             # UnboundLocalError after matches=[] falls through to pending_creates.
-            from memora.embeddings import EmbeddingStrictError
-            if isinstance(e, EmbeddingStrictError) or (
+            from memora.embeddings import EmbeddingProviderError, EmbeddingStrictError
+            if isinstance(e, (EmbeddingStrictError, EmbeddingProviderError)) or (
                 isinstance(e, RuntimeError) and "MEMORA_EMBEDDING_STRICT" in str(e)
             ):
                 raise
@@ -3525,64 +3539,168 @@ def absorb_memory(
                 merged.append(t)
         return merged
 
-    # Create consolidated memories for grouped pure-new facts
+    # Phase 3 prep: PRECOMPUTE every embedding before the first write (P1).
+    # Reuse phase-1 vectors when content is unchanged; re-embed only consolidated text.
+    # Structure: (content, vector, link_info_or_None, final_tags, decision_template)
+    phase3_jobs: List[Dict[str, Any]] = []
+
     for group_indices in groups:
         group_facts = [pure_new[gi][1][0] for gi in group_indices]
-        # Union suggested_tags from all facts in the group
-        group_suggested = []
+        group_vectors = [pure_new[gi][1][1] for gi in group_indices]
+        group_suggested: List[str] = []
         for gi in group_indices:
             group_suggested.extend(pure_new[gi][1][3])
         group_suggested = _filter_suggested_tags(list(set(group_suggested)))
+        final_tags = _merge_tags(tags, group_suggested)
 
         if len(group_facts) >= 2:
-            # Consolidate via LLM
             consolidated = _consolidate_facts_llm(group_facts, context)
-            final_tags = _merge_tags(tags, group_suggested)
-            if dry_run:
+            phase3_jobs.append({
+                "content": consolidated,
+                "vector": None,  # must re-embed consolidated text
+                "link": None,
+                "tags": final_tags,
+                "kind": "consolidated",
+                "source_facts": group_facts,
+            })
+        else:
+            phase3_jobs.append({
+                "content": group_facts[0],
+                "vector": group_vectors[0],  # reuse phase-1
+                "link": None,
+                "tags": final_tags,
+                "kind": "created",
+                "source_facts": None,
+            })
+
+    for _, (fact, vector, link_info, fact_suggested) in linkable:
+        phase3_jobs.append({
+            "content": fact,
+            "vector": vector,  # reuse phase-1
+            "link": link_info,
+            "tags": _merge_tags(tags, _filter_suggested_tags(fact_suggested)),
+            "kind": "linked",
+            "source_facts": None,
+        })
+
+    if dry_run:
+        for job in phase3_jobs:
+            if job["kind"] == "consolidated":
                 decisions.append({
-                    "fact": consolidated[:80],
+                    "fact": job["content"][:80],
                     "action": "consolidate",
-                    "reason": f"merged {len(group_facts)} related facts",
-                    "source_facts": [f[:80] for f in group_facts],
+                    "reason": f"merged {len(job['source_facts'])} related facts",
+                    "source_facts": [f[:80] for f in job["source_facts"]],
                 })
+                counts["consolidated"] += 1
+                counts["created"] += 1
+            elif job["link"] is None:
+                decisions.append({"fact": job["content"][:80], "action": "create", "reason": "new knowledge"})
+                counts["created"] += 1
             else:
-                record = add_memory(conn, content=consolidated, metadata=merged_meta, tags=final_tags)
+                edge_type, target_id, reason = job["link"]
+                action_label = {
+                    "supersedes": "supersede",
+                    "contradicts": "contradict",
+                    "related_to": "create_and_link",
+                }[edge_type]
                 decisions.append({
-                    "fact": consolidated[:80],
+                    "fact": job["content"][:80],
+                    "action": action_label,
+                    "target_id": target_id,
+                    "reason": reason,
+                })
+        return {"decisions": decisions, **counts}
+
+    # Embed any jobs that still need vectors (consolidated) BEFORE any write.
+    for job in phase3_jobs:
+        if job["vector"] is None:
+            job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
+            if not job["vector"]:
+                raise RuntimeError("absorb phase-3 embedding returned empty vector")
+
+    # All embeddings ready — write. Local SQLite: commit=False until end.
+    # D1 auto-commits each statement; on failure we compensating-delete written IDs.
+    written_ids: List[int] = []
+    try:
+        for job in phase3_jobs:
+            record = add_memory(
+                conn,
+                content=job["content"],
+                metadata=merged_meta,
+                tags=job["tags"],
+                embedding=job["vector"],
+                commit=False,
+            )
+            written_ids.append(record["id"])
+            if job["link"] is not None:
+                edge_type, target_id, reason = job["link"]
+                try:
+                    add_link(conn, record["id"], target_id, edge_type=edge_type)
+                except (ValueError, Exception) as link_err:
+                    logger.warning(
+                        "Absorb link failed (memory #%d -> #%d): %s",
+                        record["id"], target_id, link_err,
+                    )
+                action_label = {
+                    "supersedes": "superseded",
+                    "contradicts": "contradicted",
+                    "related_to": "linked",
+                }[edge_type]
+                decisions.append({
+                    "fact": job["content"][:80],
+                    "action": action_label,
+                    "memory_id": record["id"],
+                    "target_id": target_id,
+                    "reason": reason,
+                })
+            elif job["kind"] == "consolidated":
+                decisions.append({
+                    "fact": job["content"][:80],
                     "action": "consolidated",
                     "memory_id": record["id"],
-                    "reason": f"merged {len(group_facts)} related facts",
-                    "source_facts": [f[:80] for f in group_facts],
+                    "reason": f"merged {len(job['source_facts'])} related facts",
+                    "source_facts": [f[:80] for f in job["source_facts"]],
                 })
-            counts["consolidated"] += 1
-            counts["created"] += 1
-        else:
-            # Single fact — create as-is
-            fact = group_facts[0]
-            final_tags = _merge_tags(tags, group_suggested)
-            if dry_run:
-                decisions.append({"fact": fact[:80], "action": "create", "reason": "new knowledge"})
+                counts["consolidated"] += 1
+                counts["created"] += 1
             else:
-                record = add_memory(conn, content=fact, metadata=merged_meta, tags=final_tags)
-                decisions.append({"fact": fact[:80], "action": "created", "memory_id": record["id"], "reason": "new knowledge"})
-            counts["created"] += 1
-
-    # Create memories with links (supersedes/contradicts/related)
-    for _, (fact, vector, link_info, fact_suggested) in linkable:
-        edge_type, target_id, reason = link_info
-        action_label = {"supersedes": "superseded", "contradicts": "contradicted", "related_to": "linked"}[edge_type]
-
-        final_tags = _merge_tags(tags, _filter_suggested_tags(fact_suggested))
-        if dry_run:
-            decisions.append({"fact": fact[:80], "action": action_label.replace("ed", "e") if action_label != "linked" else "create_and_link", "target_id": target_id, "reason": reason})
-        else:
-            record = add_memory(conn, content=fact, metadata=merged_meta, tags=final_tags)
+                decisions.append({
+                    "fact": job["content"][:80],
+                    "action": "created",
+                    "memory_id": record["id"],
+                    "reason": "new knowledge",
+                })
+                counts["created"] += 1
+        conn.commit()
+    except Exception as write_exc:
+        # Compensating cleanup (critical on D1 where each insert already persisted).
+        cleaned: List[int] = []
+        for mid in written_ids:
             try:
-                add_link(conn, record["id"], target_id, edge_type=edge_type)
-            except (ValueError, Exception) as link_err:
-                logger.warning("Absorb link failed (memory #%d -> #%d): %s", record["id"], target_id, link_err)
-            conn.commit()
-            decisions.append({"fact": fact[:80], "action": action_label, "memory_id": record["id"], "target_id": target_id, "reason": reason})
+                delete_memory(conn, mid)
+                cleaned.append(mid)
+            except Exception as del_exc:
+                logger.error(
+                    "Absorb compensating delete failed for memory #%d: %s", mid, del_exc
+                )
+        if written_ids and len(cleaned) < len(written_ids):
+            orphans = [i for i in written_ids if i not in cleaned]
+            return {
+                "decisions": decisions,
+                **counts,
+                "error": "partial_write",
+                "partial": True,
+                "written_ids": written_ids,
+                "cleaned_ids": cleaned,
+                "orphan_ids": orphans,
+                "reason": (
+                    f"absorb phase-3 failed after writing {len(written_ids)} memories; "
+                    f"cleaned {len(cleaned)}; orphans remain: {orphans}. "
+                    f"cause: {type(write_exc).__name__}: {write_exc}"
+                ),
+            }
+        raise
 
     return {"decisions": decisions, **counts}
 

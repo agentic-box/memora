@@ -122,19 +122,20 @@ def _compute_embedding_sentence_transformers(text: str) -> Dict[str, float]:
     except ImportError as exc:
         if _strict_mode():
             _strict_raise("sentence-transformers", exc)
-        _warn_once(
-            "sentence-transformers:ImportError",
-            "package not installed (pip install sentence-transformers)",
-        )
-        return _compute_embedding_tfidf(text)
+        raise EmbeddingProviderError(
+            f"sentence-transformers unavailable; refusing TF-IDF substitute: {exc}"
+        ) from exc
+    except EmbeddingStrictError:
+        raise
+    except EmbeddingProviderError:
+        raise
     except Exception as exc:
         if _strict_mode():
             _strict_raise("sentence-transformers", exc)
-        _warn_once(
-            "sentence-transformers:runtime",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return _compute_embedding_tfidf(text)
+        raise EmbeddingProviderError(
+            f"sentence-transformers failed; refusing TF-IDF substitute: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -153,12 +154,13 @@ class EmbeddingStrictError(RuntimeError):
     """
 
 
-def _env_is_set(name: str) -> bool:
-    """True when the variable is present in the process environment.
+class EmbeddingProviderError(RuntimeError):
+    """Dense embedding backend failed; refuse to persist a TF-IDF substitute.
 
-    Distinguishes unset (absent) from empty-string (present but blank).
+    Used when MEMORA_EMBEDDING_MODEL is openai / sentence-transformers and the
+    provider call fails. A wrong embedding is worse than a missing one.
     """
-    return name in os.environ
+
 
 
 def _key_fingerprint(api_key: str) -> str:
@@ -266,19 +268,26 @@ def _vector_from_list(values: Any) -> Dict[str, float]:
     return out
 
 
-def parse_openai_embeddings_response(response: Any, expected_n: int) -> List[Dict[str, float]]:
+def parse_openai_embeddings_response(
+    response: Any,
+    expected_n: int,
+    *,
+    expected_dim: Optional[int] = None,
+) -> Tuple[List[Dict[str, float]], int]:
     """Validate and reconstruct OpenAI embeddings.create response by index (N2).
 
     Requires:
     - len(response.data) == expected_n
     - indices exactly cover 0..n-1 with no gaps, dupes, or out-of-range
-    - every vector non-empty, finite, and dimensionally uniform across the chunk
-    Reconstructs by index so out-of-order complete responses restore input order.
+    - every vector non-empty, finite, and dimensionally uniform
+    - if expected_dim is set (call-wide), every vector must match it (P1 cross-chunk)
+
+    Returns (vectors_in_input_order, dimension).
     """
     if expected_n < 0:
         raise ValueError(f"expected_n must be >= 0, got {expected_n}")
     if expected_n == 0:
-        return []
+        return [], expected_dim if expected_dim is not None else 0
     if response is None:
         raise ValueError("embeddings response is None")
     data = getattr(response, "data", None)
@@ -290,7 +299,7 @@ def parse_openai_embeddings_response(response: Any, expected_n: int) -> List[Dic
         )
 
     by_index: Dict[int, Dict[str, float]] = {}
-    dims: Optional[int] = None
+    dims: Optional[int] = expected_dim
     for item in data:
         idx = getattr(item, "index", None)
         if idx is None:
@@ -317,22 +326,11 @@ def parse_openai_embeddings_response(response: Any, expected_n: int) -> List[Dic
     missing = [i for i in range(expected_n) if i not in by_index]
     if missing:
         raise ValueError(f"embeddings response missing indices: {missing}")
+    if dims is None:
+        raise ValueError("embeddings response has no dimensions")
 
-    return [by_index[i] for i in range(expected_n)]
+    return [by_index[i] for i in range(expected_n)], dims
 
-
-def _handle_credential_or_api_failure(backend: str, exc: BaseException, texts: Optional[List[str]] = None):
-    """Strict raises; non-strict warns once and returns TF-IDF (cardinality preserved)."""
-    if _strict_mode():
-        if isinstance(exc, EmbeddingCredentialError):
-            raise RuntimeError(
-                f"MEMORA_EMBEDDING_STRICT=1 and {backend} credentials invalid: {exc}"
-            ) from exc
-        _strict_raise(backend, exc)
-    _warn_once(backend, f"{type(exc).__name__}: {exc}")
-    if texts is not None:
-        return [_compute_embedding_tfidf(t) for t in texts]
-    return None
 
 
 def _compute_embedding_openai(text: str) -> Dict[str, float]:
@@ -348,8 +346,10 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
                     f"MEMORA_EMBEDDING_STRICT=1 hard-stop: incomplete embedding credentials "
                     f"({exc}). Not a memora bug — fix MEMORA_EMBEDDING_* / OPENAI_* config."
                 ) from exc
-            _warn_once("openai:credentials", str(exc))
-            return _compute_embedding_tfidf(text)
+            raise EmbeddingProviderError(
+                f"incomplete embedding credentials ({exc}); "
+                f"refusing TF-IDF substitute for dense backend"
+            ) from exc
 
         # Construct client only after credentials resolved (N1: fail before construct).
         client = _embedding_client(openai)
@@ -361,27 +361,30 @@ def _compute_embedding_openai(text: str) -> Dict[str, float]:
             input=text,
             model=model_name,
         )
-        vectors = parse_openai_embeddings_response(response, expected_n=1)
+        vectors, _dim = parse_openai_embeddings_response(response, expected_n=1)
         return vectors[0]
 
     except ImportError as exc:
+        # Dense backend: never substitute TF-IDF (would corrupt a dense store).
         if _strict_mode():
             _strict_raise("openai", exc)
-        _warn_once(
-            "openai:ImportError",
-            "package not installed (pip install openai)",
-        )
-        return _compute_embedding_tfidf(text)
+        raise EmbeddingProviderError(
+            f"openai embeddings unavailable (package not installed); "
+            f"refusing TF-IDF substitute for dense backend: {exc}"
+        ) from exc
     except EmbeddingStrictError:
+        raise
+    except EmbeddingProviderError:
         raise
     except Exception as exc:
         if _strict_mode():
             _strict_raise("openai", exc)
-        _warn_once(
-            "openai:runtime",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return _compute_embedding_tfidf(text)
+        # Policy (round 132 #3): configured dense backend must FAIL THE WRITE,
+        # not persist TF-IDF keyword bags into an otherwise dense store.
+        raise EmbeddingProviderError(
+            f"openai embeddings failed; refusing TF-IDF substitute for dense backend: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 def compute_embedding(
@@ -470,8 +473,8 @@ def compute_embeddings_batch(
 def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]:
     """Batch OpenAI embedding computation with chunking and validated responses.
 
-    Non-strict: all-or-nothing TF-IDF for the whole call on any failure (N2).
-    Strict: raise on credential, API, or validation errors.
+    Dense backend policy: on any failure, FAIL THE CALL (never TF-IDF substitute).
+    Call-wide dimension is enforced across 2048-item chunks (P1).
     """
     try:
         import openai
@@ -484,8 +487,10 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
                     f"MEMORA_EMBEDDING_STRICT=1 hard-stop: incomplete embedding credentials "
                     f"({exc}). Not a memora bug — fix MEMORA_EMBEDDING_* / OPENAI_* config."
                 ) from exc
-            _warn_once("openai-batch:credentials", str(exc))
-            return [_compute_embedding_tfidf(t) for t in texts]
+            raise EmbeddingProviderError(
+                f"incomplete embedding credentials ({exc}); "
+                f"refusing TF-IDF substitute for dense backend"
+            ) from exc
 
         client = _embedding_client(openai)
         # See single-path note: override OPENAI_EMBEDDING_MODEL for non-OpenAI hosts.
@@ -493,24 +498,32 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
 
         max_chunk = 2048  # OpenAI batch limit
         all_results: List[Dict[str, float]] = []
+        call_dim: Optional[int] = None  # P1: one expected dim for the whole call
 
         for i in range(0, len(texts), max_chunk):
             chunk = texts[i : i + max_chunk]
             try:
                 response = client.embeddings.create(input=chunk, model=model_name)
-                # N2: validate cardinality, indices, vectors — reconstruct by index.
-                chunk_vecs = parse_openai_embeddings_response(response, expected_n=len(chunk))
+                chunk_vecs, chunk_dim = parse_openai_embeddings_response(
+                    response,
+                    expected_n=len(chunk),
+                    expected_dim=call_dim,
+                )
+                if call_dim is None:
+                    call_dim = chunk_dim
+                elif chunk_dim != call_dim:
+                    raise ValueError(
+                        f"embeddings dimension inconsistency across batch chunks: "
+                        f"chunk starting at {i} has d={chunk_dim}, call expected d={call_dim}"
+                    )
                 all_results.extend(chunk_vecs)
             except Exception as chunk_exc:
                 if _strict_mode():
                     _strict_raise("openai-batch:chunk", chunk_exc)
-                # All-or-nothing: discard any partial dense results from earlier
-                # chunks and return TF-IDF for the entire call (no mixed store).
-                _warn_once(
-                    "openai-batch:chunk",
-                    f"{type(chunk_exc).__name__}: {chunk_exc}",
-                )
-                return [_compute_embedding_tfidf(t) for t in texts]
+                raise EmbeddingProviderError(
+                    f"openai-batch chunk failed; refusing TF-IDF substitute for dense backend: "
+                    f"{type(chunk_exc).__name__}: {chunk_exc}"
+                ) from chunk_exc
 
         assert len(all_results) == len(texts), (
             f"internal: result cardinality {len(all_results)} != {len(texts)}"
@@ -520,21 +533,21 @@ def _compute_embeddings_openai_batch(texts: List[str]) -> List[Dict[str, float]]
     except ImportError as exc:
         if _strict_mode():
             _strict_raise("openai-batch", exc)
-        _warn_once(
-            "openai-batch:ImportError",
-            "package not installed (pip install openai)",
-        )
-        return [_compute_embedding_tfidf(t) for t in texts]
+        raise EmbeddingProviderError(
+            f"openai-batch unavailable (package not installed); "
+            f"refusing TF-IDF substitute: {exc}"
+        ) from exc
     except EmbeddingStrictError:
+        raise
+    except EmbeddingProviderError:
         raise
     except Exception as exc:
         if _strict_mode():
             _strict_raise("openai-batch", exc)
-        _warn_once(
-            "openai-batch:runtime",
-            f"{type(exc).__name__}: {exc}",
-        )
-        return [_compute_embedding_tfidf(t) for t in texts]
+        raise EmbeddingProviderError(
+            f"openai-batch failed; refusing TF-IDF substitute for dense backend: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
 
 
 # --- Serialization ---
@@ -623,13 +636,17 @@ def get_embeddings_for_ids(
 # --- Model management (N5: fingerprint = backend + model name + dims/kind) ---
 
 def _vector_representation(vector: Dict[str, float]) -> str:
-    """Classify a stored vector: dense:N (numeric keys) or sparse (word bags)."""
+    """Classify a stored vector: dense:N or sparse (word bags).
+
+    Dense requires the EXACT key set {\"0\",\"1\",...,\"N-1\"} — not an 8-key
+    numeric prefix (a sparse bag with keys 0..7 plus a word key must be sparse).
+    """
     if not vector:
         return "empty"
-    keys = list(vector.keys())
-    sample = keys[: min(8, len(keys))]
-    if sample and all(k.isdigit() for k in sample):
-        return f"dense:{len(vector)}"
+    n = len(vector)
+    expected = {str(i) for i in range(n)}
+    if set(vector.keys()) == expected:
+        return f"dense:{n}"
     return "sparse"
 
 
@@ -671,21 +688,15 @@ def sample_embedding_vector(conn: sqlite3.Connection) -> Optional[Dict[str, floa
     return json_to_embedding(row["embedding"])
 
 
-def sample_embedding_kinds(
-    conn: sqlite3.Connection,
-    *,
-    limit: int = 500,
-) -> Set[str]:
-    """Scan stored vectors and return kind tags: {'dense'}, {'sparse'}, or both (N7).
+def scan_embedding_kinds(conn: sqlite3.Connection) -> Set[str]:
+    """FULL-TABLE scan of embedding representations (P1 — no LIMIT sample).
 
-    Dense = numeric keys (openai / sentence-transformers). Sparse = word bags (TF-IDF).
-    A store containing BOTH is corrupt for cosine search (shared-key similarity → 0.0)
-    and must force rebuild regardless of memories_meta.
+    Probabilistic samples cannot certify a mixed store. Every non-null embedding
+    row is classified. Returns tags like {'dense', 'dense:1024', 'sparse'}.
     """
     kinds: Set[str] = set()
     rows = conn.execute(
-        "SELECT embedding FROM memories_embeddings WHERE embedding IS NOT NULL LIMIT ?",
-        (limit,),
+        "SELECT embedding FROM memories_embeddings WHERE embedding IS NOT NULL"
     ).fetchall()
     for row in rows:
         vec = json_to_embedding(row["embedding"])
@@ -694,16 +705,24 @@ def sample_embedding_kinds(
             continue
         if rep.startswith("dense"):
             kinds.add("dense")
-            # also track dims for mixed-dim dense
             kinds.add(rep)  # dense:N
         else:
             kinds.add("sparse")
     return kinds
 
 
+# Back-compat alias (tests / callers) — always full scan, limit ignored.
+def sample_embedding_kinds(
+    conn: sqlite3.Connection,
+    *,
+    limit: int = 0,
+) -> Set[str]:
+    return scan_embedding_kinds(conn)
+
+
 def store_has_mixed_embeddings(conn: sqlite3.Connection) -> bool:
-    """True when dense and sparse vectors coexist, or dense dims disagree (N7)."""
-    kinds = sample_embedding_kinds(conn)
+    """True when dense and sparse coexist, or dense dims disagree (full scan)."""
+    kinds = scan_embedding_kinds(conn)
     if "sparse" in kinds and any(k.startswith("dense") for k in kinds):
         return True
     dense_dims = {k for k in kinds if k.startswith("dense:")}
@@ -730,113 +749,142 @@ def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
     conn.commit()
 
 
-def current_embedding_fingerprint(current_model: str) -> str:
-    """Fingerprint for the configured embedding endpoint (backend|model|target-kind).
+def _embedding_endpoint_host() -> str:
+    """Host-only identity of the embedding endpoint (NEVER the API key)."""
+    try:
+        _key, base = resolve_embedding_credentials()
+    except EmbeddingCredentialError:
+        base = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or ""
+    base = (base or "").strip()
+    if not base:
+        return "default-host"
+    # strip scheme and path
+    host = base
+    if "://" in host:
+        host = host.split("://", 1)[1]
+    host = host.split("/", 1)[0]
+    return host or "default-host"
 
-    Includes the actual model name (OPENAI_EMBEDDING_MODEL / ST model), not just
-    MEMORA_EMBEDDING_MODEL=\"openai\", so endpoint/model changes force rebuild (N5/N7).
+
+def current_embedding_fingerprint(
+    current_model: str,
+    *,
+    observed_dim: Optional[int] = None,
+) -> str:
+    """Fingerprint: backend|model|host|repr (N5/N7 + endpoint identity).
+
+    Includes host (not key) so switching providers with the same model string
+    still forces rebuild. observed_dim fills dense:N when known.
     """
+    host = _embedding_endpoint_host()
     if current_model == "openai":
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        return f"openai|{model_name}|dense"
+        kind = f"dense:{observed_dim}" if observed_dim else "dense"
+        return f"openai|{model_name}|{host}|{kind}"
     if current_model == "sentence-transformers":
         model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-        return f"sentence-transformers|{model_name}|dense"
+        kind = f"dense:{observed_dim}" if observed_dim else "dense"
+        return f"sentence-transformers|{model_name}|{host}|{kind}"
     if current_model == "tfidf":
-        return "tfidf|tfidf|sparse"
-    return embedding_fingerprint(current_model)
+        return f"tfidf|tfidf|{host}|sparse"
+    return f"{current_model}|unknown|{host}|unset"
 
 
 def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
-    """True when stored embeddings are incompatible with the configured backend (N5/N7).
+    """True when stored embeddings are incompatible with the configured backend.
 
-    Rebuild is required when any of:
-    - memories_meta fingerprint ≠ configured backend|model|kind
-    - legacy bare name in meta (e.g. \"openai\") — too coarse to trust
-    - MIXED store: sparse word-keys coexist with dense vectors (cosine → 0.0)
-    - mixed dense dimensions (e.g. 384 and 1024)
-    - sample kind is sparse while current backend is dense (or vice versa)
+    Full-table scan for mixed kinds (no sampling). Rebuild when:
+    - mixed dense+sparse or mixed dense dims
+    - legacy bare meta name (e.g. \"openai\")
+    - stored fingerprint ≠ configured backend|model|host|kind
+    - any row kind incompatible with configured backend
     """
     count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
     if count == 0:
         return False
 
-    # N7: mixed representation is always corrupt for cosine search.
+    # Full scan — never certify mixed via a 500-row sample.
     if store_has_mixed_embeddings(conn):
         return True
 
     stored = get_stored_embedding_model(conn)
-    sample = sample_embedding_vector(conn)
-    current_fp = current_embedding_fingerprint(current_model)
-
     if stored is None:
         return True
-
-    # Legacy bare backend name never equals rich fingerprint.
+    # Legacy coarse name always mismatches rich fingerprints.
     if "|" not in stored:
         return True
 
-    # Data kind vs configured target
-    if sample is not None:
-        sample_kind = _vector_representation(sample)
-        if current_model in ("openai", "sentence-transformers"):
-            if sample_kind == "sparse":
-                return True
-            if sample_kind.startswith("dense:"):
-                # Refine current with observed dims; mismatch if dims or model differ
-                model_name = (
-                    os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-                    if current_model == "openai"
-                    else os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-                )
-                refined = f"{current_model}|{model_name}|{sample_kind}"
-                # If stored claims different dims or model, rebuild
-                if stored != refined and stored != current_fp:
-                    # stored may be openai|model|dense without dims — still check prefix
-                    stored_prefix = "|".join(stored.split("|")[:2])
-                    current_prefix = f"{current_model}|{model_name}"
-                    if stored_prefix != current_prefix:
-                        return True
-                    stored_kind = stored.rsplit("|", 1)[-1]
-                    if stored_kind.startswith("dense:") and stored_kind != sample_kind:
-                        return True
-                    if stored_kind == "dense" and sample_kind.startswith("dense:"):
-                        # stored without dims, data has dims — ok until model changes
-                        return False
-                    return stored != refined
-                return False
-        if current_model == "tfidf" and sample_kind.startswith("dense"):
+    kinds = scan_embedding_kinds(conn)
+    if current_model in ("openai", "sentence-transformers"):
+        if "sparse" in kinds:
             return True
+        dense_dims = sorted(k for k in kinds if k.startswith("dense:"))
+        observed_dim = int(dense_dims[0].split(":")[1]) if dense_dims else None
+        current_fp = current_embedding_fingerprint(current_model, observed_dim=observed_dim)
+        # Compare backend|model|host prefix; kind may be dense vs dense:N
+        stored_parts = stored.split("|")
+        current_parts = current_fp.split("|")
+        if len(stored_parts) < 3 or len(current_parts) < 3:
+            return stored != current_fp
+        # backend, model, host must match
+        if stored_parts[:3] != current_parts[:3]:
+            return True
+        stored_kind = stored_parts[-1]
+        current_kind = current_parts[-1]
+        if stored_kind.startswith("dense:") and current_kind.startswith("dense:"):
+            return stored_kind != current_kind
+        if stored_kind.startswith("dense:") and current_kind == "dense":
+            return False  # config without observed dim yet
+        if stored_kind == "dense" and current_kind.startswith("dense:"):
+            return False
+        return stored_kind != current_kind
 
-    return stored != current_fp
+    if current_model == "tfidf" and any(k.startswith("dense") for k in kinds):
+        return True
+
+    return stored != current_embedding_fingerprint(current_model)
 
 
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
-    """Rebuild all embeddings using given embedding model."""
+    """Rebuild all embeddings using given embedding model.
+
+    Accumulates representations across ALL rows; requires a single uniform
+    kind/dim before writing the final fingerprint (no last-vector-only stamp).
+    """
     rows = conn.execute(
         "SELECT id, content, metadata, tags FROM memories"
     ).fetchall()
     updated = 0
-    last_vector: Optional[Dict[str, float]] = None
+    seen_reps: Set[str] = set()
     for row in rows:
         memory_id = row["id"]
         metadata = json.loads(row["metadata"]) if row["metadata"] else None
         tags = json.loads(row["tags"]) if row["tags"] else []
         vector = compute_embedding(row["content"], metadata, tags, embedding_model)
+        rep = _vector_representation(vector)
+        seen_reps.add(rep)
         upsert_embedding(conn, memory_id, vector)
-        last_vector = vector
         updated += 1
-    # Store rich fingerprint (N5)
-    if embedding_model == "openai":
-        model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-        kind = _vector_representation(last_vector) if last_vector else "empty"
-        fp = f"openai|{model_name}|{kind}"
-    elif embedding_model == "sentence-transformers":
-        model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
-        kind = _vector_representation(last_vector) if last_vector else "empty"
-        fp = f"sentence-transformers|{model_name}|{kind}"
-    else:
-        fp = embedding_fingerprint(embedding_model, observed_vector=last_vector)
+
+    if updated == 0:
+        set_stored_embedding_model(conn, current_embedding_fingerprint(embedding_model))
+        conn.commit()
+        return 0
+
+    # Require one representation across the whole rebuild
+    non_empty = {r for r in seen_reps if r != "empty"}
+    if len(non_empty) != 1:
+        raise EmbeddingProviderError(
+            f"rebuild produced non-uniform representations {sorted(seen_reps)}; "
+            f"refusing to stamp fingerprint"
+        )
+    rep = next(iter(non_empty))
+    observed_dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
+    fp = current_embedding_fingerprint(embedding_model, observed_dim=observed_dim)
+    # Attach exact observed kind when dense:N
+    if rep.startswith("dense:"):
+        parts = fp.rsplit("|", 1)
+        fp = parts[0] + "|" + rep
     set_stored_embedding_model(conn, fp)
     conn.commit()
     return updated

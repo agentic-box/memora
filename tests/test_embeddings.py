@@ -165,15 +165,15 @@ def test_n1_partial_or_blank_never_cross_pairs(fake_openai, monkeypatch, env_set
             assert "MEMORA_EMBEDDING_BASE_URL is unset" in msg
 
     if strict:
-        with pytest.raises(RuntimeError, match="MEMORA_EMBEDDING_STRICT"):
+        with pytest.raises(emb.EmbeddingStrictError, match="MEMORA_EMBEDDING_STRICT"):
             emb.compute_embedding("hello", None, [], "openai")
         # Constructor must NOT have been called
         assert FakeOpenAI.instances == []
     else:
-        # Non-strict: TF-IDF fallback, still no OpenAI client with cross-pair
-        vec = emb.compute_embedding("hello world", None, [], "openai")
+        # Non-strict dense: still FAIL (no TF-IDF substitute), no cross-pair client
+        with pytest.raises(emb.EmbeddingProviderError, match="refusing TF-IDF"):
+            emb.compute_embedding("hello world", None, [], "openai")
         assert FakeOpenAI.instances == []
-        assert any(not k.isdigit() for k in vec.keys()) or vec  # tfidf word keys
 
 
 def test_n1_public_paths_share_helper(fake_openai, monkeypatch):
@@ -354,8 +354,8 @@ def test_n2_strict_endpoint_error(fake_openai, monkeypatch):
         emb.compute_embedding("x", None, [], "openai")
 
 
-def test_n2_nonstrict_all_or_nothing_tfidf(fake_openai, monkeypatch):
-    """Non-strict chunk failure returns TF-IDF for entire batch (no mixed vectors)."""
+def test_n2_nonstrict_dense_fails_not_tfidf(fake_openai, monkeypatch):
+    """Dense backend never persists TF-IDF on failure (round 132 #3 policy)."""
     monkeypatch.setenv("MEMORA_EMBEDDING_API_KEY", "k")
     monkeypatch.setenv("MEMORA_EMBEDDING_BASE_URL", "https://e")
     original_init = FakeOpenAI.__init__
@@ -366,14 +366,11 @@ def test_n2_nonstrict_all_or_nothing_tfidf(fake_openai, monkeypatch):
         self.queue(_EmbResponse([_EmbItem(0, _dense(0))]))
 
     monkeypatch.setattr(FakeOpenAI, "__init__", init_q)
-    out = emb.compute_embeddings_batch(
-        [{"content": "alpha beta", "tags": []}, {"content": "gamma delta", "tags": []}],
-        "openai",
-    )
-    assert len(out) == 2
-    # TF-IDF word keys, not dense "0","1"
-    assert "alpha" in out[0] or "beta" in out[0]
-    assert all(not (len(v) > 0 and all(k.isdigit() for k in v)) for v in out)
+    with pytest.raises(emb.EmbeddingProviderError, match="refusing TF-IDF"):
+        emb.compute_embeddings_batch(
+            [{"content": "alpha beta", "tags": []}, {"content": "gamma delta", "tags": []}],
+            "openai",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -409,10 +406,13 @@ def test_n5_word_key_store_labelled_openai_requires_rebuild(tmp_path, monkeypatc
 
 def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     conn = _meta_conn(tmp_path)
     dense = {str(i): 0.1 for i in range(8)}
     emb.upsert_embedding(conn, 1, dense)
-    emb.set_stored_embedding_model(conn, "openai|text-embedding-3-small|dense:8")
+    host = emb._embedding_endpoint_host()
+    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:8")
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is False
 
@@ -420,8 +420,11 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
 def test_n7_mixed_dense_sparse_forces_rebuild(tmp_path, monkeypatch):
     """N7: dense + word-key rows → mismatch even if meta claims matching fingerprint."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
-    emb.set_stored_embedding_model(conn, "openai|@cf/baai/bge-m3|dense:1024")
+    host = emb._embedding_endpoint_host()
+    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:1024")
     emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(1024)})
     emb.upsert_embedding(conn, 2, {"ure": 0.2, "xdg": 0.3, "zig": 0.5})
     conn.commit()
@@ -432,12 +435,93 @@ def test_n7_mixed_dense_sparse_forces_rebuild(tmp_path, monkeypatch):
 def test_n7_model_change_same_backend_name_forces_rebuild(tmp_path, monkeypatch):
     """N7: still backend openai but model/endpoint fingerprint changed."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
-    # Old dense 384 under different model id, meta still only said openai historically
-    emb.set_stored_embedding_model(conn, "openai|text-embedding-3-small|dense:384")
+    host = emb._embedding_endpoint_host()
+    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:384")
     emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(384)})
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_p1_full_scan_finds_stale_beyond_500(tmp_path, monkeypatch):
+    """P1: single sparse row at id 756 with 755 dense ahead is NOT certified healthy."""
+    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
+    conn = _meta_conn(tmp_path)
+    host = emb._embedding_endpoint_host()
+    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:2")
+    for i in range(1, 756):
+        emb.upsert_embedding(conn, i, {"0": 0.1, "1": 0.2})
+    emb.upsert_embedding(conn, 756, {"ure": 0.5, "xdg": 0.5})  # only stale row
+    conn.commit()
+    assert emb.store_has_mixed_embeddings(conn) is True
+    assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_p1_dense_key_set_exact_not_prefix():
+    """Sparse bag with keys 0..7 + word key must NOT classify as dense."""
+    vec = {str(i): 0.1 for i in range(8)}
+    vec["ure"] = 0.9
+    assert emb._vector_representation(vec) == "sparse"
+    assert emb._vector_representation({str(i): 0.1 for i in range(8)}) == "dense:8"
+
+
+def test_p1_call_wide_dim_across_chunks(fake_openai, monkeypatch):
+    """P1: 2049 inputs, chunk1 dim=1 and chunk2 dim=2 must raise under strict."""
+    monkeypatch.setenv("MEMORA_EMBEDDING_STRICT", "1")
+    monkeypatch.setenv("MEMORA_EMBEDDING_API_KEY", "k")
+    monkeypatch.setenv("MEMORA_EMBEDDING_BASE_URL", "https://e")
+    original_init = FakeOpenAI.__init__
+
+    def init_q(self, **kwargs):
+        original_init(self, **kwargs)
+        # First chunk 2048 @ dim 1, second chunk 1 @ dim 2
+        self.queue(_ok_response(2048, dim=1))
+        self.queue(_ok_response(1, dim=2))
+
+    monkeypatch.setattr(FakeOpenAI, "__init__", init_q)
+    entries = [{"content": f"t{i}", "tags": []} for i in range(2049)]
+    with pytest.raises((emb.EmbeddingStrictError, emb.EmbeddingProviderError, ValueError)):
+        emb.compute_embeddings_batch(entries, "openai")
+
+
+def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, tmp_path):
+    """P1: second phase-3 write failure leaves no partial rows (local SQLite)."""
+    import memora.storage as storage
+    from memora.backends import LocalSQLiteBackend
+
+    backend = LocalSQLiteBackend(tmp_path / "absorb2.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    # Prevent consolidation into one group so we get two phase-3 writes
+    monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
+
+    with storage.connect() as conn:
+        n_add = {"n": 0}
+        real_add = storage.add_memory
+
+        def add_once(*a, **k):
+            n_add["n"] += 1
+            if n_add["n"] >= 2:
+                raise emb.EmbeddingStrictError(
+                    "MEMORA_EMBEDDING_STRICT=1 hard-stop: simulated phase-3 failure"
+                )
+            return real_add(*a, **k)
+
+        monkeypatch.setattr(storage, "add_memory", add_once)
+        with pytest.raises(emb.EmbeddingStrictError):
+            storage.absorb_memory(
+                conn,
+                facts=[
+                    "first unique fact alpha for absorb phase three",
+                    "second unique fact beta for absorb phase three",
+                ],
+            )
+        n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        assert n == 0, f"partial rows remain after phase-3 failure: {n}"
 
 
 def test_n6_absorb_strict_failure_is_clean_not_unboundlocal(monkeypatch, tmp_path):
@@ -476,6 +560,7 @@ def test_parse_empty_vector_rejected():
 
 
 def test_parse_result_count_equals_input():
-    r = emb.parse_openai_embeddings_response(_ok_response(3, dim=2, order=[2, 0, 1]), 3)
+    r, dim = emb.parse_openai_embeddings_response(_ok_response(3, dim=2, order=[2, 0, 1]), 3)
     assert len(r) == 3
+    assert dim == 2
     assert list(r[0].keys()) == ["0", "1"]

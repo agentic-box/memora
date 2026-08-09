@@ -230,6 +230,7 @@ A partial split (only one `MEMORA_EMBEDDING_*` set) is **rejected** so one provi
 **Trap — OpenRouter has no embeddings endpoint.** OpenRouter’s catalogue is chat/multimodal only (no embedding models). Do **not** point the embedding path at OpenRouter via `OPENAI_BASE_URL` (or a MEMORA base URL). That combination 404s every embed call; without `MEMORA_EMBEDDING_STRICT=1` Memora falls back to TF-IDF and keeps answering, so the store fills with keyword bags while looking healthy. OpenRouter remains fine for the **LLM** only.
 
 **Worked example (LLM via OpenRouter, embeddings via Cloudflare Workers AI):**  
+
 `@cf/baai/bge-m3` is 1024-dimensional. Token needs Workers AI permission. Endpoint shape:
 
 `https://api.cloudflare.com/client/v4/accounts/<account_id>/ai/v1`
