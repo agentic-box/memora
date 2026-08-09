@@ -191,9 +191,12 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
 | `MEMORA_EMBEDDING_MODEL` | Embedding backend: `openai` (default), `sentence-transformers`, or `tfidf` |
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
-| `OPENAI_API_KEY`       | API key for OpenAI embeddings and LLM deduplication                        |
-| `OPENAI_BASE_URL`      | Base URL for OpenAI-compatible APIs (OpenRouter, Azure, etc.)              |
-| `OPENAI_EMBEDDING_MODEL` | OpenAI embedding model (default: `text-embedding-3-small`)               |
+| `MEMORA_EMBEDDING_API_KEY` | Embedding provider API key (atomic with base URL — see below)           |
+| `MEMORA_EMBEDDING_BASE_URL` | Embedding provider base URL (atomic with API key — see below)          |
+| `MEMORA_EMBEDDING_STRICT` | `1` to fail fast on embedding errors instead of falling back to TF-IDF |
+| `OPENAI_API_KEY`       | LLM API key (dedup/chat). Also used for embeddings only when **both** `MEMORA_EMBEDDING_*` vars are unset |
+| `OPENAI_BASE_URL`      | LLM base URL (OpenRouter, Azure, etc.). Same fallback rule as the key   |
+| `OPENAI_EMBEDDING_MODEL` | Embedding model id for the openai backend (default: `text-embedding-3-small`) |
 | `MEMORA_LLM_ENABLED`   | Enable LLM-powered deduplication comparison (`true`/`false`, default: `true`) |
 | `MEMORA_LLM_MODEL`     | Model for deduplication comparison (default: `gpt-4o-mini`)                |
 | `CHAT_MODEL`           | Model for the chat panel (default: `deepseek/deepseek-chat`, falls back to `MEMORA_LLM_MODEL`) |
@@ -214,11 +217,37 @@ Memora supports three embedding backends:
 | `sentence-transformers` | `pip install memora[local]` | Good, runs offline | Medium |
 | `tfidf` | Included | Basic keyword matching | Fast |
 
+**Embeddings vs LLM credentials (important):**  
+`OPENAI_API_KEY` / `OPENAI_BASE_URL` drive the **LLM** (dedup, chat). Embeddings can use a **different** provider via the atomic pair:
+
+- `MEMORA_EMBEDDING_API_KEY` + `MEMORA_EMBEDDING_BASE_URL` — both must be set together (or both unset). Memora will not mix one field from `MEMORA_*` with the other from `OPENAI_*` (that would send one provider’s secret to another host).
+- When **both** `MEMORA_EMBEDDING_*` vars are unset, embeddings fall back to the full `OPENAI_*` pair.
+
+**OpenRouter has no embeddings endpoint.** If the LLM uses OpenRouter (`OPENAI_BASE_URL=https://openrouter.ai/api/v1`), point embeddings elsewhere (e.g. Cloudflare AI Gateway, OpenAI, or a local OpenAI-compatible host). Otherwise every embed call 404s and Memora silently falls back to TF-IDF keyword bags unless `MEMORA_EMBEDDING_STRICT=1`.
+
+Split example (LLM on OpenRouter, embeddings on a real embeddings host):
+
+```json
+{
+  "env": {
+    "MEMORA_EMBEDDING_MODEL": "openai",
+    "OPENAI_API_KEY": "<openrouter-key>",
+    "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+    "MEMORA_LLM_MODEL": "deepseek/deepseek-chat",
+    "MEMORA_EMBEDDING_API_KEY": "<embeddings-provider-key>",
+    "MEMORA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
+    "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+    "MEMORA_EMBEDDING_STRICT": "1"
+  }
+}
+```
+
 **Automatic:** Embeddings and cross-references are computed automatically when you `memory_create`, `memory_update`, or `memory_create_batch`.
 
 **Manual rebuild required** when:
-- Changing `MEMORA_EMBEDDING_MODEL` after memories exist
+- Changing `MEMORA_EMBEDDING_MODEL`, embedding provider, or `OPENAI_EMBEDDING_MODEL` after memories exist
 - Switching to a different sentence-transformers model
+- The store fingerprint changes (backend + model name + vector kind/dims) — e.g. after a period of silent TF-IDF fallback under an `openai` label
 
 ```bash
 # After changing embedding model, rebuild all embeddings

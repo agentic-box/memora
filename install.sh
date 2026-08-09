@@ -74,16 +74,23 @@ if [ "$MCP_FOUND" = false ]; then
         "args": ["--no-graph"],
         "env": {
           "MEMORA_EMBEDDING_MODEL": "openai",
-          "OPENAI_API_KEY": "<your-key>",
-          "OPENAI_EMBEDDING_MODEL": "openai/text-embedding-3-small"
+          "OPENAI_API_KEY": "<llm-provider-key>",
+          "OPENAI_BASE_URL": "https://openrouter.ai/api/v1",
+          "MEMORA_LLM_MODEL": "deepseek/deepseek-chat",
+          "MEMORA_EMBEDDING_API_KEY": "<embeddings-provider-key>",
+          "MEMORA_EMBEDDING_BASE_URL": "https://api.openai.com/v1",
+          "OPENAI_EMBEDDING_MODEL": "text-embedding-3-small",
+          "MEMORA_EMBEDDING_STRICT": "1"
         }
       }
     }
   }
 EXAMPLE
     echo ""
+    echo "  Note: OpenRouter has no embeddings API. Set MEMORA_EMBEDDING_API_KEY +"
+    echo "  MEMORA_EMBEDDING_BASE_URL as an atomic pair (both or neither) so the LLM"
+    echo "  key is never sent to the embeddings host. See README.md."
     echo "  For cloud storage (D1/R2), add MEMORA_STORAGE_URI and credentials."
-    echo "  See README.md for full configuration options."
 fi
 
 echo ""
