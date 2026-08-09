@@ -1,9 +1,10 @@
 /**
- * Fixture tests — import shipped _lineage.ts only (no reimplementation).
+ * Fixture tests — import SHIPPED modules only (no reimplementation of planner).
  * Run: node --experimental-strip-types memora-graph/scripts/test_lineage.mjs
  *
- * UI contracts in force-graph.html are asserted via pure consumer helpers that
- * mirror the shipped predicates + source greps (HTML is not importable).
+ * - _lineage.ts: lineage/association pure logic
+ * - public/_selection.mjs: planSelectionReconcile + detail ownership (K1/K2)
+ * HTML source-presence checks are labelled as such — not coverage of async paths.
  */
 
 import { readFileSync } from "node:fs";
@@ -17,9 +18,15 @@ import {
   parseRelatedPayload,
   partitionLineageEdges,
 } from "../functions/api/_lineage.ts";
+import {
+  planSelectionReconcile,
+  detailResponseMayWrite,
+  createDetailOwner,
+} from "../public/_selection.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const html = readFileSync(join(__dirname, "../public/force-graph.html"), "utf8");
+const selectionSrc = readFileSync(join(__dirname, "../public/_selection.mjs"), "utf8");
 
 let failed = 0;
 function assert(cond, msg) {
@@ -218,29 +225,15 @@ function timelineRowClass(flags) {
 }
 
 // --- H3: forceFetch still required for content freshness ---
+// SOURCE-PRESENCE only (not coverage of fetch).
 {
-  assert(/forceFetch/.test(html), "H3: openDetail supports forceFetch");
-  assert(/forceFetch:\s*true/.test(html), "H3: reconcile openDetail uses forceFetch:true");
+  assert(/forceFetch/.test(html), "H3 source-presence: openDetail supports forceFetch");
+  assert(/forceFetch:\s*true/.test(html), "H3 source-presence: reconcile uses forceFetch:true");
   assert(/delete byId\[id\]/.test(html) || /delete byId\[/.test(html),
-    "H3: forceFetch clears byId entry");
+    "H3 source-presence: forceFetch clears byId entry");
 }
 
-// --- J1: reconcile CURRENT selection after raw commit (decision table) ---
-// Mirrors planSelectionReconcile in force-graph.html — must stay identical.
-function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds) {
-  if (curSelectedId == null) return { type: "none" };
-  const graphNode = (nodes || []).find(n => n.id === curSelectedId);
-  if (!graphNode) return { type: "clear" };
-  return {
-    type: "refresh",
-    id: curSelectedId,
-    openDetail: !!panelOpenNow,
-    isDupe: Array.isArray(duplicateIds) && duplicateIds.includes(curSelectedId),
-    superseded: !!graphNode.superseded,
-    authority_unknown: !!graphNode.authority_unknown,
-  };
-}
-
+// --- J1: reconcile CURRENT selection — IMPORTS shipped planSelectionReconcile (K2) ---
 {
   const nodesBefore = [
     { id: 1, superseded: false },
@@ -248,14 +241,14 @@ function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds
   ];
   const nodesAfterAuth = [
     { id: 1, superseded: false },
-    { id: 3, superseded: true, superseded_by: [5] }, // #5 supersedes #3 mid-refresh
+    { id: 3, superseded: true, superseded_by: [5] },
   ];
   const nodesWithout3 = [
     { id: 1, superseded: false },
     { id: 5, superseded: false },
   ];
 
-  // Case 1: none→B during refresh — selection made mid-flight must reconcile
+  // Case 1: none→B during refresh
   {
     const plan = planSelectionReconcile(3, true, nodesAfterAuth, []);
     assert(plan.type === "refresh" && plan.id === 3 && plan.openDetail === true,
@@ -263,14 +256,13 @@ function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds
     assert(plan.superseded === true, "J1 none→B: authority from NEW graph (superseded)");
   }
 
-  // Case 2: A→B during refresh — do not require selectedId === start snapshot
+  // Case 2: A→B during refresh
   {
-    // start had #1; mid-flight user picked #3; after commit cur=3
     const plan = planSelectionReconcile(3, true, nodesAfterAuth, []);
     assert(plan.type === "refresh" && plan.id === 3,
       "J1 A→B: reconciles CURRENT id 3 (not start snapshot 1)");
     assert(plan.openDetail === true && plan.superseded === true,
-      "J1 A→B: panel re-opens with NEW superseded=true (measured fail case)");
+      "J1 A→B: panel re-opens with NEW superseded=true");
   }
 
   // Case 3: B deleted during refresh
@@ -279,33 +271,104 @@ function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds
     assert(plan.type === "clear", "J1 B deleted: clear selection when id gone from new graph");
   }
 
-  // Case 4: B's authority CHANGED during refresh (leader repro: #3 becomes superseded)
+  // Case 4: B's authority CHANGED during refresh
   {
     const before = planSelectionReconcile(3, true, nodesBefore, []);
     const after = planSelectionReconcile(3, true, nodesAfterAuth, []);
     assert(before.superseded === false, "J1 authority: before refresh #3 not superseded");
     assert(after.superseded === true, "J1 authority: after refresh #3 superseded from NEW node");
     assert(after.openDetail === true && after.type === "refresh",
-      "J1 authority: open panel is re-derived (not left on stale 'Supersedes older')");
+      "J1 authority: open panel is re-derived");
   }
 
-  // Extra: deselect mid-refresh → none
   assert(planSelectionReconcile(null, false, nodesAfterAuth, []).type === "none",
     "J1 deselect: no reconcile when selectedId is null");
-  // Extra: selection kept, panel closed → highlight only
   {
     const plan = planSelectionReconcile(3, false, nodesAfterAuth, []);
     assert(plan.type === "refresh" && plan.openDetail === false,
       "J1 panel closed: setHighlight only, do not force-open panel");
   }
 
-  // Source: load uses planSelectionReconcile(selectedId, …) — not start-snapshot equality
-  assert(/function planSelectionReconcile\s*\(/.test(html), "J1 source: planSelectionReconcile defined");
+  // SOURCE-PRESENCE: page imports/uses the module (not coverage of load() itself)
+  assert(/from\s+["']\.\/_selection\.mjs["']/.test(html),
+    "J1 source-presence: force-graph imports ./_selection.mjs");
   assert(/planSelectionReconcile\(\s*selectedId/.test(html),
-    "J1 source: load reads selectedId NOW after commit");
+    "J1 source-presence: load reads selectedId NOW after commit");
   assert(!/selectedId\s*===\s*prevSelected/.test(html),
-    "J1 source: no start-snapshot selectedId===prevSelected guard");
-  assert(/applySelectionReconcile/.test(html), "J1 source: applySelectionReconcile applies plan");
+    "J1 source-presence: no start-snapshot selectedId===prevSelected guard");
+  assert(/applySelectionReconcile/.test(html),
+    "J1 source-presence: applySelectionReconcile applies plan");
+}
+
+// --- K1: older detail response must not mutate a panel that has moved on ---
+{
+  // Pure rule (shipped detailResponseMayWrite)
+  assert(
+    detailResponseMayWrite({
+      requestToken: 1,
+      currentToken: 1,
+      requestId: 2,
+      selectedId: 2,
+      panelOpen: true,
+    }) === true,
+    "K1: matching token+id+open may write",
+  );
+  // Leader repro: #2 detail late after user selected #5
+  assert(
+    detailResponseMayWrite({
+      requestToken: 1,
+      currentToken: 2, // #5's openDetail began → token bumped
+      requestId: 2,
+      selectedId: 5,
+      panelOpen: true,
+    }) === false,
+    "K1: older #2 response must NOT write when selectedId=5 (measured fail)",
+  );
+  assert(
+    detailResponseMayWrite({
+      requestToken: 1,
+      currentToken: 1,
+      requestId: 2,
+      selectedId: 2,
+      panelOpen: false, // closed mid-flight
+    }) === false,
+    "K1: closed panel rejects write even if id/token match",
+  );
+  assert(
+    detailResponseMayWrite({
+      requestToken: 1,
+      currentToken: 1,
+      requestId: 2,
+      selectedId: 5, // selected other without token bump (should not happen, still safe)
+      panelOpen: true,
+    }) === false,
+    "K1: requestId !== selectedId rejects write",
+  );
+
+  // Session simulation: begin #2, then begin #5, #2 mayWrite false
+  const owner = createDetailOwner();
+  const req2 = owner.begin();
+  assert(owner.mayWrite(req2.token, 2, 2, true) === true, "K1 session: #2 owns while current");
+  const req5 = owner.begin(); // user selects #5
+  assert(owner.mayWrite(req2.token, 2, 5, true) === false,
+    "K1 session: #2 token invalidated by #5 begin — must not write");
+  assert(owner.mayWrite(req5.token, 5, 5, true) === true, "K1 session: #5 owns panel");
+  owner.invalidate(); // close/deselect
+  assert(owner.mayWrite(req5.token, 5, 5, true) === false,
+    "K1 session: invalidate drops ownership");
+
+  // SOURCE-PRESENCE for wiring (not coverage of openDetail async):
+  assert(/detailStillOwns|detailOwner\.mayWrite/.test(html),
+    "K1 source-presence: openDetail checks detail ownership");
+  assert(/detailOwner\.begin\(/.test(html), "K1 source-presence: openDetail begins detail session");
+  assert(/detailOwner\.invalidate\(/.test(html),
+    "K1 source-presence: close/deselect/clear invalidate detail");
+  // byId write must be after re-check following r.json()
+  assert(
+    /await r\.json\(\)[\s\S]{0,200}detailStillOwns[\s\S]{0,200}byId/.test(html)
+      || /const body = await r\.json\(\)[\s\S]{0,250}detailStillOwns[\s\S]{0,200}byId/.test(html),
+    "K1 source-presence: re-check ownership after r.json before byId write",
+  );
 }
 
 // --- H4: combined integrity warning + link counts ---

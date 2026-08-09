@@ -152,7 +152,19 @@
 <!-- detail pane -->
 <div id="panel"></div>
 
-<script>
+<!-- Pure selection/detail ownership — tests import the same file (K2). -->
+<script type="module">
+import {
+  planSelectionReconcile,
+  createDetailOwner,
+  detailResponseMayWrite,
+} from "./_selection.mjs";
+
+// Detail ownership session (K1) — shared by openDetail / close / deselect / clear.
+const detailOwner = createDetailOwner();
+// Expose pure helpers for console debug only (not for tests — tests import the module).
+window.MemoraSelection = { planSelectionReconcile, detailResponseMayWrite, detailOwner };
+
 const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
 const DATABASE_STORAGE_KEY = "memora-graph.database";
@@ -579,8 +591,10 @@ addEventListener("resize", () => { if (fg) { fg.width(graphEl.clientWidth); fg.h
 
 // open detail + sync the timeline row + recenter the node AFTER the canvas resizes
 function selectMemory(id, dupe, mem, superseded) {
-  openDetail(id, dupe, mem, superseded);
+  // K1: set selectedId BEFORE openDetail so ownership checks see the new id
+  // (detailOwner.begin also invalidates older tokens).
   setHighlight(id);
+  openDetail(id, dupe, mem, superseded);
   highlightTimeline(id);
   setTimeout(() => focusInGraph(id), 230);
 }
@@ -616,10 +630,25 @@ function focusInGraph(id) {
 }
 
 /* ---------------- detail pane ---------------- */
+/** True if this openDetail call still owns the panel (K1). */
+function detailStillOwns(requestToken, requestId) {
+  return detailOwner.mayWrite(
+    requestToken,
+    requestId,
+    selectedId,
+    document.body.classList.contains("panel-open"),
+  );
+}
+
 // ✕ closes ONLY the detail pane — the graph highlight + timeline selection stay.
-window.closePane = () => { document.body.classList.remove("panel-open"); relayout(); };
+window.closePane = () => {
+  detailOwner.invalidate(); // K1: drop ownership of any in-flight detail
+  document.body.classList.remove("panel-open");
+  relayout();
+};
 // full deselect (background click / Esc): close pane + clear graph + timeline.
 window.deselect = () => {
+  detailOwner.invalidate(); // K1
   document.body.classList.remove("panel-open"); clearHighlight();
   if (activeRow) { activeRow.classList.remove("active"); activeRow = null; }
   pendingHighlight = null;
@@ -628,8 +657,10 @@ window.deselect = () => {
 /**
  * Open detail panel. opts.forceFetch skips preMem/byId and always GETs /api/memories/:id
  * so same-DB refresh cannot render stale content (H3).
+ * K1: each open takes a monotonic detail token; older responses never write the panel.
  */
 async function openDetail(id, dupe, preMem, superseded, opts) {
+  const { token: detailToken, signal: detailSignal } = detailOwner.begin();
   document.body.classList.add("panel-open");
   relayout();
   const panel = el("panel");
@@ -647,14 +678,31 @@ async function openDetail(id, dupe, preMem, superseded, opts) {
   const supIds = (graphNode && graphNode.supersedes) || [];
   try {
     if (!m) {
-      const r = await fetch(`/api/memories/${id}?db=${encodeURIComponent(db)}`, {
-        signal: loadAbort ? loadAbort.signal : undefined,
-      });
-      if (gen !== loadGen || el("db").value !== db) return; // F2: stale detail
+      // Prefer detail-specific abort; also honor loadAbort (DB switch / full reload).
+      const signals = [detailSignal, loadAbort ? loadAbort.signal : null].filter(Boolean);
+      let signal = detailSignal;
+      let mergedController = null;
+      if (signals.length > 1 && typeof AbortController !== "undefined") {
+        mergedController = new AbortController();
+        signal = mergedController.signal;
+        for (const s of signals) {
+          if (s.aborted) { mergedController.abort(); break; }
+          s.addEventListener("abort", () => mergedController.abort(), { once: true });
+        }
+      }
+      const r = await fetch(`/api/memories/${id}?db=${encodeURIComponent(db)}`, { signal });
+      // K1: ownership after await — selection change does not bump loadGen.
+      if (!detailStillOwns(detailToken, id)) return;
+      if (gen !== loadGen || el("db").value !== db) return; // F2: stale detail across load/DB
       if (!r.ok) throw new Error("HTTP " + r.status);
-      m = await r.json();
-      if (byId) byId[id] = m; // refresh cache for timeline
+      const body = await r.json();
+      // K1: re-check AFTER body decode, BEFORE byId write (cache must not poison new DB).
+      if (!detailStillOwns(detailToken, id)) return;
+      if (gen !== loadGen || el("db").value !== db) return;
+      m = body;
+      if (byId) byId[id] = m;
     }
+    if (!detailStillOwns(detailToken, id)) return;
     if (gen !== loadGen || el("db").value !== db) return;
     const tags = (m.tags || []).map(t => `<span>${esc(t)}</span>`).join("");
     const unknownWhy = !lineageAvailable()
@@ -670,6 +718,8 @@ async function openDetail(id, dupe, preMem, superseded, opts) {
     const badge = unknown
       ? ' <span class="superseded" style="color:#8b949e">· UNKNOWN</span>'
       : (isSup ? ' <span class="superseded">· SUPERSEDED</span>' : "");
+    // Final ownership check immediately before ANY panel mutation.
+    if (!detailStillOwns(detailToken, id)) return;
     panel.innerHTML =
       `<button class="close" onclick="closePane()">✕</button>` +
       `<h2>#${m.id}${dupe ? ' <span class="dupe">· DUPLICATE</span>' : ''}${badge}</h2>` +
@@ -680,8 +730,11 @@ async function openDetail(id, dupe, preMem, superseded, opts) {
     panel.scrollTop = 0;
   } catch (e) {
     if (e && e.name === "AbortError") return;
+    // K1: older error must not paint into a newer selection's panel
+    if (!detailStillOwns(detailToken, id)) return;
     if (gen !== loadGen) return;
-    panel.querySelector(".meta").innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`;
+    const meta = panel.querySelector(".meta");
+    if (meta) meta.innerHTML = `<span id="err">fetch failed: ${esc(e.message)}</span>`;
   }
 }
 
@@ -942,6 +995,7 @@ async function initializeDatabases() {
 }
 
 function clearSelectionState() {
+  detailOwner.invalidate(); // K1: drop detail ownership
   selectedId = null; hlNodes = new Set();
   document.body.classList.remove("panel-open");
   if (activeRow) { activeRow.classList.remove("active"); activeRow = null; }
@@ -1011,26 +1065,6 @@ function clearCanvasForSwitch(msg) {
   statsEl.textContent = msg || "loading…";
 }
 
-/**
- * J1: pure decision after raw commits — reconcile CURRENT selection, not a start snapshot.
- * Covers: kept selection, A→B mid-refresh, none→B, deselect, panel closed, B deleted,
- * and B's authority changed (panel re-derived from NEW graphNode + forceFetch).
- * panelOpen is "is the panel open RIGHT NOW", not whether it was open at request start.
- */
-function planSelectionReconcile(curSelectedId, panelOpenNow, nodes, duplicateIds) {
-  if (curSelectedId == null) return { type: "none" };
-  const graphNode = (nodes || []).find(n => n.id === curSelectedId);
-  if (!graphNode) return { type: "clear" };
-  return {
-    type: "refresh",
-    id: curSelectedId,
-    openDetail: !!panelOpenNow,
-    isDupe: Array.isArray(duplicateIds) && duplicateIds.includes(curSelectedId),
-    superseded: !!graphNode.superseded,
-    authority_unknown: !!graphNode.authority_unknown,
-  };
-}
-
 /** Apply J1 plan against live UI state (call only after raw = new graph). */
 function applySelectionReconcile(plan) {
   if (!plan || plan.type === "none") return;
@@ -1044,6 +1078,8 @@ function applySelectionReconcile(plan) {
     openDetail(plan.id, plan.isDupe, null, plan.superseded, { forceFetch: true });
   }
 }
+
+// planSelectionReconcile: imported from ./_selection.mjs (shipped; tests import same file).
 
 async function load() {
   if (!el("db").value) return;
