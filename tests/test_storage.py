@@ -1,7 +1,20 @@
 """Regression tests for core storage operations."""
 
+import pytest
+
 import memora
 import memora.storage as storage
+
+
+def test_resolve_follow_defaults_and_all_escape_hatch():
+    assert storage.resolve_follow(None, default=storage.DEFAULT_FOLLOW_LIST) == "active"
+    assert storage.resolve_follow(None, default=storage.DEFAULT_FOLLOW_GET, for_get=True) == "latest"
+    assert storage.resolve_follow("all", default="active") is None
+    assert storage.resolve_follow("full_history", default="active") == "full_history"
+    with pytest.raises(ValueError):
+        storage.resolve_follow("active", default="latest", for_get=True)
+    with pytest.raises(ValueError):
+        storage.resolve_follow("bogus", default="active")
 
 
 def test_find_duplicate_pairs_uses_canonical_filters(local_db):

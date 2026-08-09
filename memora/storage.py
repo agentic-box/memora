@@ -2251,17 +2251,32 @@ def remove_link(
 # ---------------------------------------------------------------------------
 
 # Valid follow modes for lineage-aware retrieval
-FOLLOW_MODES = {"latest", "active", "full_history"}
+FOLLOW_MODES = {"latest", "active", "full_history", "all"}
 
 # Modes valid for single-ID retrieval (memory_get)
-_GET_FOLLOW_MODES = {"latest", "full_history"}
+# "active" is meaningless for get-by-id (you asked for a specific id);
+# "all" is the explicit unfiltered forensic mode (return that exact id).
+_GET_FOLLOW_MODES = {"latest", "full_history", "all"}
+
+# Public MCP defaults — enforce lineage safety unless the caller opts out.
+# list/search: hide superseded. get: resolve to current leaf.
+DEFAULT_FOLLOW_LIST = "active"
+DEFAULT_FOLLOW_GET = "latest"
+
+# Explicit escape hatch: unfiltered / no lineage post-processing.
+# None is no longer a public "give me everything" signal on MCP tools.
+FOLLOW_UNFILTERED = "all"
 
 # Max depth to walk supersession chains (safety cap; visited set prevents cycles)
 _MAX_CHAIN_DEPTH = 200
 
 
 def validate_follow(follow: Optional[str], for_get: bool = False) -> Optional[str]:
-    """Validate follow parameter. Returns normalized value or raises ValueError."""
+    """Validate follow parameter. Returns normalized value or raises ValueError.
+
+    None means unfiltered at the storage layer (internal callers). Public MCP
+    tools must call resolve_follow() so that omitted follow becomes a safe default.
+    """
     if not follow:
         return None
     valid = _GET_FOLLOW_MODES if for_get else FOLLOW_MODES
@@ -2270,6 +2285,30 @@ def validate_follow(follow: Optional[str], for_get: bool = False) -> Optional[st
             f"Invalid follow mode '{follow}'. Must be one of: {', '.join(sorted(valid))}"
         )
     return follow
+
+
+def resolve_follow(
+    follow: Optional[str],
+    *,
+    default: str,
+    for_get: bool = False,
+) -> Optional[str]:
+    """Resolve a public follow argument to a storage-layer value.
+
+    - omitted / None → ``default`` (safe lineage mode for that tool)
+    - \"all\" → None (explicit unfiltered; forensic/history escape hatch)
+    - other modes → validated and returned as-is
+
+    Storage treats follow=None as unfiltered. MCP tools must not pass raw None
+    from the user without resolving defaults first.
+    """
+    raw = default if follow is None else follow
+    if raw == FOLLOW_UNFILTERED or raw == "all":
+        return None
+    validated = validate_follow(raw, for_get=for_get)
+    if validated is None:
+        raise ValueError("follow resolved to empty; use 'all' for unfiltered retrieval")
+    return validated
 
 
 def _memory_exists(conn: sqlite3.Connection, memory_id: int) -> bool:

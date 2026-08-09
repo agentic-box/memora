@@ -11,30 +11,38 @@ Memora is an MCP memory server. Use it at session start to load context, when th
 
 ## Tool usage guidelines
 
-### Retrieval — use `follow` for clean results
+### Retrieval — lineage defaults are enforced
 
-**Always use `follow="active"` when browsing or listing memories.** This excludes superseded memories, so you only see current information — not outdated versions.
-
-```
-memory_list(tags_any=["memora/todos"], follow="active")
-memory_semantic_search(query="cloud backend", follow="active")
-memory_hybrid_search(query="swap loss research", follow="active")
-```
-
-**Use `follow="latest"` when fetching a specific memory that may have been updated.** This resolves through supersession chains to the current version automatically.
+**Defaults (do not re-state them on every call):**
+- `memory_list` / `memory_semantic_search` / `memory_hybrid_search` default to
+  `follow="active"` — superseded memories are excluded.
+- `memory_get` defaults to `follow="latest"` — a superseded id resolves to the
+  current leaf of its chain.
 
 ```
-memory_get(memory_id=157, follow="latest")  # returns #170 if 157 was superseded
-memory_semantic_search(query="roadmap", follow="latest")  # deduplicates versions
+memory_list(tags_any=["memora/todos"])
+memory_semantic_search(query="cloud backend")
+memory_get(memory_id=157)  # returns the current version if 157 was superseded
 ```
 
-**Use `follow="full_history"` to see the evolution of a topic.** Returns all versions in the supersession chain, root to leaf.
+**When you need non-default lineage:**
 
 ```
-memory_get(memory_id=170, follow="full_history")  # returns history: [#157, #170]
+# Resolve hits to current leaves (dedupe versions in a search)
+memory_semantic_search(query="roadmap", follow="latest")
+
+# Full supersession chain
+memory_get(memory_id=170, follow="full_history")
+
+# Forensic / unfiltered — EXPLICIT only. Omitting follow is NOT unfiltered.
+memory_list(follow="all")
+memory_semantic_search(query="...", follow="all")
+memory_get(memory_id=157, follow="all")  # exact id, no chain walk
 ```
 
-**When to skip `follow`:** When you need raw results regardless of supersession state (e.g., debugging, auditing, or examining the full unfiltered store).
+**Do not cargo-cult `follow="active"` on every call** — that is already the
+list/search default. Pass `follow` only to change behaviour (`latest`,
+`full_history`, or `all`).
 
 ### Saving knowledge — use `memory_absorb`
 

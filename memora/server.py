@@ -51,7 +51,9 @@ from .storage import (
     sync_to_cloud,
     update_crossrefs,
     update_memory,
-    validate_follow,
+    DEFAULT_FOLLOW_GET,
+    DEFAULT_FOLLOW_LIST,
+    resolve_follow,
 )
 
 logger = logging.getLogger(__name__)
@@ -1300,11 +1302,14 @@ async def memory_list(
         content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
         preview_chars: Max chars for preview (default: 120, ignored when content_mode="full")
         fields: Optional list of fields to return (e.g. ["id","content_preview","tags"]). None returns all fields.
-        follow: Lineage mode — "latest" resolves each result to its current version,
-                "active" excludes superseded memories, "full_history" expands supersession chains.
+        follow: Lineage mode. Default ``active`` (excludes superseded memories).
+                ``latest`` resolves each hit to its current version;
+                ``full_history`` expands supersession chains;
+                ``all`` is the explicit unfiltered forensic escape hatch (includes superseded).
+                Omitting follow is NOT unfiltered — it means the safe default.
     """
     try:
-        validate_follow(follow)
+        effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     try:
@@ -1312,7 +1317,7 @@ async def memory_list(
             query, metadata_filters, limit, offset,
             date_from, date_to, tags_any, tags_all, tags_none,
             sort_by_importance,
-            follow=follow,
+            follow=effective_follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -1808,11 +1813,14 @@ async def memory_get(
         memory_id: ID of the memory to retrieve
         include_images: If False, strip image data from metadata to reduce response size
         fields: Optional list of fields to return (e.g. ["id","content","tags"]). None returns all fields.
-        follow: Lineage mode — "latest" resolves to the current version (walks supersedes chains),
-                "full_history" adds a "history" key with all versions from root to leaf.
+        follow: Lineage mode. Default ``latest`` (resolve superseded id to the current leaf).
+                ``full_history`` adds a ``history`` key with all versions root-to-leaf;
+                ``all`` returns the exact requested id with no chain walk (forensic).
+                Omitting follow is NOT unfiltered — it means resolve to latest.
     """
     try:
-        record = _get_memory(memory_id, follow=follow)
+        effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_GET, for_get=True)
+        record = _get_memory(memory_id, follow=effective_follow)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     if not record:
@@ -1980,11 +1988,13 @@ async def memory_semantic_search(
         preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
         fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
                 omit "score" for flat list of memory dicts.
-        follow: Lineage mode — "latest" resolves each result to its current version,
-                "active" excludes superseded memories, "full_history" expands supersession chains.
+        follow: Lineage mode. Default ``active`` (excludes superseded memories).
+                ``latest`` / ``full_history`` as documented on memory_list;
+                ``all`` is the explicit unfiltered forensic escape hatch.
+                Omitting follow is NOT unfiltered — it means the safe default.
     """
     try:
-        validate_follow(follow)
+        effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
 
@@ -1994,7 +2004,7 @@ async def memory_semantic_search(
             metadata_filters,
             top_k,
             min_score,
-            follow=follow,
+            follow=effective_follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -2056,14 +2066,16 @@ async def memory_hybrid_search(
         preview_chars: Max chars for preview (default: 300, ignored when content_mode="full")
         fields: Optional list of fields to return. Include "score" to keep {memory, score} envelope;
                 omit "score" for flat list of memory dicts.
-        follow: Lineage mode — "latest" resolves each result to its current version,
-                "active" excludes superseded memories, "full_history" expands supersession chains.
+        follow: Lineage mode. Default ``active`` (excludes superseded memories).
+                ``latest`` / ``full_history`` as documented on memory_list;
+                ``all`` is the explicit unfiltered forensic escape hatch.
+                Omitting follow is NOT unfiltered — it means the safe default.
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
     """
     try:
-        validate_follow(follow)
+        effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     try:
@@ -2078,7 +2090,7 @@ async def memory_hybrid_search(
             tags_any,
             tags_all,
             tags_none,
-            follow=follow,
+            follow=effective_follow,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}

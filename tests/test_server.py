@@ -168,3 +168,128 @@ def test_memory_digest_synthesize_is_warning_only(local_db):
 
     assert "warnings" in digest
     assert digest["parameters"]["synthesize"] is True
+
+
+def test_default_semantic_search_excludes_superseded_memory(local_db):
+    """Default list/search follow=active: superseded memories stay out of ordinary recall.
+
+    Explicit follow=\"all\" is the forensic escape hatch (omitting follow is NOT unfiltered).
+    """
+    old = _new_memory(
+        content="Unique lineage probe alpha-routing pane-name derived role policy",
+        tags=["lineage-probe", "clmux"],
+    )["memory"]
+    current = _new_memory(
+        content="Unique lineage probe alpha-routing registry role is identity not pane name",
+        tags=["lineage-probe", "clmux"],
+    )["memory"]
+    asyncio.run(server.memory_link(current["id"], old["id"], "supersedes"))
+
+    # Default semantic search (follow omitted → active)
+    default = asyncio.run(
+        server.memory_semantic_search(
+            "Unique lineage probe alpha-routing",
+            top_k=10,
+            content_mode="full",
+        )
+    )
+    default_ids = {
+        (entry.get("memory") or entry)["id"]
+        for entry in default.get("results", [])
+    }
+    assert current["id"] in default_ids
+    assert old["id"] not in default_ids, (
+        f"superseded memory #{old['id']} must not appear under default semantic_search; got {default_ids}"
+    )
+
+    # Explicit unfiltered history
+    unfiltered = asyncio.run(
+        server.memory_semantic_search(
+            "Unique lineage probe alpha-routing",
+            top_k=10,
+            content_mode="full",
+            follow="all",
+        )
+    )
+    unfiltered_ids = {
+        (entry.get("memory") or entry)["id"]
+        for entry in unfiltered.get("results", [])
+    }
+    assert old["id"] in unfiltered_ids, (
+        f"follow='all' must return superseded memory #{old['id']}; got {unfiltered_ids}"
+    )
+
+    # Default list also excludes superseded
+    listed = asyncio.run(
+        server.memory_list(query="Unique lineage probe alpha-routing", limit=-1, content_mode="full")
+    )
+    list_ids = {m["id"] for m in listed.get("memories", [])}
+    assert current["id"] in list_ids
+    assert old["id"] not in list_ids
+
+
+def test_default_memory_get_resolves_superseded_id_to_latest(local_db):
+    """Default memory_get follow=latest: fetch by superseded id returns the current leaf."""
+    old = _new_memory(
+        content="Lineage get-by-id obsolete zig@0.14 build path instruction",
+        tags=["lineage-get"],
+    )["memory"]
+    current = _new_memory(
+        content="Lineage get-by-id current zig 0.15 default toolchain instruction",
+        tags=["lineage-get"],
+    )["memory"]
+    asyncio.run(server.memory_link(current["id"], old["id"], "supersedes"))
+
+    resolved = asyncio.run(server.memory_get(old["id"]))
+    assert "error" not in resolved, resolved
+    resolved_mem = resolved.get("memory") or resolved
+    assert resolved_mem["id"] == current["id"], (
+        f"default get({old['id']}) should resolve to #{current['id']}, got #{resolved_mem.get('id')}"
+    )
+
+    # Forensic escape: exact id, no walk
+    exact = asyncio.run(server.memory_get(old["id"], follow="all"))
+    exact_mem = exact.get("memory") or exact
+    assert exact_mem["id"] == old["id"]
+
+
+def test_document_get_still_returns_superseded_roots(local_db):
+    """server memory_get_document calls _list_memories without follow — must keep superseded roots.
+
+    If follow=\"active\" were applied here, historical version=N retrieval would break.
+    """
+    key = "test/lineage-doc-version-probe"
+    v1 = _raw_memory(
+        content="Document root version 1 historical body",
+        tags=["doc-lineage"],
+        metadata={"type": "document_root", "document_key": key, "document_version": 1},
+    )
+    v2 = _raw_memory(
+        content="Document root version 2 current body",
+        tags=["doc-lineage"],
+        metadata={"type": "document_root", "document_key": key, "document_version": 2},
+    )
+    asyncio.run(server.memory_link(v2["id"], v1["id"], "supersedes"))
+
+    # Prove v1 is superseded for active list, but document path still finds it by version.
+    listed = asyncio.run(
+        server.memory_list(
+            metadata_filters={"document_key": key, "type": "document_root"},
+            limit=-1,
+            content_mode="full",
+        )
+    )
+    list_ids = {m["id"] for m in listed.get("memories", [])}
+    assert v2["id"] in list_ids
+    assert v1["id"] not in list_ids, "active list must hide superseded document root"
+
+    historical = asyncio.run(server.memory_get_document(document_key=key, version=1))
+    assert "error" not in historical, historical
+    assert historical["root"]["id"] == v1["id"], (
+        f"version=1 must return superseded root #{v1['id']}, got {historical.get('root', {}).get('id')}"
+    )
+    assert historical["version"] == 1
+
+    latest = asyncio.run(server.memory_get_document(document_key=key))
+    assert latest["root"]["id"] == v2["id"]
+    assert latest["version"] == 2
