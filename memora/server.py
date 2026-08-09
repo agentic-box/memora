@@ -2011,6 +2011,16 @@ async def memory_semantic_search(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
+    except Exception as exc:
+        from memora.embeddings import EmbeddingIntegrityFault
+        if isinstance(exc, EmbeddingIntegrityFault):
+            return {
+                "error": "embedding_integrity_fault",
+                "reason": exc.reason,
+                "memory_ids": exc.memory_ids,
+                "message": "Automatic rebuild skipped; run integrity verification after fixing the writer.",
+            }
+        raise
     # Project content at tool boundary — search results are [{score, memory}, ...]
     for entry in results:
         if "memory" in entry:

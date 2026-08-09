@@ -23,6 +23,10 @@ from .embeddings import (
     check_embedding_model_mismatch as _check_embedding_model_mismatch_impl,
 )
 from .embeddings import (
+    EmbeddingIntegrityFault,
+    get_embedding_integrity_status as _get_embedding_integrity_status,
+)
+from .embeddings import (
     compute_embedding as _compute_embedding_impl,
 )
 from .embeddings import (
@@ -289,6 +293,25 @@ class MemoryWriteError(Exception):
         self.memory_id = memory_id
         self.cause = cause
         super().__init__(f"memory write failed for id={memory_id}: {cause}")
+
+
+def _recover_absorb_owned_ids(conn: sqlite3.Connection, absorb_nonce: Optional[str]) -> List[int]:
+    """Recover D1 inserts whose HTTP response was lost after remote commit."""
+    if not absorb_nonce:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT id FROM memories WHERE json_extract(metadata, '$.absorb_nonce') = ?",
+            (absorb_nonce,),
+        ).fetchall()
+    except Exception:
+        # JSON functions are present on D1, but retain a conservative fallback
+        # for old SQLite builds. UUID nonce equality prevents practical overlap.
+        rows = conn.execute(
+            "SELECT id FROM memories WHERE metadata LIKE ?",
+            (f'%"absorb_nonce": "{absorb_nonce}"%',),
+        ).fetchall()
+    return [int(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
 
 
 def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: str) -> None:
@@ -2962,6 +2985,7 @@ def add_memory(
     commit: bool = True,
     owned_ids: Optional[List[int]] = None,
     absorb_nonce: Optional[str] = None,
+    absorb_operation_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
 
@@ -2970,6 +2994,8 @@ def add_memory(
     owned_ids: if provided, memory_id is appended immediately after INSERT so
     absorb can compensate even if a later step fails mid-function (P1-1).
     absorb_nonce: stamped into metadata; compensating deletes must match it.
+    absorb_operation_key: client-chosen per-row key used to recover an INSERT
+        that D1 committed before its HTTP response was lost.
     """
     content = _validate_content(content)
 
@@ -2989,6 +3015,8 @@ def add_memory(
     meta_for_embed = dict(metadata or {})
     if absorb_nonce:
         meta_for_embed["absorb_nonce"] = absorb_nonce
+    if absorb_operation_key:
+        meta_for_embed["absorb_operation_key"] = absorb_operation_key
     prepared_for_embed = _prepare_metadata(
         {k: v for k, v in meta_for_embed.items() if k != "images"} if has_images else meta_for_embed
     )
@@ -3005,9 +3033,16 @@ def add_memory(
     try:
         if has_images:
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            # The ownership stub must be present in the INSERT itself. Image/R2
+            # processing happens before the later metadata UPDATE can succeed.
+            ownership_stub: Dict[str, Any] = {}
+            if absorb_nonce:
+                ownership_stub["absorb_nonce"] = absorb_nonce
+            if absorb_operation_key:
+                ownership_stub["absorb_operation_key"] = absorb_operation_key
             cur = conn.execute(
                 "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-                (content, None, tags_json, now),
+                (content, json.dumps(ownership_stub) if ownership_stub else None, tags_json, now),
             )
             memory_id = cur.lastrowid
             if owned_ids is not None and memory_id is not None:
@@ -3016,6 +3051,9 @@ def add_memory(
             if absorb_nonce:
                 prepared_metadata = dict(prepared_metadata or {})
                 prepared_metadata["absorb_nonce"] = absorb_nonce
+            if absorb_operation_key:
+                prepared_metadata = dict(prepared_metadata or {})
+                prepared_metadata["absorb_operation_key"] = absorb_operation_key
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
             conn.execute(
                 "UPDATE memories SET metadata = ? WHERE id = ?",
@@ -3026,6 +3064,9 @@ def add_memory(
             if absorb_nonce:
                 prepared_metadata = dict(prepared_metadata or {})
                 prepared_metadata["absorb_nonce"] = absorb_nonce
+            if absorb_operation_key:
+                prepared_metadata = dict(prepared_metadata or {})
+                prepared_metadata["absorb_operation_key"] = absorb_operation_key
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
             cur = conn.execute(
@@ -3065,6 +3106,18 @@ def add_memory(
     except MemoryWriteError:
         raise
     except Exception as exc:
+        if memory_id is None and absorb_operation_key:
+            try:
+                row = conn.execute(
+                    "SELECT id FROM memories WHERE json_extract(metadata, '$.absorb_operation_key') = ?",
+                    (absorb_operation_key,),
+                ).fetchone()
+                if row is not None:
+                    memory_id = int(row["id"] if isinstance(row, sqlite3.Row) else row[0])
+                    if owned_ids is not None and memory_id not in owned_ids:
+                        owned_ids.append(memory_id)
+            except Exception:
+                pass
         if memory_id is not None:
             raise MemoryWriteError(int(memory_id), exc) from exc
         raise
@@ -3666,9 +3719,11 @@ def absorb_memory(
                 commit=False,
                 owned_ids=owned_ids,
                 absorb_nonce=absorb_nonce,
+                absorb_operation_key=str(uuid.uuid4()),
             )
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
+                link_error: Optional[Exception] = None
                 try:
                     add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
                 except (ValueError, Exception) as link_err:
@@ -3676,6 +3731,19 @@ def absorb_memory(
                         "Absorb link failed (memory #%d -> #%d): %s",
                         record["id"], target_id, link_err,
                     )
+                    link_error = link_err
+                if link_error is not None:
+                    # D1 can have committed the first directional rewrite.
+                    # Do not claim the bidirectional relationship succeeded.
+                    counts["linked"] = max(0, counts["linked"] - 1)
+                    decisions.append({
+                        "fact": job["content"][:80],
+                        "action": "created_unlinked",
+                        "memory_id": record["id"],
+                        "target_id": target_id,
+                        "reason": f"link failed: {type(link_error).__name__}: {link_error}",
+                    })
+                    continue
                 action_label = {
                     "supersedes": "superseded",
                     "contradicts": "contradicted",
@@ -3708,6 +3776,11 @@ def absorb_memory(
                 counts["created"] += 1
         conn.commit()
     except Exception as write_exc:
+        # A D1 INSERT can commit remotely while its response is lost before
+        # lastrowid reaches add_memory. Recover every row owned by this call.
+        for recovered_id in _recover_absorb_owned_ids(conn, absorb_nonce):
+            if recovered_id not in owned_ids:
+                owned_ids.append(recovered_id)
         # Capture id from MemoryWriteError if not already in owned_ids
         if isinstance(write_exc, MemoryWriteError) and write_exc.memory_id not in owned_ids:
             owned_ids.append(write_exc.memory_id)
@@ -3738,9 +3811,12 @@ def absorb_memory(
         # Reconcile counts — nothing was successfully absorbed if we are here
         counts["created"] = 0
         counts["consolidated"] = 0
+        counts["superseded"] = 0
+        counts["contradicted"] = 0
+        counts["linked"] = 0
         # Drop optimistic decisions that claimed creation
         decisions = [d for d in decisions if d.get("action") not in (
-            "created", "consolidated", "superseded", "contradicted", "linked",
+            "created", "created_unlinked", "consolidated", "superseded", "contradicted", "linked",
         )]
 
         if orphans:
@@ -4500,8 +4576,12 @@ def semantic_search(
     Returns:
         List of results with score and memory
     """
-    # Check for embedding model mismatch and rebuild if needed
-    if auto_rebuild and _check_embedding_model_mismatch(conn):
+    # Audit once per process.  A non-repairable external encoding fault must
+    # be surfaced instead of entering an auto-rebuild loop.
+    integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL)
+    if integrity["mismatch"] and not integrity["repairable"]:
+        raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
+    if auto_rebuild and integrity["mismatch"]:
         import sys
         print(
             f"[memora] Embedding model changed: rebuilding embeddings with '{EMBEDDING_MODEL}'...",
@@ -5071,9 +5151,16 @@ def import_memories(
         raise ValueError("strategy must be 'replace', 'merge', or 'append'")
 
     # Replace: clear database first
+    replace_integrity_stamp = None
     if strategy == "replace":
+        # Preserve the last complete audit stamp.  This bulk SQL path bypasses
+        # normal write helpers by design; restoring its baseline lets the next
+        # SQL audit detect replacement rather than certifying a new row alone.
+        from .embeddings import get_embedding_integrity
+        replace_integrity_stamp = get_embedding_integrity(conn)
         conn.execute("DELETE FROM memories")
-        conn.execute("DELETE FROM memories_fts")
+        if _fts_enabled(conn):
+            conn.execute("DELETE FROM memories_fts")
         conn.execute("DELETE FROM memories_embeddings")
         conn.execute("DELETE FROM memories_crossrefs")
         conn.commit()
@@ -5139,6 +5226,12 @@ def import_memories(
             errors.append({"index": idx, "error": str(exc)})
 
     conn.commit()
+
+    if replace_integrity_stamp:
+        from .embeddings import _write_embedding_integrity, invalidate_embedding_integrity_cache
+        _write_embedding_integrity(conn, replace_integrity_stamp)
+        invalidate_embedding_integrity_cache(conn)
+        conn.commit()
 
     # Rebuild cross-references after import
     if imported > 0:

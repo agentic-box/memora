@@ -162,6 +162,15 @@ class EmbeddingProviderError(RuntimeError):
     """
 
 
+class EmbeddingIntegrityFault(RuntimeError):
+    """Integrity issue an automatic rebuild cannot safely satisfy."""
+
+    def __init__(self, reason: str, memory_ids: List[int]):
+        self.reason = reason
+        self.memory_ids = memory_ids
+        super().__init__(f"embedding integrity fault: {reason}; memory_ids={memory_ids}")
+
+
 
 def _key_fingerprint(api_key: str) -> str:
     """Short non-reversible fingerprint of a secret for cache keys. Never log the raw key."""
@@ -593,6 +602,13 @@ def cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float
 # --- DB operations ---
 
 _INTEGRITY_KEY = "embedding_integrity"
+_INTEGRITY_SCHEMA_VERSION = 2
+
+# A semantic search opens a new connection for each MCP call, so the cache key
+# must identify the underlying store rather than the Python connection object.
+# Cache entries are deliberately process-local: another writer can only be
+# detected by a first-use audit in a new process or an explicit verify call.
+_integrity_check_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
@@ -615,7 +631,7 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def get_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
-    """Authoritative integrity snapshot (O(1) meta read)."""
+    """Return the last *audit stamp*, never an authoritative live state."""
     raw = _meta_get(conn, _INTEGRITY_KEY)
     if not raw:
         return {}
@@ -632,11 +648,15 @@ def _write_embedding_integrity(conn: sqlite3.Connection, data: Dict[str, Any]) -
 
 def _empty_integrity() -> Dict[str, Any]:
     return {
-        "reps": {},          # rep -> count
-        "embedding_count": 0,  # non-null embedding rows
+        "schema_version": _INTEGRITY_SCHEMA_VERSION,
+        "generation": None,
+        "state": "building",
+        "reps": {},
+        "embedding_count": 0,
         "memory_count": 0,
         "missing_count": 0,
-        "mixed": False,
+        "orphan_embedding_count": 0,
+        "mixed": True,
         "fingerprint": None,
     }
 
@@ -649,16 +669,53 @@ def _reps_are_mixed(reps: Dict[str, int]) -> bool:
     return len(dense) > 1
 
 
-def _refresh_coverage_counts(conn: sqlite3.Connection, integ: Dict[str, Any]) -> None:
-    """Fast SQL counts (no embedding JSON parse) for coverage integrity."""
-    mem_n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-    emb_n = conn.execute(
-        "SELECT COUNT(*) FROM memories_embeddings "
-        "WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'"
-    ).fetchone()[0]
-    integ["memory_count"] = int(mem_n)
-    integ["embedding_count"] = int(emb_n)
-    integ["missing_count"] = max(0, int(mem_n) - int(emb_n))
+def _store_cache_key(conn: sqlite3.Connection) -> str:
+    """Stable enough per-process identity for a local SQLite or D1 store."""
+    database_id = getattr(conn, "database_id", None)
+    account_id = getattr(conn, "account_id", None)
+    if database_id:
+        return f"d1:{account_id}:{database_id}"
+    # Normal server connections have a configured backend, so this avoids even
+    # a PRAGMA on steady-state semantic searches.  Keep the direct-connection
+    # fallback below for unit/admin callers.
+    try:
+        from . import storage
+        backend = storage.STORAGE_BACKEND
+        path = getattr(backend, "db_path", None) or getattr(backend, "cache_path", None)
+        if path is not None:
+            return f"backend:{type(backend).__name__}:{path}"
+    except Exception:
+        pass
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row:
+            path = row[2] if not isinstance(row, sqlite3.Row) else row["file"]
+            if path:
+                return f"sqlite:{path}"
+    except Exception:
+        pass
+    return f"connection:{id(conn)}"
+
+
+def invalidate_embedding_integrity_cache(conn: Optional[sqlite3.Connection] = None) -> None:
+    """Forget a first-use result after a known write or explicit admin action."""
+    if conn is None:
+        _integrity_check_cache.clear()
+    else:
+        _integrity_check_cache.pop(_store_cache_key(conn), None)
+
+
+def _mark_integrity_dirty(conn: sqlite3.Connection) -> None:
+    """Mark a prior audit stale without inventing counters from one writer.
+
+    A missing/legacy stamp remains missing on purpose.  Otherwise one normal
+    write could "bootstrap" a clean-looking snapshot over an old mixed store.
+    """
+    integ = get_embedding_integrity(conn)
+    if integ and integ.get("schema_version") == _INTEGRITY_SCHEMA_VERSION:
+        integ["state"] = "dirty"
+        _write_embedding_integrity(conn, integ)
+    invalidate_embedding_integrity_cache(conn)
 
 
 def note_embedding_write(
@@ -668,42 +725,17 @@ def note_embedding_write(
     *,
     previous_rep: Optional[str] = None,
 ) -> None:
-    """Update authoritative integrity meta after an embedding write (write-time)."""
-    integ = get_embedding_integrity(conn) or _empty_integrity()
-    reps: Dict[str, int] = dict(integ.get("reps") or {})
-    new_rep = _vector_representation(vector)
-    if previous_rep:
-        reps[previous_rep] = int(reps.get(previous_rep, 1)) - 1
-        if reps[previous_rep] <= 0:
-            del reps[previous_rep]
-    reps[new_rep] = int(reps.get(new_rep, 0)) + 1
-    # drop empty/zero
-    reps = {k: v for k, v in reps.items() if v > 0 and k != "empty"}
-    integ["reps"] = reps
-    integ["mixed"] = _reps_are_mixed(reps)
-    _refresh_coverage_counts(conn, integ)
-    # Stamp observed kind into fingerprint when uniform dense
-    dense = [k for k in reps if k.startswith("dense:")]
-    observed_dim = int(dense[0].split(":")[1]) if len(dense) == 1 and "sparse" not in reps else None
-    # fingerprint is maintained by set_stored_embedding_model / rebuild; keep current if set
-    if integ.get("fingerprint") is None:
-        # leave for set_stored; coverage alone is enough for missing detection
-        pass
-    _write_embedding_integrity(conn, integ)
+    """Invalidate a prior audit after an embedding write.
+
+    Do not maintain representations/counts here: SQL, direct imports, the
+    worker and D1's independent statement commits can all bypass this helper.
+    """
+    _mark_integrity_dirty(conn)
 
 
 def note_embedding_delete(conn: sqlite3.Connection, memory_id: int, previous_rep: Optional[str]) -> None:
-    """Update integrity meta after embedding row removal."""
-    integ = get_embedding_integrity(conn) or _empty_integrity()
-    reps: Dict[str, int] = dict(integ.get("reps") or {})
-    if previous_rep and previous_rep in reps:
-        reps[previous_rep] = int(reps[previous_rep]) - 1
-        if reps[previous_rep] <= 0:
-            del reps[previous_rep]
-    integ["reps"] = reps
-    integ["mixed"] = _reps_are_mixed(reps)
-    _refresh_coverage_counts(conn, integ)
-    _write_embedding_integrity(conn, integ)
+    """Invalidate a prior audit after an embedding row is removed."""
+    _mark_integrity_dirty(conn)
 
 
 def _previous_embedding_rep(conn: sqlite3.Connection, memory_id: int) -> Optional[str]:
@@ -822,7 +854,8 @@ def sample_embedding_vector(conn: sqlite3.Connection) -> Optional[Dict[str, floa
 def audit_scan_embedding_kinds(conn: sqlite3.Connection) -> Set[str]:
     """ADMIN/MIGRATION ONLY — full parse of every embedding (never on search path).
 
-    Prefer get_embedding_integrity() / check_embedding_model_mismatch() which are O(1).
+    Prefer get_embedding_integrity_status(): it performs this audit only on a
+    process's first use (or after explicit invalidation), never per search.
     """
     kinds: Set[str] = set()
     rows = conn.execute(
@@ -856,14 +889,8 @@ def sample_embedding_kinds(
 
 
 def store_has_mixed_embeddings(conn: sqlite3.Connection) -> bool:
-    """True when integrity meta reports mixed reps (O(1)). Falls back to audit if meta empty."""
-    integ = get_embedding_integrity(conn)
-    if integ and integ.get("reps") is not None:
-        if integ.get("mixed"):
-            return True
-        return _reps_are_mixed(dict(integ.get("reps") or {}))
-    # Legacy store without integrity meta: force mismatch via caller, do not scan hot path
-    return False
+    """Return the first-use SQL-derived result, never stale process-side reps."""
+    return bool(get_embedding_integrity_status(conn, "tfidf").get("mixed"))
 
 
 def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
@@ -872,13 +899,9 @@ def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
 
 
 def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
-    """Store the embedding model fingerprint and sync integrity fingerprint field."""
+    """Store the selected model; an admin audit owns any integrity stamp."""
     _meta_set(conn, "embedding_model", model)
-    integ = get_embedding_integrity(conn) or _empty_integrity()
-    integ["fingerprint"] = model
-    _refresh_coverage_counts(conn, integ)
-    integ["mixed"] = _reps_are_mixed(dict(integ.get("reps") or {}))
-    _write_embedding_integrity(conn, integ)
+    _mark_integrity_dirty(conn)
     conn.commit()
 
 
@@ -923,79 +946,170 @@ def current_embedding_fingerprint(
     return f"{current_model}|unknown|{host}|unset"
 
 
-def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
-    """O(1) integrity check from authoritative meta — NEVER scans embedding payloads.
-
-    Mismatch when any of:
-    - no memories (false) / no integrity meta while embeddings exist
-    - missing_count > 0 (memory without non-null embedding)
-    - mixed reps in integrity meta
-    - legacy bare fingerprint (e.g. \"openai\")
-    - stored fingerprint incompatible with configured backend|model|host|kind
-    """
-    mem_n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-    if mem_n == 0:
+def _is_numeric_gap_vector(vector: Dict[str, float]) -> bool:
+    """Recognize thresholded dense vectors without loosening dense detection."""
+    if not vector or not all(key.isdigit() for key in vector):
         return False
+    keys = {int(key) for key in vector}
+    return keys != set(range(len(keys)))
 
-    integ = get_embedding_integrity(conn)
-    stored = get_stored_embedding_model(conn)
 
-    # No integrity meta yet (legacy / pre-meta store) → must rebuild to stamp meta.
-    if not integ or not integ.get("reps"):
-        emb_n = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
-        return emb_n > 0 or stored is not None
+def _coverage_counts(conn: sqlite3.Connection) -> Dict[str, int]:
+    """Indexed anti-joins in both directions; subtraction masks cancellations."""
+    return {
+        "memory_count": int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]),
+        "embedding_count": int(conn.execute(
+            "SELECT COUNT(*) FROM memories_embeddings "
+            "WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'"
+        ).fetchone()[0]),
+        "missing_count": int(conn.execute(
+            """SELECT COUNT(*) FROM memories AS m
+               LEFT JOIN memories_embeddings AS e ON e.memory_id = m.id
+                AND e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+               WHERE e.memory_id IS NULL"""
+        ).fetchone()[0]),
+        "orphan_embedding_count": int(conn.execute(
+            """SELECT COUNT(*) FROM memories_embeddings AS e
+               LEFT JOIN memories AS m ON m.id = e.memory_id
+               WHERE m.id IS NULL"""
+        ).fetchone()[0]),
+    }
 
-    # Coverage: missing embeddings are corrupt and invisible to search (P1-3).
-    # Refresh counts with fast SQL (no payload parse) so deletes of memories are seen.
-    _refresh_coverage_counts(conn, integ)
-    if int(integ.get("missing_count") or 0) > 0:
-        _write_embedding_integrity(conn, integ)
+
+def audit_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Derive integrity from live SQL and payloads (admin/first-use only)."""
+    reps: Dict[str, int] = {}
+    encoding_fault_ids: List[int] = []
+    invalid_embedding_ids: List[int] = []
+    rows = conn.execute(
+        "SELECT memory_id, embedding FROM memories_embeddings "
+        "WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'"
+    ).fetchall()
+    for row in rows:
+        memory_id = int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
+        raw = row["embedding"] if isinstance(row, sqlite3.Row) else row[1]
+        try:
+            vector = json_to_embedding(raw)
+        except Exception:
+            invalid_embedding_ids.append(memory_id)
+            continue
+        rep = _vector_representation(vector)
+        if rep == "empty":
+            invalid_embedding_ids.append(memory_id)
+            continue
+        reps[rep] = reps.get(rep, 0) + 1
+        if rep == "sparse" and _is_numeric_gap_vector(vector):
+            encoding_fault_ids.append(memory_id)
+    return {
+        "schema_version": _INTEGRITY_SCHEMA_VERSION,
+        "reps": reps,
+        "mixed": _reps_are_mixed(reps),
+        "encoding_fault_ids": encoding_fault_ids,
+        "invalid_embedding_ids": invalid_embedding_ids,
+        **_coverage_counts(conn),
+    }
+
+
+def _snapshot_matches_live(stamp: Dict[str, Any], audit: Dict[str, Any], stored: Optional[str]) -> bool:
+    """A stamp detects bypasses; it never decides live integrity by itself."""
+    if stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION:
+        return False
+    if stamp.get("state") != "initialized" or stamp.get("fingerprint") != stored:
+        return False
+    if sum(int(n) for n in (stamp.get("reps") or {}).values()) != audit["embedding_count"]:
+        return False
+    return all(stamp.get(key) == audit.get(key) for key in (
+        "memory_count", "embedding_count", "missing_count", "orphan_embedding_count", "reps",
+    ))
+
+
+def _stamp_integrity_audit(conn: sqlite3.Connection, audit: Dict[str, Any], stored: Optional[str]) -> None:
+    """Persist a completed SQL audit as a drift baseline, never as live truth."""
+    import uuid
+    stamped = dict(audit)
+    stamped.update({
+        "fingerprint": stored,
+        "schema_version": _INTEGRITY_SCHEMA_VERSION,
+        "generation": str(uuid.uuid4()),
+        "state": "initialized",
+    })
+    _write_embedding_integrity(conn, stamped)
+    conn.commit()
+
+
+def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], current_model: str) -> bool:
+    if stored is None or "|" not in stored:
         return True
-
-    if integ.get("mixed") or _reps_are_mixed(dict(integ.get("reps") or {})):
-        return True
-
-    if stored is None:
-        return True
-    if "|" not in stored:
-        return True
-
-    reps = {k: v for k, v in (integ.get("reps") or {}).items() if v > 0}
     if current_model in ("openai", "sentence-transformers"):
         if "sparse" in reps:
             return True
         dense_dims = sorted(k for k in reps if k.startswith("dense:"))
         observed_dim = int(dense_dims[0].split(":")[1]) if dense_dims else None
         current_fp = current_embedding_fingerprint(current_model, observed_dim=observed_dim)
-        stored_parts = stored.split("|")
-        current_parts = current_fp.split("|")
-        if len(stored_parts) < 3 or len(current_parts) < 3:
-            return stored != current_fp
-        if stored_parts[:3] != current_parts[:3]:
+        stored_parts, current_parts = stored.split("|"), current_fp.split("|")
+        if len(stored_parts) < 3 or len(current_parts) < 3 or stored_parts[:3] != current_parts[:3]:
             return True
-        stored_kind = stored_parts[-1]
-        current_kind = current_parts[-1]
+        stored_kind, current_kind = stored_parts[-1], current_parts[-1]
         if stored_kind.startswith("dense:") and current_kind.startswith("dense:"):
             return stored_kind != current_kind
-        if stored_kind.startswith("dense:") and current_kind == "dense":
-            return False
-        if stored_kind == "dense" and current_kind.startswith("dense:"):
-            return False
-        return stored_kind != current_kind
+        return not (
+            (stored_kind.startswith("dense:") and current_kind == "dense")
+            or (stored_kind == "dense" and current_kind.startswith("dense:"))
+        )
+    return current_model == "tfidf" and any(k.startswith("dense") for k in reps) or stored != current_embedding_fingerprint(current_model)
 
-    if current_model == "tfidf" and any(k.startswith("dense") for k in reps):
-        return True
 
-    return stored != current_embedding_fingerprint(current_model)
+def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str) -> Dict[str, Any]:
+    """Audit once per process; faults are surfaced, never auto-rebuilt in a loop."""
+    key = _store_cache_key(conn)
+    if key in _integrity_check_cache:
+        return _integrity_check_cache[key]
+    memory_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
+    if memory_count == 0:
+        result = {"mismatch": False, "repairable": False, "mixed": False, "reason": None, "fault_ids": []}
+    else:
+        stamp = get_embedding_integrity(conn)
+        if not stamp or stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION:
+            result = {"mismatch": True, "repairable": True, "mixed": True, "reason": "integrity_uninitialized", "fault_ids": []}
+        elif stamp.get("state") == "building":
+            result = {"mismatch": True, "repairable": False, "mixed": True, "reason": "integrity_building", "fault_ids": []}
+        else:
+            audit = audit_embedding_integrity(conn)
+            stored = get_stored_embedding_model(conn)
+            # A known Python write explicitly dirtied a previously complete
+            # generation. The first subsequent full audit establishes the new
+            # baseline; legacy stores never reach this branch.
+            if stamp.get("state") == "dirty":
+                _stamp_integrity_audit(conn, audit, stored)
+                stamp = get_embedding_integrity(conn)
+            faults = sorted(set(audit["encoding_fault_ids"] + audit["invalid_embedding_ids"]))
+            if faults:
+                result = {"mismatch": True, "repairable": False, "mixed": audit["mixed"], "reason": "embedding_encoding_fault", "fault_ids": faults, "audit": audit}
+            elif audit["orphan_embedding_count"]:
+                result = {"mismatch": True, "repairable": False, "mixed": audit["mixed"], "reason": "orphan_embeddings", "fault_ids": [], "audit": audit}
+            elif stamp.get("state") == "initialized" and not _snapshot_matches_live(stamp, audit, stored):
+                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "integrity_snapshot_drift", "fault_ids": [], "audit": audit}
+            elif audit["missing_count"]:
+                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "missing_embeddings", "fault_ids": [], "audit": audit}
+            elif audit["mixed"] or _model_mismatch_for_reps(audit["reps"], stored, current_model):
+                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "model_or_representation_mismatch", "fault_ids": [], "audit": audit}
+            else:
+                result = {"mismatch": False, "repairable": False, "mixed": False, "reason": None, "fault_ids": [], "audit": audit}
+    _integrity_check_cache[key] = result
+    return result
+
+
+def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
+    """Compatibility boolean; auto-rebuild callers should inspect status."""
+    return bool(get_embedding_integrity_status(conn, current_model)["mismatch"])
 
 
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
-    """Rebuild all embeddings; stamp uniform fingerprint + integrity meta.
-
-    Admin path may parse vectors; search path uses O(1) integrity meta only.
-    """
-    # Reset integrity before rebuild so counts rebuild cleanly via note_embedding_write
-    _write_embedding_integrity(conn, _empty_integrity())
+    """Rebuild all embeddings and finish with a SQL-derived audit stamp."""
+    building = _empty_integrity()
+    building["state"] = "building"
+    _write_embedding_integrity(conn, building)
+    invalidate_embedding_integrity_cache(conn)
 
     rows = conn.execute(
         "SELECT id, content, metadata, tags FROM memories"
@@ -1014,6 +1128,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
 
     if updated == 0:
         set_stored_embedding_model(conn, current_embedding_fingerprint(embedding_model))
+        verify_embedding_integrity(conn, stamp=True)
         conn.commit()
         return 0
 
@@ -1029,20 +1144,17 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     if rep.startswith("dense:"):
         fp = fp.rsplit("|", 1)[0] + "|" + rep
     set_stored_embedding_model(conn, fp)
+    verify_embedding_integrity(conn, stamp=True)
     conn.commit()
     return updated
 
 
-def verify_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
-    """Admin doctor: full audit scan + compare to meta. Never call from search."""
-    kinds = audit_scan_embedding_kinds(conn)
-    integ = get_embedding_integrity(conn)
-    _refresh_coverage_counts(conn, integ if integ else _empty_integrity())
-    return {
-        "audit_kinds": sorted(kinds),
-        "meta": get_embedding_integrity(conn),
-        "mixed_audit": (
-            ("sparse" in kinds and any(k.startswith("dense") for k in kinds))
-            or len({k for k in kinds if k.startswith("dense:")}) > 1
-        ),
-    }
+def verify_embedding_integrity(conn: sqlite3.Connection, *, stamp: bool = True) -> Dict[str, Any]:
+    """Explicit admin audit; stamp a complete SQL generation when requested."""
+    audit = audit_embedding_integrity(conn)
+    result = dict(audit)
+    result["fingerprint"] = get_stored_embedding_model(conn)
+    if stamp:
+        _stamp_integrity_audit(conn, audit, result["fingerprint"])
+    invalidate_embedding_integrity_cache(conn)
+    return result

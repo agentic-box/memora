@@ -38,11 +38,13 @@ def _clean_embedding_state(monkeypatch):
     """Clear caches, warn-once state, and all embedding-related env vars."""
     emb._embedding_model_cache.clear()
     emb._warned_backends.clear()
+    emb._integrity_check_cache.clear()
     for var in _EMBED_ENV:
         monkeypatch.delenv(var, raising=False)
     yield
     emb._embedding_model_cache.clear()
     emb._warned_backends.clear()
+    emb._integrity_check_cache.clear()
 
 
 class _EmbItem:
@@ -426,6 +428,7 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
     emb.upsert_embedding(conn, 1, dense)
     host = emb._embedding_endpoint_host()
     emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:8")
+    emb.verify_embedding_integrity(conn)
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is False
 
@@ -460,8 +463,8 @@ def test_n7_model_change_same_backend_name_forces_rebuild(tmp_path, monkeypatch)
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
 
 
-def test_p1_integrity_meta_tracks_mixed_without_hot_scan(tmp_path, monkeypatch):
-    """Write-time integrity sees sparse among many dense rows (authoritative meta)."""
+def test_p1_integrity_audit_tracks_mixed_then_caches_result(tmp_path, monkeypatch):
+    """First-use audit derives mixed reps; repeated checks use its process cache."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
@@ -473,8 +476,11 @@ def test_p1_integrity_meta_tracks_mixed_without_hot_scan(tmp_path, monkeypatch):
     _seed_memory(conn, 51)
     emb.upsert_embedding(conn, 51, {"ure": 0.5, "xdg": 0.5})
     emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:2")
+    audit = emb.verify_embedding_integrity(conn)
     conn.commit()
     integ = emb.get_embedding_integrity(conn)
+    assert audit["mixed"] is True
+    assert integ["state"] == "initialized"
     assert integ.get("mixed") is True
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
 
@@ -507,6 +513,7 @@ def test_p1_4_mismatch_is_fast_no_payload_scan(tmp_path, monkeypatch):
         _seed_memory(conn, i)
         emb.upsert_embedding(conn, i, {str(j): 0.01 for j in range(32)})
     emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:32")
+    emb.verify_embedding_integrity(conn)
     conn.commit()
     t0 = time.perf_counter()
     for _ in range(20):
@@ -514,6 +521,192 @@ def test_p1_4_mismatch_is_fast_no_payload_scan(tmp_path, monkeypatch):
     elapsed = time.perf_counter() - t0
     # 20 checks on 200 dense:32 rows must be well under a full re-parse budget
     assert elapsed < 0.5, f"mismatch hot path too slow: {elapsed:.3f}s for 20 checks"
+
+
+def _stamp_tfidf_store(conn) -> None:
+    emb.set_stored_embedding_model(conn, emb.current_embedding_fingerprint("tfidf"))
+    emb.verify_embedding_integrity(conn)
+    emb.invalidate_embedding_integrity_cache(conn)
+
+
+def test_d1_replace_import_cannot_certify_stale_snapshot(absorb_backend):
+    """D1 probe: replace deletes vectors directly, so old generation must drift."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        storage.add_memory(conn, content="replace baseline alpha sparse")
+        storage.add_memory(conn, content="replace baseline beta sparse")
+        _stamp_tfidf_store(conn)
+        assert emb.get_embedding_integrity(conn)["reps"] == {"sparse": 2}
+        storage.import_memories(conn, [{"content": "replacement only sparse"}], strategy="replace")
+        status = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert status["mismatch"] is True
+        assert status["reason"] == "integrity_snapshot_drift"
+
+        # Hard negative control: an explicit admin audit knowingly stamps the
+        # replacement generation, after which the one-row store is healthy.
+        emb.verify_embedding_integrity(conn)
+        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is False
+
+
+def test_d1_legacy_bootstrap_stays_uninitialized_after_one_write(absorb_backend):
+    """A normal write must not turn a legacy dense+sparse store into healthy."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        first = storage.add_memory(conn, content="legacy dense row")
+        second = storage.add_memory(conn, content="legacy sparse row")
+        # Simulate old/direct writers: erase any stamp and create mixed data.
+        conn.execute("DELETE FROM memories_meta WHERE key = 'embedding_integrity'")
+        emb.upsert_embedding(conn, first["id"], {"0": 0.5, "1": 0.5})
+        emb.upsert_embedding(conn, second["id"], {"legacy": 1.0})
+        _stamp = emb.current_embedding_fingerprint("tfidf")
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_meta(key, value) VALUES ('embedding_model', ?)",
+            (_stamp,),
+        )
+        # The one ordinary upsert that used to bootstrap metadata cannot do so.
+        emb.upsert_embedding(conn, first["id"], {"0": 0.5, "1": 0.5})
+        emb.invalidate_embedding_integrity_cache(conn)
+        status = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert status["mismatch"] is True
+        assert status["reason"] == "integrity_uninitialized"
+
+        # Hard negative control: a fresh, uniform store gets a complete admin
+        # stamp and is accepted, proving this is not a blanket false positive.
+        conn.execute("DELETE FROM memories_embeddings")
+        emb.upsert_embedding(conn, first["id"], {"legacy": 1.0})
+        emb.upsert_embedding(conn, second["id"], {"legacy": 1.0})
+        _stamp_tfidf_store(conn)
+        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is False
+
+
+def test_d1_orphan_embedding_cannot_offset_missing_memory(absorb_backend):
+    """Opposite anti-joins expose one missing and one orphan independently."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        kept = storage.add_memory(conn, content="covered memory")
+        missing = storage.add_memory(conn, content="missing vector memory")
+        _stamp_tfidf_store(conn)
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (missing["id"],))
+        conn.execute(
+            "INSERT INTO memories_embeddings(memory_id, embedding) VALUES (?, ?)",
+            (999999, emb.embedding_to_json({"orphan": 1.0})),
+        )
+        emb.invalidate_embedding_integrity_cache(conn)
+        status = emb.get_embedding_integrity_status(conn, "tfidf")
+        audit = status["audit"]
+        assert audit["missing_count"] == 1
+        assert audit["orphan_embedding_count"] == 1
+        assert status["mismatch"] is True and status["reason"] == "orphan_embeddings"
+
+        # Hard negative control: remove both independent defects, stamp, and
+        # verify that a healthy store does not stay faulted.
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = 999999")
+        storage._upsert_embedding(conn, missing["id"], {"missing": 1.0})
+        _stamp_tfidf_store(conn)
+        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is False
+
+
+def test_d1_interleaved_representation_writes_cannot_lose_a_rep(absorb_backend):
+    """A last-writer-wins snapshot cannot hide the other D1 representation."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        dense = storage.add_memory(conn, content="concurrent dense")
+        sparse = storage.add_memory(conn, content="concurrent sparse")
+        emb.upsert_embedding(conn, dense["id"], {"0": 0.5, "1": 0.5})
+        emb.upsert_embedding(conn, sparse["id"], {"word": 1.0})
+        host = emb._embedding_endpoint_host()
+        stored = f"openai|text-embedding-3-small|{host}|dense:2"
+        emb.set_stored_embedding_model(conn, stored)
+        # Simulate concurrent RMW metadata writes where the final writer drops
+        # the sparse representation. SQL truth still has both rows.
+        emb._write_embedding_integrity(conn, {
+            "schema_version": 2, "generation": "lost-update", "state": "initialized",
+            "reps": {"dense:2": 1}, "memory_count": 2, "embedding_count": 2,
+            "missing_count": 0, "orphan_embedding_count": 0, "mixed": False,
+            "fingerprint": stored,
+        })
+        emb.invalidate_embedding_integrity_cache(conn)
+        status = emb.get_embedding_integrity_status(conn, "openai")
+        assert status["mismatch"] is True
+        assert status["reason"] == "integrity_snapshot_drift"
+        assert status["audit"]["reps"] == {"dense:2": 1, "sparse": 1}
+
+        # Hard negative control: a complete audit records both representations;
+        # the remaining mismatch is explicit model/representation drift, not a
+        # silently lost snapshot entry.
+        emb.verify_embedding_integrity(conn)
+        status = emb.get_embedding_integrity_status(conn, "openai")
+        assert status["reason"] == "model_or_representation_mismatch"
+
+
+def test_image_insert_stamps_nonce_before_image_processing(monkeypatch, absorb_backend):
+    """Image/R2 failure can still be safely compensated under D1 autocommit."""
+    import json
+    import memora.storage as storage
+
+    monkeypatch.setattr(
+        storage, "_process_image_for_storage",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("R2 image failure")),
+    )
+    with storage.connect() as conn:
+        owned = []
+        with pytest.raises(storage.MemoryWriteError, match="R2 image failure"):
+            storage.add_memory(
+                conn,
+                content="image nonce ownership needs to precede image processing",
+                metadata={"images": [{"src": "fake-image"}]},
+                owned_ids=owned,
+                absorb_nonce="image-owner",
+                absorb_operation_key="image-operation",
+            )
+        assert owned
+        raw = conn.execute("SELECT metadata FROM memories WHERE id = ?", (owned[0],)).fetchone()[0]
+        assert json.loads(raw) == {
+            "absorb_nonce": "image-owner", "absorb_operation_key": "image-operation",
+        }
+        assert storage.delete_memory(conn, owned[0], require_absorb_nonce="image-owner") is True
+        assert conn.execute("SELECT 1 FROM memories WHERE id = ?", (owned[0],)).fetchone() is None
+
+
+def test_d1_lost_insert_response_recovers_owned_row(monkeypatch, absorb_backend):
+    """A committed INSERT with a lost response still becomes compensation-owned."""
+    import memora.storage as storage
+    from memora.backends import D1Connection
+
+    with storage.connect() as conn:
+        if not isinstance(conn, D1Connection):
+            pytest.skip("response-loss behavior is specific to D1's HTTP execute")
+        real_execute = conn.execute
+        fired = {"value": False}
+
+        def lost_response(sql, params=None):
+            if not fired["value"] and sql.lstrip().startswith("INSERT INTO memories "):
+                fired["value"] = True
+                real_execute(sql, params)
+                raise RuntimeError("simulated D1 response lost after commit")
+            return real_execute(sql, params)
+
+        monkeypatch.setattr(conn, "execute", lost_response)
+        owned = []
+        with pytest.raises(storage.MemoryWriteError, match="response lost") as raised:
+            storage.add_memory(
+                conn,
+                content="ambiguous D1 insert must be discovered by operation key",
+                owned_ids=owned,
+                absorb_nonce="recover-owner",
+                absorb_operation_key="recover-operation",
+            )
+        assert raised.value.memory_id in owned
+        assert conn.execute(
+            "SELECT 1 FROM memories WHERE id = ?", (raised.value.memory_id,)
+        ).fetchone() is not None
+        assert storage.delete_memory(
+            conn, raised.value.memory_id, require_absorb_nonce="recover-owner"
+        ) is True
 
 
 def test_p1_dense_key_set_exact_not_prefix():
