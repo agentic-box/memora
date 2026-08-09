@@ -1450,6 +1450,9 @@ async def memory_absorb(
         logger.error("memory_absorb failed: %s", exc, exc_info=True)
         return _safe_error(exc, "memory_absorb")
 
+    # Never schedule graph sync on partial/error absorb (P1-2).
+    if result.get("partial") or result.get("error"):
+        return result
     wrote = result.get("created", 0) + result.get("superseded", 0) + result.get("contradicted", 0) + result.get("linked", 0)
     if not dry_run and wrote > 0:
         _schedule_cloud_graph_sync()

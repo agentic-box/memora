@@ -260,7 +260,13 @@ def _apply_auto_detection(
     return updated_metadata, updated_tags
 
 
-def _emit_event(conn: sqlite3.Connection, memory_id: int, tags: List[str]) -> None:
+def _emit_event(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    tags: List[str],
+    *,
+    commit: bool = True,
+) -> None:
     """Emit an event notification if memory has the trigger tag."""
     if EVENT_TRIGGER_TAG in tags:
         tags_json = json.dumps(tags, ensure_ascii=False)
@@ -269,10 +275,20 @@ def _emit_event(conn: sqlite3.Connection, memory_id: int, tags: List[str]) -> No
                 "INSERT INTO memories_events (memory_id, tags) VALUES (?, ?)",
                 (memory_id, tags_json)
             )
-            conn.commit()
+            if commit:
+                conn.commit()
         except Exception:
             # Don't fail memory operations if event emission fails
             pass
+
+
+class MemoryWriteError(Exception):
+    """Raised when add_memory fails after allocating a row id (partial insert)."""
+
+    def __init__(self, memory_id: int, cause: BaseException):
+        self.memory_id = memory_id
+        self.cause = cause
+        super().__init__(f"memory write failed for id={memory_id}: {cause}")
 
 
 def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: str) -> None:
@@ -2157,6 +2173,8 @@ def add_link(
     to_id: int,
     edge_type: str = "references",
     bidirectional: bool = True,
+    *,
+    commit: bool = True,
 ) -> Dict[str, Any]:
     """Add an explicit link between two memories.
 
@@ -2165,6 +2183,7 @@ def add_link(
         to_id: Target memory ID
         edge_type: Type of relationship (references, implements, supersedes, contradicts, extends)
         bidirectional: If True, also create reverse link
+        commit: When False, leave transaction open for batch callers (absorb).
 
     Returns:
         Dict with status and created links
@@ -2201,7 +2220,8 @@ def add_link(
         links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
 
     _log_action(conn, from_id, "link", f"Linked #{from_id} -> #{to_id} ({edge_type})")
-    conn.commit()
+    if commit:
+        conn.commit()
     return {"status": "linked", "links": links_created}
 
 
@@ -2940,20 +2960,19 @@ def add_memory(
     tags: Optional[List[str]] = None,
     embedding: Optional[Dict[str, float]] = None,
     commit: bool = True,
+    owned_ids: Optional[List[int]] = None,
+    absorb_nonce: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
 
-    embedding: optional precomputed vector (absorb phase-3). When provided,
-    embedding is NOT recomputed — avoids double API calls and partial-commit
-    races where phase-3 recompute fails after insert.
+    embedding: optional precomputed vector from FINAL content+metadata+tags.
     commit: when False, skip conn.commit() so callers can batch (local SQLite).
-    On D1, each statement auto-commits; compute embedding BEFORE insert so a
-    provider failure cannot leave an orphan row without embedding/FTS.
+    owned_ids: if provided, memory_id is appended immediately after INSERT so
+    absorb can compensate even if a later step fails mid-function (P1-1).
+    absorb_nonce: stamped into metadata; compensating deletes must match it.
     """
-    # Validate and normalize content (trim, length check)
     content = _validate_content(content)
 
-    # Auto-detect memory type (issue/todo) from content if not explicitly set
     metadata, tags = _apply_auto_detection(content, metadata, tags)
     metadata = _auto_assign_section(metadata, content, tags)
 
@@ -2962,19 +2981,19 @@ def add_memory(
     _enforce_tag_whitelist(validated_tags)
     tags_json = json.dumps(validated_tags, ensure_ascii=False)
 
-    # Prepare metadata without images first so we can embed before any write.
-    # Image two-pass still needs memory_id for R2 keys — embed uses un-uploaded meta.
     has_images = (
         metadata is not None
         and isinstance(metadata.get('images'), list)
         and len(metadata.get('images', [])) > 0
     )
+    meta_for_embed = dict(metadata or {})
+    if absorb_nonce:
+        meta_for_embed["absorb_nonce"] = absorb_nonce
     prepared_for_embed = _prepare_metadata(
-        {k: v for k, v in (metadata or {}).items() if k != "images"} if has_images else metadata
+        {k: v for k, v in meta_for_embed.items() if k != "images"} if has_images else meta_for_embed
     )
 
-    # P1 D1: compute (or accept precomputed) embedding BEFORE insert so a strict
-    # failure cannot leave an orphan row without embedding/FTS/crossrefs.
+    # Compute embedding BEFORE insert (D1 cannot leave orphan without vector).
     if embedding is not None:
         vector = embedding
     else:
@@ -2982,57 +3001,73 @@ def add_memory(
     if not vector:
         raise ValueError("embedding is empty; refusing to create memory without a vector")
 
-    if has_images:
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        cur = conn.execute(
-            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-            (content, None, tags_json, now),
-        )
-        memory_id = cur.lastrowid
-        prepared_metadata = _prepare_metadata(metadata, memory_id=memory_id)
-        metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
-        conn.execute(
-            "UPDATE memories SET metadata = ? WHERE id = ?",
-            (metadata_json, memory_id),
-        )
-    else:
-        prepared_metadata = _prepare_metadata(metadata)
-        metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
-        now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-        cur = conn.execute(
-            "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-            (content, metadata_json, tags_json, now),
-        )
-        memory_id = cur.lastrowid
+    memory_id: Optional[int] = None
+    try:
+        if has_images:
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            cur = conn.execute(
+                "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+                (content, None, tags_json, now),
+            )
+            memory_id = cur.lastrowid
+            if owned_ids is not None and memory_id is not None:
+                owned_ids.append(int(memory_id))
+            prepared_metadata = _prepare_metadata(meta_for_embed, memory_id=memory_id)
+            if absorb_nonce:
+                prepared_metadata = dict(prepared_metadata or {})
+                prepared_metadata["absorb_nonce"] = absorb_nonce
+            metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
+            conn.execute(
+                "UPDATE memories SET metadata = ? WHERE id = ?",
+                (metadata_json, memory_id),
+            )
+        else:
+            prepared_metadata = _prepare_metadata(meta_for_embed)
+            if absorb_nonce:
+                prepared_metadata = dict(prepared_metadata or {})
+                prepared_metadata["absorb_nonce"] = absorb_nonce
+            metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
+            now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            cur = conn.execute(
+                "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+                (content, metadata_json, tags_json, now),
+            )
+            memory_id = cur.lastrowid
+            if owned_ids is not None and memory_id is not None:
+                owned_ids.append(int(memory_id))
 
-    _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-    _upsert_embedding(conn, memory_id, vector)
+        _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
+        _upsert_embedding(conn, memory_id, vector)
 
-    # Compute cross-refs (skip for section memories and document fragments)
-    related: List[Dict[str, Any]] = []
-    if not _should_skip_crossrefs(prepared_metadata):
-        related = _update_crossrefs_for_memory(conn, memory_id, vector=vector)
+        related: List[Dict[str, Any]] = []
+        if not _should_skip_crossrefs(prepared_metadata):
+            related = _update_crossrefs_for_memory(conn, memory_id, vector=vector)
 
-    _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
-    if commit:
-        conn.commit()
-    _emit_event(conn, memory_id, validated_tags)
+        _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
+        if commit:
+            conn.commit()
+        _emit_event(conn, memory_id, validated_tags, commit=commit)
 
-    # Construct result locally (avoids re-fetch and D1 read replica lag)
-    result: Dict[str, Any] = {
-        "id": memory_id,
-        "content": content,
-        "metadata": _present_metadata(prepared_metadata) if prepared_metadata else None,
-        "tags": validated_tags,
-        "created_at": now,
-        "updated_at": None,
-        "importance": 1.0,
-        "access_count": 0,
-        "last_accessed": None,
-        "importance_score": calculate_importance(now, 1.0, 0),
-        "related": related,
-    }
-    return result
+        result: Dict[str, Any] = {
+            "id": memory_id,
+            "content": content,
+            "metadata": _present_metadata(prepared_metadata) if prepared_metadata else None,
+            "tags": validated_tags,
+            "created_at": now,
+            "updated_at": None,
+            "importance": 1.0,
+            "access_count": 0,
+            "last_accessed": None,
+            "importance_score": calculate_importance(now, 1.0, 0),
+            "related": related,
+        }
+        return result
+    except MemoryWriteError:
+        raise
+    except Exception as exc:
+        if memory_id is not None:
+            raise MemoryWriteError(int(memory_id), exc) from exc
+        raise
 
 
 def add_memories(
@@ -3539,14 +3574,14 @@ def absorb_memory(
                 merged.append(t)
         return merged
 
-    # Phase 3 prep: PRECOMPUTE every embedding before the first write (P1).
-    # Reuse phase-1 vectors when content is unchanged; re-embed only consolidated text.
-    # Structure: (content, vector, link_info_or_None, final_tags, decision_template)
+    # Phase 3 prep: precompute EVERY storage vector from FINAL payload (P2-1).
+    # Phase-1 vectors stay for similarity search only — not for storage.
+    import uuid
+    absorb_nonce = str(uuid.uuid4())
     phase3_jobs: List[Dict[str, Any]] = []
 
     for group_indices in groups:
         group_facts = [pure_new[gi][1][0] for gi in group_indices]
-        group_vectors = [pure_new[gi][1][1] for gi in group_indices]
         group_suggested: List[str] = []
         for gi in group_indices:
             group_suggested.extend(pure_new[gi][1][3])
@@ -3557,7 +3592,7 @@ def absorb_memory(
             consolidated = _consolidate_facts_llm(group_facts, context)
             phase3_jobs.append({
                 "content": consolidated,
-                "vector": None,  # must re-embed consolidated text
+                "vector": None,
                 "link": None,
                 "tags": final_tags,
                 "kind": "consolidated",
@@ -3566,17 +3601,17 @@ def absorb_memory(
         else:
             phase3_jobs.append({
                 "content": group_facts[0],
-                "vector": group_vectors[0],  # reuse phase-1
+                "vector": None,  # re-embed with final metadata+tags
                 "link": None,
                 "tags": final_tags,
                 "kind": "created",
                 "source_facts": None,
             })
 
-    for _, (fact, vector, link_info, fact_suggested) in linkable:
+    for _, (fact, _search_vector, link_info, fact_suggested) in linkable:
         phase3_jobs.append({
             "content": fact,
-            "vector": vector,  # reuse phase-1
+            "vector": None,  # re-embed with final metadata+tags
             "link": link_info,
             "tags": _merge_tags(tags, _filter_suggested_tags(fact_suggested)),
             "kind": "linked",
@@ -3612,16 +3647,14 @@ def absorb_memory(
                 })
         return {"decisions": decisions, **counts}
 
-    # Embed any jobs that still need vectors (consolidated) BEFORE any write.
+    # Precompute ALL storage embeddings from final content + merged_meta + tags.
     for job in phase3_jobs:
-        if job["vector"] is None:
-            job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
-            if not job["vector"]:
-                raise RuntimeError("absorb phase-3 embedding returned empty vector")
+        job["vector"] = _compute_embedding(job["content"], merged_meta, job["tags"] or [])
+        if not job["vector"]:
+            raise RuntimeError("absorb phase-3 embedding returned empty vector")
 
-    # All embeddings ready — write. Local SQLite: commit=False until end.
-    # D1 auto-commits each statement; on failure we compensating-delete written IDs.
-    written_ids: List[int] = []
+    # owned_ids tracks every INSERT id, even if add_memory fails mid-function (P1-1).
+    owned_ids: List[int] = []
     try:
         for job in phase3_jobs:
             record = add_memory(
@@ -3631,12 +3664,13 @@ def absorb_memory(
                 tags=job["tags"],
                 embedding=job["vector"],
                 commit=False,
+                owned_ids=owned_ids,
+                absorb_nonce=absorb_nonce,
             )
-            written_ids.append(record["id"])
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 try:
-                    add_link(conn, record["id"], target_id, edge_type=edge_type)
+                    add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
                 except (ValueError, Exception) as link_err:
                     logger.warning(
                         "Absorb link failed (memory #%d -> #%d): %s",
@@ -3674,32 +3708,58 @@ def absorb_memory(
                 counts["created"] += 1
         conn.commit()
     except Exception as write_exc:
-        # Compensating cleanup (critical on D1 where each insert already persisted).
+        # Capture id from MemoryWriteError if not already in owned_ids
+        if isinstance(write_exc, MemoryWriteError) and write_exc.memory_id not in owned_ids:
+            owned_ids.append(write_exc.memory_id)
+
         cleaned: List[int] = []
-        for mid in written_ids:
+        failed_deletes: List[int] = []
+        for mid in list(owned_ids):
             try:
-                delete_memory(conn, mid)
-                cleaned.append(mid)
+                ok = delete_memory(conn, mid, require_absorb_nonce=absorb_nonce)
+                if ok:
+                    # Verify absence
+                    still = conn.execute(
+                        "SELECT 1 FROM memories WHERE id = ?", (mid,)
+                    ).fetchone()
+                    if still is None:
+                        cleaned.append(mid)
+                    else:
+                        failed_deletes.append(mid)
+                else:
+                    failed_deletes.append(mid)
             except Exception as del_exc:
                 logger.error(
                     "Absorb compensating delete failed for memory #%d: %s", mid, del_exc
                 )
-        if written_ids and len(cleaned) < len(written_ids):
-            orphans = [i for i in written_ids if i not in cleaned]
+                failed_deletes.append(mid)
+
+        orphans = [i for i in owned_ids if i not in cleaned]
+        # Reconcile counts — nothing was successfully absorbed if we are here
+        counts["created"] = 0
+        counts["consolidated"] = 0
+        # Drop optimistic decisions that claimed creation
+        decisions = [d for d in decisions if d.get("action") not in (
+            "created", "consolidated", "superseded", "contradicted", "linked",
+        )]
+
+        if orphans:
             return {
                 "decisions": decisions,
                 **counts,
                 "error": "partial_write",
                 "partial": True,
-                "written_ids": written_ids,
+                "written_ids": list(owned_ids),
                 "cleaned_ids": cleaned,
                 "orphan_ids": orphans,
+                "failed_deletes": failed_deletes,
+                "absorb_nonce": absorb_nonce,
                 "reason": (
-                    f"absorb phase-3 failed after writing {len(written_ids)} memories; "
-                    f"cleaned {len(cleaned)}; orphans remain: {orphans}. "
-                    f"cause: {type(write_exc).__name__}: {write_exc}"
+                    f"absorb phase-3 failed; owned={owned_ids} cleaned={cleaned} "
+                    f"orphans={orphans}. cause: {type(write_exc).__name__}: {write_exc}"
                 ),
             }
+        # All owned rows cleaned — re-raise original for strict callers
         raise
 
     return {"decisions": decisions, **counts}
@@ -4028,9 +4088,40 @@ def update_memory(
     return result
 
 
-def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
-    # Clean up R2 images before deleting memory
+def delete_memory(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    *,
+    require_absorb_nonce: Optional[str] = None,
+) -> bool:
+    """Delete a memory. Returns True only if the row was actually removed.
+
+    require_absorb_nonce: when set, verify metadata.absorb_nonce matches BEFORE
+    any destructive work (R2/FTS/neighbour rewrites). Prefer leaving an orphan
+    over deleting an unrelated memory (absorb compensation safety).
+    """
     import logging
+
+    row = conn.execute(
+        "SELECT metadata FROM memories WHERE id = ?", (memory_id,)
+    ).fetchone()
+    if row is None:
+        return False
+
+    if require_absorb_nonce is not None:
+        raw = row["metadata"] if isinstance(row, sqlite3.Row) else row[0]
+        meta: Dict[str, Any] = {}
+        if raw:
+            try:
+                meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except json.JSONDecodeError:
+                meta = {}
+        if meta.get("absorb_nonce") != require_absorb_nonce:
+            logging.getLogger(__name__).error(
+                "Refusing delete_memory(%s): absorb_nonce mismatch (have=%r need=%r)",
+                memory_id, meta.get("absorb_nonce"), require_absorb_nonce,
+            )
+            return False
 
     from .image_storage import get_image_storage_instance
 

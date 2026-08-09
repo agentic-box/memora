@@ -383,6 +383,12 @@ def _meta_conn(tmp_path) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(
         """
+        CREATE TABLE memories (
+            id INTEGER PRIMARY KEY,
+            content TEXT,
+            metadata TEXT,
+            tags TEXT
+        );
         CREATE TABLE memories_meta (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE memories_embeddings (
             memory_id INTEGER PRIMARY KEY,
@@ -393,13 +399,19 @@ def _meta_conn(tmp_path) -> sqlite3.Connection:
     return conn
 
 
+def _seed_memory(conn, memory_id: int, content: str = "x") -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO memories (id, content, metadata, tags) VALUES (?,?,?,?)",
+        (memory_id, content, "{}", "[]"),
+    )
+
+
 def test_n5_word_key_store_labelled_openai_requires_rebuild(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
     conn = _meta_conn(tmp_path)
-    # Legacy label "openai" + word-key (sparse) vector as produced by TF-IDF fallback
+    _seed_memory(conn, 1)
     emb.set_stored_embedding_model(conn, "openai")
-    sparse = {"ure": 0.2, "xdg": 0.3, "zig": 0.5}
-    emb.upsert_embedding(conn, 1, sparse)
+    emb.upsert_embedding(conn, 1, {"ure": 0.2, "xdg": 0.3, "zig": 0.5})
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
 
@@ -409,6 +421,7 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     conn = _meta_conn(tmp_path)
+    _seed_memory(conn, 1)
     dense = {str(i): 0.1 for i in range(8)}
     emb.upsert_embedding(conn, 1, dense)
     host = emb._embedding_endpoint_host()
@@ -418,47 +431,89 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
 
 
 def test_n7_mixed_dense_sparse_forces_rebuild(tmp_path, monkeypatch):
-    """N7: dense + word-key rows → mismatch even if meta claims matching fingerprint."""
+    """Integrity meta marks mixed dens+sparse → mismatch (O(1), no full scan)."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
+    _seed_memory(conn, 1)
+    _seed_memory(conn, 2)
     host = emb._embedding_endpoint_host()
-    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:1024")
-    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(1024)})
+    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(8)})
     emb.upsert_embedding(conn, 2, {"ure": 0.2, "xdg": 0.3, "zig": 0.5})
+    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:8")
     conn.commit()
     assert emb.store_has_mixed_embeddings(conn) is True
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
 
 
 def test_n7_model_change_same_backend_name_forces_rebuild(tmp_path, monkeypatch):
-    """N7: still backend openai but model/endpoint fingerprint changed."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
+    _seed_memory(conn, 1)
     host = emb._embedding_endpoint_host()
-    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:384")
-    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(384)})
+    emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(8)})
+    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:8")
     conn.commit()
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
 
 
-def test_p1_full_scan_finds_stale_beyond_500(tmp_path, monkeypatch):
-    """P1: single sparse row at id 756 with 755 dense ahead is NOT certified healthy."""
+def test_p1_integrity_meta_tracks_mixed_without_hot_scan(tmp_path, monkeypatch):
+    """Write-time integrity sees sparse among many dense rows (authoritative meta)."""
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "@cf/baai/bge-m3")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
     host = emb._embedding_endpoint_host()
-    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:2")
-    for i in range(1, 756):
+    for i in range(1, 51):
+        _seed_memory(conn, i)
         emb.upsert_embedding(conn, i, {"0": 0.1, "1": 0.2})
-    emb.upsert_embedding(conn, 756, {"ure": 0.5, "xdg": 0.5})  # only stale row
+    _seed_memory(conn, 51)
+    emb.upsert_embedding(conn, 51, {"ure": 0.5, "xdg": 0.5})
+    emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:2")
     conn.commit()
-    assert emb.store_has_mixed_embeddings(conn) is True
+    integ = emb.get_embedding_integrity(conn)
+    assert integ.get("mixed") is True
     assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_p1_missing_embedding_is_mismatch(tmp_path, monkeypatch):
+    """P1-3: memory without embedding row → mismatch (coverage)."""
+    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    conn = _meta_conn(tmp_path)
+    _seed_memory(conn, 1)
+    _seed_memory(conn, 2)
+    emb.upsert_embedding(conn, 1, {"0": 0.1, "1": 0.2})
+    host = emb._embedding_endpoint_host()
+    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:2")
+    # memory 2 has no embedding row
+    conn.commit()
+    assert emb.check_embedding_model_mismatch(conn, "openai") is True
+
+
+def test_p1_4_mismatch_is_fast_no_payload_scan(tmp_path, monkeypatch):
+    """Hot-path mismatch must not parse embedding payloads (timing sanity)."""
+    import time
+    monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    conn = _meta_conn(tmp_path)
+    host = emb._embedding_endpoint_host()
+    for i in range(1, 201):
+        _seed_memory(conn, i)
+        emb.upsert_embedding(conn, i, {str(j): 0.01 for j in range(32)})
+    emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:32")
+    conn.commit()
+    t0 = time.perf_counter()
+    for _ in range(20):
+        emb.check_embedding_model_mismatch(conn, "openai")
+    elapsed = time.perf_counter() - t0
+    # 20 checks on 200 dense:32 rows must be well under a full re-parse budget
+    assert elapsed < 0.5, f"mismatch hot path too slow: {elapsed:.3f}s for 20 checks"
 
 
 def test_p1_dense_key_set_exact_not_prefix():
@@ -496,7 +551,6 @@ def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, tmp_path):
     backend = LocalSQLiteBackend(tmp_path / "absorb2.db")
     monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
-    # Prevent consolidation into one group so we get two phase-3 writes
     monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
 
     with storage.connect() as conn:
@@ -522,6 +576,84 @@ def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, tmp_path):
             )
         n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
         assert n == 0, f"partial rows remain after phase-3 failure: {n}"
+
+
+def test_p1_1_mid_add_memory_failure_still_compensated(monkeypatch, tmp_path):
+    """P1-1 hard case: fail AFTER insert inside add_memory; owned_ids still cleaned."""
+    import memora.storage as storage
+    from memora.backends import LocalSQLiteBackend
+
+    backend = LocalSQLiteBackend(tmp_path / "absorb_mid.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
+
+    real_fts = storage._fts_upsert
+    calls = {"n": 0}
+
+    def flaky_fts(conn, memory_id, *a, **k):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated FTS failure after INSERT")
+        return real_fts(conn, memory_id, *a, **k)
+
+    monkeypatch.setattr(storage, "_fts_upsert", flaky_fts)
+
+    with storage.connect() as conn:
+        try:
+            result = storage.absorb_memory(
+                conn,
+                facts=[
+                    "first unique fact alpha for absorb mid fail",
+                    "second unique fact beta for absorb mid fail",
+                ],
+            )
+        except storage.MemoryWriteError:
+            result = None  # full cleanup then re-raise
+        n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+        if result is not None and result.get("partial"):
+            assert result.get("error") == "partial_write"
+            # survivors only the declared orphans
+            assert n == len(result.get("orphan_ids") or [])
+        else:
+            assert n == 0, f"partial rows remain after mid-add failure: {n}"
+
+
+def test_p1_2_delete_false_reports_partial(monkeypatch, tmp_path):
+    """P1-2: delete_memory False must not claim cleaned; surface partial_write."""
+    import memora.storage as storage
+    from memora.backends import LocalSQLiteBackend
+
+    backend = LocalSQLiteBackend(tmp_path / "absorb_del.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
+
+    real_add = storage.add_memory
+    n_add = {"n": 0}
+
+    def add_then_fail(*a, **k):
+        n_add["n"] += 1
+        if n_add["n"] == 1:
+            return real_add(*a, **k)
+        # second: allocate via real then raise MemoryWriteError path by failing fts
+        raise RuntimeError("phase3 second job fail before add")
+
+    monkeypatch.setattr(storage, "add_memory", add_then_fail)
+    monkeypatch.setattr(storage, "delete_memory", lambda *a, **k: False)
+
+    with storage.connect() as conn:
+        result = storage.absorb_memory(
+            conn,
+            facts=[
+                "first unique fact alpha delete false",
+                "second unique fact beta delete false",
+            ],
+        )
+        assert result.get("partial") is True
+        assert result.get("error") == "partial_write"
+        assert result.get("cleaned_ids") == []
+        assert result.get("orphan_ids")  # at least the first written id
 
 
 def test_n6_absorb_strict_failure_is_clean_not_unboundlocal(monkeypatch, tmp_path):

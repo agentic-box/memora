@@ -592,11 +592,139 @@ def cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float
 
 # --- DB operations ---
 
+_INTEGRITY_KEY = "embedding_integrity"
+
+
+def _meta_get(conn: sqlite3.Connection, key: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT value FROM memories_meta WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        return None
+    return row["value"] if isinstance(row, sqlite3.Row) else row[0]
+
+
+def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO memories_meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value),
+    )
+
+
+def get_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Authoritative integrity snapshot (O(1) meta read)."""
+    raw = _meta_get(conn, _INTEGRITY_KEY)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+def _write_embedding_integrity(conn: sqlite3.Connection, data: Dict[str, Any]) -> None:
+    _meta_set(conn, _INTEGRITY_KEY, json.dumps(data, ensure_ascii=False, sort_keys=True))
+
+
+def _empty_integrity() -> Dict[str, Any]:
+    return {
+        "reps": {},          # rep -> count
+        "embedding_count": 0,  # non-null embedding rows
+        "memory_count": 0,
+        "missing_count": 0,
+        "mixed": False,
+        "fingerprint": None,
+    }
+
+
+def _reps_are_mixed(reps: Dict[str, int]) -> bool:
+    kinds = {k for k, n in reps.items() if n > 0}
+    if "sparse" in kinds and any(k.startswith("dense") for k in kinds):
+        return True
+    dense = {k for k in kinds if k.startswith("dense:")}
+    return len(dense) > 1
+
+
+def _refresh_coverage_counts(conn: sqlite3.Connection, integ: Dict[str, Any]) -> None:
+    """Fast SQL counts (no embedding JSON parse) for coverage integrity."""
+    mem_n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    emb_n = conn.execute(
+        "SELECT COUNT(*) FROM memories_embeddings "
+        "WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'"
+    ).fetchone()[0]
+    integ["memory_count"] = int(mem_n)
+    integ["embedding_count"] = int(emb_n)
+    integ["missing_count"] = max(0, int(mem_n) - int(emb_n))
+
+
+def note_embedding_write(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    vector: Dict[str, float],
+    *,
+    previous_rep: Optional[str] = None,
+) -> None:
+    """Update authoritative integrity meta after an embedding write (write-time)."""
+    integ = get_embedding_integrity(conn) or _empty_integrity()
+    reps: Dict[str, int] = dict(integ.get("reps") or {})
+    new_rep = _vector_representation(vector)
+    if previous_rep:
+        reps[previous_rep] = int(reps.get(previous_rep, 1)) - 1
+        if reps[previous_rep] <= 0:
+            del reps[previous_rep]
+    reps[new_rep] = int(reps.get(new_rep, 0)) + 1
+    # drop empty/zero
+    reps = {k: v for k, v in reps.items() if v > 0 and k != "empty"}
+    integ["reps"] = reps
+    integ["mixed"] = _reps_are_mixed(reps)
+    _refresh_coverage_counts(conn, integ)
+    # Stamp observed kind into fingerprint when uniform dense
+    dense = [k for k in reps if k.startswith("dense:")]
+    observed_dim = int(dense[0].split(":")[1]) if len(dense) == 1 and "sparse" not in reps else None
+    # fingerprint is maintained by set_stored_embedding_model / rebuild; keep current if set
+    if integ.get("fingerprint") is None:
+        # leave for set_stored; coverage alone is enough for missing detection
+        pass
+    _write_embedding_integrity(conn, integ)
+
+
+def note_embedding_delete(conn: sqlite3.Connection, memory_id: int, previous_rep: Optional[str]) -> None:
+    """Update integrity meta after embedding row removal."""
+    integ = get_embedding_integrity(conn) or _empty_integrity()
+    reps: Dict[str, int] = dict(integ.get("reps") or {})
+    if previous_rep and previous_rep in reps:
+        reps[previous_rep] = int(reps[previous_rep]) - 1
+        if reps[previous_rep] <= 0:
+            del reps[previous_rep]
+    integ["reps"] = reps
+    integ["mixed"] = _reps_are_mixed(reps)
+    _refresh_coverage_counts(conn, integ)
+    _write_embedding_integrity(conn, integ)
+
+
+def _previous_embedding_rep(conn: sqlite3.Connection, memory_id: int) -> Optional[str]:
+    row = conn.execute(
+        "SELECT embedding FROM memories_embeddings WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if not row:
+        return None
+    raw = row["embedding"] if isinstance(row, sqlite3.Row) else row[0]
+    if not raw:
+        return None
+    return _vector_representation(json_to_embedding(raw))
+
+
 def upsert_embedding(
     conn: sqlite3.Connection,
     memory_id: int,
     vector: Dict[str, float],
 ) -> None:
+    prev = _previous_embedding_rep(conn, memory_id)
     emb_json = embedding_to_json(vector)
     conn.execute(
         """
@@ -606,10 +734,13 @@ def upsert_embedding(
         """,
         (memory_id, emb_json),
     )
+    note_embedding_write(conn, memory_id, vector, previous_rep=prev)
 
 
 def delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
+    prev = _previous_embedding_rep(conn, memory_id)
     conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
+    note_embedding_delete(conn, memory_id, prev)
 
 
 def get_embeddings_for_ids(
@@ -688,64 +819,66 @@ def sample_embedding_vector(conn: sqlite3.Connection) -> Optional[Dict[str, floa
     return json_to_embedding(row["embedding"])
 
 
-def scan_embedding_kinds(conn: sqlite3.Connection) -> Set[str]:
-    """FULL-TABLE scan of embedding representations (P1 — no LIMIT sample).
+def audit_scan_embedding_kinds(conn: sqlite3.Connection) -> Set[str]:
+    """ADMIN/MIGRATION ONLY — full parse of every embedding (never on search path).
 
-    Probabilistic samples cannot certify a mixed store. Every non-null embedding
-    row is classified. Returns tags like {'dense', 'dense:1024', 'sparse'}.
+    Prefer get_embedding_integrity() / check_embedding_model_mismatch() which are O(1).
     """
     kinds: Set[str] = set()
     rows = conn.execute(
         "SELECT embedding FROM memories_embeddings WHERE embedding IS NOT NULL"
     ).fetchall()
     for row in rows:
-        vec = json_to_embedding(row["embedding"])
+        raw = row["embedding"] if isinstance(row, sqlite3.Row) else row[0]
+        vec = json_to_embedding(raw)
         rep = _vector_representation(vec)
         if rep == "empty":
             continue
         if rep.startswith("dense"):
             kinds.add("dense")
-            kinds.add(rep)  # dense:N
+            kinds.add(rep)
         else:
             kinds.add("sparse")
     return kinds
 
 
-# Back-compat alias (tests / callers) — always full scan, limit ignored.
+# Deprecated aliases — do not use on hot path.
+def scan_embedding_kinds(conn: sqlite3.Connection) -> Set[str]:
+    return audit_scan_embedding_kinds(conn)
+
+
 def sample_embedding_kinds(
     conn: sqlite3.Connection,
     *,
     limit: int = 0,
 ) -> Set[str]:
-    return scan_embedding_kinds(conn)
+    return audit_scan_embedding_kinds(conn)
 
 
 def store_has_mixed_embeddings(conn: sqlite3.Connection) -> bool:
-    """True when dense and sparse coexist, or dense dims disagree (full scan)."""
-    kinds = scan_embedding_kinds(conn)
-    if "sparse" in kinds and any(k.startswith("dense") for k in kinds):
-        return True
-    dense_dims = {k for k in kinds if k.startswith("dense:")}
-    return len(dense_dims) > 1
+    """True when integrity meta reports mixed reps (O(1)). Falls back to audit if meta empty."""
+    integ = get_embedding_integrity(conn)
+    if integ and integ.get("reps") is not None:
+        if integ.get("mixed"):
+            return True
+        return _reps_are_mixed(dict(integ.get("reps") or {}))
+    # Legacy store without integrity meta: force mismatch via caller, do not scan hot path
+    return False
 
 
 def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
     """Get the embedding model fingerprint (or legacy name) stored in the database."""
-    row = conn.execute(
-        "SELECT value FROM memories_meta WHERE key = 'embedding_model'"
-    ).fetchone()
-    return row["value"] if row else None
+    return _meta_get(conn, "embedding_model")
 
 
 def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
-    """Store the embedding model fingerprint in the database."""
-    conn.execute(
-        """
-        INSERT INTO memories_meta (key, value) VALUES ('embedding_model', ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """,
-        (model,),
-    )
+    """Store the embedding model fingerprint and sync integrity fingerprint field."""
+    _meta_set(conn, "embedding_model", model)
+    integ = get_embedding_integrity(conn) or _empty_integrity()
+    integ["fingerprint"] = model
+    _refresh_coverage_counts(conn, integ)
+    integ["mixed"] = _reps_are_mixed(dict(integ.get("reps") or {}))
+    _write_embedding_integrity(conn, integ)
     conn.commit()
 
 
@@ -791,42 +924,53 @@ def current_embedding_fingerprint(
 
 
 def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str) -> bool:
-    """True when stored embeddings are incompatible with the configured backend.
+    """O(1) integrity check from authoritative meta — NEVER scans embedding payloads.
 
-    Full-table scan for mixed kinds (no sampling). Rebuild when:
-    - mixed dense+sparse or mixed dense dims
-    - legacy bare meta name (e.g. \"openai\")
-    - stored fingerprint ≠ configured backend|model|host|kind
-    - any row kind incompatible with configured backend
+    Mismatch when any of:
+    - no memories (false) / no integrity meta while embeddings exist
+    - missing_count > 0 (memory without non-null embedding)
+    - mixed reps in integrity meta
+    - legacy bare fingerprint (e.g. \"openai\")
+    - stored fingerprint incompatible with configured backend|model|host|kind
     """
-    count = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
-    if count == 0:
+    mem_n = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    if mem_n == 0:
         return False
 
-    # Full scan — never certify mixed via a 500-row sample.
-    if store_has_mixed_embeddings(conn):
+    integ = get_embedding_integrity(conn)
+    stored = get_stored_embedding_model(conn)
+
+    # No integrity meta yet (legacy / pre-meta store) → must rebuild to stamp meta.
+    if not integ or not integ.get("reps"):
+        emb_n = conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0]
+        return emb_n > 0 or stored is not None
+
+    # Coverage: missing embeddings are corrupt and invisible to search (P1-3).
+    # Refresh counts with fast SQL (no payload parse) so deletes of memories are seen.
+    _refresh_coverage_counts(conn, integ)
+    if int(integ.get("missing_count") or 0) > 0:
+        _write_embedding_integrity(conn, integ)
         return True
 
-    stored = get_stored_embedding_model(conn)
+    if integ.get("mixed") or _reps_are_mixed(dict(integ.get("reps") or {})):
+        return True
+
     if stored is None:
         return True
-    # Legacy coarse name always mismatches rich fingerprints.
     if "|" not in stored:
         return True
 
-    kinds = scan_embedding_kinds(conn)
+    reps = {k: v for k, v in (integ.get("reps") or {}).items() if v > 0}
     if current_model in ("openai", "sentence-transformers"):
-        if "sparse" in kinds:
+        if "sparse" in reps:
             return True
-        dense_dims = sorted(k for k in kinds if k.startswith("dense:"))
+        dense_dims = sorted(k for k in reps if k.startswith("dense:"))
         observed_dim = int(dense_dims[0].split(":")[1]) if dense_dims else None
         current_fp = current_embedding_fingerprint(current_model, observed_dim=observed_dim)
-        # Compare backend|model|host prefix; kind may be dense vs dense:N
         stored_parts = stored.split("|")
         current_parts = current_fp.split("|")
         if len(stored_parts) < 3 or len(current_parts) < 3:
             return stored != current_fp
-        # backend, model, host must match
         if stored_parts[:3] != current_parts[:3]:
             return True
         stored_kind = stored_parts[-1]
@@ -834,23 +978,25 @@ def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str)
         if stored_kind.startswith("dense:") and current_kind.startswith("dense:"):
             return stored_kind != current_kind
         if stored_kind.startswith("dense:") and current_kind == "dense":
-            return False  # config without observed dim yet
+            return False
         if stored_kind == "dense" and current_kind.startswith("dense:"):
             return False
         return stored_kind != current_kind
 
-    if current_model == "tfidf" and any(k.startswith("dense") for k in kinds):
+    if current_model == "tfidf" and any(k.startswith("dense") for k in reps):
         return True
 
     return stored != current_embedding_fingerprint(current_model)
 
 
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
-    """Rebuild all embeddings using given embedding model.
+    """Rebuild all embeddings; stamp uniform fingerprint + integrity meta.
 
-    Accumulates representations across ALL rows; requires a single uniform
-    kind/dim before writing the final fingerprint (no last-vector-only stamp).
+    Admin path may parse vectors; search path uses O(1) integrity meta only.
     """
+    # Reset integrity before rebuild so counts rebuild cleanly via note_embedding_write
+    _write_embedding_integrity(conn, _empty_integrity())
+
     rows = conn.execute(
         "SELECT id, content, metadata, tags FROM memories"
     ).fetchall()
@@ -871,7 +1017,6 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
         conn.commit()
         return 0
 
-    # Require one representation across the whole rebuild
     non_empty = {r for r in seen_reps if r != "empty"}
     if len(non_empty) != 1:
         raise EmbeddingProviderError(
@@ -881,10 +1026,23 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     rep = next(iter(non_empty))
     observed_dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
     fp = current_embedding_fingerprint(embedding_model, observed_dim=observed_dim)
-    # Attach exact observed kind when dense:N
     if rep.startswith("dense:"):
-        parts = fp.rsplit("|", 1)
-        fp = parts[0] + "|" + rep
+        fp = fp.rsplit("|", 1)[0] + "|" + rep
     set_stored_embedding_model(conn, fp)
     conn.commit()
     return updated
+
+
+def verify_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Admin doctor: full audit scan + compare to meta. Never call from search."""
+    kinds = audit_scan_embedding_kinds(conn)
+    integ = get_embedding_integrity(conn)
+    _refresh_coverage_counts(conn, integ if integ else _empty_integrity())
+    return {
+        "audit_kinds": sorted(kinds),
+        "meta": get_embedding_integrity(conn),
+        "mixed_audit": (
+            ("sparse" in kinds and any(k.startswith("dense") for k in kinds))
+            or len({k for k in kinds if k.startswith("dense:")}) > 1
+        ),
+    }
