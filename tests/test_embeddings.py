@@ -543,14 +543,10 @@ def test_p1_call_wide_dim_across_chunks(fake_openai, monkeypatch):
         emb.compute_embeddings_batch(entries, "openai")
 
 
-def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, tmp_path):
-    """P1: second phase-3 write failure leaves no partial rows (local SQLite)."""
+def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, absorb_backend):
+    """P1: compensation removes a prior write on SQLite and D1 semantics."""
     import memora.storage as storage
-    from memora.backends import LocalSQLiteBackend
 
-    backend = LocalSQLiteBackend(tmp_path / "absorb2.db")
-    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
-    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
 
     with storage.connect() as conn:
@@ -578,14 +574,10 @@ def test_p1_absorb_second_phase3_embedding_no_partial(monkeypatch, tmp_path):
         assert n == 0, f"partial rows remain after phase-3 failure: {n}"
 
 
-def test_p1_1_mid_add_memory_failure_still_compensated(monkeypatch, tmp_path):
-    """P1-1 hard case: fail AFTER insert inside add_memory; owned_ids still cleaned."""
+def test_p1_1_mid_add_memory_failure_still_compensated(monkeypatch, absorb_backend):
+    """P1-1 hard case: FTS fails after INSERT; D1 compensation still removes it."""
     import memora.storage as storage
-    from memora.backends import LocalSQLiteBackend
 
-    backend = LocalSQLiteBackend(tmp_path / "absorb_mid.db")
-    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
-    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
 
     real_fts = storage._fts_upsert
@@ -619,14 +611,39 @@ def test_p1_1_mid_add_memory_failure_still_compensated(monkeypatch, tmp_path):
             assert n == 0, f"partial rows remain after mid-add failure: {n}"
 
 
-def test_p1_2_delete_false_reports_partial(monkeypatch, tmp_path):
+def test_p1_1_embedding_upsert_failure_still_compensated(monkeypatch, absorb_backend):
+    """Hard case: embedding write fails after INSERT; no D1 row may survive."""
+    import memora.storage as storage
+
+    monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
+    real_upsert = storage._upsert_embedding
+    calls = {"n": 0}
+
+    def flaky_embedding(conn, memory_id, vector):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("simulated embedding upsert failure after INSERT")
+        return real_upsert(conn, memory_id, vector)
+
+    monkeypatch.setattr(storage, "_upsert_embedding", flaky_embedding)
+
+    with storage.connect() as conn:
+        with pytest.raises(storage.MemoryWriteError, match="embedding upsert"):
+            storage.absorb_memory(
+                conn,
+                facts=[
+                    "first unique fact alpha embedding failure",
+                    "second unique fact beta embedding failure",
+                ],
+            )
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0] == 0
+
+
+def test_p1_2_delete_false_reports_partial(monkeypatch, absorb_backend):
     """P1-2: delete_memory False must not claim cleaned; surface partial_write."""
     import memora.storage as storage
-    from memora.backends import LocalSQLiteBackend
 
-    backend = LocalSQLiteBackend(tmp_path / "absorb_del.db")
-    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
-    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(storage, "_group_facts_by_similarity", lambda pairs: [[i] for i in range(len(pairs))])
 
     real_add = storage.add_memory
@@ -654,6 +671,92 @@ def test_p1_2_delete_false_reports_partial(monkeypatch, tmp_path):
         assert result.get("error") == "partial_write"
         assert result.get("cleaned_ids") == []
         assert result.get("orphan_ids")  # at least the first written id
+        survivors = conn.execute("SELECT id FROM memories ORDER BY id").fetchall()
+        assert [row[0] for row in survivors] == result["orphan_ids"]
+
+
+def test_d1_compensating_delete_refuses_mismatched_nonce(absorb_backend):
+    """Safety control: an owned id is not enough; nonce mismatch preserves it."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(
+            conn,
+            content="nonce-protected memory must survive a stale compensator",
+            absorb_nonce="owned-by-this-absorb",
+        )
+        assert storage.delete_memory(
+            conn, record["id"], require_absorb_nonce="some-other-absorb"
+        ) is False
+        assert conn.execute(
+            "SELECT 1 FROM memories WHERE id = ?", (record["id"],)
+        ).fetchone() is not None
+        # Checking the embedding proves the refusal happened before cleanup,
+        # rather than merely before the final DELETE.
+        assert conn.execute(
+            "SELECT 1 FROM memories_embeddings WHERE memory_id = ?", (record["id"],)
+        ).fetchone() is not None
+
+
+def test_d1_missing_embedding_row_is_integrity_failure(absorb_backend):
+    """Coverage catches a memory row that has no embedding row on both stores."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(conn, content="memory deliberately missing its vector")
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (record["id"],))
+        assert emb.check_embedding_model_mismatch(conn, "tfidf") is True
+
+
+def test_fake_d1_auto_commit_survives_rollback_and_exposes_last_row_id(
+    fake_d1_connection,
+):
+    """The harness distinguishes D1's durable statements from SQLite rollback."""
+    d1 = fake_d1_connection("d1.db")
+    d1.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)")
+    inserted = d1.execute("INSERT INTO probe (value) VALUES (?)", ("durable",))
+    d1.rollback()
+    assert inserted.lastrowid == 1
+    assert d1.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 1
+    d1.close()
+
+    # Negative control: restoring a real transaction makes rollback erase the
+    # row.  This is the unsafe difference that local-only absorb tests mask.
+    local_control = fake_d1_connection("transactional.db", transactional=True)
+    local_control.execute("CREATE TABLE probe (id INTEGER PRIMARY KEY, value TEXT)")
+    local_control.execute("INSERT INTO probe (value) VALUES (?)", ("rolled-back",))
+    local_control.rollback()
+    assert local_control.execute("SELECT COUNT(*) FROM probe").fetchone()[0] == 0
+    local_control.close()
+
+
+def test_nonce_refusal_negative_control_turns_red_when_guard_is_bypassed(
+    monkeypatch, absorb_backend
+):
+    """If the nonce guard is bypassed, the refusal assertion fails and data dies."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(
+            conn,
+            content="negative-control nonce guard must not be removed",
+            absorb_nonce="correct-owner",
+        )
+        guarded_delete = storage.delete_memory
+
+        def unsafe_delete(connection, memory_id, *, require_absorb_nonce=None):
+            return guarded_delete(connection, memory_id, require_absorb_nonce=None)
+
+        # Equivalent to deleting the nonce comparison: the original refusal
+        # assertion is now red, and the row is destructively removed.
+        monkeypatch.setattr(storage, "delete_memory", unsafe_delete)
+        with pytest.raises(AssertionError):
+            assert storage.delete_memory(
+                conn, record["id"], require_absorb_nonce="wrong-owner"
+            ) is False
+        assert conn.execute(
+            "SELECT 1 FROM memories WHERE id = ?", (record["id"],)
+        ).fetchone() is None
 
 
 def test_n6_absorb_strict_failure_is_clean_not_unboundlocal(monkeypatch, tmp_path):

@@ -1,15 +1,137 @@
 import json
 import socket
+import sqlite3
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
 import memora
 import memora.storage as storage
-from memora.backends import LocalSQLiteBackend
+from memora.backends import D1Connection, LocalSQLiteBackend
 from memora.graph.server import start_graph_server
+
+
+class FakeD1Connection(D1Connection):
+    """Offline D1 behavioral double backed by SQLite.
+
+    The real D1Connection sends one statement per HTTP request, so every
+    statement is durable before the next one begins.  In particular, its
+    ``commit`` and ``rollback`` methods are no-ops.  This double keeps those
+    semantics while using a local SQLite file for tests.  It deliberately
+    subclasses D1Connection so production's D1 branches (notably no FTS5) are
+    exercised as well.
+
+    ``transactional`` exists only for negative controls: it restores local
+    SQLite transaction behavior, showing a test is sensitive to D1's lack of
+    rollback rather than merely passing on the local backend.
+    """
+
+    def __init__(self, db_path: Path, *, transactional: bool = False):
+        self._conn = sqlite3.connect(db_path)
+        self._conn.row_factory = sqlite3.Row
+        self._transactional = transactional
+        self.statement_count = 0
+
+    @staticmethod
+    def _is_savepoint(sql: str) -> bool:
+        return sql.lstrip().upper().startswith(("SAVEPOINT", "RELEASE", "ROLLBACK TO"))
+
+    def execute(self, sql: str, params=None):
+        # D1's HTTP API has no transaction/savepoint surface.  A no-op lets
+        # callers that defensively issue savepoints run under the same limit.
+        if self._is_savepoint(sql):
+            return self._conn.execute("SELECT 1 WHERE 0")
+        cur = self._conn.execute(sql, () if params is None else params)
+        self.statement_count += 1
+        if not self._transactional:
+            self._conn.commit()
+        return cur
+
+    def executemany(self, sql: str, params_list):
+        last = None
+        for params in params_list:
+            last = self.execute(sql, params)
+        return last if last is not None else self._conn.execute("SELECT 1 WHERE 0")
+
+    def executescript(self, sql_script: str):
+        last = None
+        for statement in (part.strip() for part in sql_script.split(";")):
+            if statement:
+                last = self.execute(statement)
+        return last if last is not None else self._conn.execute("SELECT 1 WHERE 0")
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        # Cloudflare D1 already committed the individual HTTP statement.
+        if self._transactional:
+            self._conn.commit()
+
+    def rollback(self):
+        # D1 cannot roll back prior HTTP statements.
+        if self._transactional:
+            self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+class FakeD1Backend:
+    """Minimal backend for FakeD1Connection; no network or sync behavior."""
+
+    def __init__(self, db_path: Path, *, transactional: bool = False):
+        self.db_path = Path(db_path)
+        self.transactional = transactional
+        self.connections = []
+
+    def connect(self, *, check_same_thread: bool = True) -> FakeD1Connection:
+        conn = FakeD1Connection(self.db_path, transactional=self.transactional)
+        self.connections.append(conn)
+        return conn
+
+    def sync_before_use(self):
+        pass
+
+    def sync_after_write(self):
+        pass
+
+    def get_info(self):
+        return {"backend_type": "fake_d1", "db_path": str(self.db_path)}
+
+
+@pytest.fixture(params=("sqlite", "fake_d1"), ids=("sqlite", "fake-d1"))
+def absorb_backend(request, tmp_path, monkeypatch):
+    """Storage backend matrix for absorb failure tests.
+
+    Fake D1 is intentionally statement-autocommit with no rollback, matching
+    the production HTTP adapter rather than SQLite's safe transaction case.
+    """
+    if request.param == "sqlite":
+        backend = LocalSQLiteBackend(tmp_path / "absorb.db")
+    else:
+        backend = FakeD1Backend(tmp_path / "absorb-d1.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    return backend
+
+
+@pytest.fixture()
+def fake_d1_connection(tmp_path):
+    """Factory for direct D1 transaction-semantics probes."""
+    def _create(name: str, *, transactional: bool = False) -> FakeD1Connection:
+        return FakeD1Connection(tmp_path / name, transactional=transactional)
+
+    return _create
 
 
 @pytest.fixture(autouse=True)
