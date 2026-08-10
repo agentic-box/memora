@@ -530,9 +530,34 @@ div.vis-tooltip {
 .chat-typing .dots span:nth-child(2) { animation-delay: 0.2s; }
 .chat-typing .dots span:nth-child(3) { animation-delay: 0.4s; }
 @keyframes chatBlink { 0%, 80%, 100% { opacity: 0; } 40% { opacity: 1; } }
+
+/* ---- Lineage (supersession) — never present superseded as current ---- */
+#lineage-warn {
+  display: none; position: fixed; top: 52px; left: 12px; z-index: 40;
+  background: #3d2e00; color: #ffe08a; border: 1px solid #d29922; border-radius: 8px;
+  padding: 6px 12px; font-size: 12px; max-width: 520px;
+}
+#lineage-stats { color: #7d8590; font-size: 11px; margin-left: 8px; white-space: nowrap; }
+.lineage-pill { background: #161b22cc; border: 1px solid #30363d; border-radius: 8px;
+  padding: 4px 10px; display: flex; gap: 8px; align-items: center; font-size: 12px; }
+.lineage-pill label { color: #c9d1d9; cursor: pointer; display: flex; gap: 6px; align-items: center; }
+.lineage-pill input:disabled + span { color: #6e7681; }
+#timeline-list .memory-item.superseded-row { opacity: 0.72; }
+#timeline-list .memory-item.superseded-row .headline { color: #b8a078; }
+#timeline-list .memory-item.unknown-row { opacity: 0.65; }
+#timeline-list .memory-item.unknown-row .headline { color: #8b949e; font-style: italic; }
+.lineage-badge { font-size: 10px; font-weight: 600; margin-left: 6px; padding: 1px 6px; border-radius: 10px; }
+.lineage-badge.sup { background: #3d2e00; color: #d29922; border: 1px solid #d29922; }
+.lineage-badge.unk { background: #21262d; color: #8b949e; border: 1px solid #484f58; }
+#panel .lineage-banner { margin: 8px 0 12px; padding: 8px 10px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+#panel .lineage-banner.superseded { background: #3d2e0022; border: 1px solid #d29922; color: #d29922; }
+#panel .lineage-banner.unknown { background: #21262d; border: 1px solid #484f58; color: #8b949e; }
+.issue-row.superseded-row, .dup-pair.superseded-row { opacity: 0.75; }
+.issue-row .lineage-badge, .dup-pair .lineage-badge { vertical-align: middle; }
     </style>
 </head>
 <body>
+    <div id="lineage-warn">Lineage unavailable — cannot confirm which memories are current</div>
     <div id="graph"><div id="loading">Loading memories...</div></div>
     <div id="resize-handle"></div>
     <div id="panel">
@@ -550,6 +575,7 @@ div.vis-tooltip {
                 <button class="edit-icon-btn" id="panel-edit-btn" onclick="enterPanelEditMode()" title="Edit tags &amp; metadata">&#9998;</button>
             </div>
             <div class="meta" id="panel-meta"></div>
+            <div id="panel-lineage"></div>
             <div class="detail-actions" id="panel-actions">
                 <button class="detail-btn primary" id="panel-save-btn" onclick="savePanelEdits()">Save</button>
                 <button class="detail-btn" id="panel-cancel-btn" onclick="cancelPanelEdits()">Cancel</button>
@@ -633,6 +659,10 @@ div.vis-tooltip {
                 <option value="ob1">ob1</option>
             </select>
         </div>
+        <div class="lineage-pill" title="Default: show lineage (superseded dimmed). Uncheck for current-state only when lineage is available.">
+            <label><input type="checkbox" id="lineage-toggle" checked onchange="onLineageToggle()" /> <span>lineage</span></label>
+        </div>
+        <div id="lineage-stats"></div>
         <div id="version"><span id="version-db">memora</span> | Cloudflare</div>
     </div>
     <div id="help">Click tag/section to filter | Click node to view | Scroll to zoom | Type to search (or #id) | Drag timeline</div>
@@ -672,6 +702,191 @@ div.vis-tooltip {
         var panelDraftMetadataRows = [];
         var panelDraftComplexMetadata = {};
         var currentDb = 'memora';
+
+        // ---- Lineage helpers (edge_type === "supersedes" only; never infer from directed) ----
+        var SUPERSEDED_COLOR = '#6e5a2e';
+        var SUPERSEDED_BORDER = '#d29922';
+        var UNKNOWN_COLOR = '#484f58';
+        var UNKNOWN_BORDER = '#6e7681';
+
+        function lineageAvailable() {
+            return graphData && graphData.lineageAvailable !== false;
+        }
+        function crossrefsAvailable() {
+            return graphData && graphData.crossrefsAvailable !== false;
+        }
+        function showLineage() {
+            // When lineage unavailable, never pretend current-only works — show all as unknown.
+            if (!lineageAvailable()) return true;
+            var t = document.getElementById('lineage-toggle');
+            return t ? t.checked : true;
+        }
+        /** Full node map for lineage flags — survives current-only graph filtering. */
+        var lineageNodeById = {};
+        function getNodeById(id) {
+            if (lineageNodeById[id]) return lineageNodeById[id];
+            if (!graphData || !graphData.nodes) return null;
+            for (var i = 0; i < graphData.nodes.length; i++) {
+                if (graphData.nodes[i].id === id) return graphData.nodes[i];
+            }
+            return null;
+        }
+        /** Three-state: current | superseded | authority_unknown for a memory id. */
+        function lineageFlagsForId(id) {
+            var globalUnknown = !lineageAvailable();
+            var n = getNodeById(id);
+            // If graph has no node for this id and lineage is known, treat as unknown only when global.
+            var unknown = globalUnknown || !!(n && n.authority_unknown);
+            var superseded = !unknown && !!(n && n.superseded);
+            var byIds = (n && n.superseded_by) || [];
+            var supIds = (n && n.supersedes) || [];
+            return { unknown: unknown, superseded: superseded, superseded_by: byIds, supersedes: supIds };
+        }
+        function formatIntegrityStats() {
+            if (!graphData) return '';
+            var parts = [];
+            var nNodes = (graphData.nodes || []).length;
+            var nLinks = Array.isArray(graphData.edges) ? graphData.edges.length : 0;
+            parts.push(nNodes + ' nodes');
+            if (!crossrefsAvailable()) {
+                parts.push('LINKS UNAVAILABLE');
+                parts.push('DUPS UNAVAILABLE');
+            } else {
+                parts.push(nLinks + ' links');
+                var dups = Array.isArray(graphData.duplicateIds) ? graphData.duplicateIds.length : 0;
+                var pairs = graphData.duplicatePairCount;
+                parts.push(pairs != null ? (pairs + '/' + dups + ' dups') : (dups + ' dups'));
+            }
+            if (!lineageAvailable()) {
+                parts.push('LINEAGE UNAVAILABLE (cannot confirm current)');
+            } else {
+                var supN = typeof graphData.supersededCount === 'number'
+                    ? graphData.supersededCount
+                    : (Array.isArray(graphData.supersededIds) ? graphData.supersededIds.length : 0);
+                var supE = Array.isArray(graphData.supersedesEdges) ? graphData.supersedesEdges.length : 0;
+                parts.push(showLineage()
+                    ? (supN + ' superseded · ' + supE + ' lineage edges')
+                    : ('lineage hidden (' + supN + ' superseded)'));
+            }
+            return parts.join(' · ');
+        }
+        function setLineageUiState() {
+            var w = document.getElementById('lineage-warn');
+            var toggle = document.getElementById('lineage-toggle');
+            var stats = document.getElementById('lineage-stats');
+            var parts = [];
+            if (!lineageAvailable()) {
+                parts.push('Lineage unavailable — cannot confirm which memories are current. '
+                    + 'Current-only disabled. Nodes/rows show as authority-unknown (not current).');
+            }
+            if (!crossrefsAvailable()) {
+                parts.push('Crossrefs degraded — duplicate/link counts not certified.');
+            }
+            if (w) {
+                if (parts.length) {
+                    w.style.display = 'block';
+                    w.textContent = parts.join(' ');
+                } else {
+                    w.style.display = 'none';
+                }
+            }
+            if (toggle) {
+                toggle.disabled = !lineageAvailable();
+                if (!lineageAvailable()) {
+                    toggle.checked = true;
+                    toggle.title = 'Disabled: lineage unavailable, so current-only cannot be guaranteed';
+                } else {
+                    toggle.title = 'Default: show lineage — dim superseded. Uncheck for current-state only (hides superseded + authority-unknown).';
+                }
+            }
+            if (stats) stats.textContent = formatIntegrityStats();
+        }
+        /**
+         * Annotate graph nodes/edges for lineage display.
+         * Lineage styling keys ONLY on edge_type === "supersedes" (never directed alone).
+         * Issue/todo status colours must not repaint a superseded/unknown node as "current".
+         */
+        function processGraphLineage() {
+            if (!graphData || !graphData.nodes) return;
+            var globalUnknown = graphData.lineageAvailable === false;
+            var supersededIds = new Set(Array.isArray(graphData.supersededIds) ? graphData.supersededIds : []);
+            graphData.nodes.forEach(function(n) {
+                if (n.superseded) supersededIds.add(n.id);
+            });
+            var annotated = graphData.nodes.map(function(n) {
+                var unknown = globalUnknown || !!n.authority_unknown;
+                var sup = !unknown && (supersededIds.has(n.id) || !!n.superseded);
+                var out = Object.assign({}, n);
+                out.authority_unknown = unknown || undefined;
+                out.superseded = sup || undefined;
+                // Base color from API; force lineage appearance last (load-bearing order).
+                if (unknown) {
+                    out.color = { background: UNKNOWN_COLOR, border: UNKNOWN_BORDER };
+                    out.opacity = 0.85;
+                } else if (sup) {
+                    out.color = { background: SUPERSEDED_COLOR, border: SUPERSEDED_BORDER };
+                    out.opacity = 0.9;
+                }
+                return out;
+            });
+            // Full map for timeline/panel flags even when graph is current-only filtered.
+            lineageNodeById = {};
+            annotated.forEach(function(n) { lineageNodeById[n.id] = n; });
+            graphData.nodes = annotated;
+            // Style supersedes edges only (not directed associations).
+            graphData.edges = (graphData.edges || []).map(function(e) {
+                if (e.edge_type === 'supersedes') {
+                    return Object.assign({}, e, {
+                        color: { color: SUPERSEDED_BORDER, opacity: 0.95 },
+                        dashes: true,
+                        arrows: 'to',
+                        width: 2,
+                    });
+                }
+                return e;
+            });
+            // When current-only is active, drop non-current nodes from the working set.
+            if (lineageAvailable() && !showLineage()) {
+                graphData.nodes = graphData.nodes.filter(function(n) {
+                    return !n.superseded && !n.authority_unknown;
+                });
+                var present = new Set(graphData.nodes.map(function(n) { return n.id; }));
+                graphData.edges = graphData.edges.filter(function(e) {
+                    return present.has(e.from) && present.has(e.to);
+                });
+            }
+            setLineageUiState();
+        }
+        function onLineageToggle() {
+            if (!graphData) return;
+            // Re-fetch is heavy; re-process from last raw if we kept full set.
+            // Safer: reload graph to get clean copy (local is fast).
+            loadGraph();
+        }
+        function lineageBadgeHtml(flags) {
+            if (flags.unknown) {
+                return '<span class="lineage-badge unk" title="Authority unknown">UNKNOWN</span>';
+            }
+            if (flags.superseded) {
+                var by = (flags.superseded_by || []).map(function(i) { return '#' + i; }).join(', ');
+                return '<span class="lineage-badge sup" title="Superseded by ' + escapeHtmlAttr(by || '?') + '">SUPERSEDED</span>';
+            }
+            return '';
+        }
+        function panelLineageHtml(flags) {
+            if (flags.unknown) {
+                return '<div class="lineage-banner unknown">AUTHORITY UNKNOWN — lineage integrity cannot confirm currentness; do not treat as current authority</div>';
+            }
+            if (flags.superseded) {
+                var by = (flags.superseded_by || []).map(function(i) { return '#' + i; }).join(', ') || '(unknown)';
+                return '<div class="lineage-banner superseded">SUPERSEDED by ' + escapeHtmlText(by) + ' — not current authority</div>';
+            }
+            if (flags.supersedes && flags.supersedes.length) {
+                var s = flags.supersedes.map(function(i) { return '#' + i; }).join(', ');
+                return '<div class="lineage-banner" style="border:1px solid #d29922;color:#d29922;background:#3d2e0011;">Supersedes older: ' + escapeHtmlText(s) + '</div>';
+            }
+            return '';
+        }
 
         // Initialize database from URL parameter
         function initDbFromUrl() {
@@ -1485,6 +1700,14 @@ div.vis-tooltip {
         function updateDuplicatesBadge(count) {
             var badge = document.getElementById('duplicates-badge');
             if (!badge) return;
+            if (count == null) {
+                // crossrefs unavailable — never a confident zero
+                badge.textContent = '?';
+                badge.style.display = '';
+                badge.title = 'Duplicate counts unavailable (crossrefs degraded)';
+                return;
+            }
+            badge.title = '';
             if (count > 0) {
                 badge.textContent = count;
                 badge.style.display = '';
@@ -1496,6 +1719,11 @@ div.vis-tooltip {
         function renderDuplicatesList(data) {
             var listEl = document.getElementById('duplicates-list');
             var sumEl = document.getElementById('duplicates-summary');
+            if (!crossrefsAvailable()) {
+                listEl.innerHTML = '<div class="dup-empty">DUPS UNAVAILABLE — crossrefs degraded; cannot certify duplicate counts.</div>';
+                if (sumEl) sumEl.textContent = 'unavailable';
+                return;
+            }
             var pairs = (data && data.pairs) || [];
             var total = (data && data.total) || 0;
             if (pairs.length === 0) {
@@ -1539,10 +1767,13 @@ div.vis-tooltip {
             var dateB = formatDate(p.b.created_at);
             var sharedTags = (p.a.tags || []).filter(function(t) { return (p.b.tags || []).indexOf(t) !== -1; });
             var sharedStr = sharedTags.length > 0 ? 'shared: ' + sharedTags.slice(0, 3).map(escapeHtml).join(', ') : '';
+            var fa = lineageFlagsForId(p.a.id);
+            var fb = lineageFlagsForId(p.b.id);
+            var pairCls = (fa.superseded || fb.superseded) ? ' superseded-row' : ((fa.unknown || fb.unknown) ? ' unknown-row' : '');
             return ''
-                + '<div class="dup-pair">'
+                + '<div class="dup-pair' + pairCls + '">'
                 + '  <div class="dup-pair-header">'
-                + '    <span class="dup-pair-ids">#' + p.a.id + ' &harr; #' + p.b.id + '</span>'
+                + '    <span class="dup-pair-ids">#' + p.a.id + lineageBadgeHtml(fa) + ' &harr; #' + p.b.id + lineageBadgeHtml(fb) + '</span>'
                 + '    <span class="dup-pair-score ' + p.tier + '">' + scoreStr + ' ' + tierLabel + '</span>'
                 + '    <span class="dup-pair-meta">' + dateA + ' / ' + dateB + ' &middot; ' + sharedStr + '</span>'
                 + '  </div>'
@@ -1691,11 +1922,14 @@ div.vis-tooltip {
             var title = (mem.content || '').split('\n')[0].slice(0, 80);
             var preview = (mem.content || '').slice(0, 200);
             var updated = formatRelative(mem.updated || mem.created);
+            var lf = lineageFlagsForId(mem.id);
+            var issueRowCls = (lf.superseded ? ' superseded-row' : '') + (lf.unknown ? ' unknown-row' : '');
+            var issueLin = lineageBadgeHtml(lf);
             return ''
-                + '<div class="issue-row" data-memory-id="' + mem.id + '">'
+                + '<div class="issue-row' + issueRowCls + '" data-memory-id="' + mem.id + '">'
                 + '  <span class="issue-severity-icon ' + severityClass + '" title="' + escapeHtmlAttr(severityRaw) + '"></span>'
                 + '  <span class="issue-row-id">#' + mem.id + '</span>'
-                + '  <span class="issue-row-title" onclick="openIssueDetails(' + mem.id + ')">' + escapeHtmlText(title) + '</span>'
+                + '  <span class="issue-row-title" onclick="openIssueDetails(' + mem.id + ')">' + escapeHtmlText(title) + '</span>' + issueLin
                 + '  <div class="issue-row-actions">'
                 + '    <select class="issue-select ' + statusClass + '" onchange="changeIssueStatus(' + mem.id + ', this.value, this)">'
                 + '      <option value="open"' + (selectedStatus === 'open' ? ' selected' : '') + '>Open</option>'
@@ -2030,9 +2264,18 @@ div.vis-tooltip {
                     var dotCls = isClosed ? 'closed' : 'open';
                     statusDot = '<span class="issue-status-dot ' + dotCls + '" title="' + (isClosed ? 'closed' : 'open') + '"></span>';
                 }
-                return '<div class="memory-item' + selectedClass + '" data-id="' + mem.id + '" onclick="highlightMemoryInGraph(' + mem.id + ')">' +
+                var lf = lineageFlagsForId(mem.id);
+                // Current-only: exclude superseded + authority_unknown when lineage is known
+                if (lineageAvailable() && !showLineage() && (lf.superseded || lf.unknown)) {
+                    return '';
+                }
+                var rowClass = selectedClass
+                    + (lf.superseded ? ' superseded-row' : '')
+                    + (lf.unknown ? ' unknown-row' : '');
+                var linBadge = lineageBadgeHtml(lf);
+                return '<div class="memory-item' + rowClass + '" data-id="' + mem.id + '" onclick="highlightMemoryInGraph(' + mem.id + ')">' +
                     '<div class="memory-header">' +
-                        '<div class="memory-title"><span class="' + starClass + '" onclick="toggleFavorite(' + mem.id + ', this); event.stopPropagation();">' + starIcon + '</span>' + statusDot + '<span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span></div>' +
+                        '<div class="memory-title"><span class="' + starClass + '" onclick="toggleFavorite(' + mem.id + ', this); event.stopPropagation();">' + starIcon + '</span>' + statusDot + '<span class="id">#' + mem.id + '</span><span class="headline">' + escapeHtmlText(headline) + '</span>' + linBadge + '</div>' +
                         '<div class="memory-actions">' +
                             '<span class="memory-date">' + mem.created + '</span>' +
                             '<button class="details-btn" onclick="showMemoryDetails(' + mem.id + '); event.stopPropagation();">Details</button>' +
@@ -2237,7 +2480,10 @@ div.vis-tooltip {
             document.getElementById('panel').classList.add('active');
             document.getElementById('resize-handle').classList.add('active');
             switchTab('detail');
-            document.getElementById('panel-title').textContent = 'Memory #' + memId;
+            var loadFlags = lineageFlagsForId(memId);
+            document.getElementById('panel-title').innerHTML = 'Memory #' + memId
+                + (loadFlags.unknown ? ' <span class="lineage-badge unk">· UNKNOWN</span>'
+                    : (loadFlags.superseded ? ' <span class="lineage-badge sup">· SUPERSEDED</span>' : ''));
             // Focus and highlight the node + connected nodes in the graph
             if (typeof network !== 'undefined' && network && nodes && nodes.get(memId)) {
                 focusOnNode(memId);
@@ -2341,7 +2587,11 @@ div.vis-tooltip {
                 currentTab = 'detail';
             }
 
-            document.getElementById('panel-title').textContent = 'Memory #' + mem.id;
+            var flags = lineageFlagsForId(mem.id);
+            var titleBadge = flags.unknown
+                ? ' <span class="lineage-badge unk">· UNKNOWN</span>'
+                : (flags.superseded ? ' <span class="lineage-badge sup">· SUPERSEDED</span>' : '');
+            document.getElementById('panel-title').innerHTML = 'Memory #' + mem.id + titleBadge;
             setPanelEditMode(panelEditMode);
             updatePanelControls();
 
@@ -2351,6 +2601,8 @@ div.vis-tooltip {
                 metaHtml += '<br>Updated: ' + mem.updated;
             }
             document.getElementById('panel-meta').innerHTML = metaHtml;
+            var pl = document.getElementById('panel-lineage');
+            if (pl) pl.innerHTML = panelLineageHtml(flags);
 
             document.getElementById('panel-tags').innerHTML = panelEditMode ? renderTagEditor() : renderReadonlyTags(mem.tags);
             document.getElementById('panel-metadata').innerHTML = panelEditMode ? renderMetadataEditor() : renderReadonlyMetadata(mem.metadata || {});
@@ -2540,6 +2792,7 @@ div.vis-tooltip {
                     document.getElementById('loading').textContent = graphData.message || 'No memories found';
                     return;
                 }
+                processGraphLineage();
                 initGraph();
             } catch (e) {
                 document.getElementById('loading').textContent = 'Error loading graph: ' + e.message;
@@ -2743,7 +2996,12 @@ div.vis-tooltip {
             document.getElementById('duplicates-legend-items').innerHTML = duplicatesHtml;
 
             // Lightweight badge fetch — get pair count without loading the full list
+            // (when crossrefs unavailable, do not show a confident zero)
             (function() {
+                if (!crossrefsAvailable()) {
+                    updateDuplicatesBadge(null);
+                    return;
+                }
                 var dbp = getDbParam();
                 var sep = dbp ? dbp + '&' : '?';
                 fetch('/api/duplicates' + sep + 'limit=1')
@@ -2791,12 +3049,12 @@ div.vis-tooltip {
             // Seed cluster positions before vis.js init
             seedClusterPositions(graphData.nodes);
 
-            // Init vis.js
+            // Init vis.js (nodes already lineage-annotated by processGraphLineage)
             nodes = new vis.DataSet(graphData.nodes);
-            // Color edges between duplicates red
-            var duplicateSet = new Set(graphData.duplicateIds || []);
+            // Color edges between duplicates red (do not restyle supersedes lineage edges)
+            var duplicateSet = new Set(Array.isArray(graphData.duplicateIds) ? graphData.duplicateIds : []);
             var processedEdges = graphData.edges.map(function(e) {
-                if (duplicateSet.has(e.from) && duplicateSet.has(e.to)) {
+                if (duplicateSet.has(e.from) && duplicateSet.has(e.to) && e.edge_type !== 'supersedes') {
                     return Object.assign({}, e, { color: { color: '#f85149', opacity: 0.8 } });
                 }
                 return e;
@@ -3121,6 +3379,7 @@ div.vis-tooltip {
 
                 // Update graphData
                 graphData = newData;
+                processGraphLineage();
 
                 // Clear memory cache for fresh data
                 memoryCache = {};
@@ -3129,10 +3388,10 @@ div.vis-tooltip {
                 nodes.clear();
                 edges.clear();
 
-                // Reprocess edges for duplicates
-                var duplicateSet = new Set(graphData.duplicateIds || []);
+                // Reprocess edges for duplicates (after lineage edge styling)
+                var duplicateSet = new Set(Array.isArray(graphData.duplicateIds) ? graphData.duplicateIds : []);
                 var processedEdges = graphData.edges.map(function(e) {
-                    if (duplicateSet.has(e.from) && duplicateSet.has(e.to)) {
+                    if (duplicateSet.has(e.from) && duplicateSet.has(e.to) && e.edge_type !== 'supersedes') {
                         return Object.assign({}, e, { color: { color: '#f85149', opacity: 0.8 } });
                     }
                     return e;
