@@ -121,6 +121,8 @@ def test_n1_neither_split_var_uses_openai_pair(fake_openai, monkeypatch):
     assert client.kwargs == {
         "api_key": "llm-key",
         "base_url": "https://openrouter.ai/api/v1",
+        "timeout": 90.0,
+        "max_retries": 1,
     }
 
 
@@ -133,6 +135,8 @@ def test_n1_both_split_vars_use_memora_pair(fake_openai, monkeypatch):
     assert client.kwargs == {
         "api_key": "emb-key",
         "base_url": "https://api.openai.com/v1",
+        "timeout": 90.0,
+        "max_retries": 1,
     }
 
 
@@ -886,6 +890,33 @@ def test_rebuild_migrates_existing_empty_embedding_marker(absorb_backend):
         status = emb.get_embedding_integrity_status(conn, "tfidf")
         assert status["mismatch"] is False
         assert status["audit"]["missing_count"] == 0
+        epoch_before = emb._meta_get(conn, "embedding_change_epoch")
+        assert storage.semantic_search(conn, "ordinary words", auto_rebuild=False) == []
+        assert emb._meta_get(conn, "embedding_change_epoch") == epoch_before
+        assert storage.semantic_search(conn, "ordinary words", auto_rebuild=False) == []
+        assert emb._meta_get(conn, "embedding_change_epoch") == epoch_before
+
+
+def test_repair_upsert_aborts_on_stolen_lease_without_overwriting_winner(tmp_path):
+    """D1-style repair statements are individually lease-fenced."""
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(tmp_path / "repair-fence.db")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO memories_meta(key, value) VALUES (?, ?)",
+        (emb._REBUILD_LEASE_KEY, "winner|9999999999"),
+    )
+    conn.execute(
+        "INSERT INTO memories_embedding_repairs(memory_id, repaired_generation) VALUES (7, 'winner-generation')"
+    )
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb._upsert_embedding_repair(conn, 7, "loser-generation", "loser")
+    assert conn.execute(
+        "SELECT repaired_generation FROM memories_embedding_repairs WHERE memory_id = 7"
+    ).fetchone()[0] == "winner-generation"
+    conn.close()
 
 
 def test_stolen_rebuild_lease_fences_loser_vector_writes_and_certification(tmp_path, monkeypatch):

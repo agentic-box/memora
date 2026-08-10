@@ -252,7 +252,13 @@ def _embedding_credentials() -> Tuple[str, str]:
 def _openai_client_kwargs(api_key: str, base_url: str) -> Dict[str, Any]:
     """Build OpenAI() kwargs. Always pass base_url when non-empty so the SDK
     cannot recover a different host from process env after a split config."""
-    kwargs: Dict[str, Any] = {"api_key": api_key}
+    # At most two 90s attempts remain comfortably below the 300s rebuild
+    # heartbeat lease. This avoids a provider call making its own owner stale.
+    kwargs: Dict[str, Any] = {
+        "api_key": api_key,
+        "timeout": _EMBEDDING_REQUEST_TIMEOUT_SECONDS,
+        "max_retries": _EMBEDDING_MAX_RETRIES,
+    }
     if base_url and str(base_url).strip():
         kwargs["base_url"] = str(base_url).strip()
     return kwargs
@@ -615,6 +621,11 @@ _INTEGRITY_KEY = "embedding_integrity"
 _INTEGRITY_SCHEMA_VERSION = 2
 _REBUILD_LEASE_KEY = "embedding_rebuild_lease"
 _REBUILD_LEASE_SECONDS = 300
+# D1 executes a repair upsert as one HTTP statement. At its documented
+# 4–8-second statement latency, 20 keeps a heartbeat well inside the 300s TTL.
+_REBUILD_REPAIR_CHUNK_SIZE = 20
+_EMBEDDING_REQUEST_TIMEOUT_SECONDS = 90.0
+_EMBEDDING_MAX_RETRIES = 1
 
 # A semantic search opens a new connection for each MCP call, so the cache key
 # must identify the underlying store rather than the Python connection object.
@@ -708,6 +719,31 @@ def _heartbeat_rebuild_lease(conn: sqlite3.Connection, owner: str) -> bool:
 def _assert_rebuild_lease_owner(conn: sqlite3.Connection, owner: str) -> None:
     """Fence final certification and row writes after another worker takes over."""
     if not _heartbeat_rebuild_lease(conn, owner):
+        raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
+
+
+def _upsert_embedding_repair(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    generation: str,
+    lease_owner: str,
+) -> None:
+    """Fence each repair statement; D1 executes bulk calls one statement at a time."""
+    changed = conn.execute(
+        """
+        INSERT INTO memories_embedding_repairs(memory_id, repaired_generation)
+        SELECT ?, ?
+         WHERE EXISTS (
+             SELECT 1 FROM memories_meta
+              WHERE key = ? AND value LIKE ?
+         )
+        ON CONFLICT(memory_id) DO UPDATE SET
+            repaired_generation = excluded.repaired_generation,
+            repaired_at = datetime('now')
+        """,
+        (memory_id, generation, _REBUILD_LEASE_KEY, f"{lease_owner}|%"),
+    ).rowcount
+    if not changed:
         raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
 
 
@@ -1366,17 +1402,11 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     _assert_rebuild_lease_owner(conn, lease_owner)
     set_stored_embedding_model(conn, fp)
     if repaired_ids:
-        _assert_rebuild_lease_owner(conn, lease_owner)
-        conn.executemany(
-            """
-            INSERT INTO memories_embedding_repairs(memory_id, repaired_generation)
-            VALUES (?, ?)
-            ON CONFLICT(memory_id) DO UPDATE SET
-                repaired_generation = excluded.repaired_generation,
-                repaired_at = datetime('now')
-            """,
-            [(memory_id, rebuild_generation) for memory_id in repaired_ids],
-        )
+        for start in range(0, len(repaired_ids), _REBUILD_REPAIR_CHUNK_SIZE):
+            _assert_rebuild_lease_owner(conn, lease_owner)
+            for memory_id in repaired_ids[start : start + _REBUILD_REPAIR_CHUNK_SIZE]:
+                _upsert_embedding_repair(conn, memory_id, rebuild_generation, lease_owner)
+            conn.commit()
     _assert_rebuild_lease_owner(conn, lease_owner)
     verify_embedding_integrity(conn, stamp=True, lease_owner=lease_owner)
     _assert_rebuild_lease_owner(conn, lease_owner)

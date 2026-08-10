@@ -1831,20 +1831,22 @@ def _resolve_vector_scan_page_size() -> int:
 
 
 _VECTOR_SCAN_PAGE_SIZE = _resolve_vector_scan_page_size()
+_CERTIFIED_EMPTY_EMBEDDING = object()
 
 
 def _iter_memories_with_embeddings(
     conn: sqlite3.Connection,
     *,
     page_size: int = _VECTOR_SCAN_PAGE_SIZE,
-) -> Iterator[Tuple[sqlite3.Row, Optional[Dict[str, float]]]]:
-    """Yield ``(row, embedding_vector_or_None)`` for every memory, in id order.
+) -> Iterator[Tuple[sqlite3.Row, Any]]:
+    """Yield each row plus vector, missing sentinel, or certified-empty sentinel.
 
     Replaces the ``list_memories(...) + _get_embeddings_for_ids(...)`` two-step
     that cost ~10 D1 round-trips. One JOIN, paginated by primary key so page
-    boundaries are stable under concurrent writes. Callers that need lazy
-    backfill should check for a ``None`` vector and call ``_compute_embedding``
-    themselves.
+    boundaries are stable under concurrent writes. None means a genuinely
+    missing vector eligible for legacy lazy backfill. The certified-empty
+    sentinel means a rebuilt punctuation-only memory: it is intentionally
+    unsearchable and must never be backfilled.
     """
     last_id = 0
     while True:
@@ -1853,7 +1855,9 @@ def _iter_memories_with_embeddings(
             SELECT m.id, m.content, m.metadata, m.tags,
                    m.created_at, m.updated_at,
                    m.importance, m.last_accessed, m.access_count,
-                   e.embedding AS embedding
+                   e.embedding AS embedding,
+                   e.representation AS embedding_representation,
+                   e.encoding_source AS embedding_encoding_source
             FROM memories m
             LEFT JOIN memories_embeddings e ON e.memory_id = m.id
             WHERE m.id > ?
@@ -1875,6 +1879,11 @@ def _iter_memories_with_embeddings(
                 raw_embedding = None
             if raw_embedding:
                 vector = _json_to_embedding(raw_embedding)
+            elif (
+                row["embedding_representation"] == "empty"
+                and row["embedding_encoding_source"] == "python"
+            ):
+                vector = _CERTIFIED_EMPTY_EMBEDDING
             yield row, vector
             last_id = row["id"]
         if len(rows) < page_size:
@@ -1937,6 +1946,8 @@ def _search_by_vector(
     for row, vector in _iter_memories_with_embeddings(conn):
         memory_id = row["id"]
         if memory_id in exclude_set:
+            continue
+        if vector is _CERTIFIED_EMPTY_EMBEDDING:
             continue
 
         record = _serialise_row(row)
@@ -2010,6 +2021,8 @@ def _search_by_vector_ids_only(
     for row, vector in _iter_memories_with_embeddings(conn):
         memory_id = row["id"]
         if memory_id in exclude_set:
+            continue
+        if vector is _CERTIFIED_EMPTY_EMBEDDING:
             continue
 
         if vector is None:
@@ -2876,8 +2889,10 @@ def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
         if meta_type == "section":
             continue
 
-        # Lazy-backfill missing embeddings (legacy/imported memories) so the
-        # rebuild also re-embeds anything that's still on TF-IDF or empty.
+        # Lazy-backfill genuinely missing legacy/imported embeddings.
+        if vector is _CERTIFIED_EMPTY_EMBEDDING:
+            _store_crossrefs(conn, memory_id, [])
+            continue
         if vector is None:
             try:
                 tags_json = row["tags"]
