@@ -643,7 +643,7 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
 
 
 def _acquire_rebuild_lease(conn: sqlite3.Connection) -> str:
-    """Atomically claim a rebuild or recover an expired owner lease."""
+    """Atomically claim a rebuild or recover an expired owner heartbeat."""
     import time
     import uuid
     token = str(uuid.uuid4())
@@ -652,6 +652,7 @@ def _acquire_rebuild_lease(conn: sqlite3.Connection) -> str:
     conn.execute("INSERT OR IGNORE INTO memories_meta(key, value) VALUES (?, ?)", (_REBUILD_LEASE_KEY, candidate))
     current = _meta_get(conn, _REBUILD_LEASE_KEY)
     if current == candidate:
+        conn.commit()
         return token
     try:
         _owner, started = (current or "|0").rsplit("|", 1)
@@ -664,18 +665,50 @@ def _acquire_rebuild_lease(conn: sqlite3.Connection) -> str:
             (candidate, _REBUILD_LEASE_KEY, current),
         ).rowcount
         if changed:
+            conn.commit()
             return token
     raise EmbeddingIntegrityFault("integrity_building", [])
 
 
-def _rebuild_lease_is_stale(conn: sqlite3.Connection) -> bool:
+def _rebuild_lease_status(conn: sqlite3.Connection) -> Dict[str, int | bool]:
+    """Return lease age from its last owner heartbeat, not rebuild start time."""
     import time
     current = _meta_get(conn, _REBUILD_LEASE_KEY)
     try:
-        _owner, started = (current or "|0").rsplit("|", 1)
-        return int(time.time()) - int(started) > _REBUILD_LEASE_SECONDS
+        _owner, heartbeat = (current or "|0").rsplit("|", 1)
+        age = max(0, int(time.time()) - int(heartbeat))
     except (ValueError, TypeError):
-        return True
+        age = _REBUILD_LEASE_SECONDS + 1
+    return {
+        "stale": age > _REBUILD_LEASE_SECONDS,
+        "age_seconds": age,
+        "retry_after_seconds": max(0, _REBUILD_LEASE_SECONDS - age),
+    }
+
+
+def _rebuild_lease_is_stale(conn: sqlite3.Connection) -> bool:
+    return bool(_rebuild_lease_status(conn)["stale"])
+
+
+def _heartbeat_rebuild_lease(conn: sqlite3.Connection, owner: str) -> bool:
+    """CAS-refresh an owner's heartbeat; a stolen lease cannot be revived."""
+    import time
+    current = _meta_get(conn, _REBUILD_LEASE_KEY)
+    if not current or not current.startswith(f"{owner}|"):
+        return False
+    changed = conn.execute(
+        "UPDATE memories_meta SET value = ? WHERE key = ? AND value = ?",
+        (f"{owner}|{int(time.time())}", _REBUILD_LEASE_KEY, current),
+    ).rowcount
+    if changed:
+        conn.commit()
+    return bool(changed)
+
+
+def _assert_rebuild_lease_owner(conn: sqlite3.Connection, owner: str) -> None:
+    """Fence final certification and row writes after another worker takes over."""
+    if not _heartbeat_rebuild_lease(conn, owner):
+        raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
 
 
 def get_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -803,14 +836,15 @@ def upsert_embedding(
     conn: sqlite3.Connection,
     memory_id: int,
     vector: Dict[str, float],
+    *,
+    lease_owner: Optional[str] = None,
 ) -> None:
     import uuid
     emb_json = embedding_to_json(vector)
     rep = _vector_representation(vector)
     dimension = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
     stored_representation = "dense" if dimension is not None else rep
-    conn.execute(
-        """
+    sql = """
         INSERT INTO memories_embeddings(
             memory_id, embedding, representation, dimension, encoding_source, writer_token
         ) VALUES(?, ?, ?, ?, 'python', ?)
@@ -820,9 +854,31 @@ def upsert_embedding(
             dimension=excluded.dimension,
             encoding_source=excluded.encoding_source,
             writer_token=excluded.writer_token
-        """,
-        (memory_id, emb_json, stored_representation, dimension, str(uuid.uuid4())),
-    )
+    """
+    params: tuple[Any, ...] = (memory_id, emb_json, stored_representation, dimension, str(uuid.uuid4()))
+    if lease_owner is not None:
+        # The conditional source is a lease fence: once another worker owns
+        # the lease, an old worker cannot interleave any more vector writes.
+        sql = """
+            INSERT INTO memories_embeddings(
+                memory_id, embedding, representation, dimension, encoding_source, writer_token
+            )
+            SELECT ?, ?, ?, ?, 'python', ?
+             WHERE EXISTS (
+                 SELECT 1 FROM memories_meta
+                  WHERE key = ? AND value LIKE ?
+             )
+            ON CONFLICT(memory_id) DO UPDATE SET
+                embedding=excluded.embedding,
+                representation=excluded.representation,
+                dimension=excluded.dimension,
+                encoding_source=excluded.encoding_source,
+                writer_token=excluded.writer_token
+        """
+        params += (_REBUILD_LEASE_KEY, f"{lease_owner}|%")
+    changed = conn.execute(sql, params).rowcount
+    if lease_owner is not None and not changed:
+        raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
 
 
 def delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
@@ -1019,7 +1075,10 @@ def _coverage_counts(conn: sqlite3.Connection) -> Dict[str, int]:
         "missing_count": int(conn.execute(
             """SELECT COUNT(*) FROM memories AS m
                LEFT JOIN memories_embeddings AS e ON e.memory_id = m.id
-                AND e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+                AND (
+                    (e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null')
+                    OR (e.representation = 'empty' AND e.encoding_source = 'python')
+                )
                WHERE e.memory_id IS NULL"""
         ).fetchone()[0]),
         "orphan_embedding_count": int(conn.execute(
@@ -1082,7 +1141,10 @@ def audit_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
             """
             SELECT m.id FROM memories AS m
             LEFT JOIN memories_embeddings AS e ON e.memory_id = m.id
-             AND e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+             AND (
+                 (e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null')
+                 OR (e.representation = 'empty' AND e.encoding_source = 'python')
+             )
             WHERE e.memory_id IS NULL ORDER BY m.id LIMIT 100
             """
         ).fetchall()
@@ -1161,30 +1223,40 @@ def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str)
     """Read one DB-owned epoch per search; re-derive indexed SQL only on change."""
     key = _store_cache_key(conn)
     epoch = _meta_get(conn, "embedding_change_epoch") or "0"
+    # Publishing a build state changes metadata rather than an embedding row,
+    # so it does not advance the embedding epoch. Read this small stamp before
+    # accepting a healthy cached result from another connection/process.
+    stamp = get_embedding_integrity(conn)
     cached = _integrity_check_cache.get(key)
-    if cached is not None and cached.get("_epoch") == epoch:
+    if (
+        cached is not None
+        and cached.get("_epoch") == epoch
+        and stamp.get("state") != "building"
+    ):
         return cached
 
     audit = audit_embedding_integrity(conn)
-    stamp = get_embedding_integrity(conn)
     stored = get_stored_embedding_model(conn)
     if audit["orphan_embedding_count"]:
         result = {
             "mismatch": True, "repairable": False, "mixed": audit["mixed"],
             "reason": "orphan_embeddings", "fault_ids": audit["orphan_ids"], "audit": audit,
         }
-    elif stamp and stamp.get("state") == "building":
-        stale = _rebuild_lease_is_stale(conn)
-        result = {
-            "mismatch": True, "repairable": stale, "mixed": audit["mixed"],
-            "reason": "integrity_build_stale" if stale else "integrity_building",
-            "fault_ids": [], "audit": audit,
-        }
     elif audit["recurring_unknown_ids"]:
         result = {
             "mismatch": True, "repairable": False, "mixed": audit["mixed"],
             "reason": "recurring_unknown_encoding",
             "fault_ids": audit["recurring_unknown_ids"], "audit": audit,
+        }
+    elif stamp and stamp.get("state") == "building":
+        lease = _rebuild_lease_status(conn)
+        stale = bool(lease["stale"])
+        result = {
+            "mismatch": True, "repairable": stale, "mixed": audit["mixed"],
+            "reason": "integrity_build_stale" if stale else "integrity_building",
+            "fault_ids": [], "audit": audit,
+            "lease_age_seconds": lease["age_seconds"],
+            "retry_after_seconds": lease["retry_after_seconds"],
         }
     elif audit["unknown_encoding_ids"]:
         # A legacy/unknown encoding is repaired once. Rebuild records that
@@ -1217,7 +1289,10 @@ def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str)
             "reason": None, "fault_ids": [], "audit": audit,
         }
     result["_epoch"] = epoch
-    _integrity_check_cache[key] = result
+    # A lease can expire without an embedding write (and therefore without an
+    # epoch change), so never cache its live timing state.
+    if result["reason"] not in {"integrity_building", "integrity_build_stale"}:
+        _integrity_check_cache[key] = result
     return result
 
 
@@ -1234,7 +1309,9 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     building = _empty_integrity()
     building["state"] = "building"
     building["generation"] = rebuild_generation
+    _assert_rebuild_lease_owner(conn, lease_owner)
     _write_embedding_integrity(conn, building)
+    conn.commit()
     invalidate_embedding_integrity_cache(conn)
 
     rows = conn.execute(
@@ -1243,42 +1320,53 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     repaired_rows = conn.execute(
         """
         SELECT memory_id FROM memories_embeddings
-         WHERE representation IS NULL OR representation NOT IN ('dense', 'sparse')
+         WHERE representation IS NULL OR representation NOT IN ('dense', 'sparse', 'empty')
         """
     ).fetchall()
     repaired_ids = [int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]) for row in repaired_rows]
     updated = 0
     seen_reps: Set[str] = set()
     for row in rows:
+        _assert_rebuild_lease_owner(conn, lease_owner)
         memory_id = row["id"]
         metadata = json.loads(row["metadata"]) if row["metadata"] else None
         tags = json.loads(row["tags"]) if row["tags"] else []
         vector = compute_embedding(row["content"], metadata, tags, embedding_model)
+        _assert_rebuild_lease_owner(conn, lease_owner)
         rep = _vector_representation(vector)
         seen_reps.add(rep)
-        upsert_embedding(conn, memory_id, vector)
+        upsert_embedding(conn, memory_id, vector, lease_owner=lease_owner)
+        conn.commit()
         updated += 1
 
     if updated == 0:
+        _assert_rebuild_lease_owner(conn, lease_owner)
         set_stored_embedding_model(conn, current_embedding_fingerprint(embedding_model))
-        verify_embedding_integrity(conn, stamp=True)
+        _assert_rebuild_lease_owner(conn, lease_owner)
+        verify_embedding_integrity(conn, stamp=True, lease_owner=lease_owner)
+        _assert_rebuild_lease_owner(conn, lease_owner)
         conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
         conn.commit()
         return 0
 
     non_empty = {r for r in seen_reps if r != "empty"}
-    if len(non_empty) != 1:
+    if len(non_empty) > 1:
         raise EmbeddingProviderError(
             f"rebuild produced non-uniform representations {sorted(seen_reps)}; "
             f"refusing to stamp fingerprint"
         )
-    rep = next(iter(non_empty))
-    observed_dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
-    fp = current_embedding_fingerprint(embedding_model, observed_dim=observed_dim)
-    if rep.startswith("dense:"):
-        fp = fp.rsplit("|", 1)[0] + "|" + rep
+    if non_empty:
+        rep = next(iter(non_empty))
+        observed_dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
+        fp = current_embedding_fingerprint(embedding_model, observed_dim=observed_dim)
+        if rep.startswith("dense:"):
+            fp = fp.rsplit("|", 1)[0] + "|" + rep
+    else:
+        fp = current_embedding_fingerprint(embedding_model)
+    _assert_rebuild_lease_owner(conn, lease_owner)
     set_stored_embedding_model(conn, fp)
     if repaired_ids:
+        _assert_rebuild_lease_owner(conn, lease_owner)
         conn.executemany(
             """
             INSERT INTO memories_embedding_repairs(memory_id, repaired_generation)
@@ -1289,18 +1377,27 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
             """,
             [(memory_id, rebuild_generation) for memory_id in repaired_ids],
         )
-    verify_embedding_integrity(conn, stamp=True)
+    _assert_rebuild_lease_owner(conn, lease_owner)
+    verify_embedding_integrity(conn, stamp=True, lease_owner=lease_owner)
+    _assert_rebuild_lease_owner(conn, lease_owner)
     conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
     conn.commit()
     return updated
 
 
-def verify_embedding_integrity(conn: sqlite3.Connection, *, stamp: bool = True) -> Dict[str, Any]:
+def verify_embedding_integrity(
+    conn: sqlite3.Connection,
+    *,
+    stamp: bool = True,
+    lease_owner: Optional[str] = None,
+) -> Dict[str, Any]:
     """Explicit admin audit; stamp a complete SQL generation when requested."""
     audit = audit_embedding_integrity(conn)
     result = dict(audit)
     result["fingerprint"] = get_stored_embedding_model(conn)
     if stamp:
+        if lease_owner is not None:
+            _assert_rebuild_lease_owner(conn, lease_owner)
         _stamp_integrity_audit(conn, audit, result["fingerprint"])
     invalidate_embedding_integrity_cache(conn)
     return result

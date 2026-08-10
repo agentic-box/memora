@@ -3164,6 +3164,8 @@ def add_memories(
         [{"content": r["content"], "metadata": r["prepared_metadata"], "tags": r["validated_tags"]} for r in rows],
         EMBEDDING_MODEL,
     )
+    if len(embeddings) != len(rows) or any(not vector for vector in embeddings):
+        raise ValueError("embedding is empty; refusing durable batch write")
 
     if isinstance(conn, D1Connection):
         # D1 executemany executes separate HTTP inserts — IDs may not be contiguous.
@@ -5210,6 +5212,11 @@ def import_memories(
 
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
             tags_json = json.dumps(validated_tags, ensure_ascii=False)
+            # Compute before INSERT so an unembeddable import never leaves a
+            # content row without its required vector.
+            vector = _compute_embedding(content, prepared_metadata, validated_tags)
+            if not vector:
+                raise ValueError("embedding is empty; refusing durable import write")
 
             # Insert with optional created_at preservation
             if created_at:
@@ -5227,7 +5234,6 @@ def import_memories(
 
             # Update FTS and embeddings
             _fts_upsert(conn, memory_id, content, metadata_json, tags_json)
-            vector = _compute_embedding(content, prepared_metadata, validated_tags)
             _upsert_embedding(conn, memory_id, vector)
 
             imported += 1

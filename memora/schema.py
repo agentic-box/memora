@@ -315,9 +315,6 @@ def _ensure_actions_table(conn: sqlite3.Connection) -> None:
 
 def _ensure_importance_columns(conn: sqlite3.Connection) -> None:
     """Add importance scoring columns to memories table if they don't exist."""
-    cursor = conn.execute("PRAGMA table_info(memories)")
-    columns = {row[1] for row in cursor.fetchall()}
-
     _add_column_if_missing(conn, "memories", "importance", "REAL DEFAULT 1.0")
     _add_column_if_missing(conn, "memories", "last_accessed", "TEXT")
     _add_column_if_missing(conn, "memories", "access_count", "INTEGER DEFAULT 0")
@@ -327,7 +324,6 @@ def _ensure_importance_columns(conn: sqlite3.Connection) -> None:
 
 def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
     """Add updated_at column to memories table if it doesn't exist."""
-    cursor = conn.execute("PRAGMA table_info(memories)")
     _add_column_if_missing(conn, "memories", "updated_at", "TEXT")
     conn.commit()
 

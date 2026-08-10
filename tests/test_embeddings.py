@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 import types
 from typing import Any, Dict, List, Optional
@@ -816,6 +818,140 @@ def test_recurring_unknown_is_found_beyond_fresh_unknown_limit(absorb_backend):
         status = emb.get_embedding_integrity_status(conn, "tfidf")
         assert status["reason"] == "recurring_unknown_encoding"
         assert records[-1]["id"] in status["fault_ids"]
+
+
+def test_active_lease_status_is_not_cached_past_heartbeat_expiry(absorb_backend):
+    """A time-only expiry is visible even though no embedding epoch changed."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(conn, content="lease cache expiry probe")
+        assert emb.rebuild_all_embeddings(conn, "tfidf") == 1
+        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is False
+        emb._write_embedding_integrity(conn, {
+            "schema_version": 2, "state": "building", "generation": "active",
+            "reps": {}, "fingerprint": None,
+        })
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_meta(key, value) VALUES (?, ?)",
+            (emb._REBUILD_LEASE_KEY, f"owner|{int(time.time())}"),
+        )
+        active = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert active["reason"] == "integrity_building"
+        assert active["retry_after_seconds"] >= 0
+        # This updates only lease metadata, deliberately leaving the embedding
+        # epoch untouched. A cached active result would hide the stale owner.
+        conn.execute(
+            "UPDATE memories_meta SET value = ? WHERE key = ?",
+            ("dead-owner|0", emb._REBUILD_LEASE_KEY),
+        )
+        stale = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert stale["reason"] == "integrity_build_stale"
+        assert stale["repairable"] is True
+        assert stale["lease_age_seconds"] > emb._REBUILD_LEASE_SECONDS
+        assert record["id"] > 0
+
+
+def test_empty_vectors_are_rejected_before_batch_or_import_writes(absorb_backend):
+    """No public multi-write path may leave empty embeddings behind."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        with pytest.raises(ValueError, match="embedding is empty"):
+            storage.add_memories(conn, [{"content": "!!!"}])
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+
+        result = storage.import_memories(conn, [{"content": "???"}])
+        assert result["imported"] == 0
+        assert result["total_errors"] == 1
+        assert "embedding is empty" in result["errors"][0]["error"]
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+
+
+def test_rebuild_migrates_existing_empty_embedding_marker(absorb_backend):
+    """A pre-existing punctuation-only row is intentionally unsearchable, not missing."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        cur = conn.execute("INSERT INTO memories(content, tags) VALUES ('!!!', '[]')")
+        emb.upsert_embedding(conn, cur.lastrowid, {})
+        assert emb.rebuild_all_embeddings(conn, "tfidf") == 1
+        marker = conn.execute(
+            "SELECT embedding, representation, encoding_source FROM memories_embeddings WHERE memory_id = ?",
+            (cur.lastrowid,),
+        ).fetchone()
+        assert marker["embedding"] is None
+        assert marker["representation"] == "empty"
+        assert marker["encoding_source"] == "python"
+        status = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert status["mismatch"] is False
+        assert status["audit"]["missing_count"] == 0
+
+
+def test_stolen_rebuild_lease_fences_loser_vector_writes_and_certification(tmp_path, monkeypatch):
+    """A slow owner loses the heartbeat lease without corrupting the winner."""
+    from memora.schema import ensure_schema
+
+    path = tmp_path / "lease-race.db"
+    setup = sqlite3.connect(path)
+    setup.row_factory = sqlite3.Row
+    ensure_schema(setup)
+    setup.executemany(
+        "INSERT INTO memories(content, tags) VALUES (?, '[]')",
+        [("first rebuild row",), ("second rebuild row",)],
+    )
+    setup.commit()
+    setup.close()
+
+    slow = sqlite3.connect(path, check_same_thread=False)
+    winner = sqlite3.connect(path, check_same_thread=False)
+    slow.row_factory = sqlite3.Row
+    winner.row_factory = sqlite3.Row
+    monkeypatch.setattr(emb, "_REBUILD_LEASE_SECONDS", 0)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+    calls_lock = threading.Lock()
+
+    def slow_then_winner(*_args):
+        with calls_lock:
+            calls["n"] += 1
+            call = calls["n"]
+        if call == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+            return {"old-owner": 1.0}
+        return {"winner": 1.0}
+
+    monkeypatch.setattr(emb, "compute_embedding", slow_then_winner)
+    loser = {}
+
+    def run_slow():
+        try:
+            emb.rebuild_all_embeddings(slow, "tfidf")
+        except Exception as exc:  # The test asserts the ownership fence below.
+            loser["error"] = exc
+
+    thread = threading.Thread(target=run_slow)
+    thread.start()
+    assert entered.wait(timeout=5)
+    time.sleep(1.1)  # lease is stale at the one-second timestamp resolution
+    assert emb.rebuild_all_embeddings(winner, "tfidf") == 2
+    winner_stamp = emb.get_embedding_integrity(winner)
+    release.set()
+    thread.join(timeout=5)
+
+    assert isinstance(loser.get("error"), emb.EmbeddingIntegrityFault)
+    assert loser["error"].reason == "integrity_rebuild_lease_lost"
+    assert emb.get_embedding_integrity(winner) == winner_stamp
+    payloads = [
+        emb.json_to_embedding(row["embedding"])
+        for row in winner.execute("SELECT embedding FROM memories_embeddings ORDER BY memory_id")
+    ]
+    assert payloads == [{"winner": 1.0}, {"winner": 1.0}]
+    assert emb.get_embedding_integrity_status(winner, "tfidf")["mismatch"] is False
+    slow.close()
+    winner.close()
 
 
 def test_p1_dense_key_set_exact_not_prefix():
