@@ -18,6 +18,7 @@ uv.lock
 data/
 
 # Build artifacts
+build/
 dist/
 .wrangler/
 *.lock
