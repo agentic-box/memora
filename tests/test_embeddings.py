@@ -919,6 +919,110 @@ def test_repair_upsert_aborts_on_stolen_lease_without_overwriting_winner(tmp_pat
     conn.close()
 
 
+def test_rebuild_metadata_and_release_are_statement_fenced(tmp_path):
+    """A suspended loser cannot publish or release after the winner takes over."""
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(tmp_path / "metadata-fence.db")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    conn.execute(
+        "INSERT INTO memories_meta(key, value) VALUES (?, ?)",
+        (emb._REBUILD_LEASE_KEY, "winner|9999999999"),
+    )
+    emb._meta_set(conn, "embedding_model", "winner-model")
+    emb._write_embedding_integrity(conn, {
+        "state": "initialized", "generation": "winner", "fingerprint": "winner-model",
+    })
+    winner_model = emb._meta_get(conn, "embedding_model")
+    winner_stamp = emb._meta_get(conn, emb._INTEGRITY_KEY)
+
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb._write_embedding_integrity(conn, {"state": "building"}, lease_owner="loser")
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb.set_stored_embedding_model(conn, "loser-model", lease_owner="loser")
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb._stamp_integrity_audit(conn, {}, "loser-model", lease_owner="loser")
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb._release_rebuild_lease(conn, "loser")
+
+    assert emb._meta_get(conn, "embedding_model") == winner_model
+    assert emb._meta_get(conn, emb._INTEGRITY_KEY) == winner_stamp
+    assert emb._meta_get(conn, emb._REBUILD_LEASE_KEY) == "winner|9999999999"
+    conn.close()
+
+
+@pytest.mark.parametrize("memory_count", (0, 1), ids=("empty", "non-empty"))
+def test_rebuild_finalization_metadata_survives_injected_lease_steal(
+    tmp_path, monkeypatch, memory_count
+):
+    """Both finalization paths leave winner metadata byte-identical after a steal."""
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(tmp_path / f"finalize-{memory_count}.db")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    if memory_count:
+        conn.execute("INSERT INTO memories(content, tags) VALUES ('finalization row', '[]')")
+    conn.commit()
+
+    winner_integrity = '{"fingerprint":"winner-model","generation":"winner","state":"initialized"}'
+    original_set_model = emb.set_stored_embedding_model
+    fired = {"value": False}
+
+    def steal_before_model_publish(connection, model, *, lease_owner=None):
+        if lease_owner is not None and not fired["value"]:
+            fired["value"] = True
+            connection.execute(
+                "UPDATE memories_meta SET value = ? WHERE key = ?",
+                ("winner|9999999999", emb._REBUILD_LEASE_KEY),
+            )
+            emb._meta_set(connection, "embedding_model", "winner-model")
+            emb._meta_set(connection, emb._INTEGRITY_KEY, winner_integrity)
+            connection.commit()
+        return original_set_model(connection, model, lease_owner=lease_owner)
+
+    monkeypatch.setattr(emb, "set_stored_embedding_model", steal_before_model_publish)
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb.rebuild_all_embeddings(conn, "tfidf")
+    assert fired["value"] is True
+    assert emb._meta_get(conn, "embedding_model") == "winner-model"
+    assert emb._meta_get(conn, emb._INTEGRITY_KEY) == winner_integrity
+    assert emb._meta_get(conn, emb._REBUILD_LEASE_KEY) == "winner|9999999999"
+    conn.close()
+
+
+def test_rebuild_release_fails_after_injected_post_assert_steal(tmp_path, monkeypatch):
+    """The final assert/release gap cannot turn a stolen rebuild into success."""
+    from memora.schema import ensure_schema
+
+    conn = sqlite3.connect(tmp_path / "release-steal.db")
+    conn.row_factory = sqlite3.Row
+    ensure_schema(conn)
+    conn.execute("INSERT INTO memories(content, tags) VALUES ('release fence row', '[]')")
+    conn.commit()
+    original_release = emb._release_rebuild_lease
+    winner_integrity = '{"fingerprint":"winner-model","generation":"winner","state":"initialized"}'
+
+    def steal_before_release(connection, owner):
+        connection.execute(
+            "UPDATE memories_meta SET value = ? WHERE key = ?",
+            ("winner|9999999999", emb._REBUILD_LEASE_KEY),
+        )
+        emb._meta_set(connection, "embedding_model", "winner-model")
+        emb._meta_set(connection, emb._INTEGRITY_KEY, winner_integrity)
+        connection.commit()
+        return original_release(connection, owner)
+
+    monkeypatch.setattr(emb, "_release_rebuild_lease", steal_before_release)
+    with pytest.raises(emb.EmbeddingIntegrityFault, match="integrity_rebuild_lease_lost"):
+        emb.rebuild_all_embeddings(conn, "tfidf")
+    assert emb._meta_get(conn, "embedding_model") == "winner-model"
+    assert emb._meta_get(conn, emb._INTEGRITY_KEY) == winner_integrity
+    assert emb._meta_get(conn, emb._REBUILD_LEASE_KEY) == "winner|9999999999"
+    conn.close()
+
+
 def test_stolen_rebuild_lease_fences_loser_vector_writes_and_certification(tmp_path, monkeypatch):
     """A slow owner loses the heartbeat lease without corrupting the winner."""
     from memora.schema import ensure_schema

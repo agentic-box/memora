@@ -653,6 +653,39 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
     )
 
 
+def _meta_set_for_rebuild_owner(
+    conn: sqlite3.Connection,
+    key: str,
+    value: str,
+    lease_owner: str,
+) -> None:
+    """Publish rebuild metadata only while the exact lease owner still holds it."""
+    changed = conn.execute(
+        """
+        INSERT INTO memories_meta(key, value)
+        SELECT ?, ?
+         WHERE EXISTS (
+             SELECT 1 FROM memories_meta
+              WHERE key = ? AND value LIKE ?
+         )
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (key, value, _REBUILD_LEASE_KEY, f"{lease_owner}|%"),
+    ).rowcount
+    if not changed:
+        raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
+
+
+def _release_rebuild_lease(conn: sqlite3.Connection, lease_owner: str) -> None:
+    """Release only the current owner's lease; never report a stolen release as success."""
+    changed = conn.execute(
+        "DELETE FROM memories_meta WHERE key = ? AND value LIKE ?",
+        (_REBUILD_LEASE_KEY, f"{lease_owner}|%"),
+    ).rowcount
+    if not changed:
+        raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
+
+
 def _acquire_rebuild_lease(conn: sqlite3.Connection) -> str:
     """Atomically claim a rebuild or recover an expired owner heartbeat."""
     import time
@@ -759,8 +792,17 @@ def get_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
         return {}
 
 
-def _write_embedding_integrity(conn: sqlite3.Connection, data: Dict[str, Any]) -> None:
-    _meta_set(conn, _INTEGRITY_KEY, json.dumps(data, ensure_ascii=False, sort_keys=True))
+def _write_embedding_integrity(
+    conn: sqlite3.Connection,
+    data: Dict[str, Any],
+    *,
+    lease_owner: Optional[str] = None,
+) -> None:
+    value = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    if lease_owner is None:
+        _meta_set(conn, _INTEGRITY_KEY, value)
+    else:
+        _meta_set_for_rebuild_owner(conn, _INTEGRITY_KEY, value, lease_owner)
 
 
 def _empty_integrity() -> Dict[str, Any]:
@@ -1044,9 +1086,17 @@ def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
     return _meta_get(conn, "embedding_model")
 
 
-def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
+def set_stored_embedding_model(
+    conn: sqlite3.Connection,
+    model: str,
+    *,
+    lease_owner: Optional[str] = None,
+) -> None:
     """Store the selected model; an admin audit owns any integrity stamp."""
-    _meta_set(conn, "embedding_model", model)
+    if lease_owner is None:
+        _meta_set(conn, "embedding_model", model)
+    else:
+        _meta_set_for_rebuild_owner(conn, "embedding_model", model, lease_owner)
     invalidate_embedding_integrity_cache(conn)
     conn.commit()
 
@@ -1219,7 +1269,13 @@ def _snapshot_matches_live(stamp: Dict[str, Any], audit: Dict[str, Any], stored:
     ))
 
 
-def _stamp_integrity_audit(conn: sqlite3.Connection, audit: Dict[str, Any], stored: Optional[str]) -> None:
+def _stamp_integrity_audit(
+    conn: sqlite3.Connection,
+    audit: Dict[str, Any],
+    stored: Optional[str],
+    *,
+    lease_owner: Optional[str] = None,
+) -> None:
     """Persist a completed SQL audit as a drift baseline, never as live truth."""
     import uuid
     stamped = dict(audit)
@@ -1229,7 +1285,7 @@ def _stamp_integrity_audit(conn: sqlite3.Connection, audit: Dict[str, Any], stor
         "generation": str(uuid.uuid4()),
         "state": "initialized",
     })
-    _write_embedding_integrity(conn, stamped)
+    _write_embedding_integrity(conn, stamped, lease_owner=lease_owner)
     conn.commit()
 
 
@@ -1346,7 +1402,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     building["state"] = "building"
     building["generation"] = rebuild_generation
     _assert_rebuild_lease_owner(conn, lease_owner)
-    _write_embedding_integrity(conn, building)
+    _write_embedding_integrity(conn, building, lease_owner=lease_owner)
     conn.commit()
     invalidate_embedding_integrity_cache(conn)
 
@@ -1377,11 +1433,13 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
 
     if updated == 0:
         _assert_rebuild_lease_owner(conn, lease_owner)
-        set_stored_embedding_model(conn, current_embedding_fingerprint(embedding_model))
+        set_stored_embedding_model(
+            conn, current_embedding_fingerprint(embedding_model), lease_owner=lease_owner
+        )
         _assert_rebuild_lease_owner(conn, lease_owner)
         verify_embedding_integrity(conn, stamp=True, lease_owner=lease_owner)
         _assert_rebuild_lease_owner(conn, lease_owner)
-        conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
+        _release_rebuild_lease(conn, lease_owner)
         conn.commit()
         return 0
 
@@ -1400,7 +1458,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     else:
         fp = current_embedding_fingerprint(embedding_model)
     _assert_rebuild_lease_owner(conn, lease_owner)
-    set_stored_embedding_model(conn, fp)
+    set_stored_embedding_model(conn, fp, lease_owner=lease_owner)
     if repaired_ids:
         for start in range(0, len(repaired_ids), _REBUILD_REPAIR_CHUNK_SIZE):
             _assert_rebuild_lease_owner(conn, lease_owner)
@@ -1410,7 +1468,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     _assert_rebuild_lease_owner(conn, lease_owner)
     verify_embedding_integrity(conn, stamp=True, lease_owner=lease_owner)
     _assert_rebuild_lease_owner(conn, lease_owner)
-    conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
+    _release_rebuild_lease(conn, lease_owner)
     conn.commit()
     return updated
 
@@ -1428,6 +1486,6 @@ def verify_embedding_integrity(
     if stamp:
         if lease_owner is not None:
             _assert_rebuild_lease_owner(conn, lease_owner)
-        _stamp_integrity_audit(conn, audit, result["fingerprint"])
+        _stamp_integrity_audit(conn, audit, result["fingerprint"], lease_owner=lease_owner)
     invalidate_embedding_integrity_cache(conn)
     return result
