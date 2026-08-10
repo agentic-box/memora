@@ -152,17 +152,55 @@ def _validate_content(content: str) -> str:
 # Auto-detection of memory types (issue, todo) from content
 # ---------------------------------------------------------------------------
 
-# Keywords that suggest content is about a bug/issue
-_ISSUE_KEYWORDS = [
-    "bug", "fix", "fixed", "error", "crash", "broken", "resolve", "resolved",
-    "problem", "issue", "fault", "defect", "patch", "hotfix", "regression",
+# Keywords that suggest content is about a bug/issue.
+#
+# These are matched as WHOLE WORDS, one count per group. The previous version was a
+# plain substring test over a flat list, which produced two independent false-positive
+# sources and mislabelled 130 knowledge memories as issues in a real store:
+#
+#   substring bleed  "fault" matched in-DEFAULT, "patch" in-DISPATCH, "bug" in-DEBUG,
+#                    "fix" in-FIXTURES/PREFIX, "issue" in-ISSUED
+#   double counting  "resolve" AND "resolved" were both entries, so a single
+#                    occurrence of "resolved" scored 2 and cleared the >=2 threshold
+#                    on its own
+#
+# Grouping the inflections into one alternation per concept fixes the second problem
+# by construction: a group can only ever contribute 1. Keep it that way when editing —
+# do not add a variant as a separate entry.
+_ISSUE_KEYWORD_GROUPS = [
+    r"bugs?",
+    r"fix(?:es|ed|ing)?",
+    r"errors?",
+    r"crash(?:es|ed|ing)?",
+    r"broken",
+    r"resolv(?:e|es|ed|ing)",
+    r"problems?",
+    r"issues?",
+    r"faults?",
+    r"defects?",
+    r"patch(?:es|ed|ing)?",
+    r"hotfix(?:es)?",
+    r"regressions?",
 ]
 
-# Keywords that suggest content is a TODO/task
-_TODO_KEYWORDS = [
-    "todo", "task", "implement", "add feature", "need to", "should add",
-    "plan to", "will add", "must add", "want to add", "roadmap",
+# Keywords that suggest content is a TODO/task. Multi-word entries are phrases, so
+# word boundaries are applied at the ends only.
+_TODO_KEYWORD_GROUPS = [
+    r"todos?",
+    r"tasks?",
+    r"implement(?:s|ed|ing)?",
+    r"add feature",
+    r"need to",
+    r"should add",
+    r"plan to",
+    r"will add",
+    r"must add",
+    r"want to add",
+    r"roadmaps?",
 ]
+
+_ISSUE_KEYWORD_RES = [re.compile(r"\b(?:" + g + r")\b") for g in _ISSUE_KEYWORD_GROUPS]
+_TODO_KEYWORD_RES = [re.compile(r"\b(?:" + g + r")\b") for g in _TODO_KEYWORD_GROUPS]
 
 # Patterns that strongly suggest closed/resolved issues
 _RESOLVED_PATTERNS = [
@@ -196,8 +234,8 @@ def _detect_memory_type(
     content_lower = content.lower()
 
     # Count keyword matches
-    issue_matches = sum(1 for kw in _ISSUE_KEYWORDS if kw in content_lower)
-    todo_matches = sum(1 for kw in _TODO_KEYWORDS if kw in content_lower)
+    issue_matches = sum(1 for rx in _ISSUE_KEYWORD_RES if rx.search(content_lower))
+    todo_matches = sum(1 for rx in _TODO_KEYWORD_RES if rx.search(content_lower))
 
     # Check for resolved patterns (stronger signal for closed issues)
     has_resolved_pattern = any(
