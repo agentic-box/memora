@@ -1,7 +1,7 @@
 # memora 0.3.2
 
-Consolidated 0.3.x release. **Supersedes 0.3.0 and 0.3.1, whose install path was broken** —
-their notes remain in the repo as `RELEASE_NOTES_0.3.0.md` / `_0.3.1.md`.
+Consolidated 0.3.x release. Notes for the earlier 0.3.x tags remain in the repo as
+`RELEASE_NOTES_0.3.0.md` and `RELEASE_NOTES_0.3.1.md`.
 
 ## Fresh installs work again
 
