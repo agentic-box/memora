@@ -17,7 +17,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.6/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.0.6/purify.min.js"></script>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --timeline-width: 360px; --detail-width: 380px; }
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3;
     font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; overflow: hidden; }
@@ -29,9 +29,9 @@
   #refresh:hover { background: #c084fc; }
   /* shrink the graph canvas to the area NOT covered by the right drawers,
      so force-graph recenters the layout into the visible region */
-  body.panel-open:not(.timeline-open) #graph { right: 380px; }
-  body.timeline-open:not(.panel-open) #graph { right: 360px; }
-  body.timeline-open.panel-open #graph { right: 740px; }
+  body.panel-open:not(.timeline-open) #graph { right: var(--detail-width); }
+  body.timeline-open:not(.panel-open) #graph { right: var(--timeline-width); }
+  body.timeline-open.panel-open #graph { right: calc(var(--timeline-width) + var(--detail-width)); }
   @media (max-width: 900px) { body.timeline-open.panel-open #graph { right: 0; } }
   #bar { position: fixed; top: 12px; left: 12px; z-index: 30; display: flex; gap: 8px;
     align-items: center; flex-wrap: wrap; max-width: calc(100vw - 24px); }
@@ -45,7 +45,7 @@
   #stats { color: #7d8590; } #err { color: #f85149; }
 
   /* ---- timeline drawer (right) ---- */
-  #timeline { position: fixed; top: 0; right: 0; bottom: 0; width: 360px; z-index: 31;
+  #timeline { position: fixed; top: 0; right: 0; bottom: 0; width: var(--timeline-width); z-index: 31;
     background: #0d1117f7; border-left: 1px solid #30363d; backdrop-filter: blur(8px);
     transform: translateX(100%); transition: transform .18s; display: flex; flex-direction: column; }
   body.timeline-open #timeline { transform: none; }
@@ -84,11 +84,20 @@
   /* hidden fully off-screen via `right` (not transform — a width-relative transform
      didn't clear the viewport once the panel was shifted left of the timeline, so it
      covered the drawer and stole clicks). pointer-events off while hidden. */
-  #panel { position: fixed; top: 0; right: -440px; bottom: 0; width: 380px; z-index: 32;
+  #panel { position: fixed; top: 0; right: calc(0px - var(--detail-width) - 60px); bottom: 0; width: var(--detail-width); z-index: 32;
     background: #0d1117f7; border-left: 1px solid #30363d; backdrop-filter: blur(8px);
     padding: 16px; overflow: auto; transition: right .2s; pointer-events: none; }
   body.panel-open #panel { right: 0; pointer-events: auto; }
-  body.panel-open.timeline-open #panel { right: 360px; }
+  body.panel-open.timeline-open #panel { right: var(--timeline-width); }
+  .drawer-resize-handle { position: fixed; top: 0; bottom: 0; width: 8px; z-index: 34;
+    cursor: ew-resize; display: none; touch-action: none; }
+  .drawer-resize-handle::after { content: ''; position: absolute; top: 0; bottom: 0; left: 3px;
+    width: 2px; background: transparent; transition: background .12s; }
+  .drawer-resize-handle:hover::after, .drawer-resize-handle.dragging::after { background: #a855f7; }
+  body.timeline-open #timeline-resize-handle { display: block; right: calc(var(--timeline-width) - 4px); }
+  body.panel-open #detail-resize-handle { display: block; right: calc(var(--detail-width) - 4px); }
+  body.panel-open.timeline-open #detail-resize-handle {
+    right: calc(var(--timeline-width) + var(--detail-width) - 4px); }
   #panel h2 { margin: 0 0 2px; font-size: 15px; color: #a855f7; }
   #panel .meta { color: #7d8590; font-size: 11px; margin-bottom: 10px; }
   #panel .close, #tlhead .close { padding: 2px 8px; }
@@ -151,6 +160,8 @@
 
 <!-- detail pane -->
 <div id="panel"></div>
+<div id="timeline-resize-handle" class="drawer-resize-handle" title="Resize timeline"></div>
+<div id="detail-resize-handle" class="drawer-resize-handle" title="Resize memory detail"></div>
 
 <!-- Pure selection/detail ownership — tests import the same file (K2). -->
 <script type="module">
@@ -167,6 +178,43 @@ const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
 const DATABASE_STORAGE_KEY = "memora-graph.database";
 const MODE_STORAGE_KEY = "memora-graph.mode";
+const DRAWER_MIN_WIDTH = 280;
+const DRAWER_DEFAULT_WIDTHS = Object.freeze({ timeline: 360, detail: 380 });
+const DRAWER_WIDTH_KEYS = Object.freeze({
+  timeline: "memora-graph.width.timeline",
+  detail: "memora-graph.width.detail",
+});
+const drawerWidths = { timeline: DRAWER_DEFAULT_WIDTHS.timeline, detail: DRAWER_DEFAULT_WIDTHS.detail };
+
+function clampDrawerWidth(width, fallback) {
+  const max = Math.max(1, Math.floor(window.innerWidth * 0.9));
+  const min = Math.min(DRAWER_MIN_WIDTH, max);
+  const parsed = Number(width);
+  const usable = Number.isFinite(parsed) ? parsed : fallback;
+  return Math.min(max, Math.max(min, Math.round(usable)));
+}
+
+function readDrawerWidth(kind) {
+  let saved = null;
+  try { saved = localStorage.getItem(DRAWER_WIDTH_KEYS[kind]); } catch (e) {}
+  return clampDrawerWidth(saved === null ? DRAWER_DEFAULT_WIDTHS[kind] : saved, DRAWER_DEFAULT_WIDTHS[kind]);
+}
+
+function saveDrawerWidth(kind, width) {
+  try { localStorage.setItem(DRAWER_WIDTH_KEYS[kind], String(width)); } catch (e) {}
+}
+
+function applyDrawerWidth(kind, width, persist = false) {
+  const applied = clampDrawerWidth(width, DRAWER_DEFAULT_WIDTHS[kind]);
+  drawerWidths[kind] = applied;
+  document.documentElement.style.setProperty(`--${kind}-width`, `${applied}px`);
+  if (persist) saveDrawerWidth(kind, applied);
+  relayout();
+  return applied;
+}
+
+applyDrawerWidth("timeline", readDrawerWidth("timeline"));
+applyDrawerWidth("detail", readDrawerWidth("detail"));
 // Restore the last renderer choice. Read at declaration time because boot
 // (initializeDatabases -> load -> render) runs at the bottom of this module and
 // reads `mode` directly. Anything other than a known value falls back to 3d.
@@ -621,7 +669,51 @@ function forceWake() { wake(); }
 function relayout() {
   setTimeout(() => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); wake(1000); } }, 200);
 }
-addEventListener("resize", () => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); } });
+addEventListener("resize", () => {
+  applyDrawerWidth("timeline", drawerWidths.timeline, true);
+  applyDrawerWidth("detail", drawerWidths.detail, true);
+  if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); }
+});
+
+let resizingDrawer = null;
+function drawerWidthAtPointer(kind, clientX) {
+  const rightOffset = kind === "detail" && document.body.classList.contains("timeline-open")
+    ? drawerWidths.timeline
+    : 0;
+  return window.innerWidth - rightOffset - clientX;
+}
+
+function setupDrawerResize(kind) {
+  const handle = el(`${kind}-resize-handle`);
+  handle.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    resizingDrawer = kind;
+    handle.classList.add("dragging");
+    document.body.style.cursor = "ew-resize";
+    event.preventDefault();
+  });
+  handle.addEventListener("dblclick", (event) => {
+    try { localStorage.removeItem(DRAWER_WIDTH_KEYS[kind]); } catch (e) {}
+    applyDrawerWidth(kind, DRAWER_DEFAULT_WIDTHS[kind]);
+    event.preventDefault();
+  });
+}
+
+setupDrawerResize("timeline");
+setupDrawerResize("detail");
+
+document.addEventListener("mousemove", (event) => {
+  if (!resizingDrawer) return;
+  applyDrawerWidth(resizingDrawer, drawerWidthAtPointer(resizingDrawer, event.clientX));
+});
+
+document.addEventListener("mouseup", () => {
+  if (!resizingDrawer) return;
+  saveDrawerWidth(resizingDrawer, drawerWidths[resizingDrawer]);
+  el(`${resizingDrawer}-resize-handle`).classList.remove("dragging");
+  resizingDrawer = null;
+  document.body.style.cursor = "";
+});
 
 // open detail + sync the timeline row + recenter the node AFTER the canvas resizes
 function selectMemory(id, dupe, mem, superseded) {
