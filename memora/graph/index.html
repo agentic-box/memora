@@ -888,15 +888,50 @@ div.vis-tooltip {
             return '';
         }
 
-        // Initialize database from URL parameter
-        function initDbFromUrl() {
-            var params = new URLSearchParams(window.location.search);
-            var dbParam = params.get('db');
-            if (dbParam && (dbParam === 'memora' || dbParam === 'ob1')) {
-                currentDb = dbParam;
-                document.getElementById('db-select').value = currentDb;
+        // Populate the database selector from the Worker's configured bindings.
+        //
+        // This page used to hardcode the database names in TWO places — the <option>
+        // markup and a `?db=` whitelist — so a database that existed in the API and
+        // showed up in force-graph (which has always read /api/databases) was both
+        // invisible in the dropdown here AND unreachable by URL. Adding a database
+        // meant editing this file; forgetting to meant it silently did not exist.
+        // /api/databases derives the list from the Worker's DB_* bindings, so it is
+        // the single source of truth.
+        function initDatabases() {
+            var select = document.getElementById('db-select');
+            var requested = new URLSearchParams(window.location.search).get('db');
+
+            function apply(names, preferredDefault) {
+                if (names && names.length) {
+                    var options = names.map(function (name) {
+                        var o = document.createElement('option');
+                        o.value = name;
+                        o.textContent = name;
+                        return o;
+                    });
+                    select.replaceChildren.apply(select, options);
+                } else {
+                    // Endpoint unreachable: keep the options the markup shipped rather
+                    // than emptying the selector and stranding the user with no database.
+                    names = Array.prototype.map.call(select.options, function (o) { return o.value; });
+                }
+                currentDb = names.indexOf(requested) !== -1 ? requested
+                    : (names.indexOf(preferredDefault) !== -1 ? preferredDefault : names[0]);
+                select.value = currentDb;
+                document.getElementById('version-db').textContent = currentDb;
             }
-            document.getElementById('version-db').textContent = currentDb;
+
+            return fetch('/api/databases')
+                .then(function (r) { return r.ok ? r.json() : null; })
+                .then(function (payload) {
+                    if (!payload) { apply(null, null); return; }
+                    var list = Array.isArray(payload) ? payload : payload.databases;
+                    var names = Array.isArray(list) ? list.filter(function (n) {
+                        return typeof n === 'string' && n.length > 0;
+                    }) : null;
+                    apply(names, payload && payload.default);
+                })
+                .catch(function () { apply(null, null); });
         }
 
         // Get database query parameter for API calls
@@ -3276,8 +3311,12 @@ div.vis-tooltip {
         // the nodes keep spinning. Chaining on the loadGraph promise lets the
         // graph settle at full width first, then the panel opens and triggers
         // vis-network's autoResize → redraw (not physics restart).
-        if (MEMORA_CONFIG.dbSelector) initDbFromUrl();
-        loadGraph().then(function() {
+        // Resolve the database list BEFORE the first load: currentDb decides which
+        // store loadGraph() queries, and /api/databases is a network round-trip, so
+        // this can no longer be synchronous the way the old hardcoded whitelist was.
+        (MEMORA_CONFIG.dbSelector ? initDatabases() : Promise.resolve()).then(function() {
+            return loadGraph();
+        }).then(function() {
             function openDefault() {
                 try {
                     var openPref = localStorage.getItem('memora-panel-open');
