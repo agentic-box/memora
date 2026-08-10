@@ -1638,9 +1638,52 @@ div.vis-tooltip {
         // Panel functions
         var currentPanelMemoryId = null;
         var currentTab = 'detail';
+        var PANEL_DEFAULT_WIDTH = 560;
+        var PANEL_MIN_WIDTH = 280;
+
+        function panelWidthStorageKey(tabName) {
+            return 'memora-panel-width-' + tabName;
+        }
+
+        function panelWidthBounds() {
+            var max = Math.max(1, Math.floor(window.innerWidth * 0.9));
+            return { min: Math.min(PANEL_MIN_WIDTH, max), max: max };
+        }
+
+        function clampPanelWidth(width) {
+            var bounds = panelWidthBounds();
+            var parsed = Number(width);
+            if (!Number.isFinite(parsed)) parsed = PANEL_DEFAULT_WIDTH;
+            return Math.min(bounds.max, Math.max(bounds.min, Math.round(parsed)));
+        }
+
+        function getStoredPanelWidth(tabName) {
+            var stored = null;
+            try { stored = localStorage.getItem(panelWidthStorageKey(tabName)); } catch (e) {}
+            return clampPanelWidth(stored === null ? PANEL_DEFAULT_WIDTH : stored);
+        }
+
+        function persistPanelWidth(tabName, width) {
+            var clamped = clampPanelWidth(width);
+            try { localStorage.setItem(panelWidthStorageKey(tabName), String(clamped)); } catch (e) {}
+            return clamped;
+        }
+
+        function applyPanelWidth(tabName, width) {
+            var applied = clampPanelWidth(width === undefined ? getStoredPanelWidth(tabName) : width);
+            panel.style.width = applied + 'px';
+            updateTimelinePosition();
+            return applied;
+        }
+
+        function restorePanelWidth(tabName) {
+            var applied = applyPanelWidth(tabName);
+            persistPanelWidth(tabName, applied);
+        }
 
         function switchTab(tabName) {
             currentTab = tabName;
+            restorePanelWidth(tabName);
             document.querySelectorAll('#panel-tabs .tab').forEach(function(t) { t.classList.remove('active'); });
             document.querySelector('#panel-tabs .tab[onclick*="' + tabName + '"]').classList.add('active');
             document.getElementById('tab-detail').classList.toggle('active', tabName === 'detail');
@@ -2593,6 +2636,8 @@ div.vis-tooltip {
                 currentTab = 'detail';
             }
 
+            restorePanelWidth('detail');
+
             var flags = lineageFlagsForId(mem.id);
             var titleBadge = flags.unknown
                 ? ' <span class="lineage-badge unk">· UNKNOWN</span>'
@@ -2641,9 +2686,11 @@ div.vis-tooltip {
         var resizeHandle = document.getElementById('resize-handle');
         var panel = document.getElementById('panel');
         var isResizing = false;
+        var resizedPanelWidth = null;
 
         resizeHandle.addEventListener('mousedown', function(e) {
             isResizing = true;
+            resizedPanelWidth = panel.getBoundingClientRect().width;
             resizeHandle.classList.add('dragging');
             document.body.style.cursor = 'ew-resize';
             e.preventDefault();
@@ -2652,16 +2699,31 @@ div.vis-tooltip {
         document.addEventListener('mousemove', function(e) {
             if (!isResizing) return;
             var newWidth = window.innerWidth - e.clientX;
-            if (newWidth >= 200 && newWidth <= 800) {
-                panel.style.width = newWidth + 'px';
-                updateTimelinePosition();
-            }
+            resizedPanelWidth = applyPanelWidth(currentTab, newWidth);
         });
 
         document.addEventListener('mouseup', function() {
+            if (isResizing && resizedPanelWidth !== null) {
+                persistPanelWidth(currentTab, resizedPanelWidth);
+            }
             isResizing = false;
+            resizedPanelWidth = null;
             resizeHandle.classList.remove('dragging');
             document.body.style.cursor = '';
+        });
+
+        resizeHandle.addEventListener('dblclick', function(e) {
+            try { localStorage.removeItem(panelWidthStorageKey(currentTab)); } catch (err) {}
+            applyPanelWidth(currentTab, PANEL_DEFAULT_WIDTH);
+            e.preventDefault();
+        });
+
+        window.addEventListener('resize', function() {
+            var currentWidth = panel.classList.contains('active')
+                ? panel.getBoundingClientRect().width
+                : getStoredPanelWidth(currentTab);
+            var applied = applyPanelWidth(currentTab, currentWidth);
+            persistPanelWidth(currentTab, applied);
         });
 
         // Timeline slider
