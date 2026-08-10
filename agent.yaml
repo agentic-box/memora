@@ -60,6 +60,8 @@ skills:
     description: Validate stored tags against the allowlist.
   - name: memory_hierarchy
     description: Return memories organized into a hierarchy derived from metadata.
+  - name: memory_verify_integrity
+    description: Read-only embedding integrity doctor with bounded offending IDs and remediation.
   - name: memory_semantic_search
     description: Search memories by vector similarity.
   - name: memory_hybrid_search

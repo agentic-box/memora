@@ -34,17 +34,18 @@ def cmd_health() -> None:
 
 def cmd_search(query: str, top_k: int = 7, tags_any: list[str] | None = None) -> None:
     from .storage import connect, hybrid_search
+    from .embeddings import EmbeddingIntegrityFault, embedding_integrity_fault_payload
 
     conn = connect()
     try:
-        results = hybrid_search(
-            conn,
-            query,
-            semantic_weight=0.6,
-            top_k=top_k,
-            min_score=0.0,
-            tags_any=tags_any or None,
-        )
+        try:
+            results = hybrid_search(
+                conn, query, semantic_weight=0.6, top_k=top_k,
+                min_score=0.0, tags_any=tags_any or None,
+            )
+        except EmbeddingIntegrityFault as exc:
+            json.dump(embedding_integrity_fault_payload(exc), sys.stdout)
+            return
     finally:
         conn.close()
 

@@ -125,6 +125,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
     _ensure_fts(conn)
     _ensure_embeddings_table(conn)
+    _ensure_integrity_epoch_triggers(conn)
     _ensure_crossrefs_table(conn)
     _ensure_events_table(conn)
     _ensure_actions_table(conn)
@@ -154,15 +155,91 @@ def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS memories_embeddings (
             memory_id INTEGER PRIMARY KEY,
             embedding TEXT,
+            representation TEXT,
+            dimension INTEGER,
+            encoding_source TEXT,
+            writer_token TEXT,
             FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
         )
         """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(memories_embeddings)").fetchall()}
+    if "representation" not in columns:
+        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN representation TEXT")
+    if "dimension" not in columns:
+        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN dimension INTEGER")
+    if "encoding_source" not in columns:
+        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN encoding_source TEXT")
+    if "writer_token" not in columns:
+        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN writer_token TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memories_embeddings_representation "
+        "ON memories_embeddings(representation, dimension)"
     )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS memories_meta (
             key TEXT PRIMARY KEY,
             value TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_integrity_epoch_triggers(conn: sqlite3.Connection) -> None:
+    """DB-owned epoch advances for every writer, including D1/worker SQL."""
+    conn.execute(
+        "INSERT OR IGNORE INTO memories_meta(key, value) VALUES ('embedding_change_epoch', '0')"
+    )
+    for table in ("memories", "memories_embeddings"):
+        for action in ("INSERT", "UPDATE", "DELETE"):
+            conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS trg_embedding_epoch_{table}_{action.lower()}
+                AFTER {action} ON {table}
+                BEGIN
+                    UPDATE memories_meta
+                       SET value = CAST(value AS INTEGER) + 1
+                     WHERE key = 'embedding_change_epoch';
+                END
+                """
+            )
+    # Older/external writers update only embedding on conflict. Clear the
+    # Python-owned representation facts rather than certifying a new payload
+    # with stale normalized metadata.
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_embedding_external_update
+        AFTER UPDATE OF embedding ON memories_embeddings
+        WHEN NEW.writer_token IS OLD.writer_token
+        BEGIN
+            UPDATE memories_embeddings
+               SET representation = NULL, dimension = NULL,
+                   encoding_source = 'unknown', writer_token = NULL
+             WHERE memory_id = NEW.memory_id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TRIGGER IF NOT EXISTS trg_embedding_external_insert
+        AFTER INSERT ON memories_embeddings
+        WHEN NEW.writer_token IS NULL
+        BEGIN
+            UPDATE memories_embeddings
+               SET representation = NULL, dimension = NULL,
+                   encoding_source = 'unknown'
+             WHERE memory_id = NEW.memory_id;
+        END
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memories_embedding_repairs (
+            memory_id INTEGER PRIMARY KEY,
+            repaired_generation TEXT NOT NULL,
+            repaired_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
     )

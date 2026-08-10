@@ -59,6 +59,11 @@ from .storage import (
 logger = logging.getLogger(__name__)
 
 
+def _integrity_fault_response(exc: Exception) -> Optional[Dict[str, Any]]:
+    from .embeddings import EmbeddingIntegrityFault, embedding_integrity_fault_payload
+    return embedding_integrity_fault_payload(exc) if isinstance(exc, EmbeddingIntegrityFault) else None
+
+
 def _safe_error(e: Exception, context: str = "operation") -> Dict[str, str]:
     """Return sanitized error for unexpected exceptions. Log full details internally."""
     logger.error("Failed %s: %s", context, e, exc_info=True)
@@ -1968,6 +1973,27 @@ async def memory_hierarchy(
 
 
 @mcp.tool()
+async def memory_verify_integrity() -> Dict[str, Any]:
+    """Read-only embedding integrity doctor with bounded offending ids."""
+    from .embeddings import get_embedding_integrity_status, verify_embedding_integrity
+    conn = connect()
+    try:
+        audit = verify_embedding_integrity(conn, stamp=False)
+        status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
+        return {
+            "status": status,
+            "audit": audit,
+            "remediation": (
+                "Repair or remove named orphan/unknown writer rows, then run an explicit "
+                "embedding rebuild. External writers must populate representation, dimension, "
+                "encoding_source, and writer_token."
+            ),
+        }
+    finally:
+        conn.close()
+
+
+@mcp.tool()
 async def memory_semantic_search(
     query: str,
     top_k: int = 5,
@@ -2012,14 +2038,8 @@ async def memory_semantic_search(
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
     except Exception as exc:
-        from memora.embeddings import EmbeddingIntegrityFault
-        if isinstance(exc, EmbeddingIntegrityFault):
-            return {
-                "error": "embedding_integrity_fault",
-                "reason": exc.reason,
-                "memory_ids": exc.memory_ids,
-                "message": "Automatic rebuild skipped; run integrity verification after fixing the writer.",
-            }
+        if fault := _integrity_fault_response(exc):
+            return fault
         raise
     # Project content at tool boundary — search results are [{score, memory}, ...]
     for entry in results:
@@ -2107,6 +2127,10 @@ async def memory_hybrid_search(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
+    except Exception as exc:
+        if fault := _integrity_fault_response(exc):
+            return fault
+        raise
     # Project content at tool boundary — search results are [{score, memory}, ...]
     for entry in results:
         if "memory" in entry:
@@ -2204,6 +2228,10 @@ async def memory_digest(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
+    except Exception as exc:
+        if fault := _integrity_fault_response(exc):
+            return fault
+        raise
     digest["parameters"] = {
         "k": k,
         "include_lineage": include_lineage,

@@ -4588,6 +4588,9 @@ def semantic_search(
             file=sys.stderr,
         )
         rebuild_embeddings(conn)
+        integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL)
+        if integrity["mismatch"]:
+            raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
 
     vector_query = _compute_embedding(query, None, [])
     if not vector_query:

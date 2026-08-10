@@ -80,7 +80,13 @@ def search_memora(query: str, top_k: int = 5) -> list:
         return results
     except ImportError:
         return []
-    except Exception:
+    except Exception as exc:
+        try:
+            from memora.embeddings import EmbeddingIntegrityFault, embedding_integrity_fault_payload
+            if isinstance(exc, EmbeddingIntegrityFault):
+                print(json.dumps(embedding_integrity_fault_payload(exc)), file=sys.stderr)
+        except Exception:
+            pass
         return []
 
 

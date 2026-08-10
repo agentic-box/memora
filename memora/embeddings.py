@@ -171,6 +171,16 @@ class EmbeddingIntegrityFault(RuntimeError):
         super().__init__(f"embedding integrity fault: {reason}; memory_ids={memory_ids}")
 
 
+def embedding_integrity_fault_payload(exc: EmbeddingIntegrityFault) -> Dict[str, Any]:
+    """Shared bounded, actionable presentation for every public surface."""
+    return {
+        "error": "embedding_integrity_fault",
+        "reason": exc.reason,
+        "memory_ids": exc.memory_ids[:100],
+        "message": "Automatic rebuild skipped. Run memory_verify_integrity and repair the named writer/data.",
+    }
+
+
 
 def _key_fingerprint(api_key: str) -> str:
     """Short non-reversible fingerprint of a secret for cache keys. Never log the raw key."""
@@ -756,23 +766,29 @@ def upsert_embedding(
     memory_id: int,
     vector: Dict[str, float],
 ) -> None:
-    prev = _previous_embedding_rep(conn, memory_id)
+    import uuid
     emb_json = embedding_to_json(vector)
+    rep = _vector_representation(vector)
+    dimension = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
+    stored_representation = "dense" if dimension is not None else rep
     conn.execute(
         """
-        INSERT INTO memories_embeddings(memory_id, embedding)
-        VALUES(?, ?)
-        ON CONFLICT(memory_id) DO UPDATE SET embedding=excluded.embedding
+        INSERT INTO memories_embeddings(
+            memory_id, embedding, representation, dimension, encoding_source, writer_token
+        ) VALUES(?, ?, ?, ?, 'python', ?)
+        ON CONFLICT(memory_id) DO UPDATE SET
+            embedding=excluded.embedding,
+            representation=excluded.representation,
+            dimension=excluded.dimension,
+            encoding_source=excluded.encoding_source,
+            writer_token=excluded.writer_token
         """,
-        (memory_id, emb_json),
+        (memory_id, emb_json, stored_representation, dimension, str(uuid.uuid4())),
     )
-    note_embedding_write(conn, memory_id, vector, previous_rep=prev)
 
 
 def delete_embedding(conn: sqlite3.Connection, memory_id: int) -> None:
-    prev = _previous_embedding_rep(conn, memory_id)
     conn.execute("DELETE FROM memories_embeddings WHERE memory_id = ?", (memory_id,))
-    note_embedding_delete(conn, memory_id, prev)
 
 
 def get_embeddings_for_ids(
@@ -901,7 +917,7 @@ def get_stored_embedding_model(conn: sqlite3.Connection) -> Optional[str]:
 def set_stored_embedding_model(conn: sqlite3.Connection, model: str) -> None:
     """Store the selected model; an admin audit owns any integrity stamp."""
     _meta_set(conn, "embedding_model", model)
-    _mark_integrity_dirty(conn)
+    invalidate_embedding_integrity_cache(conn)
     conn.commit()
 
 
@@ -977,35 +993,71 @@ def _coverage_counts(conn: sqlite3.Connection) -> Dict[str, int]:
 
 
 def audit_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
-    """Derive integrity from live SQL and payloads (admin/first-use only)."""
+    """Derive hot-path integrity from indexed SQL, never vector JSON."""
     reps: Dict[str, int] = {}
-    encoding_fault_ids: List[int] = []
-    invalid_embedding_ids: List[int] = []
     rows = conn.execute(
-        "SELECT memory_id, embedding FROM memories_embeddings "
-        "WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'"
+        """
+        SELECT representation, dimension, COUNT(*) AS n
+          FROM memories_embeddings
+         WHERE embedding IS NOT NULL AND embedding != '' AND embedding != 'null'
+           AND representation IS NOT NULL
+         GROUP BY representation, dimension
+        """
     ).fetchall()
     for row in rows:
-        memory_id = int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
-        raw = row["embedding"] if isinstance(row, sqlite3.Row) else row[1]
-        try:
-            vector = json_to_embedding(raw)
-        except Exception:
-            invalid_embedding_ids.append(memory_id)
-            continue
-        rep = _vector_representation(vector)
-        if rep == "empty":
-            invalid_embedding_ids.append(memory_id)
-            continue
-        reps[rep] = reps.get(rep, 0) + 1
-        if rep == "sparse" and _is_numeric_gap_vector(vector):
-            encoding_fault_ids.append(memory_id)
+        representation = row["representation"] if isinstance(row, sqlite3.Row) else row[0]
+        dimension = row["dimension"] if isinstance(row, sqlite3.Row) else row[1]
+        count = int(row["n"] if isinstance(row, sqlite3.Row) else row[2])
+        rep = f"dense:{dimension}" if representation == "dense" and dimension is not None else representation
+        reps[rep] = reps.get(rep, 0) + count
+    unknown_rows = conn.execute(
+        """
+        SELECT e.memory_id,
+               CASE WHEN r.memory_id IS NULL THEN 0 ELSE 1 END AS repaired_before
+          FROM memories_embeddings AS e
+          LEFT JOIN memories_embedding_repairs AS r ON r.memory_id = e.memory_id
+         WHERE e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+           AND (e.representation IS NULL OR e.representation NOT IN ('dense', 'sparse'))
+         ORDER BY e.memory_id
+         LIMIT 101
+        """
+    ).fetchall()
+    unknown_ids = [
+        int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
+        for row in unknown_rows[:100]
+    ]
+    recurring_unknown_ids = [
+        int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
+        for row in unknown_rows[:100]
+        if int(row["repaired_before"] if isinstance(row, sqlite3.Row) else row[1])
+    ]
+    missing_ids = [
+        int(row[0]) for row in conn.execute(
+            """
+            SELECT m.id FROM memories AS m
+            LEFT JOIN memories_embeddings AS e ON e.memory_id = m.id
+             AND e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+            WHERE e.memory_id IS NULL ORDER BY m.id LIMIT 100
+            """
+        ).fetchall()
+    ]
+    orphan_ids = [
+        int(row[0]) for row in conn.execute(
+            """
+            SELECT e.memory_id FROM memories_embeddings AS e
+            LEFT JOIN memories AS m ON m.id = e.memory_id
+            WHERE m.id IS NULL ORDER BY e.memory_id LIMIT 100
+            """
+        ).fetchall()
+    ]
     return {
         "schema_version": _INTEGRITY_SCHEMA_VERSION,
         "reps": reps,
         "mixed": _reps_are_mixed(reps),
-        "encoding_fault_ids": encoding_fault_ids,
-        "invalid_embedding_ids": invalid_embedding_ids,
+        "unknown_encoding_ids": unknown_ids,
+        "recurring_unknown_ids": recurring_unknown_ids,
+        "missing_ids": missing_ids,
+        "orphan_ids": orphan_ids,
         **_coverage_counts(conn),
     }
 
@@ -1060,41 +1112,63 @@ def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], curren
 
 
 def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str) -> Dict[str, Any]:
-    """Audit once per process; faults are surfaced, never auto-rebuilt in a loop."""
+    """Read one DB-owned epoch per search; re-derive indexed SQL only on change."""
     key = _store_cache_key(conn)
-    if key in _integrity_check_cache:
-        return _integrity_check_cache[key]
-    memory_count = int(conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0])
-    if memory_count == 0:
-        result = {"mismatch": False, "repairable": False, "mixed": False, "reason": None, "fault_ids": []}
+    epoch = _meta_get(conn, "embedding_change_epoch") or "0"
+    cached = _integrity_check_cache.get(key)
+    if cached is not None and cached.get("_epoch") == epoch:
+        return cached
+
+    audit = audit_embedding_integrity(conn)
+    stamp = get_embedding_integrity(conn)
+    stored = get_stored_embedding_model(conn)
+    if audit["orphan_embedding_count"]:
+        result = {
+            "mismatch": True, "repairable": False, "mixed": audit["mixed"],
+            "reason": "orphan_embeddings", "fault_ids": audit["orphan_ids"], "audit": audit,
+        }
+    elif audit["recurring_unknown_ids"]:
+        result = {
+            "mismatch": True, "repairable": False, "mixed": audit["mixed"],
+            "reason": "recurring_unknown_encoding",
+            "fault_ids": audit["recurring_unknown_ids"], "audit": audit,
+        }
+    elif audit["unknown_encoding_ids"]:
+        # A legacy/unknown encoding is repaired once. Rebuild records that
+        # memory id, so the next recurrence becomes the fault above.
+        result = {
+            "mismatch": True, "repairable": True, "mixed": audit["mixed"],
+            "reason": "unknown_embedding_encoding",
+            "fault_ids": audit["unknown_encoding_ids"], "audit": audit,
+        }
+    elif audit["missing_count"]:
+        result = {
+            "mismatch": True, "repairable": True, "mixed": audit["mixed"],
+            "reason": "missing_embeddings", "fault_ids": audit["missing_ids"], "audit": audit,
+        }
+    elif stamp and stamp.get("state") == "building":
+        result = {
+            "mismatch": True, "repairable": False, "mixed": audit["mixed"],
+            "reason": "integrity_building", "fault_ids": [], "audit": audit,
+        }
+    elif audit["memory_count"] and (
+        not stamp or stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION
+    ):
+        result = {
+            "mismatch": True, "repairable": True, "mixed": audit["mixed"],
+            "reason": "integrity_uninitialized", "fault_ids": [], "audit": audit,
+        }
+    elif audit["mixed"] or _model_mismatch_for_reps(audit["reps"], stored, current_model):
+        result = {
+            "mismatch": True, "repairable": True, "mixed": audit["mixed"],
+            "reason": "model_or_representation_mismatch", "fault_ids": [], "audit": audit,
+        }
     else:
-        stamp = get_embedding_integrity(conn)
-        if not stamp or stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION:
-            result = {"mismatch": True, "repairable": True, "mixed": True, "reason": "integrity_uninitialized", "fault_ids": []}
-        elif stamp.get("state") == "building":
-            result = {"mismatch": True, "repairable": False, "mixed": True, "reason": "integrity_building", "fault_ids": []}
-        else:
-            audit = audit_embedding_integrity(conn)
-            stored = get_stored_embedding_model(conn)
-            # A known Python write explicitly dirtied a previously complete
-            # generation. The first subsequent full audit establishes the new
-            # baseline; legacy stores never reach this branch.
-            if stamp.get("state") == "dirty":
-                _stamp_integrity_audit(conn, audit, stored)
-                stamp = get_embedding_integrity(conn)
-            faults = sorted(set(audit["encoding_fault_ids"] + audit["invalid_embedding_ids"]))
-            if faults:
-                result = {"mismatch": True, "repairable": False, "mixed": audit["mixed"], "reason": "embedding_encoding_fault", "fault_ids": faults, "audit": audit}
-            elif audit["orphan_embedding_count"]:
-                result = {"mismatch": True, "repairable": False, "mixed": audit["mixed"], "reason": "orphan_embeddings", "fault_ids": [], "audit": audit}
-            elif stamp.get("state") == "initialized" and not _snapshot_matches_live(stamp, audit, stored):
-                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "integrity_snapshot_drift", "fault_ids": [], "audit": audit}
-            elif audit["missing_count"]:
-                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "missing_embeddings", "fault_ids": [], "audit": audit}
-            elif audit["mixed"] or _model_mismatch_for_reps(audit["reps"], stored, current_model):
-                result = {"mismatch": True, "repairable": True, "mixed": audit["mixed"], "reason": "model_or_representation_mismatch", "fault_ids": [], "audit": audit}
-            else:
-                result = {"mismatch": False, "repairable": False, "mixed": False, "reason": None, "fault_ids": [], "audit": audit}
+        result = {
+            "mismatch": False, "repairable": False, "mixed": False,
+            "reason": None, "fault_ids": [], "audit": audit,
+        }
+    result["_epoch"] = epoch
     _integrity_check_cache[key] = result
     return result
 
@@ -1106,14 +1180,24 @@ def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str)
 
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
     """Rebuild all embeddings and finish with a SQL-derived audit stamp."""
+    import uuid
+    rebuild_generation = str(uuid.uuid4())
     building = _empty_integrity()
     building["state"] = "building"
+    building["generation"] = rebuild_generation
     _write_embedding_integrity(conn, building)
     invalidate_embedding_integrity_cache(conn)
 
     rows = conn.execute(
         "SELECT id, content, metadata, tags FROM memories"
     ).fetchall()
+    repaired_rows = conn.execute(
+        """
+        SELECT memory_id FROM memories_embeddings
+         WHERE representation IS NULL OR representation NOT IN ('dense', 'sparse')
+        """
+    ).fetchall()
+    repaired_ids = [int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]) for row in repaired_rows]
     updated = 0
     seen_reps: Set[str] = set()
     for row in rows:
@@ -1144,6 +1228,17 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     if rep.startswith("dense:"):
         fp = fp.rsplit("|", 1)[0] + "|" + rep
     set_stored_embedding_model(conn, fp)
+    if repaired_ids:
+        conn.executemany(
+            """
+            INSERT INTO memories_embedding_repairs(memory_id, repaired_generation)
+            VALUES (?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                repaired_generation = excluded.repaired_generation,
+                repaired_at = datetime('now')
+            """,
+            [(memory_id, rebuild_generation) for memory_id in repaired_ids],
+        )
     verify_embedding_integrity(conn, stamp=True)
     conn.commit()
     return updated

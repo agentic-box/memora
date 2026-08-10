@@ -394,8 +394,18 @@ def _meta_conn(tmp_path) -> sqlite3.Connection:
         CREATE TABLE memories_meta (key TEXT PRIMARY KEY, value TEXT);
         CREATE TABLE memories_embeddings (
             memory_id INTEGER PRIMARY KEY,
-            embedding TEXT
+            embedding TEXT,
+            representation TEXT,
+            dimension INTEGER,
+            encoding_source TEXT,
+            writer_token TEXT
         );
+        CREATE TABLE memories_embedding_repairs (
+            memory_id INTEGER PRIMARY KEY,
+            repaired_generation TEXT NOT NULL,
+            repaired_at TEXT
+        );
+        INSERT INTO memories_meta(key, value) VALUES ('embedding_change_epoch', '0');
         """
     )
     return conn
@@ -529,8 +539,8 @@ def _stamp_tfidf_store(conn) -> None:
     emb.invalidate_embedding_integrity_cache(conn)
 
 
-def test_d1_replace_import_cannot_certify_stale_snapshot(absorb_backend):
-    """D1 probe: replace deletes vectors directly, so old generation must drift."""
+def test_d1_replace_import_epoch_reaudits_current_sql(absorb_backend):
+    """D1 probe: replace advances DB epoch and rechecks the replacement SQL."""
     import memora.storage as storage
 
     with storage.connect() as conn:
@@ -540,13 +550,21 @@ def test_d1_replace_import_cannot_certify_stale_snapshot(absorb_backend):
         assert emb.get_embedding_integrity(conn)["reps"] == {"sparse": 2}
         storage.import_memories(conn, [{"content": "replacement only sparse"}], strategy="replace")
         status = emb.get_embedding_integrity_status(conn, "tfidf")
-        assert status["mismatch"] is True
-        assert status["reason"] == "integrity_snapshot_drift"
+        assert status["mismatch"] is False
 
         # Hard negative control: an explicit admin audit knowingly stamps the
         # replacement generation, after which the one-row store is healthy.
-        emb.verify_embedding_integrity(conn)
-        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is False
+        # Hard control: an external same-count mutation also advances epoch,
+        # so it is not hidden behind the previous cached healthy result.
+        replacement_id = conn.execute("SELECT id FROM memories").fetchone()[0]
+        conn.execute(
+            "UPDATE memories_embeddings SET embedding = ? WHERE memory_id = ?",
+            (emb.embedding_to_json({"0": 1.0, "2": 1.0}), replacement_id),
+        )
+        assert conn.execute(
+            "SELECT representation FROM memories_embeddings WHERE memory_id = ?", (replacement_id,)
+        ).fetchone()[0] is None
+        assert emb.get_embedding_integrity_status(conn, "tfidf")["mismatch"] is True
 
 
 def test_d1_legacy_bootstrap_stays_uninitialized_after_one_write(absorb_backend):
@@ -570,7 +588,7 @@ def test_d1_legacy_bootstrap_stays_uninitialized_after_one_write(absorb_backend)
         emb.invalidate_embedding_integrity_cache(conn)
         status = emb.get_embedding_integrity_status(conn, "tfidf")
         assert status["mismatch"] is True
-        assert status["reason"] == "integrity_uninitialized"
+        assert status["reason"] in {"integrity_uninitialized", "unknown_embedding_encoding"}
 
         # Hard negative control: a fresh, uniform store gets a complete admin
         # stamp and is accepted, proving this is not a blanket false positive.
@@ -632,7 +650,7 @@ def test_d1_interleaved_representation_writes_cannot_lose_a_rep(absorb_backend):
         emb.invalidate_embedding_integrity_cache(conn)
         status = emb.get_embedding_integrity_status(conn, "openai")
         assert status["mismatch"] is True
-        assert status["reason"] == "integrity_snapshot_drift"
+        assert status["reason"] == "model_or_representation_mismatch"
         assert status["audit"]["reps"] == {"dense:2": 1, "sparse": 1}
 
         # Hard negative control: a complete audit records both representations;
