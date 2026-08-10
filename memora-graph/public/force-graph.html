@@ -591,6 +591,8 @@ function render() {
       .linkDirectionalArrowLength(l => isSupersedesLink(l) ? 3.5 : 0)
       .linkDirectionalArrowRelPos(1)
       .cooldownTime(5000)
+      // Physics has settled — only now is it safe to let the render loop idle.
+      .onEngineStop(() => { engineCooled = true; armIdle(); })
       .onNodeClick(n => selectMemory(n.id, n.dupe, null, n.superseded)).onBackgroundClick(() => deselect()).graphData(gd);
     // Cap the WebGL pixel ratio. On a Retina Mac devicePixelRatio is 2, so the
     // renderer paints 4x the pixels every frame — the dominant GPU cost (and heat)
@@ -647,22 +649,78 @@ function render() {
         ctx.font = `${10 / scale}px ui-monospace`;
         ctx.fillText(n.label || ("#" + n.id), n.x + 6 / scale, n.y + 3 / scale);
       })
-      .cooldownTime(5000).onEngineTick(() => { hullsDirty = true; })
+      .cooldownTime(5000).onEngineTick(() => { hullsDirty = true; engineCooled = false; })
+      .onEngineStop(() => { engineCooled = true; armIdle(); })
       .onZoom(() => wake()).onZoomEnd(() => wake()).onNodeDrag(() => wake()).onNodeDragEnd(() => wake())
       .onNodeClick(n => selectMemory(n.id, n.dupe, null, n.superseded)).onBackgroundClick(() => deselect()).graphData(gd);
   }
   tuneForces();
+  // render() builds a NEW fg instance; our pause flag described the old one.
+  resetRenderIdleState();
 }
 
 // ---- render-on-demand (CPU saver) ----
-// Pause ONLY when the tab is actually hidden — the one trigger that can never
-// desync from the library's internal render-loop state. An earlier timer-based
-// "pause after N seconds idle" saved more CPU but caused two separate stuck-motion
-// bugs (zoom stuck, then general motion stuck after a while) from pause/resume
-// racing the library's own RAF bookkeeping. Correctness > marginal idle CPU here.
-function pauseRender() { if (fg && fg.pauseAnimation) { try { fg.pauseAnimation(); } catch (e) {} } }
-function wake() { if (fg && fg.resumeAnimation) { try { fg.resumeAnimation(); } catch (e) {} } }
-function forceWake() { wake(); }
+// Measured on the user's Mac, page completely idle: 3D burned ~227% CPU (GPU
+// helper alone 140%), 2D ~37%. The loop repaints 60x/sec forever regardless of
+// whether anything changed — 722 frames over 12s of zero interaction.
+//
+// An earlier idle-pause was reverted for stuck-zoom and stuck-motion. The idea was
+// not the bug. The bug was that wake() called resumeAnimation() UNCONDITIONALLY
+// and is wired to pointermove — dozens of resume calls per second. Layering a
+// timer-driven pause on top of that interleaved pause/resume at high frequency and
+// desynced the library's RAF bookkeeping.
+//
+// So: one authoritative flag, and the library's pause/resume is only ever called
+// on a real state TRANSITION. High-frequency callers just re-arm the timer.
+let renderPaused = false;   // our source of truth — never inferred from the library
+let engineCooled = false;   // never freeze a layout that is still settling
+let idleTimer = null;
+const IDLE_MS = 2500;
+
+// Escape hatch: localStorage memora-graph.noIdle = "1" disables idling entirely,
+// so a stuck loop can be ruled out without a redeploy.
+function idleEnabled() {
+  try { return localStorage.getItem("memora-graph.noIdle") !== "1"; } catch (e) { return true; }
+}
+
+function armIdle() {
+  if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+  if (!idleEnabled()) return;
+  idleTimer = setTimeout(() => {
+    if (renderPaused || !engineCooled || !fg || !fg.pauseAnimation) return;
+    try { fg.pauseAnimation(); renderPaused = true; } catch (e) {}
+  }, IDLE_MS);
+}
+
+// Unconditional pause — only for tab-hidden, where there is no interaction to race.
+function pauseRender() {
+  if (!fg || !fg.pauseAnimation) return;
+  try { fg.pauseAnimation(); renderPaused = true; } catch (e) {}
+}
+
+// HIGH FREQUENCY (pointermove, zoom, drag, controls change). Resumes only on a
+// transition; otherwise this is just a timer re-arm. This is the call that used to
+// spam resumeAnimation().
+function wake() {
+  if (renderPaused && fg && fg.resumeAnimation) {
+    try { fg.resumeAnimation(); } catch (e) {}
+    renderPaused = false;   // cleared even if the call threw, so we can never wedge paused
+  }
+  armIdle();
+}
+
+// DISCRETE INPUT ONLY (pointerdown, wheel, touchstart, tab-visible). Resyncs
+// unconditionally, which is the escape hatch if our flag ever drifts from the
+// library's real state. Safe precisely because these events are rare — doing this
+// on pointermove is what broke it last time.
+function forceWake() {
+  if (fg && fg.resumeAnimation) { try { fg.resumeAnimation(); } catch (e) {} }
+  renderPaused = false;
+  armIdle();
+}
+
+// Called when the graph is (re)built: a new fg instance carries none of our state.
+function resetRenderIdleState() { renderPaused = false; engineCooled = false; armIdle(); }
 
 // Resize the graph canvas to its (now-smaller) container so force-graph recenters
 // the layout into the visible left area. Runs after the drawer CSS transition.
