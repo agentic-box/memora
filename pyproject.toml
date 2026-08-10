@@ -10,7 +10,8 @@ license = "MIT"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp>=1.0.0",
+    # mcp 2.0.0 removed mcp.server.fastmcp; see memora/server.py.
+    "mcp>=1.0.0,<2",
     "Pillow>=10.4.0",
     "boto3>=1.28.0",
     "filelock>=3.12.0",
