@@ -173,23 +173,13 @@ def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(memories_embeddings)").fetchall()}
     for name, sql_type in (
         ("representation", "TEXT"),
         ("dimension", "INTEGER"),
         ("encoding_source", "TEXT"),
         ("writer_token", "TEXT"),
     ):
-        if name in columns:
-            continue
-        try:
-            conn.execute(f"ALTER TABLE memories_embeddings ADD COLUMN {name} {sql_type}")
-        except Exception as exc:
-            if "duplicate column name" not in str(exc).lower():
-                raise
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(memories_embeddings)").fetchall()}
-        if name not in columns:
-            raise RuntimeError(f"concurrent embedding migration did not add {name}")
+        _add_column_if_missing(conn, "memories_embeddings", name, sql_type)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memories_embeddings_representation "
         "ON memories_embeddings(representation, dimension)"
@@ -203,6 +193,21 @@ def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
         """
     )
     conn.commit()
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, name: str, sql_type: str) -> None:
+    """Race-safe additive migration: tolerate only a verified duplicate winner."""
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if name in columns:
+        return
+    try:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
+    except Exception as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
+    columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if name not in columns:
+        raise RuntimeError(f"concurrent migration did not add {table}.{name}")
 
 
 def _ensure_integrity_epoch_triggers(conn: sqlite3.Connection) -> None:
@@ -313,14 +318,9 @@ def _ensure_importance_columns(conn: sqlite3.Connection) -> None:
     cursor = conn.execute("PRAGMA table_info(memories)")
     columns = {row[1] for row in cursor.fetchall()}
 
-    if "importance" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN importance REAL DEFAULT 1.0")
-
-    if "last_accessed" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN last_accessed TEXT")
-
-    if "access_count" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN access_count INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "memories", "importance", "REAL DEFAULT 1.0")
+    _add_column_if_missing(conn, "memories", "last_accessed", "TEXT")
+    _add_column_if_missing(conn, "memories", "access_count", "INTEGER DEFAULT 0")
 
     conn.commit()
 
@@ -328,11 +328,8 @@ def _ensure_importance_columns(conn: sqlite3.Connection) -> None:
 def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
     """Add updated_at column to memories table if it doesn't exist."""
     cursor = conn.execute("PRAGMA table_info(memories)")
-    columns = {row[1] for row in cursor.fetchall()}
-
-    if "updated_at" not in columns:
-        conn.execute("ALTER TABLE memories ADD COLUMN updated_at TEXT")
-        conn.commit()
+    _add_column_if_missing(conn, "memories", "updated_at", "TEXT")
+    conn.commit()
 
 
     # Note: memory_absorb stores source/confidence in metadata (not separate columns)

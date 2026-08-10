@@ -1064,10 +1064,18 @@ def audit_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
         int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
         for row in unknown_rows[:100]
     ]
+    recurring_rows = conn.execute(
+        """
+        SELECT e.memory_id FROM memories_embeddings AS e
+        JOIN memories_embedding_repairs AS r ON r.memory_id = e.memory_id
+         WHERE e.embedding IS NOT NULL AND e.embedding != '' AND e.embedding != 'null'
+           AND (e.representation IS NULL OR e.representation NOT IN ('dense', 'sparse'))
+         ORDER BY e.memory_id LIMIT 100
+        """
+    ).fetchall()
     recurring_unknown_ids = [
         int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0])
-        for row in unknown_rows[:100]
-        if int(row["repaired_before"] if isinstance(row, sqlite3.Row) else row[1])
+        for row in recurring_rows
     ]
     missing_ids = [
         int(row[0]) for row in conn.execute(

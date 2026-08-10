@@ -1980,15 +1980,19 @@ async def memory_verify_integrity() -> Dict[str, Any]:
     try:
         audit = verify_embedding_integrity(conn, stamp=False)
         status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
-        return {
+        response = {
             "status": status,
             "audit": audit,
-            "remediation": (
+        }
+        if status["mismatch"]:
+            response["remediation"] = (
                 "Repair or remove named orphan/unknown writer rows, then run an explicit "
                 "embedding rebuild. External writers must populate representation, dimension, "
                 "encoding_source, and writer_token."
-            ),
-        }
+            )
+        else:
+            response["remediation"] = "no action needed"
+        return response
     finally:
         conn.close()
 

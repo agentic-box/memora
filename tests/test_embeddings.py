@@ -729,7 +729,7 @@ def test_d1_lost_insert_response_recovers_owned_row(monkeypatch, absorb_backend)
 
 
 def test_schema_migration_is_safe_under_concurrent_old_store_upgrades(tmp_path):
-    """Hard migration control: four independent connections race old schema."""
+    """Hard migration control: six independent connections race old schema."""
     from memora.schema import ensure_schema
 
     path = tmp_path / "old.db"
@@ -748,11 +748,13 @@ def test_schema_migration_is_safe_under_concurrent_old_store_upgrades(tmp_path):
         finally:
             c.close()
 
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        list(pool.map(lambda _: migrate(), range(4)))
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda _: migrate(), range(6)))
     check = sqlite3.connect(path)
     columns = {row[1] for row in check.execute("PRAGMA table_info(memories_embeddings)")}
     assert {"representation", "dimension", "encoding_source", "writer_token"} <= columns
+    memory_columns = {row[1] for row in check.execute("PRAGMA table_info(memories)")}
+    assert {"importance", "last_accessed", "access_count", "updated_at"} <= memory_columns
     assert check.execute("SELECT name FROM sqlite_master WHERE name = 'memories_fts'").fetchone()
     check.close()
 
@@ -797,6 +799,23 @@ def test_building_lease_blocks_unknown_repair_then_recovers_stale_owner(absorb_b
         emb.invalidate_embedding_integrity_cache(conn)
         stale = emb.get_embedding_integrity_status(conn, "tfidf")
         assert stale["reason"] == "integrity_build_stale" and stale["repairable"] is True
+
+
+def test_recurring_unknown_is_found_beyond_fresh_unknown_limit(absorb_backend):
+    """The recurrence query is independent of the first 100 fresh unknowns."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        records = [storage.add_memory(conn, content=f"recurrence probe memory {i}") for i in range(101)]
+        conn.execute("UPDATE memories_embeddings SET representation = NULL, writer_token = NULL")
+        conn.execute(
+            "INSERT INTO memories_embedding_repairs(memory_id, repaired_generation) VALUES (?, 'old')",
+            (records[-1]["id"],),
+        )
+        emb.invalidate_embedding_integrity_cache(conn)
+        status = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert status["reason"] == "recurring_unknown_encoding"
+        assert records[-1]["id"] in status["fault_ids"]
 
 
 def test_p1_dense_key_set_exact_not_prefix():
