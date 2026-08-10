@@ -4109,6 +4109,14 @@ def update_memory(
     # Serialize for storage
     metadata_json = json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
     tags_json = json.dumps(new_tags, ensure_ascii=False)
+    vector: Optional[Dict[str, float]] = None
+    if index_changed:
+        # D1 makes the content UPDATE durable immediately. Validate the new
+        # embedding before that statement so an empty vector cannot leave a
+        # migrated store permanently unrebuildable.
+        vector = _compute_embedding(new_content, new_metadata, new_tags)
+        if not vector:
+            raise ValueError("embedding is empty; refusing to update memory without a vector")
 
     # Update the memory
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
@@ -4128,7 +4136,6 @@ def update_memory(
         _fts_upsert(conn, memory_id, new_content, metadata_json, tags_json)
 
         # Update embeddings (calls OpenAI API - ~1-2 sec)
-        vector = _compute_embedding(new_content, new_metadata, new_tags)
         _upsert_embedding(conn, memory_id, vector)
 
         # Skip cross-references update - too expensive for D1 HTTP API (~15 sec)

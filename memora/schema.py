@@ -140,12 +140,22 @@ def _ensure_fts(conn: sqlite3.Connection) -> None:
         "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
     ).fetchone()
     if not table_exists:
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE memories_fts
-            USING fts5(content, metadata, tags)
-            """
-        )
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE memories_fts
+                USING fts5(content, metadata, tags)
+                """
+            )
+        except Exception as exc:
+            # Another upgrader may have won the create race. Re-read and only
+            # suppress the known concurrent-create outcome.
+            if "already exists" not in str(exc).lower():
+                raise
+            if not conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='memories_fts'"
+            ).fetchone():
+                raise
         conn.commit()
 
 
@@ -164,14 +174,22 @@ def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
         """
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(memories_embeddings)").fetchall()}
-    if "representation" not in columns:
-        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN representation TEXT")
-    if "dimension" not in columns:
-        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN dimension INTEGER")
-    if "encoding_source" not in columns:
-        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN encoding_source TEXT")
-    if "writer_token" not in columns:
-        conn.execute("ALTER TABLE memories_embeddings ADD COLUMN writer_token TEXT")
+    for name, sql_type in (
+        ("representation", "TEXT"),
+        ("dimension", "INTEGER"),
+        ("encoding_source", "TEXT"),
+        ("writer_token", "TEXT"),
+    ):
+        if name in columns:
+            continue
+        try:
+            conn.execute(f"ALTER TABLE memories_embeddings ADD COLUMN {name} {sql_type}")
+        except Exception as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(memories_embeddings)").fetchall()}
+        if name not in columns:
+            raise RuntimeError(f"concurrent embedding migration did not add {name}")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_memories_embeddings_representation "
         "ON memories_embeddings(representation, dimension)"

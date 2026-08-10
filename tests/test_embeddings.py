@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 import types
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -725,6 +726,77 @@ def test_d1_lost_insert_response_recovers_owned_row(monkeypatch, absorb_backend)
         assert storage.delete_memory(
             conn, raised.value.memory_id, require_absorb_nonce="recover-owner"
         ) is True
+
+
+def test_schema_migration_is_safe_under_concurrent_old_store_upgrades(tmp_path):
+    """Hard migration control: four independent connections race old schema."""
+    from memora.schema import ensure_schema
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT NOT NULL, metadata TEXT, tags TEXT, created_at TEXT)")
+    conn.execute("CREATE TABLE memories_embeddings (memory_id INTEGER PRIMARY KEY, embedding TEXT)")
+    conn.execute("CREATE TABLE memories_meta (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit()
+    conn.close()
+
+    def migrate():
+        c = sqlite3.connect(path)
+        c.row_factory = sqlite3.Row
+        try:
+            ensure_schema(c)
+        finally:
+            c.close()
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(lambda _: migrate(), range(4)))
+    check = sqlite3.connect(path)
+    columns = {row[1] for row in check.execute("PRAGMA table_info(memories_embeddings)")}
+    assert {"representation", "dimension", "encoding_source", "writer_token"} <= columns
+    assert check.execute("SELECT name FROM sqlite_master WHERE name = 'memories_fts'").fetchone()
+    check.close()
+
+
+def test_empty_embedding_update_is_rejected_before_durable_content_change(absorb_backend):
+    """D1 hard case: an empty update cannot commit content ahead of its vector."""
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(conn, content="normal content with tokens")
+        with pytest.raises(ValueError, match="embedding is empty"):
+            storage.update_memory(conn, record["id"], content="!!!", metadata={}, tags=[])
+        assert storage.get_memory(conn, record["id"])["content"] == "normal content with tokens"
+
+
+def test_building_lease_blocks_unknown_repair_then_recovers_stale_owner(absorb_backend):
+    """A second worker sees building before unknown; stale owner becomes retryable."""
+    import time
+    import memora.storage as storage
+
+    with storage.connect() as conn:
+        record = storage.add_memory(conn, content="lease-controlled rebuild row")
+        conn.execute(
+            "UPDATE memories_embeddings SET representation = NULL, writer_token = NULL WHERE memory_id = ?",
+            (record["id"],),
+        )
+        emb._write_embedding_integrity(conn, {
+            "schema_version": 2, "state": "building", "generation": "active",
+            "reps": {}, "fingerprint": None,
+        })
+        conn.execute(
+            "INSERT OR REPLACE INTO memories_meta(key, value) VALUES (?, ?)",
+            (emb._REBUILD_LEASE_KEY, f"owner|{int(time.time())}"),
+        )
+        emb.invalidate_embedding_integrity_cache(conn)
+        active = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert active["reason"] == "integrity_building" and active["repairable"] is False
+        conn.execute(
+            "UPDATE memories_meta SET value = ? WHERE key = ?",
+            ("dead-owner|0", emb._REBUILD_LEASE_KEY),
+        )
+        emb.invalidate_embedding_integrity_cache(conn)
+        stale = emb.get_embedding_integrity_status(conn, "tfidf")
+        assert stale["reason"] == "integrity_build_stale" and stale["repairable"] is True
 
 
 def test_p1_dense_key_set_exact_not_prefix():

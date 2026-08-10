@@ -613,6 +613,8 @@ def cosine_similarity(vec_a: Dict[str, float], vec_b: Dict[str, float]) -> float
 
 _INTEGRITY_KEY = "embedding_integrity"
 _INTEGRITY_SCHEMA_VERSION = 2
+_REBUILD_LEASE_KEY = "embedding_rebuild_lease"
+_REBUILD_LEASE_SECONDS = 300
 
 # A semantic search opens a new connection for each MCP call, so the cache key
 # must identify the underlying store rather than the Python connection object.
@@ -638,6 +640,42 @@ def _meta_set(conn: sqlite3.Connection, key: str, value: str) -> None:
         """,
         (key, value),
     )
+
+
+def _acquire_rebuild_lease(conn: sqlite3.Connection) -> str:
+    """Atomically claim a rebuild or recover an expired owner lease."""
+    import time
+    import uuid
+    token = str(uuid.uuid4())
+    now = int(time.time())
+    candidate = f"{token}|{now}"
+    conn.execute("INSERT OR IGNORE INTO memories_meta(key, value) VALUES (?, ?)", (_REBUILD_LEASE_KEY, candidate))
+    current = _meta_get(conn, _REBUILD_LEASE_KEY)
+    if current == candidate:
+        return token
+    try:
+        _owner, started = (current or "|0").rsplit("|", 1)
+        stale = now - int(started) > _REBUILD_LEASE_SECONDS
+    except (ValueError, TypeError):
+        stale = True
+    if stale:
+        changed = conn.execute(
+            "UPDATE memories_meta SET value = ? WHERE key = ? AND value = ?",
+            (candidate, _REBUILD_LEASE_KEY, current),
+        ).rowcount
+        if changed:
+            return token
+    raise EmbeddingIntegrityFault("integrity_building", [])
+
+
+def _rebuild_lease_is_stale(conn: sqlite3.Connection) -> bool:
+    import time
+    current = _meta_get(conn, _REBUILD_LEASE_KEY)
+    try:
+        _owner, started = (current or "|0").rsplit("|", 1)
+        return int(time.time()) - int(started) > _REBUILD_LEASE_SECONDS
+    except (ValueError, TypeError):
+        return True
 
 
 def get_embedding_integrity(conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -1127,6 +1165,13 @@ def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str)
             "mismatch": True, "repairable": False, "mixed": audit["mixed"],
             "reason": "orphan_embeddings", "fault_ids": audit["orphan_ids"], "audit": audit,
         }
+    elif stamp and stamp.get("state") == "building":
+        stale = _rebuild_lease_is_stale(conn)
+        result = {
+            "mismatch": True, "repairable": stale, "mixed": audit["mixed"],
+            "reason": "integrity_build_stale" if stale else "integrity_building",
+            "fault_ids": [], "audit": audit,
+        }
     elif audit["recurring_unknown_ids"]:
         result = {
             "mismatch": True, "repairable": False, "mixed": audit["mixed"],
@@ -1145,11 +1190,6 @@ def get_embedding_integrity_status(conn: sqlite3.Connection, current_model: str)
         result = {
             "mismatch": True, "repairable": True, "mixed": audit["mixed"],
             "reason": "missing_embeddings", "fault_ids": audit["missing_ids"], "audit": audit,
-        }
-    elif stamp and stamp.get("state") == "building":
-        result = {
-            "mismatch": True, "repairable": False, "mixed": audit["mixed"],
-            "reason": "integrity_building", "fault_ids": [], "audit": audit,
         }
     elif audit["memory_count"] and (
         not stamp or stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION
@@ -1181,6 +1221,7 @@ def check_embedding_model_mismatch(conn: sqlite3.Connection, current_model: str)
 def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> int:
     """Rebuild all embeddings and finish with a SQL-derived audit stamp."""
     import uuid
+    lease_owner = _acquire_rebuild_lease(conn)
     rebuild_generation = str(uuid.uuid4())
     building = _empty_integrity()
     building["state"] = "building"
@@ -1213,6 +1254,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
     if updated == 0:
         set_stored_embedding_model(conn, current_embedding_fingerprint(embedding_model))
         verify_embedding_integrity(conn, stamp=True)
+        conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
         conn.commit()
         return 0
 
@@ -1240,6 +1282,7 @@ def rebuild_all_embeddings(conn: sqlite3.Connection, embedding_model: str) -> in
             [(memory_id, rebuild_generation) for memory_id in repaired_ids],
         )
     verify_embedding_integrity(conn, stamp=True)
+    conn.execute("DELETE FROM memories_meta WHERE key = ? AND value LIKE ?", (_REBUILD_LEASE_KEY, f"{lease_owner}|%"))
     conn.commit()
     return updated
 
