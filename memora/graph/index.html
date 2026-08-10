@@ -702,6 +702,9 @@ div.vis-tooltip {
         var panelDraftMetadataRows = [];
         var panelDraftComplexMetadata = {};
         var currentDb = 'memora';
+        // P1-4: load generation — reject stale async responses across DB switch / reload
+        // (same pattern as force-graph.html loadGen).
+        var loadGen = 0;
 
         // ---- Lineage helpers (edge_type === "supersedes" only; never infer from directed) ----
         var SUPERSEDED_COLOR = '#6e5a2e';
@@ -714,6 +717,29 @@ div.vis-tooltip {
         }
         function crossrefsAvailable() {
             return graphData && graphData.crossrefsAvailable !== false;
+        }
+        /** Clear every DB-scoped client cache (P1-4). Does not bump loadGen. */
+        function clearDbScopedCaches() {
+            memoryCache = {};
+            duplicatesData = null;
+            duplicatesLoading = false;
+            issuesData = null;
+            issuesLoading = false;
+            statusTimelineCache = { issues: {}, todos: {} };
+            cachedTimelineMemories = null;
+            favoritesCache = null;
+            timelineOffset = 0;
+            timelineTotal = 0;
+            lineageNodeById = {};
+        }
+        /** Bump loadGen and clear caches — call on DB switch / full graph reload. */
+        function beginDbLoad() {
+            loadGen++;
+            clearDbScopedCaches();
+            return loadGen;
+        }
+        function isStaleLoad(gen) {
+            return gen !== loadGen;
         }
         function showLineage() {
             // When lineage unavailable, never pretend current-only works — show all as unknown.
@@ -918,8 +944,20 @@ div.vis-tooltip {
             // Update version label
             document.getElementById('version-db').textContent = dbName;
 
-            // Clear caches
-            memoryCache = {};
+            // P1-4: bump loadGen + clear every DB-scoped cache so in-flight
+            // responses from the previous DB cannot paint wrong authority.
+            beginDbLoad();
+
+            // Reset panel memory surfaces that show cached lists
+            var dl = document.getElementById('duplicates-list');
+            if (dl) dl.innerHTML = '';
+            var il = document.getElementById('issues-list');
+            if (il) il.innerHTML = '';
+            var hl = document.getElementById('history-list');
+            if (hl) hl.innerHTML = '';
+            var tl = document.getElementById('timeline-list');
+            if (tl) tl.innerHTML = '';
+            updateDuplicatesBadge(null);
 
             // Reload graph
             document.getElementById('loading')?.remove();
@@ -1623,8 +1661,11 @@ div.vis-tooltip {
             var parts = node.title.split('\n');
             var idLine = parts[0] || '';
             var descLine = parts.slice(1).join(' ') || '';
+            // P2: every memory surface — badge authority on hover tooltips too
+            var lf = lineageFlagsForId(nodeId);
+            var badge = lineageBadgeHtml(lf);
             var tooltip = document.getElementById('node-tooltip');
-            tooltip.innerHTML = '<div class="tooltip-id">' + escapeHtmlText(idLine) + '</div>' +
+            tooltip.innerHTML = '<div class="tooltip-id">' + escapeHtmlText(idLine) + ' ' + badge + '</div>' +
                                 (descLine ? '<div class="tooltip-desc">' + escapeHtmlText(descLine) + '</div>' : '');
             tooltip.style.left = (pointer.DOM.x + 15) + 'px';
             tooltip.style.top = (pointer.DOM.y + 15) + 'px';
@@ -1672,11 +1713,20 @@ div.vis-tooltip {
 
         function loadDuplicates(forceReload) {
             if (duplicatesLoading) return;
+            // P1-3: when crossrefs unavailable, never fetch a total:0 fallback that
+            // overwrites the integrity badge "?" with a confident zero.
+            if (!crossrefsAvailable()) {
+                duplicatesData = null;
+                renderDuplicatesList(null);
+                updateDuplicatesBadge(null);
+                return;
+            }
             if (!forceReload && duplicatesData) {
                 renderDuplicatesList(duplicatesData);
                 return;
             }
             duplicatesLoading = true;
+            var gen = loadGen;
             var listEl = document.getElementById('duplicates-list');
             var sumEl = document.getElementById('duplicates-summary');
             listEl.innerHTML = '<div class="dup-loading">Loading duplicate pairs&hellip;</div>';
@@ -1686,12 +1736,21 @@ div.vis-tooltip {
             fetch('/api/duplicates' + sep + 'limit=100')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    if (isStaleLoad(gen)) return;
                     duplicatesLoading = false;
+                    // Re-check integrity: graph may have refreshed mid-flight
+                    if (!crossrefsAvailable()) {
+                        duplicatesData = null;
+                        renderDuplicatesList(null);
+                        updateDuplicatesBadge(null);
+                        return;
+                    }
                     duplicatesData = data;
                     renderDuplicatesList(data);
                     updateDuplicatesBadge(data.total || 0);
                 })
                 .catch(function() {
+                    if (isStaleLoad(gen)) return;
                     duplicatesLoading = false;
                     listEl.innerHTML = '<div class="dup-empty" style="color:#f85149;">Failed to load duplicates.</div>';
                 });
@@ -1779,17 +1838,17 @@ div.vis-tooltip {
                 + '  </div>'
                 + '  <div class="dup-pair-bodies">'
                 + '    <div class="dup-pair-body" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">'
-                + '      <div class="dup-pair-body-header">#' + p.a.id + '</div>'
+                + '      <div class="dup-pair-body-header">#' + p.a.id + ' ' + lineageBadgeHtml(fa) + '</div>'
                 + escapeHtml(p.a.preview)
                 + '    </div>'
                 + '    <div class="dup-pair-body" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">'
-                + '      <div class="dup-pair-body-header">#' + p.b.id + '</div>'
+                + '      <div class="dup-pair-body-header">#' + p.b.id + ' ' + lineageBadgeHtml(fb) + '</div>'
                 + escapeHtml(p.b.preview)
                 + '    </div>'
                 + '  </div>'
                 + '  <div class="dup-pair-actions">'
-                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">View #' + p.a.id + '</button>'
-                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">View #' + p.b.id + '</button>'
+                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.a.id + ');switchTab(\'detail\');">View #' + p.a.id + ' ' + lineageBadgeHtml(fa) + '</button>'
+                + '    <button class="dup-action-btn" onclick="loadMemoryToPanel(' + p.b.id + ');switchTab(\'detail\');">View #' + p.b.id + ' ' + lineageBadgeHtml(fb) + '</button>'
                 + '    <button class="dup-action-btn primary" disabled title="Not implemented yet">Merge into newer</button>'
                 + '    <button class="dup-action-btn" disabled title="Not implemented yet">Mark supersedes</button>'
                 + '    <button class="dup-action-btn" disabled title="Not implemented yet">Keep both</button>'
@@ -1836,6 +1895,7 @@ div.vis-tooltip {
                 return;
             }
             issuesLoading = true;
+            var gen = loadGen;
             var listEl = document.getElementById('issues-list');
             var sumEl = document.getElementById('issues-summary');
             listEl.innerHTML = '<div class="dup-loading">Loading issues&hellip;</div>';
@@ -1848,12 +1908,14 @@ div.vis-tooltip {
             fetch('/api/memories' + sep + params)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    if (isStaleLoad(gen)) return;
                     issuesLoading = false;
                     issuesData = data;
                     renderIssuesList(data);
                     updateIssuesBadge();
                 })
                 .catch(function() {
+                    if (isStaleLoad(gen)) return;
                     issuesLoading = false;
                     listEl.innerHTML = '<div class="dup-empty" style="color:#f85149;">Failed to load issues.</div>';
                 });
@@ -1861,11 +1923,13 @@ div.vis-tooltip {
 
         function updateIssuesBadge() {
             // Fetch open count independently so badge reflects global state, not filter
+            var gen = loadGen;
             var dbp = getDbParam();
             var sep = dbp ? dbp + '&' : '?';
             fetch('/api/memories' + sep + 'type=issue&status=open&limit=1')
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    if (isStaleLoad(gen)) return;
                     var badge = document.getElementById('issues-badge');
                     if (!badge) return;
                     var count = data.total || 0;
@@ -2091,11 +2155,13 @@ div.vis-tooltip {
         function loadTimelinePage() {
             if (timelineLoading) return;
             timelineLoading = true;
+            var gen = loadGen;
             var dbp = getDbParam();
             var sep = dbp ? dbp + '&' : '?';
             fetch('/api/memories' + sep + 'limit=' + timelinePageSize + '&offset=' + timelineOffset)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    if (isStaleLoad(gen)) return;
                     timelineLoading = false;
                     if (data.memories) {
                         timelineTotal = data.total || 0;
@@ -2109,6 +2175,7 @@ div.vis-tooltip {
                     }
                 })
                 .catch(function(e) {
+                    if (isStaleLoad(gen)) return;
                     timelineLoading = false;
                     if (!cachedTimelineMemories) {
                         document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading memories</div>';
@@ -2159,13 +2226,18 @@ div.vis-tooltip {
             }
             if (statusTimelineLoading) return;
             statusTimelineLoading = true;
+            var gen = loadGen;
             document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading ' + mode + '…</div>';
             var dbp = getDbParam();
             var sep = dbp ? dbp + '&' : '?';
             var url = '/api/memories' + sep + 'type=' + apiType + '&limit=500' + (st === 'all' ? '' : '&status=' + st);
             fetch(url)
-                .then(function(r) { return r.json(); })
+                .then(function(r) {
+                    if (isStaleLoad(gen)) return null;
+                    return r.json();
+                })
                 .then(function(data) {
+                    if (isStaleLoad(gen) || !data) return;
                     statusTimelineLoading = false;
                     cache[st] = data.memories || [];
                     // User may have switched mode/status while in flight.
@@ -2174,6 +2246,7 @@ div.vis-tooltip {
                     }
                 })
                 .catch(function() {
+                    if (isStaleLoad(gen)) return;
                     statusTimelineLoading = false;
                     document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading ' + mode + '</div>';
                 });
@@ -2197,12 +2270,14 @@ div.vis-tooltip {
                     renderTimelineList(favoritesCache);
                 } else if (!favoritesLoading) {
                     favoritesLoading = true;
+                    var favGen = loadGen;
                     document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Loading favorites…</div>';
                     var dbp = getDbParam();
                     var sep = dbp ? dbp + '&' : '?';
                     fetch('/api/memories' + sep + 'favorites=1')
                         .then(function(r) { return r.json(); })
                         .then(function(data) {
+                            if (isStaleLoad(favGen)) return;
                             favoritesLoading = false;
                             favoritesCache = data.memories || [];
                             // User may have flipped back to Show All while
@@ -2212,6 +2287,7 @@ div.vis-tooltip {
                             }
                         })
                         .catch(function() {
+                            if (isStaleLoad(favGen)) return;
                             favoritesLoading = false;
                             document.getElementById('timeline-list').innerHTML = '<div style="padding:20px;color:#f85149;">Error loading favorites</div>';
                         });
@@ -2352,21 +2428,36 @@ div.vis-tooltip {
         }
 
         function populateHistoryList() {
+            var gen = loadGen;
             var dbParam = new URLSearchParams(window.location.search).get('db');
             var url = '/api/actions?limit=200' + (dbParam ? '&db=' + dbParam : '');
             fetch(url)
                 .then(function(r) { return r.json(); })
                 .then(function(data) {
+                    if (isStaleLoad(gen)) return;
                     if (data.actions) renderHistoryList(data.actions);
                 })
                 .catch(function() {
+                    if (isStaleLoad(gen)) return;
                     document.getElementById('history-list').innerHTML = '<div style="padding:20px;color:#8b949e;">Could not load action history.</div>';
                 });
         }
 
+        /** P1-1: History existence from lineageNodeById (full annotated set), not filtered canvas. */
+        function historyMemLinkHtml(mid) {
+            mid = parseInt(mid, 10);
+            if (isNaN(mid)) return '#' + mid;
+            var exists = !!lineageNodeById[mid];
+            if (!exists) {
+                return '<span class="mem-link deleted" title="Deleted or not in current graph">#' + mid + '</span>';
+            }
+            var flags = lineageFlagsForId(mid);
+            var badge = lineageBadgeHtml(flags);
+            return '<span class="mem-link" onclick="showMemoryDetails(' + mid + '); event.stopPropagation();">#' + mid + '</span>' + badge;
+        }
+
         function renderHistoryList(actions) {
             var iconMap = { create: '+', update: '~', delete: 'x', boost: '^', link: '&rarr;', unlink: '&times;', merge: '&oplus;' };
-            var existingIds = graphData ? new Set(graphData.nodes.map(function(n) { return n.id; })) : new Set();
             // Group consecutive actions with same action type
             var grouped = [];
             actions.forEach(function(a) {
@@ -2384,10 +2475,7 @@ div.vis-tooltip {
                 if (g.items.length === 1) {
                     var a = g.items[0];
                     var summary = escapeHtmlText(a.summary).replace(/#(\d+)/g, function(match, id) {
-                        if (existingIds.has(parseInt(id, 10))) {
-                            return '<span class="mem-link" onclick="showMemoryDetails(' + id + '); event.stopPropagation();">#' + id + '</span>';
-                        }
-                        return '<span class="mem-link deleted">#' + id + '</span>';
+                        return historyMemLinkHtml(id);
                     });
                     return '<div class="action-item">' +
                         '<div class="action-icon ' + cls + '">' + icon + '</div>' +
@@ -2399,12 +2487,7 @@ div.vis-tooltip {
                 }
                 // Collapsed group
                 var ids = g.items.map(function(a) { return a.memory_id; });
-                var idLinks = ids.map(function(mid) {
-                    if (existingIds.has(mid)) {
-                        return '<span class="mem-link" onclick="showMemoryDetails(' + mid + '); event.stopPropagation();">#' + mid + '</span>';
-                    }
-                    return '<span class="mem-link deleted">#' + mid + '</span>';
-                }).join(', ');
+                var idLinks = ids.map(function(mid) { return historyMemLinkHtml(mid); }).join(', ');
                 var label = g.action.charAt(0).toUpperCase() + g.action.slice(1) + 'd';
                 return '<div class="action-item">' +
                     '<div class="action-icon ' + cls + '">' + icon + '</div>' +
@@ -2785,9 +2868,13 @@ div.vis-tooltip {
 
         // Main graph loading
         async function loadGraph() {
+            var gen = loadGen;
+            var dbAtStart = currentDb;
             try {
                 const response = await fetch('/api/graph' + getDbParam());
+                if (isStaleLoad(gen) || currentDb !== dbAtStart) return;
                 graphData = await response.json();
+                if (isStaleLoad(gen) || currentDb !== dbAtStart) return;
                 if (graphData.error) {
                     document.getElementById('loading').textContent = graphData.message || 'No memories found';
                     return;
@@ -2795,6 +2882,7 @@ div.vis-tooltip {
                 processGraphLineage();
                 initGraph();
             } catch (e) {
+                if (isStaleLoad(gen) || currentDb !== dbAtStart) return;
                 document.getElementById('loading').textContent = 'Error loading graph: ' + e.message;
             }
         }
@@ -3002,11 +3090,20 @@ div.vis-tooltip {
                     updateDuplicatesBadge(null);
                     return;
                 }
+                var gen = loadGen;
                 var dbp = getDbParam();
                 var sep = dbp ? dbp + '&' : '?';
                 fetch('/api/duplicates' + sep + 'limit=1')
                     .then(function(r) { return r.json(); })
-                    .then(function(data) { updateDuplicatesBadge((data && data.total) || 0); })
+                    .then(function(data) {
+                        if (isStaleLoad(gen)) return;
+                        // P1-3: integrity can flip mid-flight
+                        if (!crossrefsAvailable()) {
+                            updateDuplicatesBadge(null);
+                            return;
+                        }
+                        updateDuplicatesBadge((data && data.total) || 0);
+                    })
                     .catch(function() {});
             })();
 
@@ -3372,21 +3469,23 @@ div.vis-tooltip {
         }
 
         async function reloadGraphData() {
+            // P1-4: bump loadGen so in-flight dups/issues/history/timeline from
+            // the previous graph cannot apply under the new lineageNodeById.
+            var gen = beginDbLoad();
+            var dbAtStart = currentDb;
             try {
                 var response = await fetch('/api/graph' + getDbParam());
                 var newData = await response.json();
+                if (isStaleLoad(gen) || currentDb !== dbAtStart) return;
                 if (newData.error) return;
 
                 // Update graphData
                 graphData = newData;
                 processGraphLineage();
 
-                // Clear memory cache for fresh data
-                memoryCache = {};
-
                 // Update nodes and edges
-                nodes.clear();
-                edges.clear();
+                if (nodes) nodes.clear();
+                if (edges) edges.clear();
 
                 // Reprocess edges for duplicates (after lineage edge styling)
                 var duplicateSet = new Set(Array.isArray(graphData.duplicateIds) ? graphData.duplicateIds : []);
@@ -3406,16 +3505,60 @@ div.vis-tooltip {
                 // after memory_update via SSE/WS). Schedule a hard shut-off
                 // ~3s later as a safety net.
                 try { network.setOptions({ physics: { enabled: true } }); } catch (_) {}
-                nodes.add(graphData.nodes);
-                edges.add(processedEdges);
+                if (nodes) nodes.add(graphData.nodes);
+                if (edges) edges.add(processedEdges);
                 if (window.__schedulePhysicsOff) window.__schedulePhysicsOff(3000);
 
                 // Update legends
                 updateLegends();
 
+                // P1-4: rerender active memory surfaces so badges use the new map
+                rerenderActiveMemorySurfaces();
+
                 console.log('Graph reloaded:', graphData.nodes.length, 'nodes');
             } catch (e) {
+                if (isStaleLoad(gen)) return;
                 console.error('Error reloading graph:', e);
+            }
+        }
+
+        /** After graph/lineage refresh, repaint open lists with fresh flags (P1-4). */
+        function rerenderActiveMemorySurfaces() {
+            if (duplicatesData) {
+                renderDuplicatesList(duplicatesData);
+            } else if (currentTab === 'duplicates') {
+                loadDuplicates(true);
+            }
+            if (issuesData) {
+                renderIssuesList(issuesData);
+            } else if (currentTab === 'issues') {
+                loadIssues(true);
+            }
+            if (currentTab === 'history') {
+                populateHistoryList();
+            }
+            if (currentTab === 'timeline') {
+                if (cachedTimelineMemories) {
+                    renderTimelineList(cachedTimelineMemories);
+                } else if (favoritesCache && timelineFilter === 'favorites') {
+                    renderTimelineList(favoritesCache);
+                } else {
+                    populateTimelineList();
+                }
+            }
+            // Integrity badge: re-apply crossrefs gate after map rebuild
+            if (!crossrefsAvailable()) {
+                updateDuplicatesBadge(null);
+            }
+            // Refresh open detail panel banners if a memory is showing
+            if (currentPanelMemoryId && currentTab === 'detail' && !panelEditMode) {
+                var n = getNodeById(currentPanelMemoryId);
+                if (memoryCache[currentPanelMemoryId]) {
+                    showPanel(memoryCache[currentPanelMemoryId]);
+                } else if (n) {
+                    // flags alone may have changed; reload if needed
+                    loadMemoryToPanel(currentPanelMemoryId);
+                }
             }
         }
 
@@ -3620,9 +3763,26 @@ div.vis-tooltip {
             }
         }
 
-        function linkifyMemoryRefs(html) {
+        function chatAuthorityBadgeHtml(authority) {
+            if (authority === 'superseded') {
+                return '<span class="lineage-badge sup" title="Superseded — not current authority">SUPERSEDED</span>';
+            }
+            if (authority === 'authority_unknown' || authority === 'unknown') {
+                return '<span class="lineage-badge unk" title="Authority unknown">UNKNOWN</span>';
+            }
+            return '';
+        }
+
+        function linkifyMemoryRefs(html, authorityById) {
+            authorityById = authorityById || {};
             return html.replace(/\[Memory #(\d+)\]/g, function(match, id) {
-                return '<a class="chat-mem-link" href="#" data-mem-id="' + id + '">' + escapeHtmlText(match) + '</a>';
+                var n = parseInt(id, 10);
+                var auth = authorityById[n];
+                // Prefer server-provided authority from this answer; fall back to graph map
+                var badge = auth
+                    ? chatAuthorityBadgeHtml(auth)
+                    : lineageBadgeHtml(lineageFlagsForId(n));
+                return '<a class="chat-mem-link" href="#" data-mem-id="' + id + '">' + escapeHtmlText(match) + '</a>' + badge;
             });
         }
 
@@ -3697,6 +3857,9 @@ div.vis-tooltip {
                 var decoder = new TextDecoder();
                 var fullText = '';
                 var references = [];
+                var authorityById = {};
+                var authorityMeta = { verified: true };
+                var authorityBannerShown = false;
                 var buffer = '';
                 var eventType = '';
 
@@ -3714,8 +3877,29 @@ div.vis-tooltip {
                             eventType = line.slice(7).trim();
                         } else if (line.startsWith('data: ')) {
                             var data = line.slice(6);
-                            if (eventType === 'references') {
-                                try { references = JSON.parse(data); } catch(e) {}
+                            if (eventType === 'authority') {
+                                try {
+                                    authorityMeta = JSON.parse(data) || authorityMeta;
+                                    // P1-2: explicit unverified-authority banner on the answer
+                                    if (!authorityMeta.verified && !authorityBannerShown) {
+                                        authorityBannerShown = true;
+                                        var ban = document.createElement('div');
+                                        ban.className = 'lineage-banner unknown';
+                                        ban.style.marginBottom = '8px';
+                                        ban.textContent = 'AUTHORITY UNVERIFIED — lineage unavailable for this database; citations may include superseded memories.';
+                                        assistantDiv.insertBefore(ban, contentDiv);
+                                    }
+                                } catch(e) {}
+                            } else if (eventType === 'references') {
+                                try {
+                                    references = JSON.parse(data);
+                                    authorityById = {};
+                                    (references || []).forEach(function(ref) {
+                                        if (ref && ref.id != null && ref.authority) {
+                                            authorityById[ref.id] = ref.authority;
+                                        }
+                                    });
+                                } catch(e) {}
                             } else if (eventType === 'action') {
                                 var typing = document.getElementById('chat-typing');
                                 if (typing) typing.remove();
@@ -3725,8 +3909,10 @@ div.vis-tooltip {
                                     actionDiv.className = 'chat-action' + (action.success ? '' : ' error');
                                     if (action.success) {
                                         var verb = action.action === 'created' ? 'Created' : action.action === 'updated' ? 'Updated' : 'Deleted';
+                                        var actFlags = lineageFlagsForId(action.memory_id);
+                                        var actBadge = action.action !== 'deleted' ? lineageBadgeHtml(actFlags) : '';
                                         var memLink = action.action !== 'deleted'
-                                            ? '<a class="action-mem-link" href="#" onclick="showMemoryDetails(' + action.memory_id + '); return false;">#' + action.memory_id + '</a>'
+                                            ? '<a class="action-mem-link" href="#" onclick="showMemoryDetails(' + action.memory_id + '); return false;">#' + action.memory_id + '</a>' + actBadge
                                             : '#' + action.memory_id;
                                         actionDiv.innerHTML = '<strong>' + verb + ' Memory ' + memLink + '</strong>';
                                         if (action.preview) actionDiv.innerHTML += '<span class="action-preview">' + escapeHtmlText(action.preview) + '</span>';
@@ -3737,35 +3923,42 @@ div.vis-tooltip {
                                     msgs.scrollTop = msgs.scrollHeight;
                                     if (action.success) {
                                         reloadGraphData();
-                                        cachedTimelineMemories = null;
-                                        timelineOffset = 0;
-                                        loadTimelinePage();
+                                        // caches cleared by reloadGraphData beginDbLoad
+                                        if (currentTab === 'timeline') {
+                                            populateTimelineList();
+                                        }
                                     }
                                 } catch(e) { console.error('action parse error', e); }
                             } else if (eventType === 'token') {
                                 var typing = document.getElementById('chat-typing');
                                 if (typing) typing.remove();
                                 try { fullText += JSON.parse(data); } catch(e) { fullText += data; }
-                                contentDiv.innerHTML = linkifyMemoryRefs(renderMarkdown(fullText));
+                                contentDiv.innerHTML = linkifyMemoryRefs(renderMarkdown(fullText), authorityById);
                                 msgs.scrollTop = msgs.scrollHeight;
                             } else if (eventType === 'error') {
                                 contentDiv.innerHTML = '<span style="color:#f85149;">Error: ' + escapeHtmlText(data) + '</span>';
                             } else if (eventType === 'done') {
-                                contentDiv.innerHTML = linkifyMemoryRefs(renderMarkdown(fullText));
+                                contentDiv.innerHTML = linkifyMemoryRefs(renderMarkdown(fullText), authorityById);
                             }
                         }
                     }
                 }
 
-                // Add references
+                // Add references with authority badges (P1-2)
                 if (references.length > 0) {
                     var refsDiv = document.createElement('div');
                     refsDiv.className = 'chat-refs';
                     references.forEach(function(ref) {
                         var refLink = document.createElement('span');
                         refLink.className = 'chat-ref';
-                        refLink.textContent = '#' + ref.id;
-                        refLink.title = ref.preview || '';
+                        var auth = ref.authority || (authorityMeta.verified ? 'current' : 'authority_unknown');
+                        var badge = chatAuthorityBadgeHtml(auth);
+                        if (!badge && auth === 'current') {
+                            // still show graph flags if graph knows more
+                            badge = lineageBadgeHtml(lineageFlagsForId(ref.id));
+                        }
+                        refLink.innerHTML = '#' + ref.id + (badge ? ' ' + badge : '');
+                        refLink.title = (ref.preview || '') + (auth && auth !== 'current' ? ' [' + auth + ']' : '');
                         refLink.onclick = (function(id) {
                             return function() { showMemoryDetails(id); };
                         })(ref.id);

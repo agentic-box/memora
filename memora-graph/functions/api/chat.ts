@@ -7,6 +7,11 @@
  */
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+import {
+  buildLineageMaps,
+  parseRelatedPayload,
+  type CrossRefEntry,
+} from "./_lineage";
 
 interface Env extends DatabaseEnv {
   OPENROUTER_API_KEY?: string;
@@ -20,6 +25,17 @@ interface MemoryRow {
   content: string;
   tags: string;
   created_at?: string;
+}
+
+/** Lineage authority for chat retrieval: fail-closed when crossrefs missing/corrupt. */
+type AuthorityState = "current" | "superseded" | "authority_unknown";
+
+interface ChatLineageState {
+  lineageAvailable: boolean;
+  /** ids with at least one incoming supersedes edge (when lineageAvailable) */
+  supersededIds: Set<number>;
+  authorityUnknownIds: Set<number>;
+  supersededBy: Map<number, number[]>;
 }
 
 interface ChatMessage {
@@ -43,6 +59,9 @@ interface MemoryReference {
   score: number;
   preview: string;
   method?: string;
+  /** Lineage authority for this citation (UI badges + answer trust). */
+  authority?: AuthorityState;
+  superseded_by?: number[];
 }
 
 function parseJson<T>(str: string | null, defaultValue: T): T {
@@ -52,6 +71,89 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
   } catch {
     return defaultValue;
   }
+}
+
+/**
+ * Load supersession maps for chat retrieval.
+ * When crossrefs table is missing/corrupt, lineageAvailable=false (fail closed).
+ * Chat must NOT answer from superseded memories when lineage is certified;
+ * when not certified, every citation is authority_unknown / unverified.
+ */
+async function loadChatLineage(db: D1Database): Promise<ChatLineageState> {
+  const empty: ChatLineageState = {
+    lineageAvailable: false,
+    supersededIds: new Set(),
+    authorityUnknownIds: new Set(),
+    supersededBy: new Map(),
+  };
+  try {
+    const crossrefsResult = await db
+      .prepare("SELECT memory_id, related FROM memories_crossrefs")
+      .all<{ memory_id: number; related: string }>();
+
+    const crossrefsMap = new Map<number, CrossRefEntry[]>();
+    let lineageAvailable = true;
+    for (const cr of crossrefsResult.results || []) {
+      const parsed = parseRelatedPayload(cr.related);
+      if (!parsed.ok) {
+        lineageAvailable = false;
+        continue;
+      }
+      crossrefsMap.set(cr.memory_id, parsed.entries);
+    }
+    if (!lineageAvailable) return empty;
+
+    const lineage = buildLineageMaps(crossrefsMap.entries());
+    const supersededIds = new Set<number>(lineage.supersededBy.keys());
+    const supersededBy = new Map<number, number[]>();
+    for (const [id, set] of lineage.supersededBy) {
+      supersededBy.set(id, [...set]);
+    }
+    return {
+      lineageAvailable: true,
+      supersededIds,
+      authorityUnknownIds: lineage.authorityUnknown,
+      supersededBy,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+function authorityForId(id: number, lineage: ChatLineageState): AuthorityState {
+  if (!lineage.lineageAvailable) return "authority_unknown";
+  if (lineage.authorityUnknownIds.has(id)) return "authority_unknown";
+  if (lineage.supersededIds.has(id)) return "superseded";
+  return "current";
+}
+
+/**
+ * Filter retrieval results for chat authority.
+ * - lineage certified: drop superseded; keep current (+ authority_unknown nodes stay unknown).
+ * - lineage NOT certified: keep results but mark all unknown (caller labels answer unverified).
+ * Never silently cite superseded as ordinary current context.
+ */
+function filterSearchForAuthority(
+  results: Array<{ memory: MemoryRow; score: number }>,
+  lineage: ChatLineageState
+): {
+  results: Array<{ memory: MemoryRow; score: number; authority: AuthorityState }>;
+  authorityVerified: boolean;
+  droppedSuperseded: number;
+} {
+  const authorityVerified = lineage.lineageAvailable;
+  let droppedSuperseded = 0;
+  const out: Array<{ memory: MemoryRow; score: number; authority: AuthorityState }> = [];
+
+  for (const r of results) {
+    const authority = authorityForId(r.memory.id, lineage);
+    if (authorityVerified && authority === "superseded") {
+      droppedSuperseded++;
+      continue;
+    }
+    out.push({ memory: r.memory, score: r.score, authority });
+  }
+  return { results: out, authorityVerified, droppedSuperseded };
 }
 
 // ── Tool definitions ──────────────────────────────────────────────────
@@ -771,34 +873,52 @@ export const onRequestPost: PagesFunction<Env> = async ({
     env.REWRITE_MODEL || env.CHAT_MODEL || "deepseek/deepseek-chat";
   const rewriteResult = await rewriteQuery(message, apiKey, rewriteModel);
 
-  const { results: searchResults, method: searchMethod } =
-    await multiQuerySearch(
+  // Load lineage in parallel with multi-query search (P1-2 authority filter)
+  const [lineage, multi] = await Promise.all([
+    loadChatLineage(db),
+    multiQuerySearch(
       db,
       rewriteResult.queries,
       apiKey,
       embeddingModel,
       8
-    );
+    ),
+  ]);
+  const searchMethod = multi.method;
+  const filtered = filterSearchForAuthority(multi.results, lineage);
+  const searchResults = filtered.results;
+  const authorityVerified = filtered.authorityVerified;
 
-  // Build references and context
+  // Build references and context — only current (or unknown when unverified)
   const references: MemoryReference[] = [];
   const contextParts: string[] = [];
 
   for (const r of searchResults) {
     const mem = r.memory;
     const tags = parseJson<string[]>(mem.tags, []);
-    references.push({
+    const ref: MemoryReference = {
       id: mem.id,
       score: Math.round(r.score * 1000) / 1000,
       preview: mem.content.slice(0, 100).replace(/\n/g, " "),
-    });
+      authority: r.authority,
+    };
+    if (r.authority === "superseded") {
+      ref.superseded_by = lineage.supersededBy.get(mem.id) || [];
+    }
+    references.push(ref);
     const tagsStr = tags.join(", ");
     const dateStr = mem.created_at
       ? ` [${mem.created_at.split(" ")[0]}]`
       : "";
     const contentTruncated = mem.content.slice(0, 1500);
+    const authLabel =
+      r.authority === "current"
+        ? "current"
+        : r.authority === "superseded"
+          ? "SUPERSEDED (do not treat as current authority)"
+          : "AUTHORITY UNKNOWN (lineage not certified)";
     contextParts.push(
-      `Memory #${mem.id} (tags: ${tagsStr})${dateStr}:\n${contentTruncated}`
+      `Memory #${mem.id} [${authLabel}] (tags: ${tagsStr})${dateStr}:\n${contentTruncated}`
     );
   }
 
@@ -807,12 +927,27 @@ export const onRequestPost: PagesFunction<Env> = async ({
       ? contextParts.join("\n\n---\n\n")
       : "No relevant memories found.";
 
+  const authorityRules = authorityVerified
+    ? [
+        "## Authority / lineage (certified)",
+        "Superseded memories are excluded from context. Treat every memory below as current unless labelled otherwise.",
+        "If a memory is labelled AUTHORITY UNKNOWN, do not assert it is the latest truth.",
+      ]
+    : [
+        "## Authority / lineage (NOT certified — UNVERIFIED)",
+        "Lineage integrity is unavailable for this database. You CANNOT know which memories are current vs superseded.",
+        "You MUST open your answer by stating that authority is unverified (lineage unavailable) before citing any memory.",
+        "Do not claim any memory is the latest or authoritative version.",
+      ];
+
   const systemMsg: ChatMessage = {
     role: "system",
     content: [
       "You are a helpful assistant for the user's personal knowledge base (Memora).",
       "When referencing a memory, cite it as [Memory #<id>].",
       "If the memories don't contain relevant information, say so honestly.",
+      "",
+      ...authorityRules,
       "",
       "## Tool Use — IMPORTANT",
       "",
@@ -864,7 +999,18 @@ export const onRequestPost: PagesFunction<Env> = async ({
 
   const processStream = async () => {
     try {
-      // Emit references
+      // Emit authority status first so UI can banner unverified answers (P1-2)
+      await writeSSE(
+        "authority",
+        JSON.stringify({
+          verified: authorityVerified,
+          lineage_available: lineage.lineageAvailable,
+          dropped_superseded: filtered.droppedSuperseded,
+          method: searchMethod,
+        })
+      );
+
+      // Emit references (with authority per citation)
       if (references.length > 0) references[0].method = searchMethod;
       await writeSSE("references", JSON.stringify(references));
 
