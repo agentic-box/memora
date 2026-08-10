@@ -1,0 +1,86 @@
+# Verify memora installs and starts in an environment that has nothing in it.
+#
+# Why this exists: three separate failures shipped because every environment we own
+# was already warm. `mcp` 2.0.0 removed `mcp.server.fastmcp` on 2026-07-28 and our
+# dependency was unbounded, so `main` died at import for anyone installing fresh —
+# while our own installs kept working on an `mcp` 1.x resolved months earlier. Every
+# local test suite passed throughout. An outside contributor found it two weeks later.
+#
+# A CI runner is a clean environment by construction, which is the one thing our
+# laptops cannot be. The `schedule` trigger is the important one: that breakage
+# appeared with ZERO commits from us, so nothing driven by push could ever have
+# caught it — only a periodic re-resolve against the live package index.
+name: clean-install
+
+on:
+  push:
+    branches: [main, dev]
+    # Gate releases: a tag that cannot install must not become a release.
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # 07:00 UTC daily — catches upstream releases that break us overnight.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+jobs:
+  clean-install:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the floor we advertise in pyproject (requires-python). We all
+        # develop on much newer, so "works here" says nothing about the floor.
+        python: ["3.10", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Build the real artifact. Installing the source directory (or worse, -e .)
+      # is what every developer does and is NOT what a user gets.
+      - name: Build wheel
+        run: |
+          python -m pip install --quiet build
+          python -m build --wheel
+          ls -la dist/
+
+      - name: Install the wheel into an empty virtualenv
+        run: |
+          python -m venv /tmp/fresh
+          /tmp/fresh/bin/pip install --quiet --upgrade pip
+          /tmp/fresh/bin/pip install dist/*.whl
+
+      # THE check. This exact import is what was broken for two weeks.
+      - name: Import the server
+        run: /tmp/fresh/bin/python -c "import memora.server; print('memora.server imported OK')"
+
+      # Forensics: when a scheduled run goes red months from now, this log is how you
+      # find out which dependency moved. Cheap, and there is no other record.
+      - name: Record resolved dependency versions
+        run: /tmp/fresh/bin/pip list
+
+      - name: Run the test suite against the installed wheel
+        run: |
+          /tmp/fresh/bin/pip install --quiet pytest pytest-cov
+          /tmp/fresh/bin/python -m pytest -q
+
+      # Redundant with tests/test_gitagent_manifest.py on purpose: that test existed
+      # and still shipped a mismatched version, because nobody ran it before tagging.
+      # This step fails even if the suite itself is broken.
+      - name: Version sources must agree
+        run: |
+          python - <<'EOF'
+          import re, sys, pathlib
+          pyproject = pathlib.Path("pyproject.toml").read_text()
+          manifest = pathlib.Path("agent.yaml").read_text()
+          a = re.search(r'^version = "([^"]+)"', pyproject, re.M).group(1)
+          b = re.search(r'^version: "?([^"\n]+)"?', manifest, re.M).group(1)
+          print(f"pyproject.toml={a}  agent.yaml={b}")
+          if a != b:
+              sys.exit(f"VERSION MISMATCH: pyproject.toml={a} but agent.yaml={b}")
+          print("versions agree")
+          EOF
