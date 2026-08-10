@@ -1,6 +1,6 @@
 spec_version: "0.1.0"
 name: memora
-version: "0.2.29"
+version: "0.3.0"
 description: >
   Memora is an MCP-compatible persistent memory server for AI agents. It provides
   structured memory storage, full-text and semantic retrieval, deterministic
