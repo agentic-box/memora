@@ -166,7 +166,15 @@ const detailOwner = createDetailOwner();
 const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
 const DATABASE_STORAGE_KEY = "memora-graph.database";
+const MODE_STORAGE_KEY = "memora-graph.mode";
+// Restore the last renderer choice. Read at declaration time because boot
+// (initializeDatabases -> load -> render) runs at the bottom of this module and
+// reads `mode` directly. Anything other than a known value falls back to 3d.
 let raw = null, mode = "3d", fg = null;
+try {
+  const savedMode = localStorage.getItem(MODE_STORAGE_KEY);
+  if (savedMode === "2d" || savedMode === "3d") mode = savedMode;
+} catch (e) {}
 let mems = null, memsLoaded = false, byId = {}, activeRow = null, rowById = {}, pendingHighlight = null;
 // M4: monotonic load generation + AbortController so DB switches cannot paint A onto B.
 let loadGen = 0, loadAbort = null, loadDb = "";
@@ -524,14 +532,29 @@ function render() {
         <code style="color:#79c0ff">webgl.disabled = false</code>, then reload.</p></div></div>`;
       return;
     }
-    fg = ForceGraph3D()(graphEl).backgroundColor("#0d1117")
+    // powerPreference "low-power" asks the OS for the energy-efficient GPU and tells
+    // the driver to favour battery over peak throughput. No visual change — unlike
+    // dropping antialias, which would visibly jag the sphere edges. 3D stays the
+    // default view (user's call), so the renderer itself has to be the cheap part.
+    fg = ForceGraph3D({ rendererConfig: { powerPreference: "low-power" } })(graphEl).backgroundColor("#0d1117")
       .nodeLabel(n => n.title.replace(/\n/g, "<br>"))
-      .nodeColor(nodeColor).nodeVal(nodeSize).nodeRelSize(5).nodeResolution(12).nodeOpacity(0.92)
+      .nodeColor(nodeColor).nodeVal(nodeSize).nodeRelSize(5).nodeResolution(8).nodeOpacity(0.92)
       .linkColor(linkColor).linkOpacity(0.55)
       .linkDirectionalArrowLength(l => isSupersedesLink(l) ? 3.5 : 0)
       .linkDirectionalArrowRelPos(1)
       .cooldownTime(5000)
       .onNodeClick(n => selectMemory(n.id, n.dupe, null, n.superseded)).onBackgroundClick(() => deselect()).graphData(gd);
+    // Cap the WebGL pixel ratio. On a Retina Mac devicePixelRatio is 2, so the
+    // renderer paints 4x the pixels every frame — the dominant GPU cost (and heat)
+    // in a loop that runs at 60fps whenever the tab is visible. 1.5 keeps spheres
+    // and labels visibly smooth while cutting fill cost roughly in half.
+    // Safe by construction: this changes only the framebuffer size, never the
+    // library's RAF bookkeeping (see the render-on-demand note below for why
+    // touching pause/resume automatically is off-limits here).
+    try {
+      const r = fg.renderer && fg.renderer();
+      if (r && r.setPixelRatio) r.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5));
+    } catch (e) {}
     // resume the loop while the camera is moving (OrbitControls), pause shortly after
     try {
       const c = fg.controls();
@@ -1172,8 +1195,18 @@ async function load() {
   }
 }
 
-el("b2d").onclick = () => { mode = "2d"; el("b2d").classList.add("active"); el("b3d").classList.remove("active"); render(); };
-el("b3d").onclick = () => { mode = "3d"; el("b3d").classList.add("active"); el("b2d").classList.remove("active"); render(); };
+// Persist the 2D/3D choice. 3D is three.js/WebGL and repaints continuously while
+// the tab is visible; 2D is a canvas draw and costs far less. Without persistence
+// every reload silently put the user back on the expensive renderer.
+function setMode(next) {
+  mode = next;
+  el("b2d").classList.toggle("active", next === "2d");
+  el("b3d").classList.toggle("active", next === "3d");
+  try { localStorage.setItem(MODE_STORAGE_KEY, next); } catch (e) {}
+  render();
+}
+el("b2d").onclick = () => setMode("2d");
+el("b3d").onclick = () => setMode("3d");
 el("bcl").onclick = () => { showClusters = !showClusters; el("bcl").classList.toggle("active", showClusters); applyHighlight(); };
 el("bdoc").onclick = () => { showDocs = !showDocs; el("bdoc").classList.toggle("active", showDocs); load(); };
 el("btl").onclick = () => toggleTimeline();
@@ -1197,6 +1230,12 @@ graphEl.addEventListener("pointermove", () => wake(), { passive: true });
 document.addEventListener("visibilitychange", () => { if (document.hidden) pauseRender(); else forceWake(); });
 // defaults: timeline drawer open (3D + clusters are set on the mode/state + buttons)
 document.body.classList.add("timeline-open"); el("btl").classList.add("active");
+// Sync the 2D/3D buttons to the restored mode. The markup hardcodes 3D as active,
+// so without this a restored "2d" would render 2D under a lit 3D button.
+// Deliberately not setMode() — that would persist and trigger a second render
+// before boot has run its first one.
+el("b2d").classList.toggle("active", mode === "2d");
+el("b3d").classList.toggle("active", mode === "3d");
 initializeDatabases();
 </script>
 </body>
