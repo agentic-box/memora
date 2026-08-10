@@ -35,6 +35,18 @@
   @media (max-width: 900px) { body.timeline-open.panel-open #graph { right: 0; } }
   #bar { position: fixed; top: 12px; left: 12px; z-index: 30; display: flex; gap: 8px;
     align-items: center; flex-wrap: wrap; max-width: calc(100vw - 24px); }
+  /* Keep the bar inside the graph area. The drawers are fixed, full-height and sit
+     ABOVE the bar (z-index 31/32 vs 30), so a bar sized to the whole viewport has its
+     right-hand pills painted over once a drawer is open. Mirrors the #graph insets
+     above; flex-wrap (already set) drops the overflow onto a second row instead of
+     hiding it. Uses the width vars so it stays correct as the drawers are resized. */
+  body.panel-open:not(.timeline-open) #bar { max-width: calc(100vw - 24px - var(--detail-width)); }
+  body.timeline-open:not(.panel-open) #bar { max-width: calc(100vw - 24px - var(--timeline-width)); }
+  body.timeline-open.panel-open #bar {
+    max-width: calc(100vw - 24px - var(--timeline-width) - var(--detail-width)); }
+  /* Below 900px the drawers overlay the graph rather than inset it (see #graph), so
+     the bar gets the full width back and simply sits under them. */
+  @media (max-width: 900px) { body.timeline-open.panel-open #bar { max-width: calc(100vw - 24px); } }
   .pill { background: #161b22cc; border: 1px solid #30363d; border-radius: 8px;
     padding: 6px 10px; backdrop-filter: blur(6px); display: flex; gap: 8px; align-items: center; }
   button, select, input { background: #21262d; color: #e6edf3; border: 1px solid #30363d;
