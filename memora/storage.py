@@ -149,158 +149,19 @@ def _validate_content(content: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Auto-detection of memory types (issue, todo) from content
+# Memory-type classification
 # ---------------------------------------------------------------------------
-
-# Keywords that suggest content is about a bug/issue.
 #
-# These are matched as WHOLE WORDS, one count per group. The previous version was a
-# plain substring test over a flat list, which produced two independent false-positive
-# sources and mislabelled 130 knowledge memories as issues in a real store:
+# There is deliberately NO auto-detection here. A keyword classifier used to stamp
+# type=issue/status=open onto anything whose text mentioned enough bug vocabulary,
+# which mislabelled 130 knowledge memories in the live store. Tightening the
+# matching removed the spurious hits but could not fix the real limitation: word
+# frequency cannot tell a note ABOUT a bug from a bug REPORT, so post-mortems and
+# fix write-ups kept being filed as open issues.
 #
-#   substring bleed  "fault" matched in-DEFAULT, "patch" in-DISPATCH, "bug" in-DEBUG,
-#                    "fix" in-FIXTURES/PREFIX, "issue" in-ISSUED
-#   double counting  "resolve" AND "resolved" were both entries, so a single
-#                    occurrence of "resolved" scored 2 and cleared the >=2 threshold
-#                    on its own
-#
-# Grouping the inflections into one alternation per concept fixes the second problem
-# by construction: a group can only ever contribute 1. Keep it that way when editing —
-# do not add a variant as a separate entry.
-_ISSUE_KEYWORD_GROUPS = [
-    r"bugs?",
-    r"fix(?:es|ed|ing)?",
-    r"errors?",
-    r"crash(?:es|ed|ing)?",
-    r"broken",
-    r"resolv(?:e|es|ed|ing)",
-    r"problems?",
-    r"issues?",
-    r"faults?",
-    r"defects?",
-    r"patch(?:es|ed|ing)?",
-    r"hotfix(?:es)?",
-    r"regressions?",
-]
-
-# Keywords that suggest content is a TODO/task. Multi-word entries are phrases, so
-# word boundaries are applied at the ends only.
-_TODO_KEYWORD_GROUPS = [
-    r"todos?",
-    r"tasks?",
-    r"implement(?:s|ed|ing)?",
-    r"add feature",
-    r"need to",
-    r"should add",
-    r"plan to",
-    r"will add",
-    r"must add",
-    r"want to add",
-    r"roadmaps?",
-]
-
-_ISSUE_KEYWORD_RES = [re.compile(r"\b(?:" + g + r")\b") for g in _ISSUE_KEYWORD_GROUPS]
-_TODO_KEYWORD_RES = [re.compile(r"\b(?:" + g + r")\b") for g in _TODO_KEYWORD_GROUPS]
-
-# Patterns that strongly suggest closed/resolved issues
-_RESOLVED_PATTERNS = [
-    r"\*\*fix\*\*",  # **Fix** or **fix**
-    r"fix(?:ed)?:",  # Fix: or Fixed:
-    r"resolved?:",   # Resolve: or Resolved:
-    r"problem:.*(?:fix|solution)",  # Problem: ... fix/solution
-    r"root cause:",  # Root cause analysis
-]
-
-
-def _detect_memory_type(
-    content: str,
-    metadata: Optional[Dict[str, Any]],
-    tags: Optional[List[str]],
-) -> Optional[Dict[str, Any]]:
-    """Auto-detect if content should be an issue or TODO.
-
-    Returns metadata dict to merge if type detected, None otherwise.
-    Only detects if no explicit type is already set.
-    """
-    # Don't override if type is already explicitly set
-    if metadata and metadata.get("type"):
-        return None
-
-    # Don't detect if already tagged as issue or todo
-    if tags:
-        if "memora/issues" in tags or "memora/todos" in tags:
-            return None
-
-    content_lower = content.lower()
-
-    # Count keyword matches
-    issue_matches = sum(1 for rx in _ISSUE_KEYWORD_RES if rx.search(content_lower))
-    todo_matches = sum(1 for rx in _TODO_KEYWORD_RES if rx.search(content_lower))
-
-    # Check for resolved patterns (stronger signal for closed issues)
-    has_resolved_pattern = any(
-        re.search(pattern, content_lower) for pattern in _RESOLVED_PATTERNS
-    )
-
-    # Require at least 2 keyword matches to avoid false positives
-    # Exception: resolved patterns are a strong enough signal alone
-    if issue_matches >= 2 or (issue_matches >= 1 and has_resolved_pattern):
-        # Detect if it's a closed/resolved issue or open
-        is_closed = has_resolved_pattern or any(
-            word in content_lower for word in ["fixed", "resolved", "patched"]
-        )
-
-        return {
-            "_detected_type": "issue",
-            "_auto_metadata": {
-                "type": "issue",
-                "status": "closed" if is_closed else "open",
-                "closed_reason": "complete" if is_closed else None,
-                "severity": "minor",
-                "category": "bug",
-            },
-            "_auto_tags": ["memora/issues"],
-        }
-
-    if todo_matches >= 2:
-        return {
-            "_detected_type": "todo",
-            "_auto_metadata": {
-                "type": "todo",
-                "status": "open",
-                "priority": "medium",
-            },
-            "_auto_tags": ["memora/todos"],
-        }
-
-    return None
-
-
-def _apply_auto_detection(
-    content: str,
-    metadata: Optional[Dict[str, Any]],
-    tags: Optional[List[str]],
-) -> tuple[Optional[Dict[str, Any]], Optional[List[str]]]:
-    """Apply auto-detection and return updated metadata and tags.
-
-    Returns (updated_metadata, updated_tags) tuple.
-    """
-    detection = _detect_memory_type(content, metadata, tags)
-    if not detection:
-        return metadata, tags
-
-    # Merge detected metadata with provided metadata
-    updated_metadata = dict(metadata) if metadata else {}
-    updated_metadata.update(detection["_auto_metadata"])
-
-    # Add detected tags
-    updated_tags = list(tags) if tags else []
-    for tag in detection["_auto_tags"]:
-        if tag not in updated_tags:
-            updated_tags.append(tag)
-
-    return updated_metadata, updated_tags
-
+# Issues and TODOs are now created only by an explicit caller — memory_create_issue
+# and memory_create_todo, which set metadata['type'] themselves. Everything written
+# through absorb or a plain create stays untyped knowledge.
 
 def _emit_event(
     conn: sqlite3.Connection,
@@ -3052,7 +2913,6 @@ def add_memory(
     """
     content = _validate_content(content)
 
-    metadata, tags = _apply_auto_detection(content, metadata, tags)
     metadata = _auto_assign_section(metadata, content, tags)
 
     validated_tags = _validate_tags(tags)
@@ -3189,8 +3049,6 @@ def add_memories(
         content = str(entry["content"]).strip()
         metadata = entry.get("metadata")
         tags = entry.get("tags") or []
-        # Auto-detect memory type (issue/todo) from content if not explicitly set
-        metadata, tags = _apply_auto_detection(content, metadata, tags)
         metadata = _auto_assign_section(metadata, content, tags)
         prepared_metadata = _prepare_metadata(metadata)
         validated_tags = _validate_tags(tags)
