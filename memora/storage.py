@@ -2346,6 +2346,21 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     return leaves
 
 
+def _resolve_absorb_supersedes_target(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> int:
+    """Resolve an absorb UPDATE target to a current deterministic leaf."""
+    latest_id = max(_resolve_latest(conn, memory_id))
+    if latest_id != memory_id:
+        logger.warning(
+            "Absorb UPDATE target #%d is stale; superseding current leaf #%d instead",
+            memory_id,
+            latest_id,
+        )
+    return latest_id
+
+
 def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
     """Check if a memory has been superseded by an existing memory."""
     refs = get_crossrefs(conn, memory_id)
@@ -3486,6 +3501,7 @@ def absorb_memory(
 
             elif rel == "UPDATE":
                 # Queue for creation with supersedes link
+                target_id = _resolve_absorb_supersedes_target(conn, target_id)
                 pending_creates.append((fact, vector, ("supersedes", target_id, reason), suggested_tags))
                 counts["superseded"] += 1
                 action_taken = True

@@ -246,6 +246,49 @@ def test_semantic_search_basic(local_db):
         assert any("python" in r["memory"]["content"].lower() for r in results)
 
 
+@pytest.mark.parametrize("matched_version", ["stale", "leaf"])
+def test_absorb_update_supersedes_current_leaf(
+    local_db, monkeypatch, caplog, matched_version
+):
+    """Absorb UPDATEs must extend the leaf, even when retrieval matched history."""
+    with storage.connect() as conn:
+        original = storage.add_memory(conn, content="Deployment uses version one")
+        current = storage.add_memory(conn, content="Deployment uses version two")
+        storage.add_link(conn, current["id"], original["id"], edge_type="supersedes")
+
+        matched = original if matched_version == "stale" else current
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *args, **kwargs: [{"score": 0.5, "memory": matched}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": matched["id"],
+                "relationship": "UPDATE",
+                "reason": "new deployment version",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *args, **kwargs: {"x": 1.0})
+
+        result = storage.absorb_memory(conn, ["Deployment uses version three"])
+
+        decision = next(d for d in result["decisions"] if d["action"] == "superseded")
+        new_id = decision["memory_id"]
+        assert decision["target_id"] == current["id"]
+        assert any(
+            ref["id"] == current["id"] and ref["edge_type"] == "supersedes"
+            for ref in storage.get_crossrefs(conn, new_id)
+        )
+        assert not any(
+            ref["id"] == original["id"] and ref["edge_type"] == "supersedes"
+            for ref in storage.get_crossrefs(conn, new_id)
+        )
+        assert ("target #" in caplog.text) is (matched_version == "stale")
+
+
 def test_hybrid_search_tags_all_filters_semantic_leg(local_db):
     """Phase 0 regression: tags_all must filter both legs of hybrid_search.
 
