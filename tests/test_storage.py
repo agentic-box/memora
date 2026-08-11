@@ -1,5 +1,7 @@
 """Regression tests for core storage operations."""
 
+import logging
+
 import pytest
 
 import memora
@@ -464,6 +466,21 @@ def test_list_follow_fills_limit_without_duplicates_in_rank_order(local_db, foll
         assert len(ids) == 3, "lineage filtering depleted the requested list page"
         assert ids == expected, "list lineage processing changed stable rank order"
         assert len(ids) == len(set(ids)), "list lineage processing returned duplicates"
+
+
+def test_list_follow_logs_candidate_cap_and_shortfall(
+    local_db, monkeypatch, caplog
+):
+    caplog.set_level(logging.INFO)
+    with storage.connect() as conn:
+        _leaves, _active, _stale = _seed_depleted_lineage(conn)
+        monkeypatch.setattr(storage, "_SCAN_CAP", 3)
+
+        results = storage.list_memories(conn, limit=2, follow="active")
+
+        assert results == []
+        assert "candidate scan reached cap=3" in caplog.text
+        assert "requested=2 delivered=0 candidate_window=3" in caplog.text
 
 
 @pytest.mark.parametrize("path", ["semantic", "hybrid"])

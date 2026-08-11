@@ -58,8 +58,8 @@
   {
     "id": "contradiction-number",
     "expected": "contradiction",
-    "memory": "The service supports at most 50 concurrent jobs.",
-    "fact": "The service does not support 50 concurrent jobs; its maximum is 20.",
+    "memory": "Vendor A's audit says MAX_BATCH_SIZE is 50 in release 7.",
+    "fact": "Vendor B's audit says MAX_BATCH_SIZE is 20 in the same release 7.",
     "difficulty": "hard",
     "stub_prediction": "contradiction"
   },

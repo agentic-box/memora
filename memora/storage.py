@@ -4241,6 +4241,22 @@ def _follow_candidate_limit(requested: Optional[int], follow: Optional[str]) -> 
     return min(_SCAN_CAP, requested * _FOLLOW_OVERFETCH_FACTOR)
 
 
+def _log_follow_shortfall(
+    path: str,
+    requested: Optional[int],
+    delivered: int,
+    window: int,
+) -> None:
+    if requested is not None and delivered < requested:
+        logger.info(
+            "%s follow refill shortfall: requested=%d delivered=%d candidate_window=%d",
+            path,
+            requested,
+            delivered,
+            window,
+        )
+
+
 def list_memories(
     conn: sqlite3.Connection,
     query: Optional[str] = None,
@@ -4381,6 +4397,12 @@ def list_memories(
             except sqlite3.OperationalError:
                 rows = []
 
+    if lineage_filters_results and len(rows) >= _SCAN_CAP:
+        logger.warning(
+            "list follow candidate scan reached cap=%d; deeper rows may be omitted",
+            _SCAN_CAP,
+        )
+
     records: List[Dict[str, Any]] = []
     for row in rows:
         record = _serialise_row(row)
@@ -4431,6 +4453,9 @@ def list_memories(
         # Cap full_history expansion to prevent unbounded response size
         if follow == "full_history" and limit is not None and len(records) > limit * 3:
             records = records[:limit * 3]
+
+    if lineage_filters_results:
+        _log_follow_shortfall("list", limit, len(records), _SCAN_CAP)
 
     return records
 
@@ -4555,12 +4580,28 @@ def semantic_search(
         tags_all=tags_all,
         tags_none=tags_none,
     )
+    if (
+        follow in {"active", "latest"}
+        and candidate_top_k == _SCAN_CAP
+        and len(results) >= _SCAN_CAP
+    ):
+        logger.warning(
+            "semantic follow candidate scan reached cap=%d; deeper rows may be omitted",
+            _SCAN_CAP,
+        )
 
     if follow:
         results = apply_follow(conn, results, follow, is_search=True)
         if top_k is not None:
             cap = top_k * 3 if follow == "full_history" else top_k
             results = results[:cap]
+        if follow in {"active", "latest"}:
+            _log_follow_shortfall(
+                "semantic",
+                top_k,
+                len(results),
+                candidate_top_k or len(results),
+            )
 
     return results
 
@@ -4683,6 +4724,7 @@ def hybrid_search(
             results = results[:top_k * 3]
         elif follow in {"active", "latest"}:
             results = results[:top_k]
+            _log_follow_shortfall("hybrid", top_k, len(results), top_k * 3)
     else:
         results = results[:top_k]
 
