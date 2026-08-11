@@ -1,0 +1,84 @@
+# Browser coverage for the graph UI.
+#
+# Why: four user-visible defects shipped in a single day — a render loop that never
+# idled (~227% CPU on a still page), a database missing from one view's selector, a
+# top bar painted over by the drawers, and drawer widths that had no coverage at all.
+# Every one was caught by a hand-written probe, never by a gate, so nothing stopped
+# them recurring. The Python CI (clean-install.yml) does not touch any of this.
+#
+# Each assertion in test_ui.mjs maps to one of those defects. All three have been
+# mutation-tested: breaking the shipped code turns exactly the matching assertion red.
+name: graph-ui
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "memora-graph/**"
+      - "memora/graph/**"          # index.html lives here; public/ symlinks to it
+      - ".github/workflows/graph-ui.yml"
+  pull_request:
+    paths:
+      - "memora-graph/**"
+      - "memora/graph/**"
+      - ".github/workflows/graph-ui.yml"
+  workflow_dispatch:
+
+jobs:
+  graph-ui:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: memora-graph
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          # 22.x for --experimental-strip-types, which test_lineage.mjs needs to
+          # import the shipped _lineage.ts directly instead of reimplementing it.
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Seed local D1 from the fixture
+        # Supersession chain, non-lineage typed edges, and a mirror-only drift row.
+        run: npx wrangler d1 execute memora-graph --local --file=tests/fixture.sql
+
+      - name: Resolve the index.html symlink
+        # public/index.html is a symlink to memora/graph/index.html. `wrangler pages
+        # dev` does NOT serve symlinked assets (the page 404s), while deploys DO
+        # follow it. Swapping in a resolved copy serves identical bytes.
+        run: |
+          cp -L public/index.html /tmp/index.real.html
+          rm public/index.html
+          cp /tmp/index.real.html public/index.html
+          test -f public/index.html && ! test -L public/index.html
+
+      - name: Start wrangler pages dev
+        run: |
+          npx wrangler pages dev ./public --port 8788 --log-level warn > /tmp/wrangler.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8788/api/databases > /dev/null; then
+              echo "server up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "server never came up:"; cat /tmp/wrangler.log; exit 1
+
+      - name: Lineage logic tests
+        # Pure-logic suite that imports the shipped modules. It existed before this
+        # workflow and ran nowhere.
+        run: node --experimental-strip-types scripts/test_lineage.mjs
+
+      - name: Browser tests
+        run: node scripts/test_ui.mjs http://localhost:8788
+
+      - name: Server log on failure
+        if: failure()
+        run: cat /tmp/wrangler.log || true

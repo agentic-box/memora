@@ -24,3 +24,6 @@ Thumbs.db
 # Temp files
 *.tmp
 *.sql
+
+# Test fixtures are source, not local data — they must ship for CI.
+!tests/*.sql
