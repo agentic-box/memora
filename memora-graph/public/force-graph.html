@@ -732,17 +732,44 @@ function forceWake() {
 }
 
 // Called when the graph is (re)built: a new fg instance carries none of our state.
-function resetRenderIdleState() { renderPaused = false; engineCooled = false; armIdle(); }
+function resetRenderIdleState() { renderPaused = false; engineCooled = false; armIdle(); invalidateCanvasSize(); }
 
-// Resize the graph canvas to its (now-smaller) container so force-graph recenters
-// the layout into the visible left area. Runs after the drawer CSS transition.
-function relayout() {
-  setTimeout(() => { if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); wake(1000); } }, 200);
+// Keep the WebGL canvas exactly the size of its container, so force-graph recenters
+// the layout into the visible left area when a drawer moves.
+//
+// This used to read graphEl.clientWidth on a fixed 200ms timer while #graph animates
+// its `right` inset over 180ms — a ~20ms margin. A busy main thread delays the style
+// flush that STARTS the transition while the timer still fires on schedule, so the
+// read lands mid-transition, and nothing ever corrected it: the canvas stayed
+// permanently mismatched with its container, which skews the projection and node
+// picking. CI caught it as graph=540 canvas=535; stretching the transition to .5s
+// reproduces the same defect at 132px.
+//
+// Observing the element removes the timer and the race — a ResizeObserver fires on
+// every layout change, including the transition's last frame. It is idle-safe: no
+// size change means no callback, so this cannot resurrect the render-loop burn.
+let lastGraphW = -1, lastGraphH = -1;
+function syncCanvasToGraph() {
+  if (!fg) return;
+  const w = graphEl.clientWidth, h = graphEl.clientHeight;
+  if (w === lastGraphW && h === lastGraphH) return;   // fires per frame during a transition
+  lastGraphW = w; lastGraphH = h;
+  fg.width(w); fg.height(h);
+  wake();   // the loop may be paused; the resize still has to be painted
 }
+// A rebuilt graph is a NEW fg instance carrying none of our sizing, so the cache
+// must not suppress the first sync just because the container never moved.
+function invalidateCanvasSize() { lastGraphW = -1; lastGraphH = -1; syncCanvasToGraph(); }
+new ResizeObserver(syncCanvasToGraph).observe(graphEl);
+
+// Deferred by one frame, NOT to wait out the transition (the observer does that) but
+// because applyDrawerWidth runs during module evaluation, before `fg` is declared —
+// touching it synchronously here is a temporal-dead-zone ReferenceError that kills the
+// whole page. The old 200ms timer hid this by accident.
+function relayout() { requestAnimationFrame(syncCanvasToGraph); }
 addEventListener("resize", () => {
   applyDrawerWidth("timeline", drawerWidths.timeline, true);
   applyDrawerWidth("detail", drawerWidths.detail, true);
-  if (fg) { fg.width(graphEl.clientWidth); fg.height(graphEl.clientHeight); }
 });
 
 let resizingDrawer = null;
