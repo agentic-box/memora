@@ -13,6 +13,7 @@ name: graph-ui
 on:
   push:
     branches: [main, dev]
+    tags: ["v*"]
     paths:
       - "memora-graph/**"
       - "memora/graph/**"          # index.html lives here; public/ symlinks to it

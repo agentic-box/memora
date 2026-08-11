@@ -19,8 +19,8 @@ on:
     tags: ["v*"]
   pull_request:
   schedule:
-    # 07:00 UTC daily — catches upstream releases that break us overnight.
-    - cron: "0 7 * * *"
+    # 07:17 UTC daily — GitHub may delay/drop on-the-hour schedules.
+    - cron: "17 7 * * *"
   workflow_dispatch:
 
 jobs:
@@ -56,7 +56,9 @@ jobs:
 
       # THE check. This exact import is what was broken for two weeks.
       - name: Import the server
-        run: /tmp/fresh/bin/python -c "import memora.server; print('memora.server imported OK')"
+        run: |
+          cd /tmp
+          /tmp/fresh/bin/python -c "import memora, memora.server; import sys; p=memora.__file__; print(p); assert p.startswith('/tmp/fresh/'), f'EXPECTED WHEEL, GOT {p}'"
 
       # Forensics: when a scheduled run goes red months from now, this log is how you
       # find out which dependency moved. Cheap, and there is no other record.
@@ -66,7 +68,8 @@ jobs:
       - name: Run the test suite against the installed wheel
         run: |
           /tmp/fresh/bin/pip install --quiet pytest pytest-cov
-          /tmp/fresh/bin/python -m pytest -q
+          cd /tmp
+          /tmp/fresh/bin/python -m pytest -q "$GITHUB_WORKSPACE/tests"
 
       # Redundant with tests/test_gitagent_manifest.py on purpose: that test existed
       # and still shipped a mismatched version, because nobody ran it before tagging.

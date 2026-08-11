@@ -16,6 +16,7 @@ import { chromium } from "playwright";
 const BASE = process.argv[2] || "http://localhost:8788";
 const pass = [];
 const fail = [];
+const EXPECTED_CHECKS = 15;
 const check = (name, ok, detail) =>
   (ok ? pass : fail).push(`${name}${detail ? ` — ${detail}` : ""}`);
 
@@ -76,7 +77,10 @@ const geo = await page.evaluate(() => {
     const n = document.querySelector(sel);
     if (!n) return null;
     const b = n.getBoundingClientRect();
-    return { left: Math.round(b.left), right: Math.round(b.right) };
+    const style = getComputedStyle(n);
+    return { left: Math.round(b.left), right: Math.round(b.right),
+      width: Math.round(b.width), height: Math.round(b.height),
+      visible: style.visibility !== "hidden" && style.display !== "none" && b.width > 0 && b.height > 0 };
   };
   return {
     classes: document.body.className,
@@ -86,42 +90,64 @@ const geo = await page.evaluate(() => {
   };
 });
 const bothOpen = /timeline-open/.test(geo.classes) && /panel-open/.test(geo.classes);
-check("force-graph: both drawers open for the geometry checks", bothOpen, geo.classes.trim());
+check("force-graph: both drawers are visibly open",
+  bothOpen && geo.timeline?.visible && geo.panel?.visible, geo.classes.trim());
 
 // SHIPPED BUG: the drawers are fixed, full-height and stack ABOVE #bar (z-index
 // 31/32 vs 30), but the bar was sized to the whole viewport — with both drawers
 // open its right-hand controls were painted over and unreachable.
-if (bothOpen && geo.bar) {
-  const drawerLeft = Math.min(
-    geo.timeline?.left ?? Number.MAX_SAFE_INTEGER,
-    geo.panel?.left ?? Number.MAX_SAFE_INTEGER,
-  );
-  check(
-    "force-graph: top bar stays clear of the open drawers",
-    geo.bar.right <= drawerLeft,
-    `bar.right=${geo.bar.right} drawer.left=${drawerLeft}`,
-  );
-}
+const drawerLeft = Math.min(geo.timeline?.left ?? -1, geo.panel?.left ?? -1);
+check("force-graph: top bar stays visible and clear of open drawers",
+  !!geo.bar?.visible && drawerLeft > 0 && geo.bar.right <= drawerLeft,
+  JSON.stringify({ bar: geo.bar, drawerLeft }));
 
-// The drawers are independently resizable and each remembers its own width.
-await page.evaluate(() => {
-  localStorage.setItem("memora-graph.width.timeline", "420");
-  localStorage.setItem("memora-graph.width.detail", "640");
+const rect = (sel) => page.$eval(sel, (n) => {
+  const b = n.getBoundingClientRect(); return { x: b.x, width: b.width };
 });
-await page.reload({ waitUntil: "networkidle" });
-await page.waitForFunction(() => !!window.MemoraDebug?.fg, null, { timeout: 45000 });
-await page.waitForTimeout(1500);
-const widths = await page.evaluate(() => ({
-  timeline: localStorage.getItem("memora-graph.width.timeline"),
-  detail: localStorage.getItem("memora-graph.width.detail"),
-  cssTimeline: getComputedStyle(document.documentElement)
-    .getPropertyValue("--timeline-width").trim(),
-}));
-check(
-  "force-graph: drawer widths persist independently",
-  widths.timeline === "420" && widths.detail === "640" && widths.cssTimeline === "420px",
-  `timeline=${widths.timeline} detail=${widths.detail} css=${widths.cssTimeline}`,
-);
+const drag = async (sel, targetX) => {
+  const b = await rect(sel);
+  await page.mouse.move(b.x + b.width / 2, 200);
+  await page.mouse.down();
+  await page.mouse.move(targetX, 200, { steps: 8 });
+  await page.mouse.up();
+  await page.waitForTimeout(350);
+};
+await drag("#timeline-resize-handle", 1280 - 420);
+const timeline420 = await rect("#timeline");
+await drag("#detail-resize-handle", 1280 - 420 - 640);
+const detail640 = await rect("#panel");
+check("force-graph: real handles resize drawers independently",
+  Math.abs(timeline420.width - 420) <= 2 && Math.abs(detail640.width - 640) <= 2,
+  JSON.stringify({ timeline: timeline420.width, detail: detail640.width }));
+await drag("#timeline-resize-handle", 1279);
+const timelineMin = await rect("#timeline");
+await drag("#timeline-resize-handle", -10);
+const timelineMax = await rect("#timeline");
+check("force-graph: timeline drag enforces 280px and 90vw clamps",
+  Math.abs(timelineMin.width - 280) <= 2 && Math.abs(timelineMax.width - 1152) <= 2,
+  JSON.stringify({ min: timelineMin.width, max: timelineMax.width }));
+await page.setViewportSize({ width: 600, height: 820 });
+await page.waitForTimeout(350);
+const timelineReclamped = await rect("#timeline");
+check("force-graph: viewport resize re-clamps drawer width",
+  Math.abs(timelineReclamped.width - 540) <= 2, String(timelineReclamped.width));
+await page.dblclick("#timeline-resize-handle");
+await page.dblclick("#detail-resize-handle");
+await page.waitForTimeout(500);
+const resetTimeline = await rect("#timeline");
+const resetDetail = await rect("#panel");
+const canvasGeometry = await page.evaluate(() => {
+  const graph = document.querySelector("#graph").getBoundingClientRect();
+  const canvas = document.querySelector("#graph canvas")?.getBoundingClientRect();
+  return { graph: Math.round(graph.width), canvas: canvas ? Math.round(canvas.width) : 0 };
+});
+check("force-graph: double-click resets both drawer defaults",
+  Math.abs(resetTimeline.width - 360) <= 2 && Math.abs(resetDetail.width - 380) <= 2,
+  JSON.stringify({ timeline: resetTimeline.width, detail: resetDetail.width }));
+check("force-graph: relayout resizes canvas with the graph area",
+  canvasGeometry.canvas > 0 && Math.abs(canvasGeometry.graph - canvasGeometry.canvas) <= 2,
+  JSON.stringify(canvasGeometry));
+await page.setViewportSize({ width: 1280, height: 820 });
 
 // SHIPPED BUG: the 3D render loop repainted 60x/sec forever whether or not
 // anything changed — ~227% CPU on an idle page. It must stop when settled and
@@ -164,8 +190,9 @@ if (has3D) {
     idledAfter < 0 ? "never idled within 30s" : `idled after ${idledAfter}ms, then ${idleRenders} renders`,
   );
 
-  await page.mouse.move(500, 400);
-  await page.mouse.wheel(0, -240);
+  await page.evaluate(() => document.querySelector("#graph").dispatchEvent(
+    new WheelEvent("wheel", { bubbles: true, deltaY: -240 })
+  ));
   check(
     "force-graph: interaction wakes the loop after idling",
     (await delta(1200)) > 5,
@@ -173,9 +200,11 @@ if (has3D) {
   );
 }
 
-if (pageErrors.length) {
-  check("no uncaught page errors", false, pageErrors.slice(0, 2).join(" | "));
-}
+check("no uncaught page errors", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
+
+check("browser harness: expected assertion count",
+  pass.length + fail.length + 1 === EXPECTED_CHECKS,
+  "expected=" + EXPECTED_CHECKS + " actual=" + (pass.length + fail.length + 1));
 
 await browser.close();
 
