@@ -104,6 +104,18 @@ check("force-graph: top bar stays visible and clear of open drawers",
 const rect = (sel) => page.$eval(sel, (n) => {
   const b = n.getBoundingClientRect(); return { x: b.x, width: b.width };
 });
+const assertActionableHandle = async (sel) => {
+  const state = await page.$eval(sel, (n) => {
+    const b = n.getBoundingClientRect();
+    const style = getComputedStyle(n);
+    return { width: b.width, height: b.height, x: b.x, y: b.y,
+      visible: style.display !== "none" && style.visibility !== "hidden",
+      viewport: b.x >= 0 && b.y >= 0 && b.right <= innerWidth && b.bottom <= innerHeight };
+  });
+  if (!state.visible || state.width <= 0 || state.height <= 0 || !state.viewport) {
+    throw new Error("resize handle is not actionable: " + sel + " " + JSON.stringify(state));
+  }
+};
 const drag = async (sel, targetX) => {
   const b = await rect(sel);
   await page.mouse.move(b.x + b.width / 2, 200);
@@ -112,6 +124,7 @@ const drag = async (sel, targetX) => {
   await page.mouse.up();
   await page.waitForTimeout(350);
 };
+await page.setViewportSize({ width: 1280, height: 820 });
 await drag("#timeline-resize-handle", 1280 - 420);
 const timeline420 = await rect("#timeline");
 await drag("#detail-resize-handle", 1280 - 420 - 640);
@@ -131,7 +144,11 @@ await page.waitForTimeout(350);
 const timelineReclamped = await rect("#timeline");
 check("force-graph: viewport resize re-clamps drawer width",
   Math.abs(timelineReclamped.width - 540) <= 2, String(timelineReclamped.width));
+await page.setViewportSize({ width: 1280, height: 820 });
+await page.waitForTimeout(350);
+await assertActionableHandle("#timeline-resize-handle");
 await page.dblclick("#timeline-resize-handle");
+await assertActionableHandle("#detail-resize-handle");
 await page.dblclick("#detail-resize-handle");
 await page.waitForTimeout(500);
 const resetTimeline = await rect("#timeline");
@@ -147,7 +164,6 @@ check("force-graph: double-click resets both drawer defaults",
 check("force-graph: relayout resizes canvas with the graph area",
   canvasGeometry.canvas > 0 && Math.abs(canvasGeometry.graph - canvasGeometry.canvas) <= 2,
   JSON.stringify(canvasGeometry));
-await page.setViewportSize({ width: 1280, height: 820 });
 
 // SHIPPED BUG: the 3D render loop repainted 60x/sec forever whether or not
 // anything changed — ~227% CPU on an idle page. It must stop when settled and
