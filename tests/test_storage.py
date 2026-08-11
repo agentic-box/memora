@@ -413,6 +413,104 @@ def test_list_memories_filtered_pagination(local_db):
             assert "match" in r["tags"], f"Row {r['id']} missing 'match' tag"
 
 
+def _seed_depleted_lineage(conn):
+    leaves = [
+        storage.add_memory(conn, content=f"Current lineage leaf {i}")
+        for i in range(1)
+    ]
+    active = [
+        storage.add_memory(conn, content=f"Active deeper result {i}")
+        for i in range(3)
+    ]
+    stale = [
+        storage.add_memory(conn, content=f"Stale ranked result {i}")
+        for i in range(3)
+    ]
+    for old in stale:
+        storage.add_link(conn, leaves[0]["id"], old["id"], edge_type="supersedes")
+
+    for rank, memory in enumerate(leaves):
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (f"2010-01-0{3 - rank} 00:00:00", memory["id"]),
+        )
+    for rank, memory in enumerate(active):
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (f"2020-01-0{3 - rank} 00:00:00", memory["id"]),
+        )
+    for rank, memory in enumerate(stale):
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (f"2030-01-0{3 - rank} 00:00:00", memory["id"]),
+        )
+    conn.commit()
+    return leaves, active, stale
+
+
+@pytest.mark.parametrize("follow", ["active", "latest"])
+def test_list_follow_fills_limit_without_duplicates_in_rank_order(local_db, follow):
+    with storage.connect() as conn:
+        leaves, active, _stale = _seed_depleted_lineage(conn)
+
+        results = storage.list_memories(conn, limit=3, follow=follow)
+
+        ids = [memory["id"] for memory in results]
+        expected = (
+            [memory["id"] for memory in active]
+            if follow == "active"
+            else [leaves[0]["id"], active[0]["id"], active[1]["id"]]
+        )
+        assert len(ids) == 3, "lineage filtering depleted the requested list page"
+        assert ids == expected, "list lineage processing changed stable rank order"
+        assert len(ids) == len(set(ids)), "list lineage processing returned duplicates"
+
+
+@pytest.mark.parametrize("path", ["semantic", "hybrid"])
+@pytest.mark.parametrize("follow", ["active", "latest"])
+def test_ranked_follow_overfetch_fills_limit_without_duplicates(
+    local_db, monkeypatch, path, follow
+):
+    with storage.connect() as conn:
+        leaves, active, stale = _seed_depleted_lineage(conn)
+        ranked = stale + active + leaves
+        envelopes = [
+            {"score": 1.0 - rank / 100, "memory": memory}
+            for rank, memory in enumerate(ranked)
+        ]
+        requested_limits = []
+
+        if path == "semantic":
+            def fake_vector_search(*args, top_k=None, **kwargs):
+                requested_limits.append(top_k)
+                return envelopes[:top_k]
+
+            monkeypatch.setattr(storage, "_search_by_vector", fake_vector_search)
+            monkeypatch.setattr(storage, "_compute_embedding", lambda *args, **kwargs: {"x": 1.0})
+            results = storage.semantic_search(conn, "ranked", top_k=3, follow=follow)
+        else:
+            def fake_semantic(*args, top_k=None, **kwargs):
+                requested_limits.append(top_k)
+                return envelopes[:top_k]
+
+            monkeypatch.setattr(storage, "semantic_search", fake_semantic)
+            monkeypatch.setattr(storage, "list_memories", lambda *args, **kwargs: [])
+            results = storage.hybrid_search(
+                conn, "ranked", semantic_weight=1.0, top_k=3, follow=follow
+            )
+
+        ids = [entry["memory"]["id"] for entry in results]
+        expected = (
+            [memory["id"] for memory in active]
+            if follow == "active"
+            else [leaves[0]["id"], active[0]["id"], active[1]["id"]]
+        )
+        assert requested_limits == [9], f"{path} did not over-fetch a bounded 3x pool"
+        assert len(ids) == 3, f"lineage filtering depleted {path} below top_k"
+        assert ids == expected, f"{path} lineage processing changed stable rank order"
+        assert len(ids) == len(set(ids)), f"{path} lineage processing returned duplicates"
+
+
 def test_tag_whitelist_enforcement(local_db, monkeypatch):
     """Adding memory with invalid tag should raise when whitelist is active."""
     monkeypatch.setattr(memora, "TAG_WHITELIST", {"allowed-tag"})

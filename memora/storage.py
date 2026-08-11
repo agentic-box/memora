@@ -4231,6 +4231,14 @@ def _parse_date_filter(date_str: str) -> str:
 
 
 _SCAN_CAP = 5000
+_FOLLOW_OVERFETCH_FACTOR = 3
+
+
+def _follow_candidate_limit(requested: Optional[int], follow: Optional[str]) -> Optional[int]:
+    """Bound candidate over-fetch for lineage modes that can deplete results."""
+    if requested is None or follow not in {"active", "latest"}:
+        return requested
+    return min(_SCAN_CAP, requested * _FOLLOW_OVERFETCH_FACTOR)
 
 
 def list_memories(
@@ -4255,7 +4263,10 @@ def list_memories(
     # LIMIT/OFFSET would truncate BEFORE filtering, giving wrong pagination.
     # In that case: fetch up to _SCAN_CAP rows from SQL (no LIMIT/OFFSET),
     # filter in Python, then apply offset/limit to filtered results.
-    has_post_sql_filters = bool(validated_filters or tags_any or tags_all or tags_none)
+    lineage_filters_results = follow in {"active", "latest"}
+    has_post_sql_filters = bool(
+        validated_filters or tags_any or tags_all or tags_none or lineage_filters_results
+    )
 
     rows: List[sqlite3.Row]
 
@@ -4400,22 +4411,22 @@ def list_memories(
     if sort_by_importance:
         records.sort(key=lambda r: r.get("importance_score", 0.0), reverse=True)
 
-    # When post-SQL filters were active, apply offset/limit to filtered results
-    # (SQL LIMIT/OFFSET was skipped to avoid pre-filter truncation).
+    # Active/latest can filter or deduplicate ranked rows, so resolve lineage
+    # before Python pagination. SQL fetched a bounded candidate pool above.
+    if lineage_filters_results:
+        records = apply_follow(conn, records, follow, is_search=False)
+
+    # When post-SQL filters were active, apply offset/limit to the fully
+    # filtered result set (SQL LIMIT/OFFSET was skipped above).
     if has_post_sql_filters:
         if offset:
             records = records[offset:]
         if limit is not None:
             records = records[:limit]
 
-    # Apply lineage-aware post-processing.
-    # Note: follow is applied AFTER pagination. This means:
-    # - "active"/"latest" may return fewer items than `limit` (filtered/deduped)
-    # - "full_history" may expand beyond `limit` (capped below)
-    # Pre-follow pagination would require fetching unbounded results, which is
-    # worse for performance. Callers needing exact counts should paginate the
-    # followed result set at the tool layer.
-    if follow:
+    # Full-history expansion intentionally remains after pagination and is
+    # capped. Active/latest were already processed before pagination above.
+    if follow and not lineage_filters_results:
         records = apply_follow(conn, records, follow, is_search=False)
         # Cap full_history expansion to prevent unbounded response size
         if follow == "full_history" and limit is not None and len(records) > limit * 3:
@@ -4531,11 +4542,12 @@ def semantic_search(
     vector_query = _compute_embedding(query, None, [])
     if not vector_query:
         return []
+    candidate_top_k = _follow_candidate_limit(top_k, follow)
     results = _search_by_vector(
         conn,
         vector_query,
         metadata_filters=metadata_filters,
-        top_k=top_k,
+        top_k=candidate_top_k,
         min_score=min_score,
         date_from=date_from,
         date_to=date_to,
@@ -4546,8 +4558,9 @@ def semantic_search(
 
     if follow:
         results = apply_follow(conn, results, follow, is_search=True)
-        if follow == "full_history" and top_k is not None and len(results) > top_k * 3:
-            results = results[:top_k * 3]
+        if top_k is not None:
+            cap = top_k * 3 if follow == "full_history" else top_k
+            results = results[:cap]
 
     return results
 
@@ -4654,9 +4667,6 @@ def hybrid_search(
 
     results: List[Dict[str, Any]] = []
     for memory_id in sorted_ids:
-        if len(results) >= top_k:
-            break
-
         score = scores[memory_id]
         if score < min_score:
             continue
@@ -4671,6 +4681,10 @@ def hybrid_search(
         results = apply_follow(conn, results, follow, is_search=True)
         if follow == "full_history" and len(results) > top_k * 3:
             results = results[:top_k * 3]
+        elif follow in {"active", "latest"}:
+            results = results[:top_k]
+    else:
+        results = results[:top_k]
 
     return results
 
