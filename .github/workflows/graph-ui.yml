@@ -49,7 +49,12 @@ jobs:
 
       - name: Seed local D1 from the fixture
         # Supersession chain, non-lineage typed edges, and a mirror-only drift row.
-        run: npx wrangler d1 execute memora-graph --local --file=tests/fixture.sql
+        #
+        # --persist-to is passed to BOTH this and `pages dev` below and must match.
+        # Relying on each command's default landed the seed in one state directory
+        # and served from another: the seed reported success, the server started
+        # fine, and every query failed with "no such table: memories".
+        run: npx wrangler d1 execute memora-graph --local --persist-to=.wrangler/state --file=tests/fixture.sql
 
       - name: Resolve the index.html symlink
         # public/index.html is a symlink to memora/graph/index.html. `wrangler pages
@@ -63,14 +68,24 @@ jobs:
 
       - name: Start wrangler pages dev
         run: |
-          npx wrangler pages dev ./public --port 8788 --log-level warn > /tmp/wrangler.log 2>&1 &
+          npx wrangler pages dev ./public --local --persist-to=.wrangler/state \
+            --port 8788 --log-level warn > /tmp/wrangler.log 2>&1 &
+          # Readiness must prove the DATA is reachable, not just that a port is open.
+          # This previously polled /api/databases, which reports the binding catalog
+          # from env and answers 200 with an empty database — so an unseeded server
+          # looked healthy and the run failed 60s later as an opaque browser timeout,
+          # diagnosable only from a buried server log. /api/graph hits the tables.
           for i in $(seq 1 60); do
-            if curl -sf http://localhost:8788/api/databases > /dev/null; then
-              echo "server up after ${i}s"; exit 0
+            NODES=$(curl -sf http://localhost:8788/api/graph 2>/dev/null \
+              | python3 -c "import json,sys; print(len(json.load(sys.stdin).get('nodes',[])))" 2>/dev/null || echo 0)
+            if [ "${NODES:-0}" -gt 0 ]; then
+              echo "server up after ${i}s with ${NODES} seeded nodes"; exit 0
             fi
             sleep 1
           done
-          echo "server never came up:"; cat /tmp/wrangler.log; exit 1
+          echo "server never served seeded data. wrangler log:"; cat /tmp/wrangler.log
+          echo "--- state dirs present ---"; find .wrangler -name '*.sqlite' 2>/dev/null
+          exit 1
 
       - name: Lineage logic tests
         # Pure-logic suite that imports the shipped modules. It existed before this
