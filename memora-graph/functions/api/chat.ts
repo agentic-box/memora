@@ -6,7 +6,13 @@
  * Supports ?db=<configured name> to select a database.
  */
 
-import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db.ts";
+import {
+  loadTagPolicy,
+  tagPolicyUnavailableResponse,
+  validateTags,
+  type TagPolicy,
+} from "./_tags.ts";
 
 interface Env extends DatabaseEnv {
   OPENROUTER_API_KEY?: string;
@@ -129,17 +135,22 @@ const CHAT_TOOLS = [
 
 // ── Tool execution via D1 ─────────────────────────────────────────────
 
-async function executeToolCall(
+export async function executeToolCall(
   db: D1Database,
   toolName: string,
   args: Record<string, unknown>,
   apiKey: string,
-  embeddingModel: string
+  embeddingModel: string,
+  tagPolicy: TagPolicy,
 ): Promise<string> {
   try {
     if (toolName === "create_memory") {
       const content = String(args.content || "");
-      const tags = Array.isArray(args.tags) ? args.tags : [];
+      const validation = validateTags(args.tags === undefined ? [] : args.tags, tagPolicy);
+      if (!validation.ok) {
+        return JSON.stringify({ success: false, error: validation.error, message: validation.message });
+      }
+      const tags = validation.tags;
       const result = await db
         .prepare(
           "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, '{}', ?, datetime('now'))"
@@ -176,9 +187,17 @@ async function executeToolCall(
       }
       const newContent =
         args.content !== undefined ? String(args.content) : existing.content;
+      let validatedTags: string[] | undefined;
+      if (args.tags !== undefined) {
+        const validation = validateTags(args.tags, tagPolicy);
+        if (!validation.ok) {
+          return JSON.stringify({ success: false, error: validation.error, message: validation.message });
+        }
+        validatedTags = validation.tags;
+      }
       const newTags =
-        args.tags !== undefined
-          ? JSON.stringify(args.tags)
+        validatedTags !== undefined
+          ? JSON.stringify(validatedTags)
           : existing.tags;
       await db
         .prepare(
@@ -748,6 +767,10 @@ export const onRequestPost: PagesFunction<Env> = async ({
     );
   }
 
+  const tagPolicyResult = await loadTagPolicy(db);
+  if (!tagPolicyResult.ok) return tagPolicyUnavailableResponse();
+  const tagPolicy = tagPolicyResult.policy;
+
   let body: ChatRequest;
   try {
     body = await request.json<ChatRequest>();
@@ -911,7 +934,9 @@ export const onRequestPost: PagesFunction<Env> = async ({
           /* empty args */
         }
 
-        const resultStr = await executeToolCall(db, tc.name, args, apiKey, embeddingModel);
+        const resultStr = await executeToolCall(
+          db, tc.name, args, apiKey, embeddingModel, tagPolicy
+        );
 
         // Emit action event to frontend
         const actionData = JSON.parse(resultStr);

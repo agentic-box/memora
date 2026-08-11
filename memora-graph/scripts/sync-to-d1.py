@@ -24,6 +24,7 @@ MEMORA_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MEMORA_ROOT))
 
 try:
+    from memora import TAG_WHITELIST
     from memora.backends import parse_backend_uri, CloudSQLiteBackend
 except ImportError:
     print("Error: Could not import memora. Make sure it's installed or in PYTHONPATH.")
@@ -122,6 +123,9 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
             "",
             "BEGIN;",
             "",
+            "-- Ensure policy metadata table exists",
+            "CREATE TABLE IF NOT EXISTS memories_meta (key TEXT PRIMARY KEY, value TEXT);",
+            "",
             "-- Ensure actions table exists",
             "CREATE TABLE IF NOT EXISTS memories_actions ("
             "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
@@ -140,6 +144,21 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
             "",
             "",
         ]
+
+        tag_policy = json.dumps(
+            {
+                "version": 1,
+                "allow_any": not bool(TAG_WHITELIST),
+                "tags": sorted(TAG_WHITELIST),
+            },
+            separators=(",", ":"),
+        )
+        sql_lines.extend([
+            "-- Publish the authoritative tag policy for Pages write paths",
+            "INSERT OR REPLACE INTO memories_meta (key, value) "
+            f"VALUES ('tag_policy_v1', {escape_sql_string(tag_policy)});",
+            "",
+        ])
 
         if replace:
             sql_lines.extend([

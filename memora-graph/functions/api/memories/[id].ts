@@ -3,7 +3,8 @@
  * Supports ?db=<configured name> to select a database
  */
 
-import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "../_db";
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "../_db.ts";
+import { loadTagPolicy, tagPolicyUnavailableResponse, validateTags } from "../_tags.ts";
 
 interface Env extends DatabaseEnv {}
 
@@ -100,8 +101,18 @@ export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request 
     return Response.json({ error: "not_found" }, { status: 404 });
   }
 
-  if (body.tags !== undefined && !Array.isArray(body.tags)) {
-    return Response.json({ error: "invalid_tags" }, { status: 400 });
+  let validatedTags: string[] | undefined;
+  if (body.tags !== undefined) {
+    const policy = await loadTagPolicy(db);
+    if (!policy.ok) return tagPolicyUnavailableResponse();
+    const validation = validateTags(body.tags, policy.policy);
+    if (!validation.ok) {
+      return Response.json(
+        { error: validation.error, message: validation.message },
+        { status: 400 },
+      );
+    }
+    validatedTags = validation.tags;
   }
   if (body.metadata !== undefined && (!body.metadata || Array.isArray(body.metadata) || typeof body.metadata !== "object")) {
     return Response.json({ error: "invalid_metadata" }, { status: 400 });
@@ -128,7 +139,7 @@ export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request 
       delete meta.favorite;
     }
   }
-  const tags = body.tags !== undefined ? body.tags : parseJson<string[]>(row.tags, []);
+  const tags = validatedTags ?? parseJson<string[]>(row.tags, []);
 
   await db.prepare(
     "UPDATE memories SET metadata = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"

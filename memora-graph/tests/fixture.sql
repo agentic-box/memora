@@ -1,5 +1,6 @@
 DROP TABLE IF EXISTS memories;
 DROP TABLE IF EXISTS memories_crossrefs;
+DROP TABLE IF EXISTS memories_meta;
 
 CREATE TABLE memories (
   id INTEGER PRIMARY KEY,
@@ -14,6 +15,14 @@ CREATE TABLE memories_crossrefs (
   memory_id INTEGER PRIMARY KEY,
   related TEXT
 );
+
+CREATE TABLE memories_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
+INSERT INTO memories_meta (key, value) VALUES
+ ('tag_policy_v1', '{"version":1,"allow_any":false,"tags":["deploy","api","team","project.*"]}');
 
 -- 1 <- 2 <- 3 : a three-link supersession chain.
 --   #3 is current. #2 is mid-chain (supersedes 1, superseded by 3). #1 is dead.

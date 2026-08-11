@@ -92,6 +92,9 @@ jobs:
         # workflow and ran nowhere.
         run: node --experimental-strip-types scripts/test_lineage.mjs
 
+      - name: Tag write policy tests
+        run: node --experimental-strip-types scripts/test_tag_writes.mjs http://localhost:8788
+
       - name: Browser tests
         run: node scripts/test_ui.mjs http://localhost:8788
 
