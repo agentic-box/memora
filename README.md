@@ -32,6 +32,11 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 - 📂 **Hierarchical Organization** - Section/subsection structure with auto-hierarchy assignment
 - 📦 **Export/Import** - Backup and restore with merge strategies
 
+**Absorb & Lineage**
+- 🧬 **Absorb** - Feed facts in; an LLM classifies each against the store (duplicate / update / contradiction / related / new), skips duplicates, links relations, and consolidates related facts — with `dry_run` preview
+- 🌱 **Supersession Lineage** - Updates supersede old knowledge instead of deleting it; retrieval follows the chain to the current version by default (`follow` modes: `active`, `latest`, `full_history`)
+- 🗞️ **Topic Digest** - `memory_digest(topic)` bundles relevant memories, open TODOs/issues, related edges, and source IDs into one retrieval
+
 **Search & Intelligence**
 - 🔍 **Semantic Search** - Vector embeddings (TF-IDF, sentence-transformers, OpenAI)
 - 🎯 **Advanced Queries** - Full-text, date ranges, tag filters (AND/OR/NOT), hybrid search
@@ -64,14 +69,17 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 ## Install
 
 ```bash
-pip install git+https://github.com/agentic-box/memora.git
+pip install memora-mcp
 ```
 
-Includes cloud storage (S3/R2) and OpenAI embeddings out of the box.
+The PyPI package is **`memora-mcp`** (bare `memora` on PyPI is an unrelated project). Includes cloud storage (S3/R2) and OpenAI embeddings out of the box.
 
 ```bash
 # Optional: local embeddings (offline, ~2GB for PyTorch)
-pip install "memora[local]" @ git+https://github.com/agentic-box/memora.git
+pip install "memora-mcp[local]"
+
+# Latest development version straight from git
+pip install "git+https://github.com/agentic-box/memora.git"
 ```
 
 <details id="usage">
@@ -186,9 +194,10 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_CLOUD_COMPRESS`| Compress database before uploading to cloud (`true`/`false`)               |
 | `MEMORA_CACHE_DIR`     | Local cache directory for cloud-synced database                            |
 | `MEMORA_ALLOW_ANY_TAG` | Allow any tag without validation against allowlist (`1` to enable)         |
-| `MEMORA_TAG_FILE`      | Path to file containing allowed tags (one per line)                        |
+| `MEMORA_TAG_FILE`      | Path to a JSON file containing an array of allowed tags, e.g. `["plan", "memora/issues"]` |
 | `MEMORA_TAGS`          | Comma-separated list of allowed tags                                       |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
+| `MEMORA_STALE_DAYS`    | Days before an open TODO/issue counts as stale in `memory_insights` (default: `14`) |
 | `MEMORA_EMBEDDING_MODEL` | Embedding backend: `openai` (default), `sentence-transformers`, or `tfidf` |
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
 | `MEMORA_EMBEDDING_API_KEY` | Embedding provider API key (atomic with base URL — see below)           |
