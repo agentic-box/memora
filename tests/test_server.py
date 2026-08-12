@@ -170,6 +170,61 @@ def test_memory_digest_synthesize_is_warning_only(local_db):
     assert digest["parameters"]["synthesize"] is True
 
 
+def test_search_tools_honor_limit_alias_under_follow_active(local_db):
+    """MCP callers pass ``limit`` (same as memory_list). Hybrid used to ignore it
+    and return the top_k default of 10."""
+    token = "limitprobe-zzxq"
+    for i in range(12):
+        _new_memory(content=f"{token} matching document number {i} extra context words here")
+    _new_memory(content="completely unrelated office printer recycled paper")
+
+    hybrid = asyncio.run(
+        server.memory_hybrid_search(token, limit=3, follow="active", content_mode="full")
+    )
+    assert hybrid["count"] == 3, (
+        f"hybrid limit=3 must return 3, got {hybrid['count']} "
+        "(mutation: drop limit= from the tool signature and this goes red — default 10 leaks)"
+    )
+    assert len(hybrid["results"]) == 3
+
+    semantic = asyncio.run(
+        server.memory_semantic_search(token, limit=3, follow="active", content_mode="full")
+    )
+    assert semantic["count"] == 3, f"semantic limit=3 must return 3, got {semantic['count']}"
+    assert len(semantic["results"]) == 3
+
+    listed = asyncio.run(
+        server.memory_list(query=token, limit=3, follow="active", content_mode="full")
+    )
+    assert listed["count"] == 3
+    assert len(listed["memories"]) == 3
+
+    # Legacy top_k still works on hybrid
+    hybrid_topk = asyncio.run(
+        server.memory_hybrid_search(token, top_k=4, follow="active")
+    )
+    assert hybrid_topk["count"] == 4
+
+    rare = "qzxplmvw"
+    _new_memory(content=f"{rare} first matching document extra words", tags=["rare-probe"])
+    _new_memory(content=f"{rare} second matching document extra words", tags=["rare-probe"])
+    few = asyncio.run(
+        server.memory_hybrid_search(
+            rare, limit=5, follow="active", tags_all=["rare-probe"]
+        )
+    )
+    assert 1 <= few["count"] <= 2
+    assert few["count"] == len(few["results"])
+    assert few["count"] < 5
+
+
+def test_resolve_search_cap_prefers_limit_over_top_k_default():
+    assert server._resolve_search_cap(limit=3, top_k=None, default=10) == 3
+    assert server._resolve_search_cap(limit=3, top_k=10, default=10) == 3
+    assert server._resolve_search_cap(limit=None, top_k=4, default=10) == 4
+    assert server._resolve_search_cap(limit=None, top_k=None, default=10) == 10
+
+
 def test_default_semantic_search_excludes_superseded_memory(local_db):
     """Default list/search follow=active: superseded memories stay out of ordinary recall.
 

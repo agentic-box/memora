@@ -386,6 +386,27 @@ def test_absorb_update_supersedes_current_leaf(
         assert ("target #" in caplog.text) is (matched_version == "stale")
 
 
+def test_hybrid_semantic_list_honor_requested_limit(local_db):
+    token = "storelimit-zzxq"
+    with storage.connect() as conn:
+        for i in range(12):
+            storage.add_memory(conn, content=f"{token} matching document number {i} extra words")
+        hybrid = storage.hybrid_search(conn, token, top_k=3, follow="active")
+        semantic = storage.semantic_search(conn, token, top_k=3, follow="active")
+        listed = storage.list_memories(conn, query=token, limit=3, follow="active")
+        assert len(hybrid) == 3
+        assert len(semantic) == 3
+        assert len(listed) == 3
+        few_token = "qzxplmvw"
+        storage.add_memory(
+            conn, content=f"{few_token} only one extra words", tags=["rare-probe"]
+        )
+        few = storage.hybrid_search(
+            conn, few_token, top_k=5, follow="active", tags_all=["rare-probe"]
+        )
+        assert len(few) == 1
+
+
 def test_hybrid_search_tags_all_filters_semantic_leg(local_db):
     """Phase 0 regression: tags_all must filter both legs of hybrid_search.
 

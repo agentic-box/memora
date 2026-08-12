@@ -438,6 +438,20 @@ def _semantic_search(
     )
 
 
+def _resolve_search_cap(
+    *,
+    limit: Optional[int],
+    top_k: Optional[int],
+    default: int,
+) -> int:
+    """Honor MCP ``limit`` or legacy ``top_k``. Unknown ``limit`` used to be dropped
+    by the schema, so hybrid defaulted to 10 — the live ``count=10`` quirk."""
+    requested = limit if limit is not None else top_k
+    if requested is None:
+        return default
+    return max(1, int(requested))
+
+
 @_with_connection
 def _hybrid_search(
     conn,
@@ -2000,7 +2014,8 @@ async def memory_verify_integrity() -> Dict[str, Any]:
 @mcp.tool()
 async def memory_semantic_search(
     query: str,
-    top_k: int = 5,
+    top_k: Optional[int] = None,
+    limit: Optional[int] = None,
     metadata_filters: Optional[Dict[str, Any]] = None,
     min_score: Optional[float] = None,
     content_mode: str = "preview",
@@ -2014,7 +2029,8 @@ async def memory_semantic_search(
 
     Args:
         query: Search query text
-        top_k: Maximum number of results (default: 5)
+        top_k: Maximum number of results (legacy name; default 5 if neither limit nor top_k)
+        limit: Alias for top_k — preferred name; honored so callers matching memory_list work
         metadata_filters: Optional metadata filters
         min_score: Minimum similarity score threshold
         content_mode: "preview" (default) returns truncated content_preview; "full" returns complete content
@@ -2031,11 +2047,12 @@ async def memory_semantic_search(
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
 
+    cap = _resolve_search_cap(limit=limit, top_k=top_k, default=5)
     try:
         results = _semantic_search(
             query,
             metadata_filters,
-            top_k,
+            cap,
             min_score,
             follow=effective_follow,
         )
@@ -2066,7 +2083,8 @@ async def memory_semantic_search(
 async def memory_hybrid_search(
     query: str,
     semantic_weight: float = 0.6,
-    top_k: int = 10,
+    top_k: Optional[int] = None,
+    limit: Optional[int] = None,
     min_score: float = 0.0,
     metadata_filters: Optional[Dict[str, Any]] = None,
     date_from: Optional[str] = None,
@@ -2091,7 +2109,8 @@ async def memory_hybrid_search(
         query: Search query text
         semantic_weight: Weight for semantic results (0-1). Higher values favor semantic similarity.
                         Keyword weight = 1 - semantic_weight. Default: 0.6 (60% semantic, 40% keyword)
-        top_k: Maximum number of results to return (default: 10)
+        top_k: Maximum number of results (legacy name; default 10 if neither limit nor top_k)
+        limit: Alias for top_k — preferred name; honored so callers matching memory_list work
         min_score: Minimum combined score threshold (default: 0.0)
         metadata_filters: Optional metadata filters
         date_from: Optional date filter (ISO format or relative like "7d", "1m", "1y")
@@ -2115,11 +2134,12 @@ async def memory_hybrid_search(
         effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
+    cap = _resolve_search_cap(limit=limit, top_k=top_k, default=10)
     try:
         results = _hybrid_search(
             query,
             semantic_weight,
-            top_k,
+            cap,
             min_score,
             metadata_filters,
             date_from,
