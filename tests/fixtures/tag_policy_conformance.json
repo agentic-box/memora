@@ -1,92 +1,140 @@
 [
   {
     "id": "exact-hit",
-    "policy": ["deploy"],
+    "policy": [
+      "deploy"
+    ],
     "tag": "deploy",
     "expected": true
   },
   {
     "id": "exact-miss",
-    "policy": ["deploy"],
+    "policy": [
+      "deploy"
+    ],
     "tag": "other",
     "expected": false
   },
   {
     "id": "dot-wildcard-self",
-    "policy": ["project.*"],
+    "policy": [
+      "project.*"
+    ],
     "tag": "project",
     "expected": true
   },
   {
     "id": "dot-wildcard-child",
-    "policy": ["project.*"],
+    "policy": [
+      "project.*"
+    ],
     "tag": "project.child",
     "expected": true
   },
   {
     "id": "dot-wildcard-nested",
-    "policy": ["project.*"],
+    "policy": [
+      "project.*"
+    ],
     "tag": "project.child.leaf",
     "expected": true
   },
   {
     "id": "dot-wildcard-rejects-slash",
-    "policy": ["project.*"],
+    "policy": [
+      "project.*"
+    ],
     "tag": "project/child",
     "expected": false
   },
   {
     "id": "slash-wildcard-self",
-    "policy": ["memora/*"],
+    "policy": [
+      "memora/*"
+    ],
     "tag": "memora",
     "expected": true
   },
   {
     "id": "slash-wildcard-child",
-    "policy": ["memora/*"],
+    "policy": [
+      "memora/*"
+    ],
     "tag": "memora/issues",
     "expected": true
   },
   {
     "id": "slash-wildcard-nested",
-    "policy": ["memora/*"],
+    "policy": [
+      "memora/*"
+    ],
     "tag": "memora/issues/open",
     "expected": true
   },
   {
     "id": "slash-wildcard-rejects-dot",
-    "policy": ["memora/*"],
+    "policy": [
+      "memora/*"
+    ],
     "tag": "memora.issues",
     "expected": false
   },
   {
     "id": "bare-star-does-not-match",
-    "policy": ["*"],
+    "policy": [
+      "*"
+    ],
     "tag": "anything",
     "expected": false
   },
   {
     "id": "dot-star-only-does-not-match",
-    "policy": [".*"],
+    "policy": [
+      ".*"
+    ],
     "tag": "foo",
     "expected": false
   },
   {
     "id": "slash-star-only-does-not-match",
-    "policy": ["/*"],
+    "policy": [
+      "/*"
+    ],
     "tag": "foo",
     "expected": false
   },
   {
     "id": "mixed-policy-slash-hit",
-    "policy": ["deploy", "memora/*", "project.*"],
+    "policy": [
+      "deploy",
+      "memora/*",
+      "project.*"
+    ],
     "tag": "memora/research",
     "expected": true
   },
   {
     "id": "mixed-policy-unrelated-miss",
-    "policy": ["deploy", "memora/*", "project.*"],
+    "policy": [
+      "deploy",
+      "memora/*",
+      "project.*"
+    ],
     "tag": "other/ns",
     "expected": false
+  },
+  {
+    "id": "length-100-emoji-accepted",
+    "policy": [],
+    "tag": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+    "expected": true,
+    "check": "length"
+  },
+  {
+    "id": "length-101-emoji-rejected",
+    "policy": [],
+    "tag": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+    "expected": false,
+    "check": "length"
   }
 ]

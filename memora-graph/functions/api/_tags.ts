@@ -48,6 +48,11 @@ export async function loadTagPolicy(db: D1Database): Promise<TagPolicyResult> {
 
 export const MAX_TAG_LENGTH = 100;
 
+/** Unicode code-point length — matches Python len(tag), not UTF-16 string.length. */
+export function tagCodePointLength(tag: string): number {
+  return Array.from(tag).length;
+}
+
 /** Separator-specific wildcard: prefix.* / prefix/* ; no bare-* catch-all. */
 export function tagMatchesPattern(tag: string, pattern: string): boolean {
   if (pattern.endsWith(".*")) {
@@ -81,7 +86,7 @@ export function validateTags(value: unknown, policy: TagPolicy): TagValidationRe
     if (!tag) {
       return { ok: false, error: "invalid_tags", message: "Tags cannot be empty strings." };
     }
-    if (tag.length > MAX_TAG_LENGTH) {
+    if (tagCodePointLength(tag) > MAX_TAG_LENGTH) {
       return {
         ok: false,
         error: "invalid_tags",

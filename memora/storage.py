@@ -757,6 +757,11 @@ def _serialise_row(row: sqlite3.Row) -> Dict[str, Any]:
 MAX_TAG_LENGTH = 100
 
 
+def tag_code_point_length(tag: str) -> int:
+    """Unicode code-point length (not UTF-16 units). Shared with Pages _tags.ts."""
+    return len(tag)
+
+
 def tag_matches_policy(tag: str, policy_tags: Iterable[str]) -> bool:
     """Return True if tag is allowed by any policy entry.
 
@@ -796,7 +801,7 @@ def _validate_tags(tags: Optional[Iterable[str]]) -> List[str]:
         stripped = tag.strip()
         if not stripped:
             raise ValueError("Tags cannot be empty strings")
-        if len(stripped) > MAX_TAG_LENGTH:
+        if tag_code_point_length(stripped) > MAX_TAG_LENGTH:
             raise ValueError(
                 f"Tag exceeds maximum length of {MAX_TAG_LENGTH} characters"
             )
@@ -3229,6 +3234,10 @@ ABSORB_ACTIONS = {"created", "superseded", "contradicted", "linked", "skipped"}
 _ABSORB_DUPLICATE_THRESHOLD = 0.85  # No-LLM auto-skip: must be very high confidence
 _ABSORB_RELATED_THRESHOLD = 0.35    # Send to LLM for classification
 
+# Measurement harness sets this so a provider timeout is a named failure.
+# Production absorb keeps degrade-to-fallback on timeout.
+_LLM_TIMEOUT_STRICT = False
+
 
 def _classify_fact_against_matches(
     fact: str,
@@ -3327,7 +3336,17 @@ Respond with JSON only (no markdown):
                 validated.append(cls)
         return validated, suggested_tags
     except Exception as e:
-        _reraise_llm_timeout(e)
+        if _LLM_TIMEOUT_STRICT:
+            _reraise_llm_timeout(e)
+        else:
+            try:
+                _reraise_llm_timeout(e)
+            except LLMTimeoutError as timeout_err:
+                logger.warning(
+                    "Absorb LLM classification timed out (degrading): %s",
+                    timeout_err,
+                )
+                return [], []
         logger.warning("Absorb LLM classification failed: %s", e, exc_info=True)
         return [], []
 
@@ -4358,7 +4377,10 @@ def _list_memory_sql_rows(
         order_plain += ", " + _safe_order_clause("id", "DESC", "plain")
 
     rows: List[sqlite3.Row] = []
+    fts_attempted = False
+    fts_operational_error = False
     if query and _fts_enabled(conn):
+        fts_attempted = True
         fts_query = " ".join(f'"{t}"' for t in query.split() if t)
         try:
             rows = conn.execute(
@@ -4366,13 +4388,14 @@ def _list_memory_sql_rows(
                 SELECT {cols_fts}
                 FROM memories m
                 JOIN memories_fts f ON m.id = f.rowid
-                WHERE f MATCH ?{date_clause_fts}
+                WHERE memories_fts MATCH ?{date_clause_fts}
                 ORDER BY {order_fts}{limit_clause}
                 """,
                 (fts_query, *date_params, *limit_params),
             ).fetchall()
         except sqlite3.OperationalError:
             rows = []
+            fts_operational_error = True
     elif query:
         words = [w for w in query.split() if w]
         if words:
@@ -4399,7 +4422,10 @@ def _list_memory_sql_rows(
             tuple([*date_params, *limit_params]),
         ).fetchall()
 
-    if query and _fts_enabled(conn) and not rows:
+    # LIKE fallback only when FTS is unusable (OperationalError) or the
+    # first page is empty (legacy no-result policy). An empty later window
+    # is exhaustion — do not switch to substring LIKE mid-scan.
+    if query and fts_attempted and not rows and (fts_operational_error or sql_offset == 0):
         words = [w for w in query.split() if w]
         if words:
             word_clauses = " ".join(
@@ -4498,15 +4524,16 @@ def list_memories(
         followed: List[Dict[str, Any]] = []
         seen_ids: set[int] = set()
         raw_scanned = 0
+        # COST: sort_by_importance + follow cannot stop at offset+limit.
+        # importance_score is computed in Python, so ranking requires the
+        # full followed set (windowed up to _SCAN_HARD_CAP) even for limit=1.
+        # SQL-side importance sort is a future round.
         needed = None if sort_by_importance or limit is None else offset + limit
         while True:
             remaining_budget = _SCAN_HARD_CAP - raw_scanned
-            if remaining_budget <= 0:
-                raise LineageScanLimitError(
-                    f"list follow scan exceeded hard cap={_SCAN_HARD_CAP} "
-                    f"before filling offset={offset} limit={limit}"
-                )
             window = min(_SCAN_WINDOW, remaining_budget)
+            if window <= 0:
+                break
             rows = _list_memory_sql_rows(
                 conn, sql_limit=window, sql_offset=raw_scanned, **fetch_kwargs
             )
@@ -4540,6 +4567,13 @@ def list_memories(
 
         records = followed
         if sort_by_importance:
+            if raw_scanned > _SCAN_CAP:
+                logger.info(
+                    "list follow importance scan scanned %d rows (>%d); "
+                    "full-store scan required for correct ranking",
+                    raw_scanned,
+                    _SCAN_CAP,
+                )
             records.sort(key=lambda r: r.get("importance_score", 0.0), reverse=True)
         if offset:
             records = records[offset:]

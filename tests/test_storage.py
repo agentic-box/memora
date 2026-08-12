@@ -36,7 +36,7 @@ def test_llm_client_passes_explicit_timeout(monkeypatch):
 
 
 def test_classify_timeout_is_named_failure(monkeypatch):
-    """A hung/timeout provider must raise LLMTimeoutError, not return []."""
+    """Strict/measurement mode: timeout is a named failure, not []."""
 
     class Completions:
         def create(self, *args, **kwargs):
@@ -46,12 +46,61 @@ def test_classify_timeout_is_named_failure(monkeypatch):
         chat=SimpleNamespace(completions=Completions())
     )
     monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+    monkeypatch.setattr(storage, "_LLM_TIMEOUT_STRICT", True)
 
     with pytest.raises(storage.LLMTimeoutError, match="timed out"):
         storage._classify_fact_against_matches(
             "Deployment uses version three",
             [{"id": 1, "content": "old version", "score": 0.5, "tags": []}],
         )
+
+
+def test_classify_timeout_falls_back_outside_strict_mode(monkeypatch):
+    """Production absorb: timeout degrades to empty classification, does not raise."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            raise TimeoutError("simulated hang")
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+    monkeypatch.setattr(storage, "_LLM_TIMEOUT_STRICT", False)
+
+    result = storage._classify_fact_against_matches(
+        "Deployment uses version three",
+        [{"id": 1, "content": "old version", "score": 0.5, "tags": []}],
+    )
+    assert result == ([], []), (
+        "mutation: re-raise timeout unconditionally and this assert/absorb test goes red"
+    )
+
+
+def test_absorb_timeout_falls_back_instead_of_raising(local_db, monkeypatch):
+    """Runtime absorb_memory must not raise LLMTimeoutError on a hung provider."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            raise TimeoutError("simulated hang")
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+    monkeypatch.setattr(storage, "_LLM_TIMEOUT_STRICT", False)
+    monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+
+    with storage.connect() as conn:
+        existing = storage.add_memory(conn, content="Deployment uses version one")
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": existing}],
+        )
+        result = storage.absorb_memory(conn, ["Deployment uses version three"])
+    assert isinstance(result, dict) and "decisions" in result
+    # Timeout degraded: fact is preserved as a create/link, not an exception.
 
 
 def test_resolve_follow_defaults_and_all_escape_hatch():
@@ -644,6 +693,49 @@ def test_list_follow_page_boundaries_do_not_repeat_or_skip(local_db, monkeypatch
         assert set(ids1).isdisjoint(ids2)
 
 
+def test_list_follow_fts_window_exhaustion_does_not_switch_to_like(
+    local_db, monkeypatch
+):
+    """Empty later FTS windows are exhaustion, not a LIKE semantic switch."""
+    monkeypatch.setattr(storage, "_SCAN_WINDOW", 4)
+    monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 100)
+    token = "uniquefstokenzz"
+    like_only = f"prefix{token}suffix"
+    with storage.connect() as conn:
+        assert storage._fts_enabled(conn)
+        fts_rows = []
+        for i in range(8):
+            fts_rows.append(
+                storage.add_memory(
+                    conn,
+                    content=f"Document {i} mentions {token} explicitly as a word",
+                )
+            )
+        like_rows = []
+        for i in range(3):
+            like_rows.append(
+                storage.add_memory(
+                    conn,
+                    content=f"Substring trap {i} {like_only} should not appear via FTS",
+                )
+            )
+        windowed = storage.list_memories(
+            conn, query=token, follow="active", limit=20
+        )
+        monkeypatch.setattr(storage, "_SCAN_WINDOW", 100)
+        full = storage.list_memories(conn, query=token, follow="active", limit=20)
+        windowed_ids = [row["id"] for row in windowed]
+        full_ids = [row["id"] for row in full]
+        like_ids = {row["id"] for row in like_rows}
+        fts_ids = {row["id"] for row in fts_rows}
+        assert like_ids.isdisjoint(windowed_ids), (
+            "LIKE-only rows leaked into a later FTS window "
+            "(mutation: restore empty-page LIKE fallback and this goes red)"
+        )
+        assert set(windowed_ids) == fts_ids
+        assert windowed_ids == full_ids
+
+
 def test_list_follow_hard_cap_errors_loudly(local_db, monkeypatch):
     monkeypatch.setattr(storage, "_SCAN_WINDOW", 3)
     monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 6)
@@ -672,6 +764,19 @@ def _tag_conformance_cases():
 
 @pytest.mark.parametrize("case", _tag_conformance_cases(), ids=lambda c: c["id"])
 def test_tag_policy_conformance_fixture(case):
+    if case.get("check") == "length":
+        length = storage.tag_code_point_length(case["tag"])
+        if case["expected"]:
+            assert length <= storage.MAX_TAG_LENGTH
+            assert storage._validate_tags([case["tag"]]) == [case["tag"]], (
+                f"{case['id']}: 100 code-point tag must be accepted "
+                "(mutation: measure UTF-16 units and this goes red)"
+            )
+        else:
+            assert length > storage.MAX_TAG_LENGTH
+            with pytest.raises(ValueError, match="maximum length"):
+                storage._validate_tags([case["tag"]])
+        return
     allowed = storage.tag_matches_policy(case["tag"], case["policy"])
     assert allowed is case["expected"], (
         f"{case['id']}: policy={case['policy']!r} tag={case['tag']!r} "

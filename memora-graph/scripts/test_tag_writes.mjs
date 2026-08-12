@@ -11,6 +11,7 @@ import { executeToolCall } from "../functions/api/chat.ts";
 import { onRequestPatch } from "../functions/api/memories/[id].ts";
 import {
   MAX_TAG_LENGTH,
+  tagCodePointLength,
   tagMatchesPolicy,
   validateTags,
 } from "../functions/api/_tags.ts";
@@ -28,6 +29,14 @@ const CONFORMANCE = JSON.parse(
   ),
 );
 for (const caseRow of CONFORMANCE) {
+  if (caseRow.check === "length") {
+    const result = validateTags([caseRow.tag], { version: 1, allow_any: true, tags: [] });
+    assert(
+      result.ok === caseRow.expected,
+      `conformance ${caseRow.id}: code-point length ${tagCodePointLength(caseRow.tag)} expected ok=${caseRow.expected} got ${JSON.stringify(result)} (mutation: use tag.length UTF-16 and 100-emoji goes red)`,
+    );
+    continue;
+  }
   const allowed = tagMatchesPolicy(caseRow.tag, caseRow.policy);
   assert(
     allowed === caseRow.expected,
