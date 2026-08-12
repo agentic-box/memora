@@ -3,7 +3,7 @@
 <p align="center"><sub><sub><i>"You never truly know the value of a moment until it becomes a memory."</i></sub></sub></p>
 
 <p align="center">
-<b>Give your AI agents persistent memory</b><br>
+<b>Give your AI agents persistent collective memory</b><br>
 An MCP memory layer for agents: structured storage, semantic retrieval, graph relations, and source-backed cross-session context.
 </p>
 
