@@ -89,7 +89,10 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
                 live_classifier = original_classifier
 
                 def checked_live_classifier(fact, matches):
-                    classifications, suggested_tags = live_classifier(fact, matches)
+                    try:
+                        classifications, suggested_tags = live_classifier(fact, matches)
+                    except storage.LLMTimeoutError:
+                        raise
                     if not classifications:
                         raise RuntimeError(
                             f"live classifier returned no result for fixture {case['id']}"

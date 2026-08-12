@@ -43,6 +43,20 @@ def test_classifier_measurement_fails_threshold_when_fixture_label_is_mutated(tm
     assert not meets_threshold(report, 1.0)
 
 
+def test_live_measurement_surfaces_llm_timeout(tmp_path, monkeypatch):
+    """Live harness must fail named on timeout — not a partial score or empty-result."""
+    cases = load_cases(FIXTURES)[:1]
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: object())
+
+    def boom(fact, matches):
+        raise storage.LLMTimeoutError("LLM request timed out after 60s")
+
+    monkeypatch.setattr(storage, "_classify_fact_against_matches", boom)
+
+    with pytest.raises(storage.LLMTimeoutError, match="timed out"):
+        evaluate(cases, mode="live", work_dir=tmp_path)
+
+
 def test_live_measurement_rejects_empty_classifier_response(tmp_path, monkeypatch):
     cases = load_cases(FIXTURES)[:1]
     monkeypatch.setattr(storage, "_get_llm_client", lambda: object())

@@ -1,11 +1,55 @@
 """Regression tests for core storage operations."""
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 
 import memora
 import memora.storage as storage
+
+
+def test_llm_client_passes_explicit_timeout(monkeypatch):
+    """OpenAI client must be constructed with MEMORA_LLM_TIMEOUT (not SDK 600s)."""
+    captured = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    import openai
+
+    storage._llm_client_cache.clear()
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-timeout")
+    monkeypatch.setenv("MEMORA_LLM_TIMEOUT", "45")
+    monkeypatch.setattr(storage, "LLM_ENABLED", True)
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+
+    client = storage._get_llm_client()
+    assert client is not None
+    assert captured.get("timeout") == 45.0, (
+        "mutation: drop timeout= from OpenAI() kwargs and this assertion goes red"
+    )
+    storage._llm_client_cache.clear()
+
+
+def test_classify_timeout_is_named_failure(monkeypatch):
+    """A hung/timeout provider must raise LLMTimeoutError, not return []."""
+
+    class Completions:
+        def create(self, *args, **kwargs):
+            raise TimeoutError("simulated hang")
+
+    fake_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=Completions())
+    )
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: fake_client)
+
+    with pytest.raises(storage.LLMTimeoutError, match="timed out"):
+        storage._classify_fact_against_matches(
+            "Deployment uses version three",
+            [{"id": 1, "content": "old version", "score": 0.5, "tags": []}],
+        )
 
 
 def test_resolve_follow_defaults_and_all_escape_hatch():

@@ -82,6 +82,21 @@ EMBEDDING_MODEL = os.getenv("MEMORA_EMBEDDING_MODEL", "openai")  # openai, sente
 LLM_ENABLED = os.getenv("MEMORA_LLM_ENABLED", "true").lower() in ("true", "1", "yes")
 LLM_MODEL = os.getenv("MEMORA_LLM_MODEL", "gpt-4o-mini")
 REWRITE_MODEL = os.getenv("MEMORA_REWRITE_MODEL", "") or LLM_MODEL
+_DEFAULT_LLM_TIMEOUT_SECONDS = 60.0
+
+
+def llm_timeout_seconds() -> float:
+    """Seconds the OpenAI client waits before failing. Env: MEMORA_LLM_TIMEOUT."""
+    raw = os.getenv("MEMORA_LLM_TIMEOUT", str(int(_DEFAULT_LLM_TIMEOUT_SECONDS)))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = _DEFAULT_LLM_TIMEOUT_SECONDS
+    return max(1.0, value)
+
+
+class LLMTimeoutError(RuntimeError):
+    """Named failure when an LLM provider call exceeds MEMORA_LLM_TIMEOUT."""
 
 # Event notification configuration
 EVENT_TRIGGER_TAG = "shared-cache"
@@ -973,7 +988,10 @@ def _get_llm_client():
 
         if "llm_client" not in _llm_client_cache:
             base_url = os.getenv("OPENAI_BASE_URL")
-            client_kwargs = {"api_key": api_key}
+            client_kwargs = {
+                "api_key": api_key,
+                "timeout": llm_timeout_seconds(),
+            }
             if base_url:
                 client_kwargs["base_url"] = base_url
             _llm_client_cache["llm_client"] = openai.OpenAI(**client_kwargs)
@@ -982,6 +1000,17 @@ def _get_llm_client():
 
     except ImportError:
         return None
+
+
+def _reraise_llm_timeout(exc: BaseException) -> None:
+    """Promote provider/SDK timeouts to LLMTimeoutError; leave other errors alone."""
+    if isinstance(exc, LLMTimeoutError):
+        raise exc
+    name = type(exc).__name__
+    if name == "APITimeoutError" or isinstance(exc, TimeoutError):
+        raise LLMTimeoutError(
+            f"LLM request timed out after {llm_timeout_seconds():.0f}s"
+        ) from exc
 
 
 def compare_memories_llm(
@@ -3263,6 +3292,7 @@ Respond with JSON only (no markdown):
                 validated.append(cls)
         return validated, suggested_tags
     except Exception as e:
+        _reraise_llm_timeout(e)
         logger.warning("Absorb LLM classification failed: %s", e, exc_info=True)
         return [], []
 
