@@ -517,16 +517,22 @@ def test_list_follow_fills_limit_without_duplicates_in_rank_order(local_db, foll
 def test_list_follow_logs_candidate_cap_and_shortfall(
     local_db, monkeypatch, caplog
 ):
+    """Windowed scan refills a page the old single-cap path used to empty.
+
+    Genuine shortfall (limit > remaining followed rows) still logs.
+    """
     caplog.set_level(logging.INFO)
     with storage.connect() as conn:
         _leaves, _active, _stale = _seed_depleted_lineage(conn)
-        monkeypatch.setattr(storage, "_SCAN_CAP", 3)
+        monkeypatch.setattr(storage, "_SCAN_WINDOW", 3)
+        monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 100)
 
-        results = storage.list_memories(conn, limit=2, follow="active")
+        filled = storage.list_memories(conn, limit=2, follow="active")
+        assert len(filled) == 2, "windowed continuation should refill past a 3-row window"
 
-        assert results == []
-        assert "candidate scan reached cap=3" in caplog.text
-        assert "requested=2 delivered=0 candidate_window=3" in caplog.text
+        short = storage.list_memories(conn, limit=20, follow="active")
+        assert len(short) < 20
+        assert "requested=20 delivered=" in caplog.text
 
 
 @pytest.mark.parametrize("path", ["semantic", "hybrid"])
@@ -572,6 +578,79 @@ def test_ranked_follow_overfetch_fills_limit_without_duplicates(
         assert len(ids) == 3, f"lineage filtering depleted {path} below top_k"
         assert ids == expected, f"{path} lineage processing changed stable rank order"
         assert len(ids) == len(set(ids)), f"{path} lineage processing returned duplicates"
+
+
+def _seed_superseded_head_active_tail(conn, n_stale: int, n_active: int):
+    """Newest rows are superseded; current rows sit past that head."""
+    leaf = storage.add_memory(conn, content="Current lineage leaf for windowed list")
+    stale = [
+        storage.add_memory(conn, content=f"Stale window-head memory {i} extra words")
+        for i in range(n_stale)
+    ]
+    for old in stale:
+        storage.add_link(conn, leaf["id"], old["id"], edge_type="supersedes")
+    active = [
+        storage.add_memory(conn, content=f"Active window-tail memory {i} extra words")
+        for i in range(n_active)
+    ]
+    for rank, memory in enumerate(stale):
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (f"2030-01-01 00:00:{rank:02d}", memory["id"]),
+        )
+    conn.execute(
+        "UPDATE memories SET created_at = ? WHERE id = ?",
+        ("2025-01-01 00:00:00", leaf["id"]),
+    )
+    for rank, memory in enumerate(active):
+        conn.execute(
+            "UPDATE memories SET created_at = ? WHERE id = ?",
+            (f"2020-01-01 00:00:{rank:02d}", memory["id"]),
+        )
+    conn.commit()
+    return leaf, stale, active
+
+
+@pytest.mark.parametrize("follow", ["active", "latest"])
+def test_list_follow_windows_past_old_scan_cap(local_db, monkeypatch, follow):
+    """Deep pages must keep scanning windows; mutation: single 5000 cap under-fills."""
+    monkeypatch.setattr(storage, "_SCAN_WINDOW", 4)
+    monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 100)
+    with storage.connect() as conn:
+        leaf, _stale, active = _seed_superseded_head_active_tail(conn, n_stale=8, n_active=3)
+        page = storage.list_memories(conn, limit=3, offset=0, follow=follow)
+        ids = [row["id"] for row in page]
+        assert len(ids) == 3, (
+            "windowed follow scan failed to refill past a superseded-heavy head "
+            "(mutation: restore single-window _SCAN_CAP fetch and this goes red)"
+        )
+        assert leaf["id"] in ids or all(i in {m["id"] for m in active} | {leaf["id"]} for i in ids)
+        assert len(ids) == len(set(ids))
+
+
+@pytest.mark.parametrize("follow", ["active", "latest"])
+def test_list_follow_page_boundaries_do_not_repeat_or_skip(local_db, monkeypatch, follow):
+    monkeypatch.setattr(storage, "_SCAN_WINDOW", 4)
+    monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 100)
+    with storage.connect() as conn:
+        _seed_superseded_head_active_tail(conn, n_stale=8, n_active=3)
+        page1 = storage.list_memories(conn, limit=2, offset=0, follow=follow)
+        page2 = storage.list_memories(conn, limit=2, offset=2, follow=follow)
+        full = storage.list_memories(conn, limit=4, offset=0, follow=follow)
+        ids1 = [row["id"] for row in page1]
+        ids2 = [row["id"] for row in page2]
+        ids_full = [row["id"] for row in full]
+        assert ids1 + ids2 == ids_full
+        assert set(ids1).isdisjoint(ids2)
+
+
+def test_list_follow_hard_cap_errors_loudly(local_db, monkeypatch):
+    monkeypatch.setattr(storage, "_SCAN_WINDOW", 3)
+    monkeypatch.setattr(storage, "_SCAN_HARD_CAP", 6)
+    with storage.connect() as conn:
+        _seed_superseded_head_active_tail(conn, n_stale=9, n_active=1)
+        with pytest.raises(storage.LineageScanLimitError, match="hard cap"):
+            storage.list_memories(conn, limit=1, offset=0, follow="active")
 
 
 def test_tag_whitelist_enforcement(local_db, monkeypatch):

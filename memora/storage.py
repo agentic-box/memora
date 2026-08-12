@@ -2490,6 +2490,7 @@ def apply_follow(
     results: List[Dict[str, Any]],
     follow: str,
     is_search: bool = False,
+    seen_ids: Optional[set[int]] = None,
 ) -> List[Dict[str, Any]]:
     """Apply lineage-aware post-processing to retrieval results.
 
@@ -2498,6 +2499,8 @@ def apply_follow(
         results: List of memory dicts (or search results with {score, memory} envelope)
         follow: Follow mode — "latest", "active", or "full_history"
         is_search: If True, results are {score, memory} envelopes
+        seen_ids: Optional shared set so windowed list scans can dedupe
+            latest leaves across successive candidate windows.
 
     Returns:
         Transformed results list
@@ -2523,7 +2526,8 @@ def apply_follow(
         return [item for item in results if not _is_superseded(conn, _get_id(item))]
 
     if follow == "latest":
-        seen_ids: set[int] = set()
+        if seen_ids is None:
+            seen_ids = set()
         out: List[Dict[str, Any]] = []
         for item in results:
             leaf_ids = _resolve_latest(conn, _get_id(item))
@@ -4292,7 +4296,13 @@ def _parse_date_filter(date_str: str) -> str:
 
 
 _SCAN_CAP = 5000
+_SCAN_WINDOW = 5000
+_SCAN_HARD_CAP = 100_000
 _FOLLOW_OVERFETCH_FACTOR = 3
+
+
+class LineageScanLimitError(RuntimeError):
+    """Follow pagination hit the hard raw-row bound before the page could be filled."""
 
 
 def _follow_candidate_limit(requested: Optional[int], follow: Optional[str]) -> Optional[int]:
@@ -4318,79 +4328,38 @@ def _log_follow_shortfall(
         )
 
 
-def list_memories(
+def _list_memory_sql_rows(
     conn: sqlite3.Connection,
-    query: Optional[str] = None,
-    metadata_filters: Optional[Dict[str, Any]] = None,
-    limit: Optional[int] = None,
-    offset: Optional[int] = 0,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    tags_any: Optional[List[str]] = None,
-    tags_all: Optional[List[str]] = None,
-    tags_none: Optional[List[str]] = None,
-    sort_by_importance: bool = False,
-    follow: Optional[str] = None,
-) -> List[Dict[str, Any]]:
-    validated_filters = _validate_metadata_filters(metadata_filters)
-    limit = _clamp_limit(limit)
-    offset = _clamp_offset(offset) or 0
-
-    # When post-SQL filters are active (tags_*/metadata_filters), SQL
-    # LIMIT/OFFSET would truncate BEFORE filtering, giving wrong pagination.
-    # In that case: fetch up to _SCAN_CAP rows from SQL (no LIMIT/OFFSET),
-    # filter in Python, then apply offset/limit to filtered results.
-    lineage_filters_results = follow in {"active", "latest"}
-    has_post_sql_filters = bool(
-        validated_filters or tags_any or tags_all or tags_none or lineage_filters_results
-    )
-
-    rows: List[sqlite3.Row]
-
-    # Parse date filters
-    parsed_date_from = _parse_date_filter(date_from) if date_from else None
-    parsed_date_to = _parse_date_filter(date_to) if date_to else None
-
-    # Build date filter clauses (one with alias 'm.' for FTS, one without for regular queries)
-    date_clause_fts = ""  # For FTS queries using alias 'm'
-    date_clause_plain = ""  # For non-FTS queries
-    date_params = []
-
-    if parsed_date_from:
-        date_clause_fts += " AND m.created_at >= ?"
-        date_clause_plain += " AND created_at >= ?"
-        date_params.append(parsed_date_from)
-    if parsed_date_to:
-        date_clause_fts += " AND m.created_at <= ?"
-        date_clause_plain += " AND created_at <= ?"
-        date_params.append(parsed_date_to)
-
-    # Build LIMIT/OFFSET clause — skip when post-SQL filters are active
+    *,
+    query: Optional[str],
+    date_clause_fts: str,
+    date_clause_plain: str,
+    date_params: List[Any],
+    sql_limit: Optional[int],
+    sql_offset: int,
+    tiebreak_id: bool,
+) -> List[sqlite3.Row]:
+    """Fetch one ordered page of raw memory rows (pre-Python filters)."""
     limit_clause = ""
-    limit_params = []
-    if has_post_sql_filters:
-        # Fetch up to scan cap; filtering + offset/limit applied in Python below
+    limit_params: List[Any] = []
+    if sql_limit is not None:
         limit_clause = " LIMIT ?"
-        limit_params.append(_SCAN_CAP)
-    elif limit is not None:
-        limit_clause = " LIMIT ?"
-        limit_params.append(limit)
-        if offset:
+        limit_params.append(sql_limit)
+        if sql_offset:
             limit_clause += " OFFSET ?"
-            limit_params.append(offset)
+            limit_params.append(sql_offset)
 
-    # Column list including importance fields
     cols_fts = "m.id, m.content, m.metadata, m.tags, m.created_at, m.updated_at, m.importance, m.last_accessed, m.access_count"
     cols_plain = "id, content, metadata, tags, created_at, updated_at, importance, last_accessed, access_count"
-
-    # Order clause - use safe whitelist guard
     order_fts = _safe_order_clause("created_at", "DESC", "fts")
     order_plain = _safe_order_clause("created_at", "DESC", "plain")
+    if tiebreak_id:
+        order_fts += ", " + _safe_order_clause("id", "DESC", "fts")
+        order_plain += ", " + _safe_order_clause("id", "DESC", "plain")
 
+    rows: List[sqlite3.Row] = []
     if query and _fts_enabled(conn):
-        # Sanitize query for FTS5: quote each term to avoid syntax errors
         fts_query = " ".join(f'"{t}"' for t in query.split() if t)
-        # Use full-text search when available. Fall back to LIKE if the query fails.
         try:
             rows = conn.execute(
                 f"""
@@ -4405,7 +4374,6 @@ def list_memories(
         except sqlite3.OperationalError:
             rows = []
     elif query:
-        # Search each word individually to avoid LIKE pattern complexity limits
         words = [w for w in query.split() if w]
         if words:
             word_clauses = " AND ".join(
@@ -4424,8 +4392,6 @@ def list_memories(
                 """,
                 (*word_params, *date_params, *limit_params),
             ).fetchall()
-        else:
-            rows = []
     else:
         where_clause = " WHERE 1=1" + date_clause_plain if date_clause_plain else ""
         rows = conn.execute(
@@ -4433,8 +4399,6 @@ def list_memories(
             tuple([*date_params, *limit_params]),
         ).fetchall()
 
-    # If the FTS search yielded nothing because of an SQLite error (e.g. malformed query)
-    # fall back to a LIKE search for resilience.
     if query and _fts_enabled(conn) and not rows:
         words = [w for w in query.split() if w]
         if words:
@@ -4457,66 +4421,167 @@ def list_memories(
                 ).fetchall()
             except sqlite3.OperationalError:
                 rows = []
+    return rows
 
-    if lineage_filters_results and len(rows) >= _SCAN_CAP:
-        logger.warning(
-            "list follow candidate scan reached cap=%d; deeper rows may be omitted",
-            _SCAN_CAP,
+
+def _records_pass_post_sql_filters(
+    record: Dict[str, Any],
+    validated_filters: Optional[Dict[str, Any]],
+    tags_any: Optional[List[str]],
+    tags_all: Optional[List[str]],
+    tags_none: Optional[List[str]],
+) -> bool:
+    if validated_filters and not _metadata_matches_filters(record.get("metadata"), validated_filters):
+        return False
+    record_tags = set(record.get("tags", []))
+    if tags_any and not any(tag in record_tags for tag in tags_any):
+        return False
+    if tags_all and not all(tag in record_tags for tag in tags_all):
+        return False
+    if tags_none and any(tag in record_tags for tag in tags_none):
+        return False
+    return True
+
+
+def list_memories(
+    conn: sqlite3.Connection,
+    query: Optional[str] = None,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    offset: Optional[int] = 0,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+    sort_by_importance: bool = False,
+    follow: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    validated_filters = _validate_metadata_filters(metadata_filters)
+    limit = _clamp_limit(limit)
+    offset = _clamp_offset(offset) or 0
+
+    # When post-SQL filters are active (tags_*/metadata_filters), SQL
+    # LIMIT/OFFSET would truncate BEFORE filtering, giving wrong pagination.
+    # Lineage (active/latest) is also post-SQL: windowed continuation below.
+    lineage_filters_results = follow in {"active", "latest"}
+    has_post_sql_filters = bool(
+        validated_filters or tags_any or tags_all or tags_none or lineage_filters_results
+    )
+
+    parsed_date_from = _parse_date_filter(date_from) if date_from else None
+    parsed_date_to = _parse_date_filter(date_to) if date_to else None
+
+    date_clause_fts = ""
+    date_clause_plain = ""
+    date_params: List[Any] = []
+    if parsed_date_from:
+        date_clause_fts += " AND m.created_at >= ?"
+        date_clause_plain += " AND created_at >= ?"
+        date_params.append(parsed_date_from)
+    if parsed_date_to:
+        date_clause_fts += " AND m.created_at <= ?"
+        date_clause_plain += " AND created_at <= ?"
+        date_params.append(parsed_date_to)
+
+    fetch_kwargs = dict(
+        query=query,
+        date_clause_fts=date_clause_fts,
+        date_clause_plain=date_clause_plain,
+        date_params=date_params,
+        tiebreak_id=lineage_filters_results,
+    )
+
+    if lineage_filters_results:
+        # Windowed continuation: keep scanning bounded windows until the
+        # followed page is filled, or raise when the hard raw-row bound bites.
+        followed: List[Dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        raw_scanned = 0
+        needed = None if sort_by_importance or limit is None else offset + limit
+        while True:
+            remaining_budget = _SCAN_HARD_CAP - raw_scanned
+            if remaining_budget <= 0:
+                raise LineageScanLimitError(
+                    f"list follow scan exceeded hard cap={_SCAN_HARD_CAP} "
+                    f"before filling offset={offset} limit={limit}"
+                )
+            window = min(_SCAN_WINDOW, remaining_budget)
+            rows = _list_memory_sql_rows(
+                conn, sql_limit=window, sql_offset=raw_scanned, **fetch_kwargs
+            )
+            if not rows:
+                break
+            raw_scanned += len(rows)
+            batch = [
+                rec
+                for rec in (_serialise_row(row) for row in rows)
+                if _records_pass_post_sql_filters(
+                    rec, validated_filters, tags_any, tags_all, tags_none
+                )
+            ]
+            batch = apply_follow(
+                conn, batch, follow, is_search=False, seen_ids=seen_ids
+            )
+            followed.extend(batch)
+            exhausted = len(rows) < window
+            if needed is not None and len(followed) >= needed:
+                break
+            if exhausted:
+                break
+            if raw_scanned >= _SCAN_HARD_CAP and not exhausted:
+                if needed is None or len(followed) < needed:
+                    raise LineageScanLimitError(
+                        f"list follow scan exceeded hard cap={_SCAN_HARD_CAP} "
+                        f"before filling offset={offset} limit={limit} "
+                        f"(followed={len(followed)})"
+                    )
+                break
+
+        records = followed
+        if sort_by_importance:
+            records.sort(key=lambda r: r.get("importance_score", 0.0), reverse=True)
+        if offset:
+            records = records[offset:]
+        if limit is not None:
+            records = records[:limit]
+        _log_follow_shortfall("list", limit, len(records), raw_scanned)
+        return records
+
+    if has_post_sql_filters:
+        rows = _list_memory_sql_rows(
+            conn, sql_limit=_SCAN_CAP, sql_offset=0, **fetch_kwargs
+        )
+    elif limit is not None:
+        rows = _list_memory_sql_rows(
+            conn, sql_limit=limit, sql_offset=offset, **fetch_kwargs
+        )
+    else:
+        rows = _list_memory_sql_rows(
+            conn, sql_limit=None, sql_offset=0, **fetch_kwargs
         )
 
-    records: List[Dict[str, Any]] = []
-    for row in rows:
-        record = _serialise_row(row)
-        if validated_filters and not _metadata_matches_filters(record.get("metadata"), validated_filters):
-            continue
+    records = [
+        rec
+        for rec in (_serialise_row(row) for row in rows)
+        if _records_pass_post_sql_filters(
+            rec, validated_filters, tags_any, tags_all, tags_none
+        )
+    ]
 
-        # Apply tag filters
-        record_tags = set(record.get("tags", []))
-
-        # tags_any: match if ANY of the specified tags are present (OR logic)
-        if tags_any:
-            if not any(tag in record_tags for tag in tags_any):
-                continue
-
-        # tags_all: match only if ALL of the specified tags are present (AND logic)
-        if tags_all:
-            if not all(tag in record_tags for tag in tags_all):
-                continue
-
-        # tags_none: exclude if ANY of the specified tags are present (NOT logic)
-        if tags_none:
-            if any(tag in record_tags for tag in tags_none):
-                continue
-
-        records.append(record)
-
-    # Sort by importance score if requested
     if sort_by_importance:
         records.sort(key=lambda r: r.get("importance_score", 0.0), reverse=True)
 
-    # Active/latest can filter or deduplicate ranked rows, so resolve lineage
-    # before Python pagination. SQL fetched a bounded candidate pool above.
-    if lineage_filters_results:
-        records = apply_follow(conn, records, follow, is_search=False)
-
-    # When post-SQL filters were active, apply offset/limit to the fully
-    # filtered result set (SQL LIMIT/OFFSET was skipped above).
     if has_post_sql_filters:
         if offset:
             records = records[offset:]
         if limit is not None:
             records = records[:limit]
 
-    # Full-history expansion intentionally remains after pagination and is
-    # capped. Active/latest were already processed before pagination above.
-    if follow and not lineage_filters_results:
+    if follow:
         records = apply_follow(conn, records, follow, is_search=False)
-        # Cap full_history expansion to prevent unbounded response size
         if follow == "full_history" and limit is not None and len(records) > limit * 3:
             records = records[:limit * 3]
-
-    if lineage_filters_results:
-        _log_follow_shortfall("list", limit, len(records), _SCAN_CAP)
 
     return records
 
