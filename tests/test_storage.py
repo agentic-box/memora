@@ -1,6 +1,8 @@
 """Regression tests for core storage operations."""
 
+import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -582,3 +584,34 @@ def test_tag_whitelist_enforcement(local_db, monkeypatch):
             assert False, "Expected ValueError for invalid tag"
         except ValueError as e:
             assert "not-allowed" in str(e).lower() or "whitelist" in str(e).lower() or "allowed" in str(e).lower()
+
+
+def _tag_conformance_cases():
+    fixture = Path(__file__).parent / "fixtures" / "tag_policy_conformance.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("case", _tag_conformance_cases(), ids=lambda c: c["id"])
+def test_tag_policy_conformance_fixture(case):
+    allowed = storage.tag_matches_policy(case["tag"], case["policy"])
+    assert allowed is case["expected"], (
+        f"{case['id']}: policy={case['policy']!r} tag={case['tag']!r} "
+        f"expected {case['expected']} got {allowed} "
+        "(mutation: revert matcher to dot-only .* and slash cases go red)"
+    )
+
+
+def test_tag_length_cap_rejects_overlong(monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    too_long = "x" * (storage.MAX_TAG_LENGTH + 1)
+    with pytest.raises(ValueError, match="maximum length"):
+        storage._validate_tags([too_long])
+
+
+def test_slash_namespace_wildcard_allows_memora_family(local_db, monkeypatch):
+    monkeypatch.setattr(memora, "TAG_WHITELIST", {"memora/*"})
+    with storage.connect() as conn:
+        row = storage.add_memory(
+            conn, content="Slash namespace tag should pass memora/*", tags=["memora/issues"]
+        )
+        assert "memora/issues" in row["tags"]

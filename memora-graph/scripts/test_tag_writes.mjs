@@ -3,14 +3,43 @@
  * Run: node --experimental-strip-types scripts/test_tag_writes.mjs
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { executeToolCall } from "../functions/api/chat.ts";
 import { onRequestPatch } from "../functions/api/memories/[id].ts";
+import {
+  MAX_TAG_LENGTH,
+  tagMatchesPolicy,
+  validateTags,
+} from "../functions/api/_tags.ts";
 
 const VALID_POLICY = JSON.stringify({
   version: 1,
   allow_any: false,
-  tags: ["deploy", "project.*"],
+  tags: ["deploy", "project.*", "memora/*"],
 });
+
+const CONFORMANCE = JSON.parse(
+  readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/tag_policy_conformance.json"),
+    "utf8",
+  ),
+);
+for (const caseRow of CONFORMANCE) {
+  const allowed = tagMatchesPolicy(caseRow.tag, caseRow.policy);
+  assert(
+    allowed === caseRow.expected,
+    `conformance ${caseRow.id}: policy=${JSON.stringify(caseRow.policy)} tag=${caseRow.tag} expected ${caseRow.expected} got ${allowed}`,
+  );
+}
+
+{
+  const tooLong = "x".repeat(MAX_TAG_LENGTH + 1);
+  const result = validateTags([tooLong], { version: 1, allow_any: true, tags: [] });
+  assert(result.ok === false && result.error === "invalid_tags", "overlong tag rejected even when allow_any");
+}
 
 let failed = 0;
 function assert(condition, message) {
@@ -102,6 +131,12 @@ async function patch(db, tags) {
   const response = await patch(db, [" deploy ", "project.child"]);
   assert(response.status === 200, "PATCH accepts exact and wildcard policy tags");
   assert(db.memory.tags === '["deploy","project.child"]', "PATCH stores trimmed validated tags");
+}
+
+{
+  const db = new FakeDb();
+  const response = await patch(db, ["memora/issues"]);
+  assert(response.status === 200, "PATCH accepts slash-namespace wildcard tags");
 }
 
 // NC2: policy absence/malformed content must fail closed, never allow-any.

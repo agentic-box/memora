@@ -46,6 +46,28 @@ export async function loadTagPolicy(db: D1Database): Promise<TagPolicyResult> {
   }
 }
 
+export const MAX_TAG_LENGTH = 100;
+
+/** Separator-specific wildcard: prefix.* / prefix/* ; no bare-* catch-all. */
+export function tagMatchesPattern(tag: string, pattern: string): boolean {
+  if (pattern.endsWith(".*")) {
+    const prefix = pattern.slice(0, -2);
+    if (!prefix) return false;
+    return tag === prefix || tag.startsWith(prefix + ".");
+  }
+  if (pattern.endsWith("/*")) {
+    const prefix = pattern.slice(0, -2);
+    if (!prefix) return false;
+    return tag === prefix || tag.startsWith(prefix + "/");
+  }
+  if (pattern === "*") return false;
+  return tag === pattern;
+}
+
+export function tagMatchesPolicy(tag: string, policyTags: string[]): boolean {
+  return policyTags.some(pattern => tagMatchesPattern(tag, pattern));
+}
+
 export function validateTags(value: unknown, policy: TagPolicy): TagValidationResult {
   if (!Array.isArray(value)) {
     return { ok: false, error: "invalid_tags", message: "Tags must be an array." };
@@ -59,17 +81,19 @@ export function validateTags(value: unknown, policy: TagPolicy): TagValidationRe
     if (!tag) {
       return { ok: false, error: "invalid_tags", message: "Tags cannot be empty strings." };
     }
+    if (tag.length > MAX_TAG_LENGTH) {
+      return {
+        ok: false,
+        error: "invalid_tags",
+        message: `Tag exceeds maximum length of ${MAX_TAG_LENGTH} characters`,
+      };
+    }
     tags.push(tag);
   }
   if (policy.allow_any) return { ok: true, tags };
 
-  const explicit = new Set(policy.tags.filter(tag => !tag.endsWith(".*")));
-  const wildcards = policy.tags
-    .filter(tag => tag.endsWith(".*"))
-    .map(tag => tag.slice(0, -2));
   for (const tag of tags) {
-    if (explicit.has(tag)) continue;
-    if (wildcards.some(prefix => tag === prefix || tag.startsWith(prefix + "."))) continue;
+    if (tagMatchesPolicy(tag, policy.tags)) continue;
     return {
       ok: false,
       error: "invalid_tags",

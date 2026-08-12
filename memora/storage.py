@@ -754,6 +754,38 @@ def _serialise_row(row: sqlite3.Row) -> Dict[str, Any]:
     return result
 
 
+MAX_TAG_LENGTH = 100
+
+
+def tag_matches_policy(tag: str, policy_tags: Iterable[str]) -> bool:
+    """Return True if tag is allowed by any policy entry.
+
+    Wildcard rules (separator-specific; no bare-* catch-all):
+    - ``prefix.*`` matches ``prefix`` or ``prefix.<suffix>``
+    - ``prefix/*`` matches ``prefix`` or ``prefix/<suffix>``
+    """
+    for pattern in policy_tags:
+        if _tag_matches_pattern(tag, pattern):
+            return True
+    return False
+
+
+def _tag_matches_pattern(tag: str, pattern: str) -> bool:
+    if pattern.endswith(".*"):
+        prefix = pattern[:-2]
+        if not prefix:
+            return False
+        return tag == prefix or tag.startswith(prefix + ".")
+    if pattern.endswith("/*"):
+        prefix = pattern[:-2]
+        if not prefix:
+            return False
+        return tag == prefix or tag.startswith(prefix + "/")
+    if pattern == "*":
+        return False
+    return tag == pattern
+
+
 def _validate_tags(tags: Optional[Iterable[str]]) -> List[str]:
     if tags is None:
         return []
@@ -764,6 +796,10 @@ def _validate_tags(tags: Optional[Iterable[str]]) -> List[str]:
         stripped = tag.strip()
         if not stripped:
             raise ValueError("Tags cannot be empty strings")
+        if len(stripped) > MAX_TAG_LENGTH:
+            raise ValueError(
+                f"Tag exceeds maximum length of {MAX_TAG_LENGTH} characters"
+            )
         validated.append(stripped)
     return validated
 
@@ -947,13 +983,8 @@ def _enforce_tag_whitelist(tags: List[str]) -> None:
     if not TAG_WHITELIST:
         return
 
-    explicit = {tag for tag in TAG_WHITELIST if not tag.endswith('.*')}
-    wildcards = [tag[:-2] for tag in TAG_WHITELIST if tag.endswith('.*')]
-
     for tag in tags:
-        if tag in explicit:
-            continue
-        if any(tag == prefix or tag.startswith(prefix + '.') for prefix in wildcards):
+        if tag_matches_policy(tag, TAG_WHITELIST):
             continue
         raise ValueError(f"Tag '{tag}' is not in the allowed tag list")
 
@@ -4515,8 +4546,7 @@ def find_invalid_tag_entries(
     if not allowed:
         return []
 
-    explicit = {tag for tag in allowed if not tag.endswith('.*')}
-    wildcards = [tag[:-2] for tag in allowed if tag.endswith('.*')]
+    # Matching uses tag_matches_policy (dot and slash namespace wildcards).
 
     invalid: List[Dict[str, Any]] = []
     rows = conn.execute("SELECT id, tags FROM memories")
@@ -4533,9 +4563,7 @@ def find_invalid_tag_entries(
         for tag in parsed:
             if not isinstance(tag, str):
                 continue
-            if tag in explicit:
-                continue
-            if any(tag == prefix or tag.startswith(prefix + '.') for prefix in wildcards):
+            if tag_matches_policy(tag, allowed):
                 continue
             bad.append(tag)
         if bad:
