@@ -1059,9 +1059,24 @@ function populateMonths(all) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
-const TL_TYPE_SUPERSEDED = "__superseded";
-const TL_TYPE_DUPLICATED = "__duplicated";
-const isSpecialTlType = (ty) => ty === TL_TYPE_SUPERSEDED || ty === TL_TYPE_DUPLICATED;
+function selectedTlFilter() {
+  const sel = el("tltype");
+  const opt = sel && sel.options[sel.selectedIndex];
+  if (!opt) return { kind: "all" };
+  const kind = opt.dataset.tlkind || "all";
+  if (kind === "type") return { kind: "type", type: opt.value };
+  return { kind };
+}
+
+function addTlOption(sel, kind, value, label) {
+  const o = document.createElement("option");
+  o.dataset.tlkind = kind;
+  // Special filters live in dataset.tlkind only — never in the type-value namespace.
+  o.value = kind === "type" ? value : "";
+  o.textContent = label;
+  sel.appendChild(o);
+  return o;
+}
 
 function populateTypes(all) {
   const cnt = {};
@@ -1069,12 +1084,20 @@ function populateTypes(all) {
   const types = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]);
   const nSup = all.filter(m => m._superseded).length;
   const nDup = all.filter(m => m._dupe).length;
-  const sel = el("tltype"), cur = sel.value;
-  sel.innerHTML = `<option value="">All types</option>`
-    + types.map(t => `<option value="${t}">${t} (${cnt[t]})</option>`).join("")
-    + `<option value="${TL_TYPE_SUPERSEDED}">SUPERSEDED (${nSup})</option>`
-    + `<option value="${TL_TYPE_DUPLICATED}">DUPLICATED (${nDup})</option>`;
-  sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
+  const sel = el("tltype");
+  const prev = selectedTlFilter();
+  while (sel.firstChild) sel.removeChild(sel.firstChild);
+  addTlOption(sel, "all", "", "All types");
+  for (const t of types) addTlOption(sel, "type", t, t + " (" + cnt[t] + ")");
+  addTlOption(sel, "superseded", "", "SUPERSEDED (" + nSup + ")");
+  addTlOption(sel, "duplicated", "", "DUPLICATED (" + nDup + ")");
+  let idx = 0;
+  for (let i = 0; i < sel.options.length; i++) {
+    const o = sel.options[i];
+    if (prev.kind === "type" && o.dataset.tlkind === "type" && o.value === prev.type) idx = i;
+    else if (prev.kind !== "type" && o.dataset.tlkind === prev.kind) idx = i;
+  }
+  sel.selectedIndex = idx;
 }
 
 // Normalize an issue's OR todo's status to open/closed. Closed covers every
@@ -1105,11 +1128,12 @@ function drawTimeline() {
   }
 
   populateYears(all); populateMonths(all); populateTypes(all);
-  const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
+  const yr = el("tlyear").value, mo = el("tlmonth").value;
+  const filt = selectedTlFilter();
   // The status sub-select only applies to (and only shows for) status-bearing
   // types (issue, todo). Special lineage/dupe filters are not types.
   const stSel = el("tlstatus");
-  const showStatus = hasStatusFilter(ty);
+  const showStatus = filt.kind === "type" && hasStatusFilter(filt.type);
   stSel.style.display = showStatus ? "" : "none";
   if (!showStatus && stSel.value) stSel.value = "";
   const st = showStatus ? stSel.value : "";
@@ -1117,17 +1141,18 @@ function drawTimeline() {
   let pool = all;
   // F1: when lineage unavailable, never pretend current-only filtering works.
   // H2: current-only excludes BOTH superseded and per-node authority_unknown.
-  // Special filters must still reveal their rows when the canvas is current-only.
-  if (lineageAvailable() && !showLineage() && !isSpecialTlType(ty)) {
+  // SUPERSEDED is the only filter that bypasses current-only (empty-list paradox).
+  // DUPLICATED stays consistent with canvas "dupes only" and hides superseded dups.
+  if (lineageAvailable() && !showLineage() && filt.kind !== "superseded") {
     pool = pool.filter(m => !m._superseded && !m._unknown);
   }
   const rows = pool.filter(m => {
     if (yr && m.created.slice(0, 4) !== yr) return false;
     if (mo && m.created.slice(5, 7) !== mo) return false;
     if (favOnly && !isFav(m)) return false;
-    if (ty === TL_TYPE_SUPERSEDED) return !!m._superseded;
-    if (ty === TL_TYPE_DUPLICATED) return !!m._dupe;
-    if (ty && typeOf(m) !== ty) return false;
+    if (filt.kind === "superseded") return !!m._superseded;
+    if (filt.kind === "duplicated") return !!m._dupe;
+    if (filt.kind === "type" && typeOf(m) !== filt.type) return false;
     if (st && statusOf(m) !== st) return false;
     return true;
   });

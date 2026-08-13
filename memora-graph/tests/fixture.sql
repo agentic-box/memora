@@ -41,7 +41,11 @@ INSERT INTO memories (id, content, metadata, tags, created_at, updated_at) VALUE
  (6, 'Reviewers may commit fixes directly.',             '{"type":"fact"}', '["team"]',   '2026-05-05T10:00:00Z', '2026-05-05T10:00:00Z'),
  (7, 'Reviews are read-only; the leader applies fixes.', '{"type":"fact"}', '["team"]',   '2026-06-05T10:00:00Z', '2026-06-05T10:00:00Z'),
  (8, 'The cache TTL is fifteen minutes in production.',  '{"type":"fact"}', '["api"]',    '2026-07-05T10:00:00Z', '2026-07-05T10:00:00Z'),
- (9, 'The cache TTL is 15 minutes in production.',       '{"type":"fact"}', '["api"]',    '2026-07-06T10:00:00Z', '2026-07-06T10:00:00Z');
+ (9, 'The cache TTL is 15 minutes in production.',       '{"type":"fact"}', '["api"]',    '2026-07-06T10:00:00Z', '2026-07-06T10:00:00Z'),
+ (10, 'A memory whose type collides with the old sentinel.', '{"type":"__superseded"}', '["api"]', '2026-08-01T10:00:00Z', '2026-08-01T10:00:00Z'),
+ (11, 'A memory whose type contains markup.', '{"type":"a\"><img src=x>"}', '["api"]', '2026-08-02T10:00:00Z', '2026-08-02T10:00:00Z'),
+ (12, 'Superseded duplicate of the cache TTL pair.', '{"type":"fact"}', '["api"]', '2026-08-03T10:00:00Z', '2026-08-03T10:00:00Z'),
+ (13, 'Current rewrite of the superseded duplicate.', '{"type":"fact"}', '["api"]', '2026-08-04T10:00:00Z', '2026-08-04T10:00:00Z');
 
 -- #3 supersedes #2 (both halves present, the healthy case)
 -- #2 supersedes #1 (both halves present)
@@ -55,5 +59,9 @@ INSERT INTO memories_crossrefs (memory_id, related) VALUES
  (5, '[{"id":4,"score":0.77,"edge_type":"contradicts"}]'),
  (6, '[{"id":7,"score":0.83,"edge_type":"superseded_by"}]'),
  (7, '[]'),
- (8, '[{"id":9,"score":0.93,"edge_type":"related_to"}]'),
- (9, '[{"id":8,"score":0.93,"edge_type":"related_to"}]');
+ (8, '[{"id":9,"score":0.93,"edge_type":"related_to"},{"id":12,"score":0.91,"edge_type":"related_to"}]'),
+ (9, '[{"id":8,"score":0.93,"edge_type":"related_to"}]'),
+ (10, '[]'),
+ (11, '[]'),
+ (12, '[{"id":8,"score":0.91,"edge_type":"related_to"},{"id":13,"score":0.9,"edge_type":"superseded_by"}]'),
+ (13, '[{"id":12,"score":0.9,"edge_type":"supersedes"}]');

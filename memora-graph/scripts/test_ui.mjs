@@ -16,7 +16,7 @@ import { chromium } from "playwright";
 const BASE = process.argv[2] || "http://localhost:8788";
 const pass = [];
 const fail = [];
-const EXPECTED_CHECKS = 19;
+const EXPECTED_CHECKS = 25;
 const check = (name, ok, detail) =>
   (ok ? pass : fail).push(`${name}${detail ? ` — ${detail}` : ""}`);
 
@@ -225,36 +225,101 @@ const trowIds = () => page.$$eval(".trow .day", (els) =>
 const waitTimeline = async () => {
   await page.waitForFunction(() => document.querySelectorAll(".trow").length > 0, null, { timeout: 20000 });
 };
+const selectTl = async (kind, typeValue) => {
+  await page.evaluate(({ kind, typeValue }) => {
+    const sel = document.getElementById("tltype");
+    const i = [...sel.options].findIndex((o) =>
+      kind === "type"
+        ? o.dataset.tlkind === "type" && o.value === typeValue
+        : o.dataset.tlkind === kind);
+    if (i < 0) throw new Error("tltype option not found: " + kind + " " + (typeValue || ""));
+    sel.selectedIndex = i;
+    sel.dispatchEvent(new Event("change"));
+  }, { kind, typeValue });
+  await page.waitForTimeout(250);
+};
 await waitTimeline();
 const defaultIds = await trowIds();
-await page.selectOption("#tltype", "__superseded");
-await page.waitForTimeout(200);
+await selectTl("superseded");
 const supersededIds = await trowIds();
 const supersededStyled = await page.$$eval(".trow", (els) =>
   els.length > 0 && els.every((e) => e.classList.contains("superseded-row")));
 check(
   "force-graph: SUPERSEDED filter lists exactly the fixture superseded ids",
-  JSON.stringify(supersededIds) === JSON.stringify([1, 2, 6]) && supersededStyled,
+  JSON.stringify(supersededIds) === JSON.stringify([1, 2, 6, 12]) && supersededStyled,
   `got ${JSON.stringify(supersededIds)} styled=${supersededStyled}`,
 );
-await page.selectOption("#tltype", "__duplicated");
-await page.waitForTimeout(200);
+await selectTl("duplicated");
 const duplicatedIds = await trowIds();
 check(
   "force-graph: DUPLICATED filter lists exactly the fixture duplicate ids",
-  JSON.stringify(duplicatedIds) === JSON.stringify([8, 9]),
+  JSON.stringify(duplicatedIds) === JSON.stringify([8, 9, 12]),
   `got ${JSON.stringify(duplicatedIds)}`,
 );
-await page.selectOption("#tltype", "");
-await page.waitForTimeout(200);
+await selectTl("all");
 const restoredIds = await trowIds();
 check(
   "force-graph: All types restores the default timeline row set",
   JSON.stringify(restoredIds) === JSON.stringify(defaultIds) && defaultIds.length >= 7,
   `default=${JSON.stringify(defaultIds)} restored=${JSON.stringify(restoredIds)}`,
 );
-await page.selectOption("#tltype", "__superseded");
-await page.waitForTimeout(200);
+await selectTl("type", "__superseded");
+const collisionIds = await trowIds();
+check(
+  "force-graph: real type __superseded filters to that memory only",
+  JSON.stringify(collisionIds) === JSON.stringify([10]),
+  `got ${JSON.stringify(collisionIds)}`,
+);
+const xssType = 'a"><img src=x>';
+await selectTl("type", xssType);
+const xssIds = await trowIds();
+const selectClean = await page.$eval("#tltype", (sel) =>
+  sel.querySelectorAll("img, b").length === 0
+  && [...sel.options].some((o) => o.dataset.tlkind === "type" && o.value === 'a"><img src=x>'));
+check(
+  "force-graph: markup type option is unescaped-safe and filters exactly",
+  JSON.stringify(xssIds) === JSON.stringify([11]) && selectClean,
+  `got ${JSON.stringify(xssIds)} clean=${selectClean}`,
+);
+await selectTl("all");
+await page.evaluate(() => {
+  const box = document.getElementById("lineage");
+  if (box.checked) { box.checked = false; box.dispatchEvent(new Event("change")); }
+});
+await page.waitForTimeout(400);
+const hiddenSuperseded = await trowIds();
+check(
+  "force-graph: current-only All types excludes superseded ids",
+  [1, 2, 6, 12].every((id) => !hiddenSuperseded.includes(id)),
+  `got ${JSON.stringify(hiddenSuperseded)}`,
+);
+await selectTl("superseded");
+const revealed = await trowIds();
+check(
+  "force-graph: current-only SUPERSEDED still lists [1,2,6,12]",
+  JSON.stringify(revealed) === JSON.stringify([1, 2, 6, 12]),
+  `got ${JSON.stringify(revealed)}`,
+);
+await selectTl("all");
+const hiddenAgain = await trowIds();
+check(
+  "force-graph: All types after SUPERSEDED hides superseded again",
+  [1, 2, 6, 12].every((id) => !hiddenAgain.includes(id)),
+  `got ${JSON.stringify(hiddenAgain)}`,
+);
+await selectTl("duplicated");
+const dupsCurrentOnly = await trowIds();
+check(
+  "force-graph: current-only DUPLICATED hides superseded dups",
+  JSON.stringify(dupsCurrentOnly) === JSON.stringify([8, 9]),
+  `got ${JSON.stringify(dupsCurrentOnly)}`,
+);
+await page.evaluate(() => {
+  const box = document.getElementById("lineage");
+  if (!box.checked) { box.checked = true; box.dispatchEvent(new Event("change")); }
+});
+await selectTl("all");
+await selectTl("superseded");
 await page.click(".trow");
 await page.waitForTimeout(400);
 const panelOpen = await page.evaluate(() =>
@@ -264,7 +329,7 @@ check(
   panelOpen,
   await page.evaluate(() => document.querySelector("#panel h2")?.textContent || "no panel"),
 );
-await page.selectOption("#tltype", "");
+await selectTl("all");
 
 check("no uncaught page errors", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 
