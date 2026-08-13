@@ -16,7 +16,7 @@ import { chromium } from "playwright";
 const BASE = process.argv[2] || "http://localhost:8788";
 const pass = [];
 const fail = [];
-const EXPECTED_CHECKS = 15;
+const EXPECTED_CHECKS = 19;
 const check = (name, ok, detail) =>
   (ok ? pass : fail).push(`${name}${detail ? ` — ${detail}` : ""}`);
 
@@ -215,6 +215,56 @@ if (has3D) {
     "regression guard for the stuck-zoom bug that reverted the first attempt",
   );
 }
+
+// Timeline type filter: SUPERSEDED / DUPLICATED (keys graph supersededIds + duplicateIds).
+const trowIds = () => page.$$eval(".trow .day", (els) =>
+  els.map((e) => {
+    const m = e.textContent.match(/#(\d+)/);
+    return m ? Number(m[1]) : null;
+  }).filter((n) => n != null).sort((a, b) => a - b));
+const waitTimeline = async () => {
+  await page.waitForFunction(() => document.querySelectorAll(".trow").length > 0, null, { timeout: 20000 });
+};
+await waitTimeline();
+const defaultIds = await trowIds();
+await page.selectOption("#tltype", "__superseded");
+await page.waitForTimeout(200);
+const supersededIds = await trowIds();
+const supersededStyled = await page.$$eval(".trow", (els) =>
+  els.length > 0 && els.every((e) => e.classList.contains("superseded-row")));
+check(
+  "force-graph: SUPERSEDED filter lists exactly the fixture superseded ids",
+  JSON.stringify(supersededIds) === JSON.stringify([1, 2, 6]) && supersededStyled,
+  `got ${JSON.stringify(supersededIds)} styled=${supersededStyled}`,
+);
+await page.selectOption("#tltype", "__duplicated");
+await page.waitForTimeout(200);
+const duplicatedIds = await trowIds();
+check(
+  "force-graph: DUPLICATED filter lists exactly the fixture duplicate ids",
+  JSON.stringify(duplicatedIds) === JSON.stringify([8, 9]),
+  `got ${JSON.stringify(duplicatedIds)}`,
+);
+await page.selectOption("#tltype", "");
+await page.waitForTimeout(200);
+const restoredIds = await trowIds();
+check(
+  "force-graph: All types restores the default timeline row set",
+  JSON.stringify(restoredIds) === JSON.stringify(defaultIds) && defaultIds.length >= 7,
+  `default=${JSON.stringify(defaultIds)} restored=${JSON.stringify(restoredIds)}`,
+);
+await page.selectOption("#tltype", "__superseded");
+await page.waitForTimeout(200);
+await page.click(".trow");
+await page.waitForTimeout(400);
+const panelOpen = await page.evaluate(() =>
+  document.body.classList.contains("panel-open") && !!document.querySelector("#panel h2"));
+check(
+  "force-graph: SUPERSEDED row click still opens detail",
+  panelOpen,
+  await page.evaluate(() => document.querySelector("#panel h2")?.textContent || "no panel"),
+);
+await page.selectOption("#tltype", "");
 
 check("no uncaught page errors", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

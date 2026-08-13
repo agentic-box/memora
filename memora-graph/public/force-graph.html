@@ -1059,12 +1059,21 @@ function populateMonths(all) {
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
+const TL_TYPE_SUPERSEDED = "__superseded";
+const TL_TYPE_DUPLICATED = "__duplicated";
+const isSpecialTlType = (ty) => ty === TL_TYPE_SUPERSEDED || ty === TL_TYPE_DUPLICATED;
+
 function populateTypes(all) {
   const cnt = {};
   for (const m of all) { const t = typeOf(m); cnt[t] = (cnt[t] || 0) + 1; }
   const types = Object.keys(cnt).sort((a, b) => cnt[b] - cnt[a]);
+  const nSup = all.filter(m => m._superseded).length;
+  const nDup = all.filter(m => m._dupe).length;
   const sel = el("tltype"), cur = sel.value;
-  sel.innerHTML = `<option value="">All types</option>` + types.map(t => `<option value="${t}">${t} (${cnt[t]})</option>`).join("");
+  sel.innerHTML = `<option value="">All types</option>`
+    + types.map(t => `<option value="${t}">${t} (${cnt[t]})</option>`).join("")
+    + `<option value="${TL_TYPE_SUPERSEDED}">SUPERSEDED (${nSup})</option>`
+    + `<option value="${TL_TYPE_DUPLICATED}">DUPLICATED (${nDup})</option>`;
   sel.value = [...sel.options].some(o => o.value === cur) ? cur : "";
 }
 
@@ -1082,33 +1091,46 @@ function drawTimeline() {
   let all = mems.filter(m => m.created).slice().sort((a, b) => a.created < b.created ? 1 : -1);
   if (order === "asc") all.reverse();
 
+  // Re-sync flags from graph raw before populating counts / filtering
+  // (covers load race + lineage toggle). _dupe keys on raw.duplicateIds —
+  // the same canonical set the canvas "dupes only" toggle uses.
+  const supers = supersededSetFromRaw();
+  const authUnknown = authorityUnknownSetFromRaw();
+  const globalUnknown = !lineageAvailable();
+  const dupes = new Set((raw && raw.duplicateIds) || []);
+  for (const m of all) {
+    m._unknown = globalUnknown || authUnknown.has(m.id);
+    m._superseded = !globalUnknown && supers.has(m.id);
+    m._dupe = dupes.has(m.id);
+  }
+
   populateYears(all); populateMonths(all); populateTypes(all);
   const yr = el("tlyear").value, mo = el("tlmonth").value, ty = el("tltype").value;
   // The status sub-select only applies to (and only shows for) status-bearing
-  // types (issue, todo).
+  // types (issue, todo). Special lineage/dupe filters are not types.
   const stSel = el("tlstatus");
   const showStatus = hasStatusFilter(ty);
   stSel.style.display = showStatus ? "" : "none";
   if (!showStatus && stSel.value) stSel.value = "";
   const st = showStatus ? stSel.value : "";
   const favOnly = el("tlfav").classList.contains("active");
-  // M2/H2: re-sync flags from graph raw (covers load race + toggle), filter when lineage off.
-  const supers = supersededSetFromRaw();
-  const authUnknown = authorityUnknownSetFromRaw();
-  const globalUnknown = !lineageAvailable();
-  for (const m of all) {
-    m._unknown = globalUnknown || authUnknown.has(m.id);
-    m._superseded = !globalUnknown && supers.has(m.id);
-  }
   let pool = all;
   // F1: when lineage unavailable, never pretend current-only filtering works.
   // H2: current-only excludes BOTH superseded and per-node authority_unknown.
-  if (lineageAvailable() && !showLineage()) {
+  // Special filters must still reveal their rows when the canvas is current-only.
+  if (lineageAvailable() && !showLineage() && !isSpecialTlType(ty)) {
     pool = pool.filter(m => !m._superseded && !m._unknown);
   }
-  const rows = pool.filter(m =>
-    (!yr || m.created.slice(0, 4) === yr) && (!mo || m.created.slice(5, 7) === mo) &&
-    (!ty || typeOf(m) === ty) && (!st || statusOf(m) === st) && (!favOnly || isFav(m)));
+  const rows = pool.filter(m => {
+    if (yr && m.created.slice(0, 4) !== yr) return false;
+    if (mo && m.created.slice(5, 7) !== mo) return false;
+    if (favOnly && !isFav(m)) return false;
+    if (ty === TL_TYPE_SUPERSEDED) return !!m._superseded;
+    if (ty === TL_TYPE_DUPLICATED) return !!m._dupe;
+    if (ty && typeOf(m) !== ty) return false;
+    if (st && statusOf(m) !== st) return false;
+    return true;
+  });
   el("tlhead").querySelector("h2").textContent = `Timeline (${rows.length})`;
 
   const list = el("tllist"); list.innerHTML = ""; rowById = {}; activeRow = null; let cur = "";
