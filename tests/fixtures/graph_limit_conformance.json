@@ -1,0 +1,12 @@
+[
+  { "id": "float", "value": "2.5", "valid": false },
+  { "id": "blank", "value": " ", "valid": false },
+  { "id": "empty", "value": "", "valid": false },
+  { "id": "padded", "value": " 3 ", "valid": true, "expected": 3 },
+  { "id": "plus", "value": "+3", "valid": false },
+  { "id": "minus", "value": "-3", "valid": false },
+  { "id": "leading_zeros", "value": "0003", "valid": true, "expected": 3 },
+  { "id": "scientific", "value": "1e3", "valid": false },
+  { "id": "arabic_digit", "value": "٣", "valid": false },
+  { "id": "huge", "value": "123456789012", "valid": true, "expected": 123456789012 }
+]

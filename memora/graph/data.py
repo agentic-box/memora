@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from datetime import datetime, timedelta
 from importlib.metadata import version as get_version
 from typing import Any, Dict, List, Optional
@@ -50,9 +51,63 @@ DUPLICATE_THRESHOLD = 0.85
 # Node cap for the graph ?limit= parameter. Without an explicit ?limit the
 # response is capped at DEFAULT_GRAPH_LIMIT so a large store can't produce an
 # unbounded graph that stalls the renderer. An explicit ?limit may raise this
-# up to GRAPH_LIMIT_MAX; higher values clamp.
+# up to GRAPH_LIMIT_MAX; higher values clamp. Both are overridable via the
+# GRAPH_DEFAULT_LIMIT / GRAPH_LIMIT_MAX environment variables; the effective
+# default is clamped to the effective max (min(default, max)).
 DEFAULT_GRAPH_LIMIT = 2000
 GRAPH_LIMIT_MAX = 5000
+
+# Shared ?limit= grammar: ASCII digits only, optional surrounding whitespace,
+# no sign. Used by both the Python producer and the Pages endpoint.
+_GRAPH_LIMIT_RE = re.compile(r"^[0-9]+$")
+
+# Sentinel for an invalid ?limit= value (malformed, non-ASCII, signed, or 0).
+_INVALID_LIMIT = object()
+
+
+def parse_graph_limit_value(raw: str | None):
+    """Parse a present ?limit= value under the shared ASCII-digit grammar.
+
+    ``raw`` is the query value (may be None/empty). Returns an int when the
+    value is a valid positive integer (after trim), or the ``_INVALID_LIMIT``
+    sentinel otherwise. The result is NOT clamped here — clamping to the
+    effective max happens in :func:`get_graph_data`.
+    """
+    if raw is None:
+        return None
+    s = raw.strip()
+    if not _GRAPH_LIMIT_RE.match(s):
+        return _INVALID_LIMIT
+    value = int(s)
+    if value <= 0:
+        return _INVALID_LIMIT
+    return value
+
+
+def _env_positive_int(name: str, fallback: int) -> int:
+    """Read a positive-int env override under the shared grammar.
+
+    Malformed (non-ASCII, signed, unsafe) or non-positive values fall back to
+    the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return fallback
+    s = raw.strip()
+    if not _GRAPH_LIMIT_RE.match(s):
+        return fallback
+    try:
+        value = int(s)
+    except ValueError:
+        return fallback
+    return value if value > 0 else fallback
+
+
+def resolve_graph_limits() -> tuple:
+    """Resolve (effective_default, effective_max) from env, default <= max."""
+    default = _env_positive_int("GRAPH_DEFAULT_LIMIT", DEFAULT_GRAPH_LIMIT)
+    maximum = _env_positive_int("GRAPH_LIMIT_MAX", GRAPH_LIMIT_MAX)
+    return min(default, maximum), maximum
 
 # Stale styling
 STALE_COLOR = "#8b949e"  # Gray
@@ -543,10 +598,11 @@ def get_graph_data(
 
         # Node cap: deterministic "newest first" subset. Eligible = not section
         # and not document-fragment, mirroring _build_nodes below. Without an
-        # explicit limit the default DEFAULT_GRAPH_LIMIT applies. Order:
-        # created_at DESC, id DESC (stable). Truncating before edges /
-        # duplicates / mappings keeps the result closed over the included node
-        # set — no dangling edges to excluded nodes.
+        # explicit limit the effective default applies (env-resolved, clamped to
+        # the effective max). Order: created_at DESC, id DESC (stable). The
+        # selected set is ALWAYS the sorted eligible prefix — even when not
+        # truncated — so hidden sections/fragments never count as included by
+        # _build_edges (no dangling edges) and the declared ordering holds.
         eligible = [
             m
             for m in memories
@@ -554,14 +610,14 @@ def get_graph_data(
             and not _is_document_fragment(m.get("metadata"))
         ]
         total = len(eligible)
-        effective = DEFAULT_GRAPH_LIMIT if limit is None else min(limit, GRAPH_LIMIT_MAX)
+        effective_default, effective_max = resolve_graph_limits()
+        effective = effective_default if limit is None else min(limit, effective_max)
         truncated = total > effective
-        if truncated:
-            memories = sorted(
-                eligible,
-                key=lambda m: (m.get("created_at") or "", m.get("id") or 0),
-                reverse=True,
-            )[:effective]
+        memories = sorted(
+            eligible,
+            key=lambda m: (m.get("created_at") or "", m.get("id") or 0),
+            reverse=True,
+        )[:effective]
 
         if rebuild:
             rebuild_crossrefs(conn)

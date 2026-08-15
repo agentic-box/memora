@@ -280,11 +280,15 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
   }
 }
 
-/** Parse a positive-int env override; returns the fallback when unset/invalid. */
+/** Parse a positive-int env override under the shared ASCII-digit grammar.
+ * Malformed (non-ASCII, signed, scientific) or unsafe-integer values fall back
+ * to the provided default. */
 function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
   if (raw === undefined) return fallback;
-  const n = parseInt(raw, 10);
-  return Number.isInteger(n) && n > 0 ? n : fallback;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) return fallback;
+  const n = Number(trimmed);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
 }
 
 function isSection(metadata: Record<string, unknown> | null): boolean {
@@ -347,16 +351,19 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   // Resolve the node caps. DEFAULT_GRAPH_LIMIT / GRAPH_LIMIT_MAX are the
   // production defaults; the corresponding env vars override them for tuning
   // and for the test harness (so the clamp is observable on small fixtures).
+  // The effective default is clamped to the effective max: min(default, max).
   const defaultLimit = parsePositiveIntEnv(env.GRAPH_DEFAULT_LIMIT, DEFAULT_GRAPH_LIMIT);
   const graphLimitMax = parsePositiveIntEnv(env.GRAPH_LIMIT_MAX, GRAPH_LIMIT_MAX);
+  const effectiveDefault = Math.min(defaultLimit, graphLimitMax);
 
-  // ?limit= node cap. Absent => defaultLimit. Non-numeric or <= 0 => 400
-  // invalid_limit. > graphLimitMax clamps to max.
+  // ?limit= node cap. Absent => effectiveDefault. Malformed, signed,
+  // non-ASCII, or <= 0 => 400 invalid_limit (shared ASCII-digit grammar).
+  // > graphLimitMax clamps to max.
   const limitRaw = url.searchParams.get("limit");
-  let limit = defaultLimit;
+  let limit = effectiveDefault;
   if (limitRaw !== null) {
     const trimmed = limitRaw.trim();
-    if (!/^-?\d+$/.test(trimmed)) {
+    if (!/^[0-9]+$/.test(trimmed)) {
       return Response.json({ error: "invalid_limit" }, { status: 400 });
     }
     const parsed = parseInt(trimmed, 10);
@@ -479,6 +486,36 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   // Placeholder counts — recomputed from final drawable edges after nodes exist (G5).
   const connectionCounts = new Map<number, number>();
 
+  // Node cap: deterministic "newest first" subset. Eligible = not section and
+  // (not document-fragment unless ?docs=1), mirroring the node-building loop
+  // below. Order: created_at DESC, id DESC (stable, so a later re-run of the
+  // same limit returns the same set). All downstream steps
+  // (duplicate/cluster/edges/mappings) run over the truncated `memories`, which
+  // keeps edges and mappings closed over the included node set — no dangling
+  // edges to excluded nodes.
+  const eligibleMemories = memories.filter((m) => {
+    const meta = parseJson<Record<string, unknown>>(m.metadata, {});
+    if (isSection(meta)) return false;
+    if (isDocumentFragment(meta) && !includeDocs) return false;
+    return true;
+  });
+  const total = eligibleMemories.length;
+  const truncated = total > limit;
+  memories = eligibleMemories
+    .slice()
+    .sort((a, b) => {
+      const ta = a.created_at || "";
+      const tb = b.created_at || "";
+      if (ta < tb) return 1;
+      if (ta > tb) return -1;
+      return b.id - a.id;
+    })
+    .slice(0, limit);
+
+  // Derived metadata is computed AFTER selection so it is closed over the
+  // included node set (no duplicateIds / tagColors / doc-root keys naming
+  // excluded nodes). Crossrefs and lineage stay full-set above for
+  // conservative authority.
   // Find duplicate memories from canonical duplicate pairs.
   // Filter rules must match find_duplicate_pairs() in storage.py
   // and the /api/duplicates endpoint:
@@ -533,32 +570,6 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
     if (isDocumentRoot(meta) && typeof meta.document_key === "string") rootByDocKey.set(meta.document_key, m.id);
   }
-
-  // Node cap: deterministic "newest first" subset. Eligible = not section and
-  // (not document-fragment unless ?docs=1), mirroring the node-building loop
-  // below. Order: created_at DESC, id DESC (stable, so a later re-run of the
-  // same limit returns the same set). All downstream steps
-  // (duplicate/cluster/edges/mappings) run over the truncated `memories`, which
-  // keeps edges and mappings closed over the included node set — no dangling
-  // edges to excluded nodes.
-  const eligibleMemories = memories.filter((m) => {
-    const meta = parseJson<Record<string, unknown>>(m.metadata, {});
-    if (isSection(meta)) return false;
-    if (isDocumentFragment(meta) && !includeDocs) return false;
-    return true;
-  });
-  const total = eligibleMemories.length;
-  const truncated = total > limit;
-  memories = eligibleMemories
-    .slice()
-    .sort((a, b) => {
-      const ta = a.created_at || "";
-      const tb = b.created_at || "";
-      if (ta < tb) return 1;
-      if (ta > tb) return -1;
-      return b.id - a.id;
-    })
-    .slice(0, limit);
 
   const nodes: GraphNode[] = [];
   for (const m of memories) {

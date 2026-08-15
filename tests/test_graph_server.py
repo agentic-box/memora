@@ -190,12 +190,11 @@ def test_graph_limit_default_unbounded(graph_request, memory_factory):
 def test_graph_default_cap_truncates(monkeypatch, graph_request, memory_factory):
     """Without ?limit=, a store above the default cap is truncated.
 
-    Monkeypatch the default cap down to 2 so the test needs few memories
-    (mutation: removing the default cap returns all and truncated=false).
+    Set the real GRAPH_DEFAULT_LIMIT env var down to 2 so the test needs few
+    memories (mutation: removing the default cap returns all and
+    truncated=false). Uses real process env, not a module-constant patch.
     """
-    import memora.graph.data as graph_data
-
-    monkeypatch.setattr(graph_data, "DEFAULT_GRAPH_LIMIT", 2)
+    monkeypatch.setenv("GRAPH_DEFAULT_LIMIT", "2")
     for i in range(5):
         memory_factory(content=f"Limit memory {i}")
 
@@ -210,11 +209,18 @@ def test_graph_default_cap_truncates(monkeypatch, graph_request, memory_factory)
 
 
 def test_graph_limit_invalid_rejected(graph_request, memory_factory):
-    """Non-numeric, zero, and negative ?limit values return 400 invalid_limit."""
+    """Malformed ?limit values return 400 invalid_limit (shared grammar).
+
+    Sign/whitespace/plus cases are covered by test_graph_limit_conformance via
+    the direct parser (URL query strings decode '+' as a space); here we send
+    URL-safe malformed values through the HTTP layer.
+    """
     memory_factory(content="Limit memory")
 
-    for bad in ("abc", "0", "-5", "2.5"):
-        status, data = graph_request("GET", f"/api/graph?limit={bad}")
+    from urllib.parse import quote
+
+    for bad in ("abc", "0", "-5", "2.5", "1e3", "٣"):
+        status, data = graph_request("GET", f"/api/graph?limit={quote(bad)}")
         assert status == 400, f"limit={bad!r} should be 400"
         assert data["error"] == "invalid_limit", f"limit={bad!r} error code"
 
@@ -222,13 +228,12 @@ def test_graph_limit_invalid_rejected(graph_request, memory_factory):
 def test_graph_limit_clamps_to_hard_max(monkeypatch, graph_request, memory_factory):
     """?limit= above the hard cap is clamped, not rejected.
 
-    Monkeypatch GRAPH_LIMIT_MAX down to 3 so the clamp is observable on a small
-    store (mutation: removing the clamp / raising the max returns all 5 nodes
-    untruncated).
+    Set the real GRAPH_LIMIT_MAX env var down to 3 so the clamp is observable
+    on a small store (mutation: removing the clamp / raising the max returns
+    all 5 nodes untruncated). Uses real process env, not a module-constant
+    patch.
     """
-    import memora.graph.data as graph_data
-
-    monkeypatch.setattr(graph_data, "GRAPH_LIMIT_MAX", 3)
+    monkeypatch.setenv("GRAPH_LIMIT_MAX", "3")
     for i in range(5):
         memory_factory(content=f"Limit memory {i}")
 
@@ -240,6 +245,44 @@ def test_graph_limit_clamps_to_hard_max(monkeypatch, graph_request, memory_facto
     assert data["total"] == 5
     # Clamp keeps the newest (same created_at tick, id DESC).
     assert [n["id"] for n in data["nodes"]] == [5, 4, 3]
+
+
+def test_graph_effective_default_respects_max(monkeypatch, graph_request, memory_factory):
+    """With max < default and no ?limit, the effective default = max.
+
+    Real env: GRAPH_LIMIT_MAX=3 (below the 2000 default) means a no-?limit
+    request must be capped at 3, not 2000 (mutation: default ignoring the max
+    returns all 5).
+    """
+    monkeypatch.setenv("GRAPH_LIMIT_MAX", "3")
+    for i in range(5):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph")
+
+    assert status == 200
+    assert data["truncated"] is True
+    assert data["total"] == 5
+    assert len(data["nodes"]) == 3
+    assert [n["id"] for n in data["nodes"]] == [5, 4, 3]
+
+
+def test_graph_limit_conformance(monkeypatch):
+    """Shared adversarial grammar matrix, exercised via the real parser."""
+    import json
+    from pathlib import Path
+
+    from memora.graph.data import _INVALID_LIMIT, parse_graph_limit_value
+
+    cases = json.loads(
+        Path(__file__).parent.joinpath("fixtures", "graph_limit_conformance.json").read_text()
+    )
+    for case in cases:
+        parsed = parse_graph_limit_value(case["value"])
+        if case["valid"]:
+            assert parsed == case["expected"], f"conformance {case['id']}: {case['value']!r}"
+        else:
+            assert parsed is _INVALID_LIMIT, f"conformance {case['id']}: {case['value']!r}"
 
 
 def test_graph_limit_no_dangling_edges(graph_request, local_db):
@@ -288,3 +331,32 @@ def test_graph_limit_clamp_observable_on_volume(local_db):
     assert data["truncated"] is True
     assert data["total"] == n
     assert len(data["nodes"]) == GRAPH_LIMIT_MAX
+
+
+def test_graph_limit_nontruncated_excludes_hidden(graph_request, local_db):
+    """Even when not truncated, hidden section/fragment memories are excluded
+    from nodes and no edge dangles to them (mutation: keeping the raw memory
+    list when untruncated makes a hidden node count as included)."""
+    with storage.connect() as conn:
+        v1 = storage.add_memory(conn, content="Visible one")
+        hidden = storage.add_memory(
+            conn, content="Section", metadata={"type": "section"}
+        )
+        v2 = storage.add_memory(conn, content="Visible two")
+        storage.add_link(conn, v1["id"], hidden["id"], edge_type="references")
+        storage.add_link(conn, v2["id"], v1["id"], edge_type="references")
+
+    # No limit and well below the default cap => not truncated, but the hidden
+    # section must still not appear as a node, and no edge may reference it.
+    status, data = graph_request("GET", "/api/graph")
+
+    assert status == 200
+    assert data["truncated"] is False
+    node_ids = {n["id"] for n in data["nodes"]}
+    assert hidden["id"] not in node_ids, "mutation: hidden section became a node"
+    # Newest-first: v2, v1 (hidden excluded), id DESC on the same tick.
+    assert [n["id"] for n in data["nodes"]] == [v2["id"], v1["id"]]
+    for edge in data["edges"]:
+        assert edge["from"] in node_ids and edge["to"] in node_ids, (
+            "mutation: edge dangles to a hidden section"
+        )

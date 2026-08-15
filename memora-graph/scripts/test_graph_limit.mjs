@@ -4,6 +4,9 @@
  * Run: node --experimental-strip-types scripts/test_graph_limit.mjs
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { onRequestGet } from "../functions/api/graph.ts";
 
 let failed = 0;
@@ -44,12 +47,12 @@ class FakeDb {
   }
 }
 
-function memory(id, created_at, content = `memory ${id}`) {
+function memory(id, created_at, content = `memory ${id}`, overrides = {}) {
   return {
     id,
     content,
-    metadata: "{}",
-    tags: "[]",
+    metadata: overrides.metadata ?? "{}",
+    tags: overrides.tags ?? "[]",
     created_at,
     updated_at: null,
   };
@@ -61,6 +64,14 @@ async function graph(env, url) {
     request: new Request(url),
   });
 }
+
+// Shared adversarial grammar fixture (same file the Python suite runs).
+const conformance = JSON.parse(
+  readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), "../../tests/fixtures/graph_limit_conformance.json"),
+    "utf8",
+  ),
+);
 
 // Default (no ?limit): full graph, not truncated.
 {
@@ -221,6 +232,105 @@ for (const bad of ["abc", "0", "-5", "2.5", ""]) {
     assert(
       nodeIds.has(edge.from) && nodeIds.has(edge.to),
       `edge ${edge.from}->${edge.to} must not dangle to an excluded node`,
+    );
+  }
+}
+
+// Shared adversarial grammar matrix: invalid values must 400, valid values 200.
+// When a valid value is a real limit (<= store size) we also check the count.
+{
+  const db = new FakeDb([
+    memory(1, "2026-01-01T00:00:00Z"),
+    memory(2, "2026-02-01T00:00:00Z"),
+    memory(3, "2026-03-01T00:00:00Z"),
+    memory(4, "2026-04-01T00:00:00Z"),
+    memory(5, "2026-05-01T00:00:00Z"),
+  ]);
+  for (const caseRow of conformance) {
+    const res = await graph(
+      { DB_MEMORA: db },
+      `http://local/api/graph?limit=${encodeURIComponent(caseRow.value)}`,
+    );
+    if (!caseRow.valid) {
+      assert(res.status === 400, `conformance ${caseRow.id}: ${JSON.stringify(caseRow.value)} -> 400`);
+    } else {
+      assert(res.status === 200, `conformance ${caseRow.id}: ${JSON.stringify(caseRow.value)} -> 200`);
+      if (caseRow.expected <= 5) {
+        const data = await res.json();
+        assert(
+          data.nodes.length === caseRow.expected,
+          `conformance ${caseRow.id}: value ${JSON.stringify(caseRow.value)} yields ${caseRow.expected} nodes, got ${data.nodes.length}`,
+        );
+      }
+    }
+  }
+}
+
+// Effective default respects a max below the default: GRAPH_LIMIT_MAX=3 with no
+// ?limit must cap at 3, not the 2000 default (red if the default ignores max).
+{
+  const db = new FakeDb([
+    memory(1, "2026-01-01T00:00:00Z"),
+    memory(2, "2026-02-01T00:00:00Z"),
+    memory(3, "2026-03-01T00:00:00Z"),
+    memory(4, "2026-04-01T00:00:00Z"),
+    memory(5, "2026-05-01T00:00:00Z"),
+  ]);
+  const res = await graph({ DB_MEMORA: db, GRAPH_LIMIT_MAX: "3" }, "http://local/api/graph");
+  const data = await res.json();
+  assert(res.status === 200, "max<default no-query returns 200");
+  assert(data.nodes.length === 3, "max<default no-query caps at the max (3)");
+  assert(data.truncated === true, "max<default no-query is truncated");
+  assert(data.total === 5, "max<default no-query total reports 5");
+}
+
+// FIX 4: junk env caps fall back to the default, not a partially-parsed value.
+{
+  const db = new FakeDb([
+    memory(1, "2026-01-01T00:00:00Z"),
+    memory(2, "2026-02-01T00:00:00Z"),
+    memory(3, "2026-03-01T00:00:00Z"),
+    memory(4, "2026-04-01T00:00:00Z"),
+    memory(5, "2026-05-01T00:00:00Z"),
+  ]);
+  for (const junk of ["3junk", "2.5", "1e3", "+7"]) {
+    const res = await graph(
+      { DB_MEMORA: db, GRAPH_LIMIT_MAX: junk },
+      "http://local/api/graph?limit=999999",
+    );
+    const data = await res.json();
+    assert(
+      data.nodes.length === 5,
+      `malformed env GRAPH_LIMIT_MAX=${JSON.stringify(junk)} falls back to default (all 5), got ${data.nodes.length}`,
+    );
+  }
+}
+
+// FIX 5: duplicateIds and tagColors are closed over the included nodes.
+{
+  const db = new FakeDb(
+    [
+      memory(1, "2026-01-01T00:00:00Z", "dup a", { tags: '["alpha"]' }),
+      memory(2, "2026-02-01T00:00:00Z", "dup b", { tags: '["beta"]' }),
+      memory(3, "2026-03-01T00:00:00Z", "newest", { tags: '["gamma"]' }),
+    ],
+    [
+      { memory_id: 1, related: JSON.stringify([{ id: 2, score: 0.9, edge_type: "related_to" }]) },
+      { memory_id: 2, related: JSON.stringify([{ id: 1, score: 0.9, edge_type: "related_to" }]) },
+      { memory_id: 3, related: "[]" },
+    ],
+  );
+  const res = await graph({ DB_MEMORA: db }, "http://local/api/graph?limit=1");
+  const data = await res.json();
+  const nodeIds = new Set(data.nodes.map((n) => n.id));
+  for (const id of data.duplicateIds || []) {
+    assert(nodeIds.has(id), `duplicateIds entry ${id} must be an included node (FIX 5)`);
+  }
+  for (const tag of Object.keys(data.tagColors || {})) {
+    const refs = data.tagToNodes?.[tag];
+    assert(
+      Array.isArray(refs) && refs.length > 0,
+      `tagColors key ${JSON.stringify(tag)} must have an included node (FIX 5)`,
     );
   }
 }
