@@ -11,6 +11,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import {
+  applyRetirement,
   buildAssociationEdges,
   buildLineageMaps,
   isLineageEdgeType,
@@ -446,6 +447,31 @@ function timelineRowClass(flags) {
   assert(/openDetail\(plan\.id/.test(html) || /openDetail\(plan\.id,/.test(html),
     "G1/J1: openDetail from plan.id (current selection)");
   assert(/refreshing…/.test(html), "G1: refreshing shell on abort");
+}
+
+// --- retired ancestor after leaf delete is not current (graph + timeline) ---
+{
+  // Stored A<-B (B supersedes A), then B deleted: only A remains, no edges.
+  const L = buildLineageMaps(new Map([
+    [1, []],
+  ]));
+  applyRetirement(L, [1]);
+  assert(L.authorityUnknown.has(1), "retired ancestor is authority_unknown");
+  const nodes = [{ id: 1, superseded: false, authority_unknown: L.authorityUnknown.has(1) }];
+  const kept = nodes.filter(n => currentOnlyKeep(n, true, false));
+  assert(kept.length === 0, "current-only drops retired ancestor A after B deleted");
+  const flags = timelineFlags(1, {
+    lineageAvailable: true,
+    supersededIds: new Set(),
+    authorityUnknownIds: L.authorityUnknown,
+  });
+  assert(flags._unknown === true, "timeline flags retired ancestor unknown (not current)");
+  assert(
+    /tombstone_components/.test(
+      readFileSync(join(__dirname, "../functions/api/graph.ts"), "utf8"),
+    ),
+    "graph.ts consults tombstone_components",
+  );
 }
 
 if (failed) {

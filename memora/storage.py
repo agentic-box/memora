@@ -2020,6 +2020,9 @@ def _search_by_vector_ids_only(
     ]
 
 
+_CROSSREF_CAS_RETRIES = 8
+
+
 def _store_crossrefs(
     conn: sqlite3.Connection,
     memory_id: int,
@@ -2033,6 +2036,89 @@ def _store_crossrefs(
         ON CONFLICT(memory_id) DO UPDATE SET related=excluded.related
         """,
         (memory_id, related_json),
+    )
+
+
+def _cas_store_crossrefs(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    row_exists: bool,
+    expected_raw: Optional[str],
+    related: List[Dict[str, Any]],
+) -> bool:
+    """Write related JSON only if the stored blob still matches expected_raw.
+
+    Closes the D1 lost-update window on reverse-crossref read-modify-write:
+    each HTTP statement auto-commits, so two add_link writers must retry
+    rather than blindly overwrite.
+
+    A pre-existing row with NULL related is not "missing" — UPDATE it.
+    """
+    related_json = json.dumps(related, ensure_ascii=False) if related else None
+    if not row_exists:
+        try:
+            conn.execute(
+                """
+                INSERT INTO memories_crossrefs(memory_id, related)
+                VALUES(?, ?)
+                """,
+                (memory_id, related_json),
+            )
+            return True
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "unique" in msg or "constraint" in msg:
+                return False
+            raise
+    cur = conn.execute(
+        """
+        UPDATE memories_crossrefs
+           SET related = ?
+         WHERE memory_id = ?
+           AND (
+                (related IS NULL AND ? IS NULL)
+                OR related = ?
+           )
+        """,
+        (related_json, memory_id, expected_raw, expected_raw),
+    )
+    return (getattr(cur, "rowcount", 0) or 0) > 0
+
+
+def _load_crossrefs_raw(
+    conn: sqlite3.Connection, memory_id: int
+) -> Tuple[bool, Optional[str], List[Dict[str, Any]]]:
+    row = conn.execute(
+        "SELECT related FROM memories_crossrefs WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if not row:
+        return False, None, []
+    raw = row["related"] if isinstance(row, sqlite3.Row) else row[0]
+    if not raw:
+        return True, None, []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return True, raw, []
+    return True, raw, data if isinstance(data, list) else []
+
+
+def _upsert_crossref_edge(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    peer_id: int,
+    edge_type: str,
+) -> None:
+    """CAS-merge one edge onto memory_id's related blob."""
+    for _ in range(_CROSSREF_CAS_RETRIES):
+        exists, raw, existing = _load_crossrefs_raw(conn, memory_id)
+        merged = [r for r in existing if r.get("id") != peer_id]
+        merged.append({"id": peer_id, "score": 1.0, "edge_type": edge_type})
+        if _cas_store_crossrefs(conn, memory_id, exists, raw, merged):
+            return
+    raise RuntimeError(
+        f"crossref CAS exhausted writing {edge_type} #{memory_id}->{peer_id}"
     )
 
 
@@ -2202,22 +2288,14 @@ def add_link(
 
     links_created = []
 
-    # Add link from -> to
-    existing = get_crossrefs(conn, from_id)
-    # Remove any existing link to the same target
-    existing = [r for r in existing if r.get("id") != to_id]
-    # Add new link
-    existing.append({"id": to_id, "score": 1.0, "edge_type": edge_type})
-    _store_crossrefs(conn, from_id, existing)
+    # CAS-merge both directions so two D1 writers cannot lost-update the
+    # reverse crossref blob (each statement auto-commits).
+    _upsert_crossref_edge(conn, from_id, to_id, edge_type)
     links_created.append({"from": from_id, "to": to_id, "edge_type": edge_type})
 
-    # Add reverse link if bidirectional
     if bidirectional:
         reverse_type = _get_reverse_edge_type(edge_type)
-        existing_reverse = get_crossrefs(conn, to_id)
-        existing_reverse = [r for r in existing_reverse if r.get("id") != from_id]
-        existing_reverse.append({"id": from_id, "score": 1.0, "edge_type": reverse_type})
-        _store_crossrefs(conn, to_id, existing_reverse)
+        _upsert_crossref_edge(conn, to_id, from_id, reverse_type)
         links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
 
     _log_action(conn, from_id, "link", f"Linked #{from_id} -> #{to_id} ({edge_type})")
@@ -2387,12 +2465,46 @@ def content_tombstone_hash(content: str) -> str:
     Normalization: strip ends, collapse any Unicode whitespace run to a
     single ASCII space, then casefold. Absorb and import consult this hash.
     Pages do not read tombstones in V1.
+
+    Scope: content-global within one database (per-db table). Aliasing via
+    this normalization is intentional. No tenant/scope key in V1.
     """
     normalized = re.sub(r"\s+", " ", (content or "").strip()).casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def _is_tombstoned_id(conn: sqlite3.Connection, memory_id: int) -> bool:
+def retired_memory_ids(conn: sqlite3.Connection) -> set[int]:
+    """All memory ids retired by a component marker or a per-member tombstone.
+
+    Two statements total — callers must not probe per row on D1.
+    """
+    ids: set[int] = set()
+    try:
+        for row in conn.execute("SELECT memory_id FROM tombstone_components"):
+            ids.add(int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]))
+    except Exception:
+        pass
+    try:
+        for row in conn.execute("SELECT memory_id FROM tombstones"):
+            ids.add(int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]))
+    except Exception:
+        pass
+    return ids
+
+
+def _is_tombstoned_id(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    retired_ids: Optional[set[int]] = None,
+) -> bool:
+    if retired_ids is not None:
+        return memory_id in retired_ids
+    row = conn.execute(
+        "SELECT 1 FROM tombstone_components WHERE memory_id = ? LIMIT 1",
+        (memory_id,),
+    ).fetchone()
+    if row is not None:
+        return True
     row = conn.execute(
         "SELECT 1 FROM tombstones WHERE memory_id = ? LIMIT 1",
         (memory_id,),
@@ -2403,11 +2515,15 @@ def _is_tombstoned_id(conn: sqlite3.Connection, memory_id: int) -> bool:
 def _lookup_tombstone_by_hash(
     conn: sqlite3.Connection, content: str
 ) -> Optional[str]:
-    """Return a stored tombstone reason for this content, or None if none."""
+    """Return a stored tombstone reason for this content, or None if none.
+
+    V1 scope is content-global within this database. Tie-break: newest
+    created_at, then highest memory_id (deterministic when timestamps collide).
+    """
     digest = content_tombstone_hash(content)
     row = conn.execute(
         "SELECT reason FROM tombstones WHERE content_hash = ? "
-        "ORDER BY created_at DESC LIMIT 1",
+        "ORDER BY created_at DESC, memory_id DESC LIMIT 1",
         (digest,),
     ).fetchone()
     if row is None:
@@ -2459,11 +2575,29 @@ def _tombstone_component(
             missing,
         ):
             known[int(row["id"])] = row["content"]
-    for mid in component:
+    members = sorted(component)
+    if members:
+        # Atomic on D1: one INSERT covering every member. Must land BEFORE
+        # per-hash rows so a later insert failure cannot leave survivors current.
+        values_sql = ",".join(["(?, ?)"] * len(members))
+        params: List[Any] = []
+        for mid in members:
+            params.extend([mid, reason])
+        conn.execute(
+            "INSERT OR IGNORE INTO tombstone_components(memory_id, reason) "
+            f"VALUES {values_sql}",
+            params,
+        )
+    for mid in members:
         content = known.get(mid)
         if content is None:
             continue
-        _write_tombstone(conn, memory_id=mid, content=content, reason=reason)
+        try:
+            _write_tombstone(conn, memory_id=mid, content=content, reason=reason)
+        except Exception as exc:
+            logger.warning(
+                "best-effort per-member tombstone failed for #%d: %s", mid, exc
+            )
 
 
 def _component_live_leaves(
@@ -2474,9 +2608,13 @@ def _component_live_leaves(
     Returns (leaves_sorted, is_cycle). is_cycle True means no leaves (SCC);
     caller must not collapse — use [max(component)] as today's fallback.
     """
+    if _is_tombstoned_id(conn, memory_id):
+        return [], False
     component = _get_full_history(conn, memory_id)
     if not component:
         return [memory_id], False
+    if any(_is_tombstoned_id(conn, mid) for mid in component):
+        return [], False
     comp = set(component)
     leaves: List[int] = []
     for mid in component:
@@ -2496,7 +2634,11 @@ def _component_live_leaves(
     return sorted(live), False
 
 
-def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
+def _resolve_latest(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    retired_ids: Optional[set[int]] = None,
+) -> List[int]:
     """Walk forward along superseded_by edges to find all leaf versions.
 
     Returns list of leaf IDs (memories with no further superseded_by edges).
@@ -2504,6 +2646,8 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     If a cycle is detected (no leaves found), returns the original memory_id
     and sets the cycle flag so callers can warn.
     """
+    if _is_tombstoned_id(conn, memory_id, retired_ids):
+        return []
     all_ids = _walk_chain(conn, memory_id, "superseded_by")
     # Leaves are nodes with no outgoing superseded_by edge to a node in our set
     # (edges to nodes outside the walked set don't count as successors within the chain)
@@ -2524,7 +2668,7 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     # deterministic fallback (same node regardless of entry point).
     if not leaves:
         return [max(all_ids)]
-    return [mid for mid in leaves if not _is_tombstoned_id(conn, mid)]
+    return [mid for mid in leaves if not _is_tombstoned_id(conn, mid, retired_ids)]
 
 
 def _resolve_absorb_supersedes_target(
@@ -2577,6 +2721,34 @@ def _resolve_absorb_supersedes_target(
         "cycle": False,
         "tombstoned": False,
     }
+
+
+_FORK_HEAL_RETRIES = 8
+
+
+def _heal_supersession_fork(conn: sqlite3.Connection, new_id: int) -> None:
+    """Post-link verify-and-heal: D1 writers that both linked the same leaf.
+
+    Each D1 statement auto-commits, so two absorbs can both resolve [L] and
+    both write before either sees the other. After linking, re-read live
+    leaves. Higher new-id wins: winner supersedes every other live leaf.
+    The loser retries until it sees itself superseded (or is the winner).
+    Bounded retries close a remaining race on the reverse crossref CAS.
+    """
+    for _ in range(_FORK_HEAL_RETRIES):
+        leaves, is_cycle = _component_live_leaves(conn, new_id)
+        if is_cycle or len(leaves) <= 1:
+            return
+        winner = max(leaves)
+        for loser in leaves:
+            if loser == winner:
+                continue
+            add_link(conn, winner, loser, edge_type="supersedes", commit=False)
+    leaves, is_cycle = _component_live_leaves(conn, new_id)
+    if not is_cycle and len(leaves) > 1:
+        raise RuntimeError(
+            f"supersession fork heal did not converge: leaves={leaves}"
+        )
 
 
 def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
@@ -2681,18 +2853,24 @@ def apply_follow(
         return {"score": score, "memory": mem} if is_search else mem
 
     if follow == "active":
+        # Pre-existing forks: storage follow=active (and digest) still
+        # surfaces EVERY live leaf until the next absorb UPDATE collapses
+        # them. Graph-only quarantine (authority_unknown on multi-leaf tips)
+        # is the approved middle scope; storage-side quarantine is a follow-up.
+        retired_ids = retired_memory_ids(conn)
         return [
             item for item in results
             if not _is_superseded(conn, _get_id(item))
-            and not _is_tombstoned_id(conn, _get_id(item))
+            and _get_id(item) not in retired_ids
         ]
 
     if follow == "latest":
         if seen_ids is None:
             seen_ids = set()
+        retired_ids = retired_memory_ids(conn)
         out: List[Dict[str, Any]] = []
         for item in results:
-            leaf_ids = _resolve_latest(conn, _get_id(item))
+            leaf_ids = _resolve_latest(conn, _get_id(item), retired_ids)
             for latest_id in leaf_ids:
                 if latest_id in seen_ids:
                     continue
@@ -3608,6 +3786,10 @@ def absorb_memory(
     then create/supersede/link/skip as appropriate. New facts that are related to
     each other are consolidated into single, richer memories via LLM synthesis.
 
+    Pre-existing supersession forks are NOT quarantined here: follow=active
+    and digest keep showing every live leaf until an absorb UPDATE collapses
+    them. Graph producers mark those tips authority_unknown (middle scope).
+
     Args:
         conn: Database connection
         facts: List of atomic fact strings to absorb
@@ -3994,6 +4176,7 @@ def absorb_memory(
                                 edge_type="supersedes", commit=False,
                             )
                             linked_ids.append(tid)
+                        _heal_supersession_fork(conn, record["id"])
                     except Exception as link_err:
                         # ALL-OR-COMPENSATE: partial collapse is worse than the fork.
                         raise RuntimeError(

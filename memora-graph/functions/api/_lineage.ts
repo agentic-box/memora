@@ -276,6 +276,18 @@ export function buildLineageMaps(
   return maps;
 }
 
+/** Mark retired/tombstoned ids so they cannot render as current. */
+export function applyRetirement(
+  maps: LineageMaps,
+  retiredIds: Iterable<number>,
+): void {
+  for (const id of retiredIds) {
+    if (typeof id === "number" && Number.isFinite(id)) {
+      maps.authorityUnknown.add(id);
+    }
+  }
+}
+
 export function isLineageEdgeType(edgeType: string | undefined | null): boolean {
   return edgeType === "supersedes";
 }

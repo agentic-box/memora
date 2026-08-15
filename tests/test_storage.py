@@ -437,6 +437,13 @@ def test_absorb_update_collapses_fork_to_one_leaf(local_db, monkeypatch):
 
 
 def test_absorb_contradict_does_not_collapse_fork(local_db, monkeypatch):
+    """LOCKING INTENDED BEHAVIOR — not an accident.
+
+    Storage follow=active / digest keep showing pre-existing fork leaves
+    until the next absorb UPDATE heals them. Graph-only quarantine
+    (authority_unknown on multi-leaf tips) is the approved middle scope.
+    CONTRADICT never collapses.
+    """
     with storage.connect() as conn:
         orig, left, right = _seed_fork(conn)
         monkeypatch.setattr(
@@ -729,6 +736,134 @@ def test_delete_memories_writes_tombstones(local_db):
         ids = {row["memory_id"] for row in _tombstone_rows(conn)}
         assert {a["id"], b["id"]} <= ids
         assert all(row["reason"] == "batch-clear" for row in _tombstone_rows(conn))
+
+
+def _reciprocal_supersedes(conn, newer, older):
+    fwd = storage.get_crossrefs(conn, newer)
+    rev = storage.get_crossrefs(conn, older)
+    return (
+        any(r.get("id") == older and r.get("edge_type") == "supersedes" for r in fwd)
+        and any(r.get("id") == newer and r.get("edge_type") == "superseded_by" for r in rev)
+    )
+
+
+def test_d1_dual_writer_links_converge_to_one_leaf(fake_d1_backend):
+    """Two FakeD1 connections resolve the same leaf, then both link.
+
+    Must go red without post-link heal + reverse-crossref CAS: both new
+    ids stay leaves and/or L's reverse blob lost-updates.
+    """
+    backend = fake_d1_backend
+    with storage.connect() as setup:
+        leaf = storage.add_memory(setup, content="Shared absorb leaf extra words")
+        a = storage.add_memory(setup, content="Writer A new version extra words")
+        b = storage.add_memory(setup, content="Writer B new version extra words")
+        lid, aid, bid = leaf["id"], a["id"], b["id"]
+
+    c1 = backend.connect()
+    c2 = backend.connect()
+    plan1 = storage._resolve_absorb_supersedes_target(c1, lid)
+    plan2 = storage._resolve_absorb_supersedes_target(c2, lid)
+    assert plan1["targets"] == [lid]
+    assert plan2["targets"] == [lid]
+    storage.add_link(c1, aid, lid, edge_type="supersedes", commit=False)
+    storage.add_link(c2, bid, lid, edge_type="supersedes", commit=False)
+    storage._heal_supersession_fork(c1, aid)
+    storage._heal_supersession_fork(c2, bid)
+
+    with storage.connect() as conn:
+        leaves, cycle = storage._component_live_leaves(conn, lid)
+        assert not cycle
+        assert leaves == [max(aid, bid)], (
+            f"mutation: skip post-link heal and both writers stay leaves={leaves}"
+        )
+        winner, loser = max(aid, bid), min(aid, bid)
+        assert _reciprocal_supersedes(conn, winner, loser), (
+            "mutation: reverse-crossref lost-update drops a reciprocal edge"
+        )
+        assert _reciprocal_supersedes(conn, aid, lid)
+        assert _reciprocal_supersedes(conn, bid, lid)
+    c1.close()
+    c2.close()
+
+
+def test_component_marker_survives_nth_member_insert_failure(fake_d1_backend):
+    """Nth per-member tombstone INSERT fails: every member must still be non-current."""
+    with storage.connect() as conn:
+        orig = storage.add_memory(conn, content="Nth fail root extra words")
+        mid = storage.add_memory(conn, content="Nth fail mid extra words")
+        leaf = storage.add_memory(conn, content="Nth fail leaf extra words")
+        storage.add_link(conn, mid["id"], orig["id"], edge_type="supersedes")
+        storage.add_link(conn, leaf["id"], mid["id"], edge_type="supersedes")
+        hash_inserts = {"n": 0}
+
+        def fail_when(sql, params):
+            upper = sql.lstrip().upper()
+            if "TOMBSTONE_COMPONENTS" in upper:
+                return False
+            if upper.startswith("INSERT") and "TOMBSTONES" in upper:
+                hash_inserts["n"] += 1
+                return hash_inserts["n"] >= 3
+            return False
+
+        conn.fail_when = fail_when
+        try:
+            storage.delete_memory(conn, leaf["id"])
+        except RuntimeError as exc:
+            assert "injected" in str(exc)
+        conn.fail_when = None
+
+        retired = storage.retired_memory_ids(conn)
+        assert {orig["id"], mid["id"], leaf["id"]} <= retired, (
+            "mutation: skip component marker; leftover ancestor stays current"
+        )
+        active = {m["id"] for m in storage.list_memories(conn, follow="active")}
+        assert orig["id"] not in active
+        assert mid["id"] not in active
+        assert leaf["id"] not in active
+
+
+def test_list_active_tombstone_queries_are_per_window(fake_d1_backend):
+    """FakeD1 statement count for tombstone consults is O(windows), not O(rows)."""
+    n = 40
+    with storage.connect() as conn:
+        for i in range(n):
+            storage.add_memory(conn, content=f"Windowed tombstone probe {i} extra words")
+        conn.statement_count = 0
+        listed = storage.list_memories(conn, follow="active")
+        assert len(listed) == n
+        tombstone_sql = []
+        # Re-run with a wrapper that records tombstone SQL only.
+        real_execute = conn.execute
+
+        def counting_execute(sql, params=None):
+            if "tombstone" in sql.lower():
+                tombstone_sql.append(sql)
+            return real_execute(sql, params)
+
+        conn.execute = counting_execute
+        storage.list_memories(conn, follow="active")
+        assert len(tombstone_sql) <= 6, (
+            f"mutation: per-row _is_tombstoned_id => {len(tombstone_sql)} queries "
+            f"for {n} rows (must be O(windows))"
+        )
+
+
+def test_tombstone_hash_lookup_tiebreaks_on_memory_id(local_db):
+    with storage.connect() as conn:
+        content = "Tiebreak same hash extra words"
+        digest = storage.content_tombstone_hash(content)
+        conn.execute(
+            "INSERT INTO tombstones(content_hash, memory_id, reason, created_at) "
+            "VALUES (?, ?, ?, ?), (?, ?, ?, ?)",
+            (digest, 1, "older-id", "2026-01-01 00:00:00",
+             digest, 9, "newer-id", "2026-01-01 00:00:00"),
+        )
+        conn.commit()
+        reason = storage._lookup_tombstone_by_hash(conn, content)
+        assert reason == "newer-id", (
+            "mutation: drop memory_id DESC tiebreak and this is non-deterministic"
+        )
 
 
 def test_hybrid_semantic_list_honor_requested_limit(local_db):

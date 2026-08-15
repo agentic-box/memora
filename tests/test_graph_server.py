@@ -1,4 +1,37 @@
 import memora
+import memora.storage as storage
+from memora.graph.data import get_graph_data
+
+
+def test_graph_retired_ancestor_not_current(graph_request, local_db):
+    """A<-B, delete B: A must not appear current in graph or timeline payload."""
+    with storage.connect() as conn:
+        ancestor = storage.add_memory(conn, content="Retired graph ancestor extra")
+        leaf = storage.add_memory(conn, content="Retired graph leaf extra")
+        storage.add_link(conn, leaf["id"], ancestor["id"], edge_type="supersedes")
+        storage.delete_memory(conn, leaf["id"])
+        ancestor_id = ancestor["id"]
+
+    data = get_graph_data()
+    node = next(n for n in data["nodes"] if n["id"] == ancestor_id)
+    assert node.get("retired") or node.get("authority_unknown"), (
+        "mutation: local producer ignores tombstones; ancestor looks current"
+    )
+    current_only = [
+        n for n in data["nodes"]
+        if not n.get("superseded") and not n.get("authority_unknown")
+    ]
+    assert ancestor_id not in {n["id"] for n in current_only}
+
+    status, api = graph_request("GET", "/api/graph")
+    assert status == 200
+    api_node = next(n for n in api["nodes"] if n["id"] == ancestor_id)
+    assert api_node.get("retired") or api_node.get("authority_unknown")
+    timeline_current = [
+        n for n in api["nodes"]
+        if not n.get("superseded") and not n.get("authority_unknown")
+    ]
+    assert ancestor_id not in {n["id"] for n in timeline_current}
 
 
 def test_graph_patch_updates_tags_and_metadata(graph_request, memory_factory):

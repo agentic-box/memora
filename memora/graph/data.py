@@ -25,6 +25,7 @@ from ..storage import (  # noqa: E402
     get_memory,
     list_memories,
     rebuild_crossrefs,
+    retired_memory_ids,
 )
 from .issues import (  # noqa: E402
     TAG_COLORS,
@@ -171,6 +172,7 @@ def _build_nodes(
     tag_colors: Dict[str, str],
     connection_counts: Optional[Dict[int, int]] = None,
     duplicate_ids: Optional[set] = None,
+    retired_ids: Optional[set] = None,
 ) -> List[Dict]:
     """Build vis.js node objects from memories.
 
@@ -180,6 +182,8 @@ def _build_nodes(
 
     if duplicate_ids is None:
         duplicate_ids = set()
+    if retired_ids is None:
+        retired_ids = set()
 
     nodes = []
     for m in memories:
@@ -212,14 +216,23 @@ def _build_nodes(
         elif is_todo(meta):
             type_label = " - TODO"
 
+        retired = m["id"] in retired_ids
+        lineage_label = " - RETIRED" if retired else ""
         node = {
             "id": m["id"],
             "label": label + "..." if len(content) > 35 else label,
-            "title": f"#{m['id']}{type_label}\n{headline}",
+            "title": f"#{m['id']}{type_label}{lineage_label}\n{headline}",
             "color": tag_colors[primary_tag],
             "size": node_size,
             "mass": node_mass,
         }
+        if retired:
+            # Fail closed: a tombstoned ancestor is not current. History
+            # view still includes the node; current-only drops authority_unknown.
+            node["authority_unknown"] = True
+            node["retired"] = True
+            node["color"] = "#484f58"
+            node["size"] = max(8, int(node_size * 0.7))
 
         # Apply issue-specific styling
         issue_style = get_issue_node_style(meta)
@@ -512,9 +525,12 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
 
         # Find duplicate memories from canonical duplicate pairs.
         duplicate_ids = _find_duplicate_ids(conn, memories)
+        retired_ids = retired_memory_ids(conn)
 
         tag_colors = _build_tag_colors(memories)
-        nodes = _build_nodes(memories, tag_colors, connection_counts, duplicate_ids)
+        nodes = _build_nodes(
+            memories, tag_colors, connection_counts, duplicate_ids, retired_ids
+        )
         tag_to_nodes = _build_tag_to_nodes(memories)
         section_to_nodes, path_to_nodes = _build_section_mappings(memories)
         status_to_nodes = build_status_to_nodes(memories)
@@ -540,6 +556,7 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
             "todoStatusToNodes": todo_status_to_nodes,
             "todoCategoryToNodes": todo_category_to_nodes,
             "duplicateIds": list(duplicate_ids),
+            "retiredIds": list(retired_ids),
             "nodeTimestamps": node_timestamps,
             "minDate": min_date,
             "maxDate": max_date,
@@ -599,9 +616,12 @@ def export_graph_html(
 
         # Find duplicate memories from canonical duplicate pairs.
         duplicate_ids = _find_duplicate_ids(conn, memories)
+        retired_ids = retired_memory_ids(conn)
 
         tag_colors = _build_tag_colors(memories)
-        nodes = _build_nodes(memories, tag_colors, connection_counts, duplicate_ids)
+        nodes = _build_nodes(
+            memories, tag_colors, connection_counts, duplicate_ids, retired_ids
+        )
         tag_to_nodes = _build_tag_to_nodes(memories)
         section_to_nodes, path_to_nodes = _build_section_mappings(memories)
         status_to_nodes = build_status_to_nodes(memories)

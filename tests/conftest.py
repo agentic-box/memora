@@ -34,6 +34,8 @@ class FakeD1Connection(D1Connection):
         self._conn.row_factory = sqlite3.Row
         self._transactional = transactional
         self.statement_count = 0
+        # Optional (sql, params) -> bool. When True, raise after counting the statement.
+        self.fail_when = None
 
     @staticmethod
     def _is_savepoint(sql: str) -> bool:
@@ -44,8 +46,10 @@ class FakeD1Connection(D1Connection):
         # callers that defensively issue savepoints run under the same limit.
         if self._is_savepoint(sql):
             return self._conn.execute("SELECT 1 WHERE 0")
-        cur = self._conn.execute(sql, () if params is None else params)
         self.statement_count += 1
+        if self.fail_when is not None and self.fail_when(sql, () if params is None else params):
+            raise RuntimeError("injected D1 statement failure")
+        cur = self._conn.execute(sql, () if params is None else params)
         if not self._transactional:
             self._conn.commit()
         return cur
@@ -132,6 +136,17 @@ def fake_d1_connection(tmp_path):
         return FakeD1Connection(tmp_path / name, transactional=transactional)
 
     return _create
+
+
+@pytest.fixture()
+def fake_d1_backend(tmp_path, monkeypatch):
+    """Shared-file FakeD1 backend patched onto storage."""
+    backend = FakeD1Backend(tmp_path / "fake-d1.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    with storage.connect() as conn:
+        conn.commit()
+    return backend
 
 
 @pytest.fixture(autouse=True)

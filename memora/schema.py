@@ -348,6 +348,18 @@ def _ensure_tombstones_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tombstones_memory ON tombstones(memory_id)"
     )
+    # Component-level retirement marker: one INSERT covers every member id.
+    # Written FIRST (single D1 statement) so a later per-hash insert failure
+    # cannot leave leftover ancestors current.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tombstone_components (
+            memory_id INTEGER PRIMARY KEY,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+        """
+    )
     conn.commit()
 
 

@@ -5,6 +5,7 @@
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
 import {
+  applyRetirement,
   buildAssociationEdges,
   buildLineageMaps,
   parseRelatedPayload,
@@ -48,6 +49,8 @@ interface GraphNode {
   superseded_by?: number[];
   /** Ids of older memories this node supersedes. */
   supersedes?: number[];
+  /** True when this id is in a tombstoned/retired component. */
+  retired?: boolean;
 }
 
 interface GraphEdge {
@@ -365,6 +368,21 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   // Lineage: normalize BOTH halves (supersedes + superseded_by) into canonical
   // newer→older, then dedupe. Associations use SEMANTIC endpoints (G2).
+  const retiredIds = new Set<number>();
+  try {
+    const components = await db.prepare(
+      "SELECT memory_id FROM tombstone_components"
+    ).all<{ memory_id: number }>();
+    const hashes = await db.prepare(
+      "SELECT memory_id FROM tombstones"
+    ).all<{ memory_id: number }>();
+    for (const row of [...(components.results || []), ...(hashes.results || [])]) {
+      if (typeof row.memory_id === "number") retiredIds.add(row.memory_id);
+    }
+  } catch {
+    // Tables may not exist on an unmigrated D1 binding; skip retirement.
+  }
+
   const lineage = lineageAvailable
     ? buildLineageMaps(crossrefsMap.entries())
     : {
@@ -374,6 +392,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
         conflicts: [],
         authorityUnknown: new Set<number>(),
       };
+  applyRetirement(lineage, retiredIds);
   const supersededBy = lineage.supersededBy;
   const supersedesMap = lineage.supersedesMap;
 
@@ -494,6 +513,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     else if (isTodo(meta)) typeLabel = " - TODO";
 
     const isSuperseded = lineageAvailable && supersededBy.has(m.id);
+    const isRetired = retiredIds.has(m.id);
     const authorityUnknown =
       !lineageAvailable || (lineageAvailable && lineage.authorityUnknown.has(m.id));
     const supersededByIds: number[] | undefined = isSuperseded
@@ -518,6 +538,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       mass: nodeMass,
       superseded: isSuperseded || undefined,
       authority_unknown: authorityUnknown || undefined,
+      retired: isRetired || undefined,
       superseded_by: supersededByIds,
       supersedes: supersedesIds,
     };
@@ -783,6 +804,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     /** null when unavailable — never [] that reads as "zero superseded". */
     supersededIds,
     supersededCount: lineageAvailable ? (supersededIds as number[]).length : null,
+    retiredIds: Array.from(retiredIds),
     /** Directed lineage edges only (from=newer, to=older), both ends present. */
     supersedesEdges: lineageAvailable
       ? drawableLineage.map(e => ({ from: e.from, to: e.to, score: e.score }))
