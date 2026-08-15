@@ -750,8 +750,9 @@ def _reciprocal_supersedes(conn, newer, older):
 def test_d1_dual_writer_links_converge_to_one_leaf(fake_d1_backend):
     """Two FakeD1 connections resolve the same leaf, then both link.
 
-    Must go red without post-link heal + reverse-crossref CAS: both new
-    ids stay leaves and/or L's reverse blob lost-updates.
+    Sequential add_link + heal: must go red if heal is a no-op (two live
+    leaves). Reverse-blob lost-update is covered by
+    test_d1_reverse_crossref_cas_keeps_both_edges.
     """
     backend = fake_d1_backend
     with storage.connect() as setup:
@@ -783,6 +784,60 @@ def test_d1_dual_writer_links_converge_to_one_leaf(fake_d1_backend):
         )
         assert _reciprocal_supersedes(conn, aid, lid)
         assert _reciprocal_supersedes(conn, bid, lid)
+    c1.close()
+    c2.close()
+
+
+def test_d1_reverse_crossref_cas_keeps_both_edges(fake_d1_backend):
+    """Read/read/write/write on the contested leaf's reverse blob.
+
+    Both writers snapshot L.related, then both write. Without the UPDATE
+    guard (OR 1=1), the second overwrite drops the first writer's edge.
+    Heal cannot save this: it only links winner→loser, it does not
+    restore L's reverse blob. CAS must reject the stale write so the
+    loser retries.
+    """
+    backend = fake_d1_backend
+    with storage.connect() as setup:
+        leaf = storage.add_memory(setup, content="CAS leaf extra words enough")
+        a = storage.add_memory(setup, content="CAS writer A extra words enough")
+        b = storage.add_memory(setup, content="CAS writer B extra words enough")
+        lid, aid, bid = leaf["id"], a["id"], b["id"]
+        # Force the UPDATE path (not INSERT): L already has a related row.
+        storage._store_crossrefs(setup, lid, [])
+        storage._upsert_crossref_edge(setup, aid, lid, "supersedes")
+        storage._upsert_crossref_edge(setup, bid, lid, "supersedes")
+
+    c1 = backend.connect()
+    c2 = backend.connect()
+    exists1, raw1, refs1 = storage._load_crossrefs_raw(c1, lid)
+    exists2, raw2, refs2 = storage._load_crossrefs_raw(c2, lid)
+    assert exists1 and exists2
+    merged1 = [r for r in refs1 if r.get("id") != aid]
+    merged1.append({"id": aid, "score": 1.0, "edge_type": "superseded_by"})
+    merged2 = [r for r in refs2 if r.get("id") != bid]
+    merged2.append({"id": bid, "score": 1.0, "edge_type": "superseded_by"})
+
+    assert storage._cas_store_crossrefs(c1, lid, exists1, raw1, merged1) is True
+    stale_ok = storage._cas_store_crossrefs(c2, lid, exists2, raw2, merged2)
+    assert stale_ok is False, (
+        "mutation: OR 1=1 on the UPDATE guard lets the stale write succeed"
+    )
+    storage._upsert_crossref_edge(c2, lid, bid, "superseded_by")
+
+    with storage.connect() as conn:
+        assert _reciprocal_supersedes(conn, aid, lid), (
+            "mutation: OR 1=1 lost-update drops writer A's reverse edge on L"
+        )
+        assert _reciprocal_supersedes(conn, bid, lid), (
+            "mutation: retry path never landed writer B's reverse edge"
+        )
+        rev_ids = {
+            r["id"]
+            for r in storage.get_crossrefs(conn, lid)
+            if r.get("edge_type") == "superseded_by"
+        }
+        assert {aid, bid} <= rev_ids
     c1.close()
     c2.close()
 
