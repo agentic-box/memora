@@ -170,6 +170,55 @@ def test_memory_digest_synthesize_is_warning_only(local_db):
     assert digest["parameters"]["synthesize"] is True
 
 
+def test_uniform_current_after_fork_collapse(local_db, monkeypatch):
+    import memora.storage as st
+
+    with st.connect() as conn:
+        orig = st.add_memory(conn, content="Uniform current probe version one extra")
+        left = st.add_memory(conn, content="Uniform current probe version two left extra")
+        right = st.add_memory(conn, content="Uniform current probe version two right extra")
+        st.add_link(conn, left["id"], orig["id"], edge_type="supersedes")
+        st.add_link(conn, right["id"], orig["id"], edge_type="supersedes")
+        monkeypatch.setattr(
+            st,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": left}],
+        )
+        monkeypatch.setattr(
+            st,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": left["id"],
+                "relationship": "UPDATE",
+                "reason": "v3",
+            }], []),
+        )
+        monkeypatch.setattr(st, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = st.absorb_memory(conn, ["Uniform current probe version three extra"])
+    new_id = next(d["memory_id"] for d in result["decisions"] if d["action"] == "superseded")
+
+    got = asyncio.run(server.memory_get(orig["id"], follow="latest"))
+    assert got["memory"]["id"] == new_id
+    listed = asyncio.run(server.memory_list(query="Uniform current probe", follow="active", limit=50))
+    list_ids = {m["id"] for m in listed.get("memories", [])}
+    assert new_id in list_ids
+    assert left["id"] not in list_ids and right["id"] not in list_ids
+    searched = asyncio.run(
+        server.memory_semantic_search("Uniform current probe", top_k=10, follow="latest")
+    )
+    search_ids = {(e.get("memory") or e)["id"] for e in searched.get("results", [])}
+    assert new_id in search_ids
+    assert left["id"] not in search_ids and right["id"] not in search_ids
+    digest = asyncio.run(server.memory_digest("Uniform current probe", k=10, include_lineage=True))
+    digest_ids = {m["id"] for m in digest.get("memories", [])}
+    assert new_id in digest_ids
+    assert left["id"] not in digest_ids and right["id"] not in digest_ids
+    hist = asyncio.run(server.memory_get(new_id, follow="full_history"))
+    hist_mem = hist.get("memory") or hist
+    hist_ids = {m["id"] for m in hist_mem.get("history") or [hist_mem]}
+    assert {orig["id"], left["id"], right["id"], new_id} <= hist_ids
+
+
 def test_search_tools_honor_limit_alias_under_follow_active(local_db):
     """MCP callers pass ``limit`` (same as memory_list). Hybrid used to ignore it
     and return the top_k default of 10."""

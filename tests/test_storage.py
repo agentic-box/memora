@@ -386,6 +386,127 @@ def test_absorb_update_supersedes_current_leaf(
         assert ("target #" in caplog.text) is (matched_version == "stale")
 
 
+def _seed_fork(conn):
+    orig = storage.add_memory(conn, content="Deployment uses version one extra words")
+    left = storage.add_memory(conn, content="Deployment uses version two left extra")
+    right = storage.add_memory(conn, content="Deployment uses version two right extra")
+    storage.add_link(conn, left["id"], orig["id"], edge_type="supersedes")
+    storage.add_link(conn, right["id"], orig["id"], edge_type="supersedes")
+    return orig, left, right
+
+
+def test_absorb_update_collapses_fork_to_one_leaf(local_db, monkeypatch):
+    with storage.connect() as conn:
+        orig, left, right = _seed_fork(conn)
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": left["id"],
+                "relationship": "UPDATE",
+                "reason": "version three",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+
+        preview = storage.absorb_memory(conn, ["Deployment uses version three extra"], dry_run=True)
+        dec = next(d for d in preview["decisions"] if d["action"] == "supersede")
+        assert set(dec["target_ids"]) == {left["id"], right["id"]}
+        assert set(dec["fork_collapsed"]) == {left["id"], right["id"]}
+
+        result = storage.absorb_memory(conn, ["Deployment uses version three extra"])
+        decision = next(d for d in result["decisions"] if d["action"] == "superseded")
+        new_id = decision["memory_id"]
+        assert set(decision["fork_collapsed"]) == {left["id"], right["id"]}
+        assert set(decision["target_ids"]) == {left["id"], right["id"]}
+
+        latest = storage.get_memory(conn, orig["id"], follow="latest")
+        assert latest["id"] == new_id
+        active = storage.list_memories(conn, follow="active")
+        active_ids = {m["id"] for m in active}
+        assert new_id in active_ids
+        assert left["id"] not in active_ids and right["id"] not in active_ids
+        hist = storage.get_memory(conn, new_id, follow="full_history")
+        hist_ids = {m["id"] for m in hist.get("history") or [hist]}
+        assert {orig["id"], left["id"], right["id"], new_id} <= hist_ids
+
+
+def test_absorb_contradict_does_not_collapse_fork(local_db, monkeypatch):
+    with storage.connect() as conn:
+        orig, left, right = _seed_fork(conn)
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": left["id"],
+                "relationship": "CONTRADICT",
+                "reason": "opposing claim",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = storage.absorb_memory(conn, ["Deployment never uses versions extra"])
+        assert any(d["action"] == "contradicted" for d in result["decisions"])
+        active = {m["id"] for m in storage.list_memories(conn, follow="active")}
+        assert left["id"] in active and right["id"] in active
+
+
+def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch):
+    with storage.connect() as conn:
+        orig, left, right = _seed_fork(conn)
+        real_add = storage.add_memory
+        injected = {}
+
+        def racing_add(*args, **kwargs):
+            rec = real_add(*args, **kwargs)
+            if kwargs.get("absorb_nonce") and "competitor" not in injected:
+                competitor = real_add(
+                    conn,
+                    content="Competing absorb already collapsed the fork extra",
+                    tags=["test"],
+                )
+                storage.add_link(conn, competitor["id"], left["id"], edge_type="supersedes", commit=False)
+                storage.add_link(conn, competitor["id"], right["id"], edge_type="supersedes", commit=False)
+                injected["competitor"] = competitor["id"]
+            return rec
+
+        monkeypatch.setattr(storage, "add_memory", racing_add)
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": left["id"],
+                "relationship": "UPDATE",
+                "reason": "version three",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = storage.absorb_memory(conn, ["Deployment uses version three extra"])
+        decision = next(d for d in result["decisions"] if d["action"] == "superseded")
+        new_id = decision["memory_id"]
+        leaves, cycle = storage._component_live_leaves(conn, orig["id"])
+        assert not cycle
+        assert leaves == [new_id], (
+            f"re-forked leaves={leaves} (mutation: skip write-boundary resolve)"
+        )
+        assert injected["competitor"] != new_id
+        assert injected["competitor"] not in leaves
+
+
 def test_hybrid_semantic_list_honor_requested_limit(local_db):
     token = "storelimit-zzxq"
     with storage.connect() as conn:

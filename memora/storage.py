@@ -2380,6 +2380,35 @@ def _walk_chain(
     return chain
 
 
+def _component_live_leaves(
+    conn: sqlite3.Connection, memory_id: int
+) -> Tuple[List[int], bool]:
+    """Live leaves of the full supersession component containing memory_id.
+
+    Returns (leaves_sorted, is_cycle). is_cycle True means no leaves (SCC);
+    caller must not collapse — use [max(component)] as today's fallback.
+    """
+    component = _get_full_history(conn, memory_id)
+    if not component:
+        return [memory_id], False
+    comp = set(component)
+    leaves: List[int] = []
+    for mid in component:
+        refs = get_crossrefs(conn, mid)
+        has_successor = any(
+            ref.get("edge_type") == "superseded_by"
+            and ref["id"] in comp
+            and ref["id"] != mid
+            and _memory_exists(conn, ref["id"])
+            for ref in refs
+        )
+        if not has_successor:
+            leaves.append(mid)
+    if not leaves:
+        return [max(component)], True
+    return sorted(leaves), False
+
+
 def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     """Walk forward along superseded_by edges to find all leaf versions.
 
@@ -2414,16 +2443,36 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
 def _resolve_absorb_supersedes_target(
     conn: sqlite3.Connection,
     memory_id: int,
-) -> int:
-    """Resolve an absorb UPDATE target to a current deterministic leaf."""
-    latest_id = max(_resolve_latest(conn, memory_id))
-    if latest_id != memory_id:
+) -> Dict[str, Any]:
+    """Resolve an absorb UPDATE target to ALL live leaves of its component.
+
+    Cycle / no-leaf components keep the max(id) fallback and are never
+    collapsed (collapsible=False). Dry-run and persist share this function.
+    """
+    leaves, is_cycle = _component_live_leaves(conn, memory_id)
+    if is_cycle:
+        logger.warning(
+            "Absorb UPDATE target #%d is in a cycle/no-leaf component; "
+            "not collapsing, using fallback #%d",
+            memory_id,
+            leaves[0],
+        )
+        return {
+            "targets": leaves,
+            "collapsible": False,
+            "cycle": True,
+        }
+    if len(leaves) == 1 and leaves[0] != memory_id:
         logger.warning(
             "Absorb UPDATE target #%d is stale; superseding current leaf #%d instead",
             memory_id,
-            latest_id,
+            leaves[0],
         )
-    return latest_id
+    return {
+        "targets": leaves,
+        "collapsible": True,
+        "cycle": False,
+    }
 
 
 def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
@@ -3584,8 +3633,8 @@ def absorb_memory(
                 break
 
             elif rel == "UPDATE":
-                # Queue for creation with supersedes link
-                target_id = _resolve_absorb_supersedes_target(conn, target_id)
+                # Store the classifier target; resolve leaves at dry-run/write
+                # (shared _resolve_absorb_supersedes_target). CONTRADICT does not.
                 pending_creates.append((fact, vector, ("supersedes", target_id, reason), suggested_tags))
                 counts["superseded"] += 1
                 action_taken = True
@@ -3705,12 +3754,28 @@ def absorb_memory(
                     "contradicts": "contradict",
                     "related_to": "create_and_link",
                 }[edge_type]
-                decisions.append({
+                decision = {
                     "fact": job["content"][:80],
                     "action": action_label,
                     "target_id": target_id,
                     "reason": reason,
-                })
+                }
+                if edge_type == "supersedes":
+                    plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    decision["target_ids"] = list(plan["targets"])
+                    decision["target_id"] = plan["targets"][0] if plan["targets"] else target_id
+                    collapsed = (
+                        list(plan["targets"])
+                        if plan["collapsible"] and len(plan["targets"]) > 1
+                        else []
+                    )
+                    decision["fork_collapsed"] = collapsed
+                    if collapsed:
+                        logger.warning(
+                            "Absorb UPDATE dry_run would collapse fork %s",
+                            collapsed,
+                        )
+                decisions.append(decision)
         return {"decisions": decisions, **counts}
 
     # Precompute ALL storage embeddings from final content + merged_meta + tags.
@@ -3736,6 +3801,46 @@ def absorb_memory(
             )
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
+                if edge_type == "supersedes":
+                    # Write-boundary re-resolution: see concurrent absorb's new leaf.
+                    plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    targets = [t for t in plan["targets"] if t != record["id"]]
+                    if not targets:
+                        targets = [t for t in plan["targets"] if t != record["id"]] or list(plan["targets"])
+                    linked_ids: List[int] = []
+                    try:
+                        for tid in targets:
+                            add_link(
+                                conn, record["id"], tid,
+                                edge_type="supersedes", commit=False,
+                            )
+                            linked_ids.append(tid)
+                    except Exception as link_err:
+                        # ALL-OR-COMPENSATE: partial collapse is worse than the fork.
+                        raise RuntimeError(
+                            f"absorb fork collapse failed after {linked_ids}: {link_err}"
+                        ) from link_err
+                    collapsed = (
+                        list(linked_ids)
+                        if plan["collapsible"] and len(linked_ids) > 1
+                        else []
+                    )
+                    if collapsed:
+                        logger.warning(
+                            "Absorb UPDATE collapsed fork %s under #%d",
+                            collapsed,
+                            record["id"],
+                        )
+                    decisions.append({
+                        "fact": job["content"][:80],
+                        "action": "superseded",
+                        "memory_id": record["id"],
+                        "target_id": linked_ids[0] if linked_ids else target_id,
+                        "target_ids": linked_ids,
+                        "fork_collapsed": collapsed,
+                        "reason": reason,
+                    })
+                    continue
                 link_error: Optional[Exception] = None
                 try:
                     add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
@@ -3758,7 +3863,6 @@ def absorb_memory(
                     })
                     continue
                 action_label = {
-                    "supersedes": "superseded",
                     "contradicts": "contradicted",
                     "related_to": "linked",
                 }[edge_type]

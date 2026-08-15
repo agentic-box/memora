@@ -197,6 +197,35 @@ function finalizeLineageConflicts(maps: LineageMaps): void {
   // Keep self_cycle conflicts as recorded.
   const selfConflicts = maps.conflicts.filter(c => c.kind === "self_cycle");
   maps.conflicts = [...selfConflicts, ...scoreConflicts, ...cycleConflicts];
+
+  // Multi-leaf components (forks): fail closed — leaves are authority_unknown.
+  // Cycles already have no unsuperseded leaf (every member has an incoming
+  // supersedes edge), so this only marks genuine DAG forks.
+  const undirected = new Map<number, Set<number>>();
+  const addUndirected = (a: number, b: number) => {
+    if (!undirected.has(a)) undirected.set(a, new Set());
+    if (!undirected.has(b)) undirected.set(b, new Set());
+    undirected.get(a)!.add(b);
+    undirected.get(b)!.add(a);
+  };
+  for (const e of maps.supersedesEdges) addUndirected(e.from, e.to);
+  const seen = new Set<number>();
+  for (const start of undirected.keys()) {
+    if (seen.has(start)) continue;
+    const stack = [start];
+    const comp: number[] = [];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (seen.has(n)) continue;
+      seen.add(n);
+      comp.push(n);
+      for (const w of undirected.get(n) || []) stack.push(w);
+    }
+    const leaves = comp.filter(id => !maps.supersededBy.has(id));
+    if (leaves.length > 1) {
+      for (const leaf of leaves) maps.authorityUnknown.add(leaf);
+    }
+  }
 }
 
 /**

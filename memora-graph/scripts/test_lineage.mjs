@@ -136,6 +136,26 @@ function timelineRowClass(flags) {
     "H5 contract: directed means order meaningful, NOT a lineage marker");
 }
 
+// --- Fork: two leaves of one ancestor are authority_unknown ---
+{
+  const L = buildLineageMaps(new Map([
+    [2, [{ id: 1, score: 1, edge_type: "supersedes" }]],
+    [3, [{ id: 1, score: 1, edge_type: "supersedes" }]],
+    [1, [
+      { id: 2, score: 1, edge_type: "superseded_by" },
+      { id: 3, score: 1, edge_type: "superseded_by" },
+    ]],
+  ]));
+  assert(L.authorityUnknown.has(2) && L.authorityUnknown.has(3),
+    "fork leaves marked authority_unknown");
+  assert(!L.authorityUnknown.has(1), "fork ancestor is superseded, not unknown");
+  const linear = buildLineageMaps(new Map([
+    [2, [{ id: 1, score: 1, edge_type: "supersedes" }]],
+    [1, [{ id: 2, score: 1, edge_type: "superseded_by" }]],
+  ]));
+  assert(!linear.authorityUnknown.has(2), "linear leaf is not authority_unknown");
+}
+
 // --- G3: self-lineage module ---
 {
   const L = buildLineageMaps(new Map([
