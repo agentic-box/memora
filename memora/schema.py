@@ -355,10 +355,16 @@ def _ensure_tombstones_table(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS tombstone_components (
             memory_id INTEGER PRIMARY KEY,
+            content_hash TEXT,
             reason TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
         """
+    )
+    _add_column_if_missing(conn, "tombstone_components", "content_hash", "TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tombstone_components_hash "
+        "ON tombstone_components(content_hash)"
     )
     conn.commit()
 

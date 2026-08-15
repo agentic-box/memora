@@ -8,6 +8,7 @@ import {
   applyRetirement,
   buildAssociationEdges,
   buildLineageMaps,
+  classifyRetirementQueryError,
   parseRelatedPayload,
   partitionLineageEdges,
   type CrossRefEntry,
@@ -369,19 +370,25 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   // Lineage: normalize BOTH halves (supersedes + superseded_by) into canonical
   // newer→older, then dedupe. Associations use SEMANTIC endpoints (G2).
   const retiredIds = new Set<number>();
-  try {
-    const components = await db.prepare(
-      "SELECT memory_id FROM tombstone_components"
-    ).all<{ memory_id: number }>();
-    const hashes = await db.prepare(
-      "SELECT memory_id FROM tombstones"
-    ).all<{ memory_id: number }>();
-    for (const row of [...(components.results || []), ...(hashes.results || [])]) {
-      if (typeof row.memory_id === "number") retiredIds.add(row.memory_id);
+  let retirementAvailable = true;
+  const ingestRetired = async (table: "tombstone_components" | "tombstones") => {
+    try {
+      const result = await db.prepare(
+        `SELECT memory_id FROM ${table}`
+      ).all<{ memory_id: number }>();
+      for (const row of result.results || []) {
+        if (typeof row.memory_id === "number") retiredIds.add(row.memory_id);
+      }
+    } catch (err) {
+      if (classifyRetirementQueryError(err, table) === "absent") return;
+      retirementAvailable = false;
+      lineageAvailable = false;
+      crossrefsAvailable = false;
+      lineageDegradedReason = lineageDegradedReason || "retirement_query_failed";
     }
-  } catch {
-    // Tables may not exist on an unmigrated D1 binding; skip retirement.
-  }
+  };
+  await ingestRetired("tombstone_components");
+  await ingestRetired("tombstones");
 
   const lineage = lineageAvailable
     ? buildLineageMaps(crossrefsMap.entries())

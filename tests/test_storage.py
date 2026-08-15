@@ -842,6 +842,195 @@ def test_d1_reverse_crossref_cas_keeps_both_edges(fake_d1_backend):
     c2.close()
 
 
+def test_absorb_import_blocked_when_legacy_hash_insert_fails(fake_d1_backend, monkeypatch):
+    """Legacy tombstones INSERT can fail; the atomic marker must still block resurrect."""
+    content = "Durable marker hash probe extra words"
+    with storage.connect() as conn:
+        mem = storage.add_memory(conn, content=content)
+
+        def fail_legacy_hash(sql, params):
+            upper = " ".join(sql.split()).upper()
+            return (
+                upper.startswith("INSERT")
+                and "INTO TOMBSTONES" in upper
+                and "TOMBSTONE_COMPONENTS" not in upper
+            )
+
+        conn.fail_when = fail_legacy_hash
+        assert storage.delete_memory(conn, mem["id"]) is True
+        conn.fail_when = None
+        legacy = conn.execute(
+            "SELECT 1 FROM tombstones WHERE memory_id = ?", (mem["id"],)
+        ).fetchone()
+        assert legacy is None, "legacy hash row must be absent for this probe"
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = storage.absorb_memory(conn, [content])
+        assert any(d["action"] == "tombstoned" for d in result["decisions"]), (
+            "mutation: hash consult ignores tombstone_components.content_hash"
+        )
+        imported = storage.import_memories(
+            conn, [{"content": content}], strategy="append"
+        )
+        assert imported["imported"] == 0, (
+            "mutation: import still resurrects when only the marker carries the hash"
+        )
+
+
+def test_delete_absorb_interleave_new_leaf_not_current(fake_d1_backend):
+    """Delete snapshot then absorb link: N must be retired or compensated."""
+    with storage.connect() as conn:
+        ancestor = storage.add_memory(conn, content="Interleave ancestor extra words")
+        leaf = storage.add_memory(conn, content="Interleave leaf extra words")
+        storage.add_link(conn, leaf["id"], ancestor["id"], edge_type="supersedes")
+        new = storage.add_memory(conn, content="Interleave absorb new extra words")
+
+        def after_snap(comp):
+            assert leaf["id"] in comp
+            assert new["id"] not in comp
+            storage.add_link(conn, new["id"], leaf["id"], edge_type="supersedes")
+
+        storage._after_component_snapshot = after_snap
+        try:
+            storage.delete_memory(conn, leaf["id"])
+        finally:
+            storage._after_component_snapshot = None
+
+        active = {m["id"] for m in storage.list_memories(conn, follow="active")}
+        assert new["id"] not in active, (
+            "mutation: no delete rewalk; absorb leaf N stays current"
+        )
+        leaves, _ = storage._component_live_leaves(conn, ancestor["id"])
+        assert new["id"] not in leaves
+        retired = storage.retired_memory_ids(conn)
+        still = storage.get_memory(conn, new["id"])
+        assert new["id"] in retired or still is None
+
+
+def test_retired_memory_ids_fail_closed_on_operational_error(fake_d1_backend):
+    with storage.connect() as conn:
+        storage.add_memory(conn, content="Fail-closed retirement extra words")
+
+        def fail_components(sql, params):
+            return "from tombstone_components" in sql.lower()
+
+        conn.fail_when = fail_components
+        with pytest.raises(storage.RetirementIntegrityError):
+            storage.retired_memory_ids(conn)
+        with pytest.raises(storage.RetirementIntegrityError):
+            storage.list_memories(conn, follow="active")
+        conn.fail_when = None
+
+
+def test_losing_absorb_reports_winner_current_id(fake_d1_backend, monkeypatch):
+    backend = fake_d1_backend
+    with storage.connect() as setup:
+        leaf = storage.add_memory(setup, content="Concurrent absorb leaf extra words")
+        lid = leaf["id"]
+
+    monkeypatch.setattr(
+        storage,
+        "_search_by_vector",
+        lambda *a, **k: [{"score": 0.5, "memory": {"id": lid, "content": "Concurrent absorb leaf extra words", "metadata": None, "tags": []}}],
+    )
+    monkeypatch.setattr(
+        storage,
+        "_classify_fact_against_matches",
+        lambda fact, matches: ([{
+            "memory_id": lid,
+            "relationship": "UPDATE",
+            "reason": "concurrent update",
+        }], []),
+    )
+    monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+
+    c1 = backend.connect()
+    c2 = backend.connect()
+    nested = {"done": False}
+    second = {}
+
+    def after_resolve(plan):
+        if nested["done"]:
+            return
+        nested["done"] = True
+        second["result"] = storage.absorb_memory(
+            c2, ["Second concurrent absorb fact extra words"]
+        )
+
+    storage._after_absorb_resolve = after_resolve
+    try:
+        first = storage.absorb_memory(c1, ["First concurrent absorb fact extra words"])
+    finally:
+        storage._after_absorb_resolve = None
+
+    loser = next(
+        d for d in first["decisions"]
+        if d["action"] in {"superseded", "concurrency_resolved"}
+    )
+    winner = next(
+        d for d in second["result"]["decisions"]
+        if d["action"] in {"superseded", "concurrency_resolved"}
+    )
+    winner_id = winner.get("current_id") or winner["memory_id"]
+    assert loser["action"] == "concurrency_resolved", (
+        "mutation: loser still reports action=superseded with its own id"
+    )
+    assert loser["current_id"] == winner_id
+    assert loser["canonical"] == winner_id
+    assert storage.get_memory(c1, loser["memory_id"]) is not None
+    c1.close()
+    c2.close()
+
+
+def test_absorb_second_link_failure_compensates(fake_d1_backend, monkeypatch):
+    """Nth add_link failure on a 3-leaf fork must not leave a partial collapse."""
+    with storage.connect() as conn:
+        orig = storage.add_memory(conn, content="Compensate root extra words")
+        leaves = []
+        for label in ("one", "two", "three"):
+            leaf = storage.add_memory(conn, content=f"Compensate leaf {label} extra words")
+            storage.add_link(conn, leaf["id"], orig["id"], edge_type="supersedes")
+            leaves.append(leaf)
+        before = {orig["id"], *(lf["id"] for lf in leaves)}
+        real_add_link = storage.add_link
+        seen = {"n": 0}
+
+        def flaky_add_link(*args, **kwargs):
+            edge = kwargs.get("edge_type")
+            if edge is None and len(args) >= 4:
+                edge = args[3]
+            if edge == "supersedes":
+                seen["n"] += 1
+                if seen["n"] == 2:
+                    raise RuntimeError("injected link fail")
+            return real_add_link(*args, **kwargs)
+
+        monkeypatch.setattr(storage, "add_link", flaky_add_link)
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": leaves[0]}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": leaves[0]["id"],
+                "relationship": "UPDATE",
+                "reason": "collapse three",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        with pytest.raises(RuntimeError, match="fork collapse failed"):
+            storage.absorb_memory(conn, ["Compensate incoming extra words"])
+        remaining = {m["id"] for m in storage.list_memories(conn, follow="all")}
+        assert remaining == before, (
+            "mutation: skip compensation and the new memory / partial edges remain"
+        )
+        live, cycle = storage._component_live_leaves(conn, orig["id"])
+        assert not cycle
+        assert set(live) == {lf["id"] for lf in leaves}
+
+
 def test_component_marker_survives_nth_member_insert_failure(fake_d1_backend):
     """Nth per-member tombstone INSERT fails: every member must still be non-current."""
     with storage.connect() as conn:

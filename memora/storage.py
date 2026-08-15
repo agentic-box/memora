@@ -96,6 +96,10 @@ def llm_timeout_seconds() -> float:
     return max(1.0, value)
 
 
+class RetirementIntegrityError(RuntimeError):
+    """Operational failure reading retirement tables — must not fail open."""
+
+
 class LLMTimeoutError(RuntimeError):
     """Named failure when an LLM provider call exceeds MEMORA_LLM_TIMEOUT."""
 
@@ -2473,22 +2477,41 @@ def content_tombstone_hash(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def _is_absent_relation(exc: BaseException, table: str) -> bool:
+    """True when the error is a missing table (unmigrated), not an operational fault."""
+    msg = str(exc).lower()
+    if "no such table" not in msg and "no such column" not in msg:
+        return False
+    return table.lower() in msg
+
+
+def _select_retirement_rows(
+    conn: sqlite3.Connection, table: str, sql: str, params: tuple = ()
+) -> list:
+    try:
+        return list(conn.execute(sql, params))
+    except Exception as exc:
+        if _is_absent_relation(exc, table):
+            return []
+        raise RetirementIntegrityError(
+            f"retirement query failed on {table}: {exc}"
+        ) from exc
+
+
 def retired_memory_ids(conn: sqlite3.Connection) -> set[int]:
     """All memory ids retired by a component marker or a per-member tombstone.
 
     Two statements total — callers must not probe per row on D1.
+    Missing tables (unmigrated) are empty. Any other failure raises
+    RetirementIntegrityError so active/latest cannot fail open.
     """
     ids: set[int] = set()
-    try:
-        for row in conn.execute("SELECT memory_id FROM tombstone_components"):
+    for table, sql in (
+        ("tombstone_components", "SELECT memory_id FROM tombstone_components"),
+        ("tombstones", "SELECT memory_id FROM tombstones"),
+    ):
+        for row in _select_retirement_rows(conn, table, sql):
             ids.add(int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]))
-    except Exception:
-        pass
-    try:
-        for row in conn.execute("SELECT memory_id FROM tombstones"):
-            ids.add(int(row["memory_id"] if isinstance(row, sqlite3.Row) else row[0]))
-    except Exception:
-        pass
     return ids
 
 
@@ -2499,17 +2522,21 @@ def _is_tombstoned_id(
 ) -> bool:
     if retired_ids is not None:
         return memory_id in retired_ids
-    row = conn.execute(
+    rows = _select_retirement_rows(
+        conn,
+        "tombstone_components",
         "SELECT 1 FROM tombstone_components WHERE memory_id = ? LIMIT 1",
         (memory_id,),
-    ).fetchone()
-    if row is not None:
+    )
+    if rows:
         return True
-    row = conn.execute(
+    rows = _select_retirement_rows(
+        conn,
+        "tombstones",
         "SELECT 1 FROM tombstones WHERE memory_id = ? LIMIT 1",
         (memory_id,),
-    ).fetchone()
-    return row is not None
+    )
+    return bool(rows)
 
 
 def _lookup_tombstone_by_hash(
@@ -2517,23 +2544,64 @@ def _lookup_tombstone_by_hash(
 ) -> Optional[str]:
     """Return a stored tombstone reason for this content, or None if none.
 
+    Durable source is tombstone_components.content_hash (written in the
+    same atomic marker statement as retirement). The legacy tombstones
+    table is consulted only as a redundant best-effort copy.
+
     V1 scope is content-global within this database. Tie-break: newest
-    created_at, then highest memory_id (deterministic when timestamps collide).
+    created_at, then highest memory_id.
     """
     digest = content_tombstone_hash(content)
-    row = conn.execute(
+    rows = _select_retirement_rows(
+        conn,
+        "tombstone_components",
+        "SELECT reason FROM tombstone_components WHERE content_hash = ? "
+        "ORDER BY created_at DESC, memory_id DESC LIMIT 1",
+        (digest,),
+    )
+    if rows:
+        row = rows[0]
+        reason = row["reason"] if isinstance(row, sqlite3.Row) else row[0]
+        return reason or "deleted"
+    rows = _select_retirement_rows(
+        conn,
+        "tombstones",
         "SELECT reason FROM tombstones WHERE content_hash = ? "
         "ORDER BY created_at DESC, memory_id DESC LIMIT 1",
         (digest,),
-    ).fetchone()
-    if row is None:
+    )
+    if not rows:
         return None
+    row = rows[0]
     reason = row["reason"] if isinstance(row, sqlite3.Row) else row[0]
     return reason or "deleted"
 
 
 def _is_tombstoned_hash(conn: sqlite3.Connection, content: str) -> bool:
     return _lookup_tombstone_by_hash(conn, content) is not None
+
+
+def _retirement_reason_for_id(conn: sqlite3.Connection, memory_id: int) -> Optional[str]:
+    rows = _select_retirement_rows(
+        conn,
+        "tombstone_components",
+        "SELECT reason FROM tombstone_components WHERE memory_id = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (memory_id,),
+    )
+    if not rows:
+        rows = _select_retirement_rows(
+            conn,
+            "tombstones",
+            "SELECT reason FROM tombstones WHERE memory_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (memory_id,),
+        )
+    if not rows:
+        return None
+    row = rows[0]
+    reason = row["reason"] if isinstance(row, sqlite3.Row) else row[0]
+    return reason or "deleted"
 
 
 def _write_tombstone(
@@ -2552,6 +2620,56 @@ def _write_tombstone(
     )
 
 
+# Test hooks for delete/absorb interleave. Production leaves these None.
+_after_component_snapshot = None
+_after_absorb_resolve = None
+_COMPONENT_RETIRE_REWALKS = 8
+
+
+def _fill_component_content(
+    conn: sqlite3.Connection,
+    members: Iterable[int],
+    known: Dict[int, str],
+) -> None:
+    missing = [mid for mid in members if mid not in known]
+    if not missing:
+        return
+    placeholders = ",".join("?" * len(missing))
+    for row in conn.execute(
+        f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+        missing,
+    ):
+        known[int(row["id"])] = row["content"] or ""
+
+
+def _retire_members_atomic(
+    conn: sqlite3.Connection,
+    members: Iterable[int],
+    *,
+    reason: str,
+    known: Dict[int, str],
+) -> None:
+    """One D1 statement: retire every member id WITH its content_hash."""
+    ids = sorted({int(m) for m in members})
+    if not ids:
+        return
+    _fill_component_content(conn, ids, known)
+    values_sql = ",".join(["(?, ?, ?)"] * len(ids))
+    params: List[Any] = []
+    for mid in ids:
+        content = known.get(mid, "")
+        params.extend([mid, content_tombstone_hash(content), reason])
+    conn.execute(
+        "INSERT INTO tombstone_components(memory_id, content_hash, reason) "
+        f"VALUES {values_sql} "
+        "ON CONFLICT(memory_id) DO UPDATE SET "
+        "content_hash = COALESCE(excluded.content_hash, "
+        "tombstone_components.content_hash), "
+        "reason = excluded.reason",
+        params,
+    )
+
+
 def _tombstone_component(
     conn: sqlite3.Connection,
     memory_id: int,
@@ -2561,34 +2679,34 @@ def _tombstone_component(
 ) -> None:
     """Record tombstones for every member of the supersession component.
 
-    Deleting any member retires the whole component so remaining ancestors
-    cannot become current leaves after successor edges are cleared.
+    The durable marker is one INSERT of (memory_id, content_hash, reason)
+    for the current component. After that insert, rewalk and mark anyone
+    who attached in the window (absorb linking a new leaf). Legacy
+    per-hash rows in `tombstones` are best-effort only.
     """
     known = dict(content_by_id or {})
-    component = set(_get_full_history(conn, memory_id) or [])
-    component.add(memory_id)
-    missing = [mid for mid in component if mid not in known]
-    if missing:
-        placeholders = ",".join("?" * len(missing))
-        for row in conn.execute(
-            f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
-            missing,
-        ):
-            known[int(row["id"])] = row["content"]
-    members = sorted(component)
-    if members:
-        # Atomic on D1: one INSERT covering every member. Must land BEFORE
-        # per-hash rows so a later insert failure cannot leave survivors current.
-        values_sql = ",".join(["(?, ?)"] * len(members))
-        params: List[Any] = []
-        for mid in members:
-            params.extend([mid, reason])
-        conn.execute(
-            "INSERT OR IGNORE INTO tombstone_components(memory_id, reason) "
-            f"VALUES {values_sql}",
-            params,
-        )
-    for mid in members:
+    marked: set[int] = set()
+    first = True
+    for _ in range(_COMPONENT_RETIRE_REWALKS):
+        component = set(_get_full_history(conn, memory_id) or [])
+        component.add(memory_id)
+        if first:
+            snapshot = set(component)
+            hook = _after_component_snapshot
+            if hook is not None:
+                hook(snapshot)
+            # Mark the pre-hook snapshot first. A leaf attached after this
+            # insert is caught on the next rewalk (delete-side stabilization).
+            _retire_members_atomic(conn, snapshot, reason=reason, known=known)
+            marked = set(snapshot)
+            first = False
+            continue
+        new_ids = component - marked
+        if not new_ids:
+            break
+        _retire_members_atomic(conn, component, reason=reason, known=known)
+        marked |= component
+    for mid in marked:
         content = known.get(mid)
         if content is None:
             continue
@@ -4069,15 +4187,7 @@ def absorb_memory(
                 if edge_type == "supersedes":
                     plan = _resolve_absorb_supersedes_target(conn, target_id)
                     if plan.get("tombstoned"):
-                        stored = conn.execute(
-                            "SELECT reason FROM tombstones WHERE memory_id = ? "
-                            "ORDER BY created_at DESC LIMIT 1",
-                            (target_id,),
-                        ).fetchone()
-                        stored_reason = (
-                            (stored["reason"] if isinstance(stored, sqlite3.Row) else stored[0])
-                            if stored else None
-                        )
+                        stored_reason = _retirement_reason_for_id(conn, target_id)
                         decision["action"] = "tombstoned"
                         decision["target_ids"] = []
                         decision["fork_collapsed"] = []
@@ -4130,7 +4240,12 @@ def absorb_memory(
                     # Write-boundary re-resolution: see concurrent absorb's new leaf
                     # and refuse to resurrect a component tombstoned after classify.
                     plan = _resolve_absorb_supersedes_target(conn, target_id)
-                    if plan.get("tombstoned"):
+                    hook = _after_absorb_resolve
+                    if hook is not None:
+                        hook(plan)
+                    if plan.get("tombstoned") or any(
+                        _is_tombstoned_id(conn, tid) for tid in plan.get("targets") or []
+                    ) or _is_tombstoned_id(conn, target_id):
                         ok = delete_memory(
                             conn, record["id"], require_absorb_nonce=absorb_nonce,
                         )
@@ -4144,19 +4259,13 @@ def absorb_memory(
                         counts["superseded"] = max(0, counts["superseded"] - 1)
                         counts["tombstoned"] += 1
                         counts["skipped"] += 1
-                        stored = conn.execute(
-                            "SELECT reason FROM tombstones WHERE memory_id = ? "
-                            "ORDER BY created_at DESC LIMIT 1",
-                            (target_id,),
-                        ).fetchone()
-                        stored_reason = (
-                            (stored["reason"] if isinstance(stored, sqlite3.Row) else stored[0])
-                            if stored else None
-                        )
                         decisions.append({
                             "fact": job["content"][:80],
                             "action": "tombstoned",
-                            "reason": stored_reason or "target component was tombstoned (deletion wins)",
+                            "reason": (
+                                _retirement_reason_for_id(conn, target_id)
+                                or "target component was tombstoned (deletion wins)"
+                            ),
                             "target_id": target_id,
                             "target_ids": [],
                             "fork_collapsed": [],
@@ -4182,6 +4291,37 @@ def absorb_memory(
                         raise RuntimeError(
                             f"absorb fork collapse failed after {linked_ids}: {link_err}"
                         ) from link_err
+                    # Deletion wins: a marker that landed after resolve (or a
+                    # delete-side rewalk that marked this new leaf) must not
+                    # leave N current. Compensate the absorb row.
+                    if _is_tombstoned_id(conn, record["id"]) or any(
+                        _is_tombstoned_id(conn, tid) for tid in linked_ids
+                    ):
+                        ok = delete_memory(
+                            conn, record["id"], require_absorb_nonce=absorb_nonce,
+                        )
+                        if not ok:
+                            raise RuntimeError(
+                                "absorb linked into a retired component but "
+                                f"could not compensate #{record['id']}"
+                            )
+                        if record["id"] in owned_ids:
+                            owned_ids.remove(record["id"])
+                        counts["superseded"] = max(0, counts["superseded"] - 1)
+                        counts["tombstoned"] += 1
+                        counts["skipped"] += 1
+                        decisions.append({
+                            "fact": job["content"][:80],
+                            "action": "tombstoned",
+                            "reason": (
+                                _retirement_reason_for_id(conn, target_id)
+                                or "target component was tombstoned (deletion wins)"
+                            ),
+                            "target_id": target_id,
+                            "target_ids": [],
+                            "fork_collapsed": [],
+                        })
+                        continue
                     collapsed = (
                         list(linked_ids)
                         if plan["collapsible"] and len(linked_ids) > 1
@@ -4193,6 +4333,22 @@ def absorb_memory(
                             collapsed,
                             record["id"],
                         )
+                    live_now, _cycle = _component_live_leaves(conn, record["id"])
+                    current_id = max(live_now) if live_now else record["id"]
+                    if current_id != record["id"]:
+                        counts["superseded"] = max(0, counts["superseded"] - 1)
+                        decisions.append({
+                            "fact": job["content"][:80],
+                            "action": "concurrency_resolved",
+                            "memory_id": record["id"],
+                            "current_id": current_id,
+                            "canonical": current_id,
+                            "target_id": linked_ids[0] if linked_ids else target_id,
+                            "target_ids": linked_ids,
+                            "fork_collapsed": collapsed,
+                            "reason": reason,
+                        })
+                        continue
                     decisions.append({
                         "fact": job["content"][:80],
                         "action": "superseded",

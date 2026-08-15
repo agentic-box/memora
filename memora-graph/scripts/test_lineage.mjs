@@ -14,6 +14,7 @@ import {
   applyRetirement,
   buildAssociationEdges,
   buildLineageMaps,
+  classifyRetirementQueryError,
   isLineageEdgeType,
   normalizeAssociationRef,
   parseRelatedPayload,
@@ -471,6 +472,29 @@ function timelineRowClass(flags) {
       readFileSync(join(__dirname, "../functions/api/graph.ts"), "utf8"),
     ),
     "graph.ts consults tombstone_components",
+  );
+}
+
+// --- retirement query fail-closed ---
+{
+  assert(
+    classifyRetirementQueryError("no such table: tombstone_components", "tombstone_components")
+      === "absent",
+    "missing tombstone_components is migration-absent",
+  );
+  assert(
+    classifyRetirementQueryError("no such table: tombstones", "tombstones") === "absent",
+    "missing tombstones is migration-absent",
+  );
+  assert(
+    classifyRetirementQueryError("D1 HTTP 500: internal error", "tombstone_components")
+      === "operational",
+    "operational D1 fault is not table-absent",
+  );
+  const graphSrc = readFileSync(join(__dirname, "../functions/api/graph.ts"), "utf8");
+  assert(
+    /retirement_query_failed/.test(graphSrc) && /lineageAvailable = false/.test(graphSrc),
+    "graph.ts fail-closes lineage on operational retirement read",
   );
 }
 

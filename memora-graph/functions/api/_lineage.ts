@@ -276,6 +276,19 @@ export function buildLineageMaps(
   return maps;
 }
 
+/** Missing table/column (unmigrated) vs operational D1 failure. */
+export function classifyRetirementQueryError(
+  err: unknown,
+  table: string,
+): "absent" | "operational" {
+  const msg = String(err ?? "").toLowerCase();
+  const tableHit = msg.includes(table.toLowerCase());
+  if (tableHit && (msg.includes("no such table") || msg.includes("no such column"))) {
+    return "absent";
+  }
+  return "operational";
+}
+
 /** Mark retired/tombstoned ids so they cannot render as current. */
 export function applyRetirement(
   maps: LineageMaps,
