@@ -131,18 +131,63 @@ async function graph(env, url) {
   );
 }
 
-// ?limit=N larger than the node count is not truncated.
+// Hard-max clamp is OBSERVED against the real constant: build a store larger
+// than GRAPH_LIMIT_MAX (5000), request above it, assert exactly GRAPH_LIMIT_MAX
+// nodes + truncated + total. Red under the leader's mutation (max -> huge)
+// because then all 5100 nodes come back untruncated.
+{
+  const many = [];
+  for (let i = 0; i < 5100; i++) {
+    many.push(memory(i + 1, new Date(2020, 0, 1 + i).toISOString()));
+  }
+  const db = new FakeDb(many);
+  const res = await graph({ DB_MEMORA: db }, "http://local/api/graph?limit=999999");
+  const data = await res.json();
+  assert(res.status === 200, "clamped oversized limit returns 200");
+  assert(
+    data.nodes.length === 5000,
+    `clamp keeps exactly GRAPH_LIMIT_MAX=5000 nodes, got ${data.nodes.length}`,
+  );
+  assert(data.truncated === true, "clamped oversized limit is truncated");
+  assert(data.total === 5100, "clamped oversized limit total reports the store count");
+}
+
+// The hard max is tunable via env (test-harness injection): a small injected
+// max is respected. Red if the env override is ignored (max stays huge).
 {
   const db = new FakeDb([
     memory(1, "2026-01-01T00:00:00Z"),
     memory(2, "2026-02-01T00:00:00Z"),
     memory(3, "2026-03-01T00:00:00Z"),
+    memory(4, "2026-04-01T00:00:00Z"),
+    memory(5, "2026-05-01T00:00:00Z"),
+  ]);
+  const res = await graph(
+    { DB_MEMORA: db, GRAPH_LIMIT_MAX: "3" },
+    "http://local/api/graph?limit=999999",
+  );
+  const data = await res.json();
+  assert(res.status === 200, "env-injected max oversized limit returns 200");
+  assert(data.nodes.length === 3, "env-injected max respects GRAPH_LIMIT_MAX=3");
+  assert(data.truncated === true, "env-injected max oversized limit is truncated");
+  const ids = data.nodes.map((n) => n.id);
+  assert(JSON.stringify(ids) === JSON.stringify([5, 4, 3]), "env-injected clamp keeps newest");
+}
+
+// Explicit limit below the max is not clamped.
+{
+  const db = new FakeDb([
+    memory(1, "2026-01-01T00:00:00Z"),
+    memory(2, "2026-02-01T00:00:00Z"),
+    memory(3, "2026-03-01T00:00:00Z"),
+    memory(4, "2026-04-01T00:00:00Z"),
+    memory(5, "2026-05-01T00:00:00Z"),
   ]);
   const res = await graph({ DB_MEMORA: db }, "http://local/api/graph?limit=10");
   const data = await res.json();
   assert(data.truncated === false, "limit=10 not truncated");
-  assert(data.total === 3, "limit=10 total=3");
-  assert(data.nodes.length === 3, "limit=10 returns all nodes");
+  assert(data.total === 5, "limit=10 total=5");
+  assert(data.nodes.length === 5, "limit=10 returns all nodes");
 }
 
 // Non-numeric, zero, and negative ?limit are rejected with 400 invalid_limit.
@@ -152,20 +197,6 @@ for (const bad of ["abc", "0", "-5", "2.5", ""]) {
   const data = await res.json();
   assert(res.status === 400, `limit=${JSON.stringify(bad)} -> 400`);
   assert(data.error === "invalid_limit", `limit=${JSON.stringify(bad)} -> invalid_limit`);
-}
-
-// ?limit= far above the hard cap is clamped, not rejected.
-{
-  const db = new FakeDb([
-    memory(1, "2026-01-01T00:00:00Z"),
-    memory(2, "2026-02-01T00:00:00Z"),
-    memory(3, "2026-03-01T00:00:00Z"),
-  ]);
-  const res = await graph({ DB_MEMORA: db }, "http://local/api/graph?limit=999999");
-  const data = await res.json();
-  assert(res.status === 200, "oversized limit is clamped, not rejected");
-  assert(data.truncated === false, "oversized limit over 3 nodes is not truncated");
-  assert(data.nodes.length === 3, "oversized limit returns all nodes");
 }
 
 // No dangling edges: with limit keeping only the newest node, a crossref edge

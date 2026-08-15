@@ -219,17 +219,27 @@ def test_graph_limit_invalid_rejected(graph_request, memory_factory):
         assert data["error"] == "invalid_limit", f"limit={bad!r} error code"
 
 
-def test_graph_limit_clamps_to_hard_max(graph_request, memory_factory):
-    """?limit= above the hard cap is clamped, not rejected."""
+def test_graph_limit_clamps_to_hard_max(monkeypatch, graph_request, memory_factory):
+    """?limit= above the hard cap is clamped, not rejected.
+
+    Monkeypatch GRAPH_LIMIT_MAX down to 3 so the clamp is observable on a small
+    store (mutation: removing the clamp / raising the max returns all 5 nodes
+    untruncated).
+    """
+    import memora.graph.data as graph_data
+
+    monkeypatch.setattr(graph_data, "GRAPH_LIMIT_MAX", 3)
     for i in range(5):
         memory_factory(content=f"Limit memory {i}")
 
     status, data = graph_request("GET", "/api/graph?limit=999999")
 
     assert status == 200
-    # Only 5 memories exist, so the clamp yields all 5 (not truncated).
-    assert data["truncated"] is False
-    assert len(data["nodes"]) == 5
+    assert len(data["nodes"]) == 3
+    assert data["truncated"] is True
+    assert data["total"] == 5
+    # Clamp keeps the newest (same created_at tick, id DESC).
+    assert [n["id"] for n in data["nodes"]] == [5, 4, 3]
 
 
 def test_graph_limit_no_dangling_edges(graph_request, local_db):
@@ -250,3 +260,31 @@ def test_graph_limit_no_dangling_edges(graph_request, local_db):
         assert edge["from"] in node_ids and edge["to"] in node_ids, (
             "mutation: edge dangles to an excluded node"
         )
+
+
+def test_graph_limit_clamp_observable_on_volume(local_db):
+    """Clamp is observable against the real GRAPH_LIMIT_MAX.
+
+    Seed a store larger than GRAPH_LIMIT_MAX, request above it, and assert
+    exactly GRAPH_LIMIT_MAX nodes + truncated + total (mutation: raising
+    GRAPH_LIMIT_MAX returns all rows untruncated).
+    """
+    from memora.graph.data import GRAPH_LIMIT_MAX, get_graph_data
+
+    # Fixed row count (5100 > the real GRAPH_LIMIT_MAX of 5000), independent of
+    # the constant so a mutation that raises GRAPH_LIMIT_MAX doesn't blow up the
+    # insert loop and the clamp stays observable.
+    n = 5100
+    with storage.connect() as conn:
+        for i in range(1, n + 1):
+            conn.execute(
+                "INSERT INTO memories (id, content, metadata, tags, created_at, updated_at) "
+                "VALUES (?, ?, '{}', '[]', '2026-01-01T00:00:00Z', NULL)",
+                (i, f"bulk {i}"),
+            )
+
+    data = get_graph_data(limit=GRAPH_LIMIT_MAX + 999)
+
+    assert data["truncated"] is True
+    assert data["total"] == n
+    assert len(data["nodes"]) == GRAPH_LIMIT_MAX

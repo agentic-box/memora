@@ -16,6 +16,10 @@ import {
 
 interface Env extends DatabaseEnv {
   MIN_EDGE_SCORE?: string;
+  /** Override the default (no-?limit) node cap; positive int or ignored. */
+  GRAPH_DEFAULT_LIMIT?: string;
+  /** Override the hard cap for explicit ?limit=; positive int or ignored. */
+  GRAPH_LIMIT_MAX?: string;
 }
 
 interface Memory {
@@ -276,6 +280,13 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
   }
 }
 
+/** Parse a positive-int env override; returns the fallback when unset/invalid. */
+function parsePositiveIntEnv(raw: string | undefined, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const n = parseInt(raw, 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
 function isSection(metadata: Record<string, unknown> | null): boolean {
   return metadata?.type === "section";
 }
@@ -333,10 +344,16 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const db = selection.binding;
   const minScore = parseFloat(env.MIN_EDGE_SCORE || "0.40");
 
-  // ?limit= node cap. Absent => DEFAULT_GRAPH_LIMIT. Non-numeric or <= 0 => 400
-  // invalid_limit. > GRAPH_LIMIT_MAX clamps to max.
+  // Resolve the node caps. DEFAULT_GRAPH_LIMIT / GRAPH_LIMIT_MAX are the
+  // production defaults; the corresponding env vars override them for tuning
+  // and for the test harness (so the clamp is observable on small fixtures).
+  const defaultLimit = parsePositiveIntEnv(env.GRAPH_DEFAULT_LIMIT, DEFAULT_GRAPH_LIMIT);
+  const graphLimitMax = parsePositiveIntEnv(env.GRAPH_LIMIT_MAX, GRAPH_LIMIT_MAX);
+
+  // ?limit= node cap. Absent => defaultLimit. Non-numeric or <= 0 => 400
+  // invalid_limit. > graphLimitMax clamps to max.
   const limitRaw = url.searchParams.get("limit");
-  let limit = DEFAULT_GRAPH_LIMIT;
+  let limit = defaultLimit;
   if (limitRaw !== null) {
     const trimmed = limitRaw.trim();
     if (!/^-?\d+$/.test(trimmed)) {
@@ -346,7 +363,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (parsed <= 0) {
       return Response.json({ error: "invalid_limit" }, { status: 400 });
     }
-    limit = Math.min(parsed, GRAPH_LIMIT_MAX);
+    limit = Math.min(parsed, graphLimitMax);
   }
 
   // Fetch all memories
