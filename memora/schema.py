@@ -131,6 +131,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_actions_table(conn)
     _ensure_importance_columns(conn)
     _ensure_updated_at_column(conn)
+    _ensure_tombstones_table(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -328,5 +329,27 @@ def _ensure_updated_at_column(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-    # Note: memory_absorb stores source/confidence in metadata (not separate columns)
-    # to avoid schema migration and keep provenance co-located with other metadata.
+def _ensure_tombstones_table(conn: sqlite3.Connection) -> None:
+    """Tombstones survive the deleted row (no FK). Python absorb/import consult them."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS tombstones (
+            content_hash TEXT NOT NULL,
+            memory_id INTEGER NOT NULL,
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (content_hash, memory_id)
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tombstones_hash ON tombstones(content_hash)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tombstones_memory ON tombstones(memory_id)"
+    )
+    conn.commit()
+
+
+# Note: memory_absorb stores source/confidence in metadata (not separate columns)
+# to avoid schema migration and keep provenance co-located with other metadata.

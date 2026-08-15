@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import json
 import logging
@@ -2380,6 +2381,91 @@ def _walk_chain(
     return chain
 
 
+def content_tombstone_hash(content: str) -> str:
+    """sha256 hex of V1 tombstone-normalized content.
+
+    Normalization: strip ends, collapse any Unicode whitespace run to a
+    single ASCII space, then casefold. Absorb and import consult this hash.
+    Pages do not read tombstones in V1.
+    """
+    normalized = re.sub(r"\s+", " ", (content or "").strip()).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _is_tombstoned_id(conn: sqlite3.Connection, memory_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM tombstones WHERE memory_id = ? LIMIT 1",
+        (memory_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _lookup_tombstone_by_hash(
+    conn: sqlite3.Connection, content: str
+) -> Optional[str]:
+    """Return a stored tombstone reason for this content, or None if none."""
+    digest = content_tombstone_hash(content)
+    row = conn.execute(
+        "SELECT reason FROM tombstones WHERE content_hash = ? "
+        "ORDER BY created_at DESC LIMIT 1",
+        (digest,),
+    ).fetchone()
+    if row is None:
+        return None
+    reason = row["reason"] if isinstance(row, sqlite3.Row) else row[0]
+    return reason or "deleted"
+
+
+def _is_tombstoned_hash(conn: sqlite3.Connection, content: str) -> bool:
+    return _lookup_tombstone_by_hash(conn, content) is not None
+
+
+def _write_tombstone(
+    conn: sqlite3.Connection,
+    *,
+    memory_id: int,
+    content: str,
+    reason: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO tombstones (content_hash, memory_id, reason)
+        VALUES (?, ?, ?)
+        """,
+        (content_tombstone_hash(content), memory_id, reason),
+    )
+
+
+def _tombstone_component(
+    conn: sqlite3.Connection,
+    memory_id: int,
+    *,
+    reason: str,
+    content_by_id: Optional[Dict[int, str]] = None,
+) -> None:
+    """Record tombstones for every member of the supersession component.
+
+    Deleting any member retires the whole component so remaining ancestors
+    cannot become current leaves after successor edges are cleared.
+    """
+    known = dict(content_by_id or {})
+    component = set(_get_full_history(conn, memory_id) or [])
+    component.add(memory_id)
+    missing = [mid for mid in component if mid not in known]
+    if missing:
+        placeholders = ",".join("?" * len(missing))
+        for row in conn.execute(
+            f"SELECT id, content FROM memories WHERE id IN ({placeholders})",
+            missing,
+        ):
+            known[int(row["id"])] = row["content"]
+    for mid in component:
+        content = known.get(mid)
+        if content is None:
+            continue
+        _write_tombstone(conn, memory_id=mid, content=content, reason=reason)
+
+
 def _component_live_leaves(
     conn: sqlite3.Connection, memory_id: int
 ) -> Tuple[List[int], bool]:
@@ -2406,7 +2492,8 @@ def _component_live_leaves(
             leaves.append(mid)
     if not leaves:
         return [max(component)], True
-    return sorted(leaves), False
+    live = [mid for mid in leaves if not _is_tombstoned_id(conn, mid)]
+    return sorted(live), False
 
 
 def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
@@ -2437,7 +2524,7 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     # deterministic fallback (same node regardless of entry point).
     if not leaves:
         return [max(all_ids)]
-    return leaves
+    return [mid for mid in leaves if not _is_tombstoned_id(conn, mid)]
 
 
 def _resolve_absorb_supersedes_target(
@@ -2451,6 +2538,14 @@ def _resolve_absorb_supersedes_target(
     """
     leaves, is_cycle = _component_live_leaves(conn, memory_id)
     if is_cycle:
+        component = _get_full_history(conn, memory_id)
+        if component and all(_is_tombstoned_id(conn, mid) for mid in component):
+            return {
+                "targets": [],
+                "collapsible": False,
+                "cycle": True,
+                "tombstoned": True,
+            }
         logger.warning(
             "Absorb UPDATE target #%d is in a cycle/no-leaf component; "
             "not collapsing, using fallback #%d",
@@ -2461,6 +2556,14 @@ def _resolve_absorb_supersedes_target(
             "targets": leaves,
             "collapsible": False,
             "cycle": True,
+            "tombstoned": False,
+        }
+    if not leaves:
+        return {
+            "targets": [],
+            "collapsible": False,
+            "cycle": False,
+            "tombstoned": True,
         }
     if len(leaves) == 1 and leaves[0] != memory_id:
         logger.warning(
@@ -2472,6 +2575,7 @@ def _resolve_absorb_supersedes_target(
         "targets": leaves,
         "collapsible": True,
         "cycle": False,
+        "tombstoned": False,
     }
 
 
@@ -2577,7 +2681,11 @@ def apply_follow(
         return {"score": score, "memory": mem} if is_search else mem
 
     if follow == "active":
-        return [item for item in results if not _is_superseded(conn, _get_id(item))]
+        return [
+            item for item in results
+            if not _is_superseded(conn, _get_id(item))
+            and not _is_tombstoned_id(conn, _get_id(item))
+        ]
 
     if follow == "latest":
         if seen_ids is None:
@@ -3514,10 +3622,10 @@ def absorb_memory(
         Dict with decisions list and summary counts
     """
     if not facts:
-        return {"decisions": [], "created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0}
+        return {"decisions": [], "created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
     decisions: List[Dict[str, Any]] = []
-    counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0}
+    counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
     # Phase 1: Classify each fact against existing memories, collect "to create" facts
     pending_creates: List[tuple] = []  # (fact, vector, link_info_or_None, suggested_tags)
@@ -3533,6 +3641,17 @@ def absorb_memory(
         redacted_fact, secrets = _redact_secrets(fact)
         if secrets:
             fact = redacted_fact
+
+        tombstone_reason = _lookup_tombstone_by_hash(conn, fact)
+        if tombstone_reason is not None:
+            decisions.append({
+                "fact": fact[:80],
+                "action": "tombstoned",
+                "reason": tombstone_reason,
+            })
+            counts["tombstoned"] += 1
+            counts["skipped"] += 1
+            continue
 
         # Search for similar existing memories.
         # N6: initialize vector before try so a strict embedding failure cannot
@@ -3571,6 +3690,11 @@ def absorb_memory(
             if not _is_document_memory(
                 (m.get("memory") or m).get("metadata")
             )
+        ]
+        # Retired component members stay in the table but are not absorb targets.
+        matches = [
+            m for m in matches
+            if not _is_tombstoned_id(conn, (m.get("memory") or m)["id"])
         ]
 
         # No similar memories — queue for creation (vector is guaranteed set here)
@@ -3762,6 +3886,25 @@ def absorb_memory(
                 }
                 if edge_type == "supersedes":
                     plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    if plan.get("tombstoned"):
+                        stored = conn.execute(
+                            "SELECT reason FROM tombstones WHERE memory_id = ? "
+                            "ORDER BY created_at DESC LIMIT 1",
+                            (target_id,),
+                        ).fetchone()
+                        stored_reason = (
+                            (stored["reason"] if isinstance(stored, sqlite3.Row) else stored[0])
+                            if stored else None
+                        )
+                        decision["action"] = "tombstoned"
+                        decision["target_ids"] = []
+                        decision["fork_collapsed"] = []
+                        decision["reason"] = stored_reason or "target component is tombstoned"
+                        counts["superseded"] = max(0, counts["superseded"] - 1)
+                        counts["tombstoned"] += 1
+                        counts["skipped"] += 1
+                        decisions.append(decision)
+                        continue
                     decision["target_ids"] = list(plan["targets"])
                     decision["target_id"] = plan["targets"][0] if plan["targets"] else target_id
                     collapsed = (
@@ -3802,11 +3945,47 @@ def absorb_memory(
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 if edge_type == "supersedes":
-                    # Write-boundary re-resolution: see concurrent absorb's new leaf.
+                    # Write-boundary re-resolution: see concurrent absorb's new leaf
+                    # and refuse to resurrect a component tombstoned after classify.
                     plan = _resolve_absorb_supersedes_target(conn, target_id)
+                    if plan.get("tombstoned"):
+                        ok = delete_memory(
+                            conn, record["id"], require_absorb_nonce=absorb_nonce,
+                        )
+                        if not ok:
+                            raise RuntimeError(
+                                "absorb refused tombstoned component but "
+                                f"could not compensate #{record['id']}"
+                            )
+                        if record["id"] in owned_ids:
+                            owned_ids.remove(record["id"])
+                        counts["superseded"] = max(0, counts["superseded"] - 1)
+                        counts["tombstoned"] += 1
+                        counts["skipped"] += 1
+                        stored = conn.execute(
+                            "SELECT reason FROM tombstones WHERE memory_id = ? "
+                            "ORDER BY created_at DESC LIMIT 1",
+                            (target_id,),
+                        ).fetchone()
+                        stored_reason = (
+                            (stored["reason"] if isinstance(stored, sqlite3.Row) else stored[0])
+                            if stored else None
+                        )
+                        decisions.append({
+                            "fact": job["content"][:80],
+                            "action": "tombstoned",
+                            "reason": stored_reason or "target component was tombstoned (deletion wins)",
+                            "target_id": target_id,
+                            "target_ids": [],
+                            "fork_collapsed": [],
+                        })
+                        continue
                     targets = [t for t in plan["targets"] if t != record["id"]]
                     if not targets:
-                        targets = [t for t in plan["targets"] if t != record["id"]] or list(plan["targets"])
+                        raise RuntimeError(
+                            "absorb UPDATE resolved no live targets "
+                            f"(classifier target #{target_id})"
+                        )
                     linked_ids: List[int] = []
                     try:
                         for tid in targets:
@@ -4134,6 +4313,8 @@ def get_memory(
     # monotonically increasing, so this favors the most recently created branch.
     if follow == "latest":
         leaf_ids = _resolve_latest(conn, memory_id)
+        if not leaf_ids:
+            return None
         latest_id = max(leaf_ids)
         if latest_id != memory_id:
             return get_memory(conn, latest_id, track_access=track_access)
@@ -4293,23 +4474,29 @@ def delete_memory(
     memory_id: int,
     *,
     require_absorb_nonce: Optional[str] = None,
+    reason: Optional[str] = None,
 ) -> bool:
     """Delete a memory. Returns True only if the row was actually removed.
 
     require_absorb_nonce: when set, verify metadata.absorb_nonce matches BEFORE
     any destructive work (R2/FTS/neighbour rewrites). Prefer leaving an orphan
     over deleting an unrelated memory (absorb compensation safety).
+    Compensating deletes do not write tombstones.
+
+    reason: stored on the tombstone row (default "deleted"). User deletes and
+    merge-source deletes write a component-wide tombstone so absorb/import
+    cannot resurrect the retired content.
     """
     import logging
 
     row = conn.execute(
-        "SELECT metadata FROM memories WHERE id = ?", (memory_id,)
+        "SELECT content, metadata FROM memories WHERE id = ?", (memory_id,)
     ).fetchone()
     if row is None:
         return False
 
     if require_absorb_nonce is not None:
-        raw = row["metadata"] if isinstance(row, sqlite3.Row) else row[0]
+        raw = row["metadata"] if isinstance(row, sqlite3.Row) else row[1]
         meta: Dict[str, Any] = {}
         if raw:
             try:
@@ -4322,6 +4509,14 @@ def delete_memory(
                 memory_id, meta.get("absorb_nonce"), require_absorb_nonce,
             )
             return False
+    else:
+        deleted_content = row["content"] if isinstance(row, sqlite3.Row) else row[0]
+        _tombstone_component(
+            conn,
+            memory_id,
+            reason=reason or "deleted",
+            content_by_id={memory_id: deleted_content or ""},
+        )
 
     from .image_storage import get_image_storage_instance
 
@@ -4348,10 +4543,30 @@ def delete_memory(
     return cur.rowcount > 0
 
 
-def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
+def delete_memories(
+    conn: sqlite3.Connection,
+    memory_ids: Iterable[int],
+    *,
+    reason: Optional[str] = None,
+) -> int:
     ids = list(memory_ids)
     if not ids:
         return 0
+
+    tombstone_reason = reason or "deleted"
+    for memory_id in ids:
+        row = conn.execute(
+            "SELECT content FROM memories WHERE id = ?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            continue
+        content = row["content"] if isinstance(row, sqlite3.Row) else row[0]
+        _tombstone_component(
+            conn,
+            memory_id,
+            reason=tombstone_reason,
+            content_by_id={memory_id: content or ""},
+        )
 
     # Clean up R2 images for all memories
     import logging
@@ -5440,6 +5655,10 @@ def import_memories(
 
             # Skip duplicates in merge mode
             if strategy == "merge" and content in existing_contents:
+                skipped += 1
+                continue
+
+            if _is_tombstoned_hash(conn, content):
                 skipped += 1
                 continue
 

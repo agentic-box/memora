@@ -507,6 +507,230 @@ def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch):
         assert injected["competitor"] not in leaves
 
 
+def _tombstone_rows(conn):
+    return conn.execute(
+        "SELECT content_hash, memory_id, reason FROM tombstones ORDER BY memory_id"
+    ).fetchall()
+
+
+def test_content_tombstone_hash_normalizes():
+    a = storage.content_tombstone_hash("  Hello\n\tWorld  ")
+    b = storage.content_tombstone_hash("hello world")
+    c = storage.content_tombstone_hash("HELLO   WORLD")
+    d = storage.content_tombstone_hash("hello worlds")
+    assert a == b == c, (
+        "mutation: drop strip/collapse-whitespace/casefold and this goes red"
+    )
+    assert a != d
+    assert len(a) == 64
+
+
+def test_delete_memory_writes_tombstone(local_db):
+    with storage.connect() as conn:
+        mem = storage.add_memory(conn, content="Tombstone probe ALPHA extra words")
+        mid = mem["id"]
+        digest = storage.content_tombstone_hash(mem["content"])
+        assert storage.delete_memory(conn, mid, reason="user-retracted") is True
+        rows = _tombstone_rows(conn)
+        assert len(rows) == 1, "mutation: skip _write_tombstone in delete_memory"
+        assert rows[0]["content_hash"] == digest
+        assert rows[0]["memory_id"] == mid
+        assert rows[0]["reason"] == "user-retracted"
+        leftover = conn.execute(
+            "SELECT 1 FROM tombstones WHERE memory_id = ?", (mid,)
+        ).fetchone()
+        assert leftover is not None, "tombstones must survive the deleted row (no FK)"
+
+
+def test_delete_retires_whole_component(local_db):
+    with storage.connect() as conn:
+        orig = storage.add_memory(conn, content="Component retire root extra words")
+        leaf = storage.add_memory(conn, content="Component retire leaf extra words")
+        storage.add_link(conn, leaf["id"], orig["id"], edge_type="supersedes")
+        sibling = storage.add_memory(conn, content="Unrelated live memory extra words")
+
+        assert storage.delete_memory(conn, leaf["id"]) is True
+        tomb_ids = {row["memory_id"] for row in _tombstone_rows(conn)}
+        assert {orig["id"], leaf["id"]} <= tomb_ids, (
+            "mutation: tombstone only the deleted id and ancestor becomes current"
+        )
+
+        active = {m["id"] for m in storage.list_memories(conn, follow="active")}
+        assert orig["id"] not in active
+        assert leaf["id"] not in active
+        assert sibling["id"] in active
+
+        assert storage.get_memory(conn, orig["id"], follow="latest") is None
+        assert storage.get_memory(conn, orig["id"]) is not None
+        hist = storage.get_memory(conn, orig["id"], follow="full_history")
+        hist_ids = {m["id"] for m in (hist.get("history") or [hist])}
+        assert orig["id"] in hist_ids
+        leaves, cycle = storage._component_live_leaves(conn, orig["id"])
+        assert not cycle
+        assert leaves == []
+
+
+def test_absorb_skips_tombstoned_hash(local_db, monkeypatch):
+    with storage.connect() as conn:
+        mem = storage.add_memory(conn, content="Retired absorb fact extra words")
+        storage.delete_memory(conn, mem["id"], reason="user-retracted")
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        preview = storage.absorb_memory(
+            conn, ["  RETIRED   absorb fact extra words "], dry_run=True
+        )
+        preview_dec = next(d for d in preview["decisions"] if d["action"] == "tombstoned")
+        assert preview_dec["reason"] == "user-retracted"
+        result = storage.absorb_memory(conn, ["  RETIRED   absorb fact extra words "])
+        decision = next(d for d in result["decisions"] if d["action"] == "tombstoned")
+        assert decision["reason"] == "user-retracted", (
+            "mutation: skip absorb hash consult and this goes red"
+        )
+        assert result["tombstoned"] >= 1
+        created = [d for d in result["decisions"] if d.get("memory_id")]
+        assert created == []
+        remaining = storage.list_memories(conn, query="Retired absorb fact", follow="all")
+        assert remaining == [] or all(m["id"] != mem["id"] for m in remaining)
+
+
+def test_absorb_new_content_after_tombstone_creates_root(local_db, monkeypatch):
+    with storage.connect() as conn:
+        orig = storage.add_memory(conn, content="Retired chain root extra words")
+        leaf = storage.add_memory(conn, content="Retired chain leaf extra words")
+        storage.add_link(conn, leaf["id"], orig["id"], edge_type="supersedes")
+        storage.delete_memory(conn, leaf["id"])
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": storage.get_memory(conn, orig["id"])}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: (_ for _ in ()).throw(
+                AssertionError("tombstoned match must not reach the classifier")
+            ),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = storage.absorb_memory(conn, ["Brand new fact after retirement extra"])
+        decision = next(d for d in result["decisions"] if d["action"] == "created")
+        new_id = decision["memory_id"]
+        assert storage.get_memory(conn, new_id) is not None
+        refs = storage.get_crossrefs(conn, new_id)
+        assert not any(r.get("edge_type") == "supersedes" for r in refs)
+
+
+def test_absorb_write_boundary_tombstone_wins(local_db, monkeypatch):
+    with storage.connect() as conn:
+        target = storage.add_memory(conn, content="Race tombstone target extra words")
+        real_add = storage.add_memory
+
+        def racing_add(*args, **kwargs):
+            rec = real_add(*args, **kwargs)
+            if kwargs.get("absorb_nonce") and storage.get_memory(conn, target["id"]):
+                storage.delete_memory(conn, target["id"], reason="raced-delete")
+            return rec
+
+        monkeypatch.setattr(storage, "add_memory", racing_add)
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": target}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": target["id"],
+                "relationship": "UPDATE",
+                "reason": "should not land",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+        result = storage.absorb_memory(conn, ["Race tombstone incoming extra words"])
+        assert any(d["action"] == "tombstoned" for d in result["decisions"]), (
+            "mutation: skip write-boundary tombstoned refuse and this resurrects"
+        )
+        assert not any(d.get("memory_id") for d in result["decisions"] if d["action"] != "tombstoned")
+        assert storage.get_memory(conn, target["id"]) is None
+        incoming = storage.list_memories(
+            conn, query="Race tombstone incoming", follow="all"
+        )
+        assert incoming == [], (
+            "mutation: leave the absorb insert linked and a new current appears"
+        )
+
+
+def test_import_skips_tombstoned_hash(local_db):
+    with storage.connect() as conn:
+        mem = storage.add_memory(conn, content="Imported retired content extra")
+        storage.delete_memory(conn, mem["id"])
+        result = storage.import_memories(
+            conn,
+            [{"content": "imported   RETIRED content extra"}],
+            strategy="append",
+        )
+        assert result["imported"] == 0, "mutation: skip import hash consult"
+        assert result["skipped"] == 1
+
+
+def test_memory_create_allowed_after_tombstone(local_db):
+    with storage.connect() as conn:
+        mem = storage.add_memory(conn, content="Create after tombstone extra words")
+        storage.delete_memory(conn, mem["id"])
+        created = storage.add_memory(conn, content="Create after tombstone extra words")
+        assert created["id"] != mem["id"]
+        fetched = storage.get_memory(conn, created["id"])
+        assert fetched is not None
+        assert fetched["content"] == "Create after tombstone extra words"
+
+
+def test_compensate_delete_skips_tombstone(local_db):
+    with storage.connect() as conn:
+        mem = storage.add_memory(
+            conn,
+            content="Compensating absorb orphan extra words",
+            metadata={"absorb_nonce": "nonce-abc"},
+        )
+        assert storage.delete_memory(
+            conn, mem["id"], require_absorb_nonce="nonce-abc"
+        ) is True
+        rows = _tombstone_rows(conn)
+        assert rows == [], (
+            "mutation: write tombstones on require_absorb_nonce deletes"
+        )
+
+
+def test_merge_source_writes_tombstone(local_db):
+    import asyncio
+    import memora.server as server
+
+    with storage.connect() as conn:
+        src = storage.add_memory(conn, content="Merge source body extra words")
+        tgt = storage.add_memory(conn, content="Merge target body extra words")
+        src_id, tgt_id = src["id"], tgt["id"]
+    result = asyncio.run(server.memory_merge(src_id, tgt_id))
+    assert result.get("merged") is True
+    with storage.connect() as conn:
+        rows = [
+            r for r in _tombstone_rows(conn) if r["memory_id"] == src_id
+        ]
+        assert rows, "mutation: merge source delete skips tombstone"
+        assert rows[0]["reason"] == "merged"
+        assert storage.get_memory(conn, src_id) is None
+        assert storage.get_memory(conn, tgt_id) is not None
+
+
+def test_delete_memories_writes_tombstones(local_db):
+    with storage.connect() as conn:
+        a = storage.add_memory(conn, content="Batch tombstone alpha extra")
+        b = storage.add_memory(conn, content="Batch tombstone beta extra")
+        deleted = storage.delete_memories(conn, [a["id"], b["id"]], reason="batch-clear")
+        assert deleted == 2
+        ids = {row["memory_id"] for row in _tombstone_rows(conn)}
+        assert {a["id"], b["id"]} <= ids
+        assert all(row["reason"] == "batch-clear" for row in _tombstone_rows(conn))
+
+
 def test_hybrid_semantic_list_honor_requested_limit(local_db):
     token = "storelimit-zzxq"
     with storage.connect() as conn:

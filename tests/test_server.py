@@ -219,6 +219,26 @@ def test_uniform_current_after_fork_collapse(local_db, monkeypatch):
     assert {orig["id"], left["id"], right["id"], new_id} <= hist_ids
 
 
+def test_memory_delete_writes_tombstone_reason(local_db):
+    created = _new_memory(content="Server delete tombstone extra words")["memory"]
+    result = asyncio.run(
+        server.memory_delete(created["id"], reason="user-retracted")
+    )
+    assert result["status"] == "deleted"
+    with storage.connect() as conn:
+        row = conn.execute(
+            "SELECT reason, content_hash FROM tombstones WHERE memory_id = ?",
+            (created["id"],),
+        ).fetchone()
+        assert row is not None
+        assert row["reason"] == "user-retracted"
+        assert row["content_hash"] == storage.content_tombstone_hash(
+            "Server delete tombstone extra words"
+        )
+    again = _new_memory(content="Server delete tombstone extra words")
+    assert again["memory"]["id"] != created["id"]
+
+
 def test_search_tools_honor_limit_alias_under_follow_active(local_db):
     """MCP callers pass ``limit`` (same as memory_list). Hybrid used to ignore it
     and return the top_k default of 10."""

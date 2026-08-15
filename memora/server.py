@@ -296,8 +296,8 @@ def _update_memory(
 
 
 @_with_connection(writes=True)
-def _delete_memory(conn, memory_id: int):
-    return delete_memory(conn, memory_id)
+def _delete_memory(conn, memory_id: int, reason: Optional[str] = None):
+    return delete_memory(conn, memory_id, reason=reason)
 
 
 @_with_connection
@@ -387,8 +387,8 @@ def _detect_supersessions(
 
 
 @_with_connection(writes=True)
-def _delete_memories(conn, ids: List[int]):
-    return delete_memories(conn, ids)
+def _delete_memories(conn, ids: List[int], reason: Optional[str] = None):
+    return delete_memories(conn, ids, reason=reason)
 
 
 @_with_connection
@@ -1421,9 +1421,14 @@ async def memory_create_batch(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 @mcp.tool()
-async def memory_delete_batch(ids: List[int]) -> Dict[str, Any]:
-    """Delete multiple memories by id."""
-    deleted = _delete_memories(ids)
+async def memory_delete_batch(ids: List[int], reason: Optional[str] = None) -> Dict[str, Any]:
+    """Delete multiple memories by id.
+
+    Args:
+        ids: Memory IDs to delete
+        reason: Optional tombstone reason (default "deleted")
+    """
+    deleted = _delete_memories(ids, reason=reason)
     _schedule_cloud_graph_sync()
     return {"deleted": deleted}
 
@@ -1899,13 +1904,18 @@ async def memory_update(
 
 
 @mcp.tool()
-async def memory_delete(memory_id: int, force: bool = False) -> Dict[str, Any]:
+async def memory_delete(
+    memory_id: int,
+    force: bool = False,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
     """Delete a memory by id.
 
     Args:
         memory_id: Memory ID to delete
         force: If True, allow deleting document fragments/roots.
                Use memory_delete_document() instead for clean document removal.
+        reason: Optional tombstone reason (default "deleted")
     """
     if not force:
         mem = _get_memory(memory_id)
@@ -1920,7 +1930,7 @@ async def memory_delete(memory_id: int, force: bool = False) -> Dict[str, Any]:
                 ),
             }
 
-    if _delete_memory(memory_id):
+    if _delete_memory(memory_id, reason=reason):
         _schedule_cloud_graph_sync()
         return {"status": "deleted", "id": memory_id}
     return {"error": "not_found", "id": memory_id}
@@ -2729,8 +2739,8 @@ async def memory_merge(
         )
         conn.commit()
 
-        # Delete source memory
-        delete_memory(conn, source_id)
+        # Delete source memory (tombstone reason records the merge decision)
+        delete_memory(conn, source_id, reason="merged")
 
         from .storage import _log_action
         _log_action(conn, target_id, "merge", f"Merged #{source_id} into #{target_id}")
