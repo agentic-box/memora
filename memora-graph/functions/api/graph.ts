@@ -3,7 +3,7 @@
  * Supports ?db=<configured name> to select a database
  */
 
-import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db";
+import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db.ts";
 import {
   applyRetirement,
   buildAssociationEdges,
@@ -12,7 +12,7 @@ import {
   parseRelatedPayload,
   partitionLineageEdges,
   type CrossRefEntry,
-} from "./_lineage";
+} from "./_lineage.ts";
 
 interface Env extends DatabaseEnv {
   MIN_EDGE_SCORE?: string;
@@ -92,6 +92,15 @@ const TODO_STATUS_COLORS: Record<string, string> = {
 };
 
 const DUPLICATE_THRESHOLD = 0.85;
+
+// Node cap for GET /api/graph. Without an explicit ?limit= the response is
+// capped at DEFAULT_GRAPH_LIMIT so a large store can't produce an unbounded
+// graph that stalls the force-directed renderer or the browser (thousands of
+// labeled nodes degrade badly). An explicit ?limit= may raise this up to
+// GRAPH_LIMIT_MAX; higher values clamp. Both sit far above the 13-node test
+// fixture yet keep memory/time bounded.
+const DEFAULT_GRAPH_LIMIT = 2000;
+const GRAPH_LIMIT_MAX = 5000;
 
 // Cluster colors (distinct from TAG_COLORS)
 const CLUSTER_COLORS = [
@@ -324,6 +333,22 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const db = selection.binding;
   const minScore = parseFloat(env.MIN_EDGE_SCORE || "0.40");
 
+  // ?limit= node cap. Absent => DEFAULT_GRAPH_LIMIT. Non-numeric or <= 0 => 400
+  // invalid_limit. > GRAPH_LIMIT_MAX clamps to max.
+  const limitRaw = url.searchParams.get("limit");
+  let limit = DEFAULT_GRAPH_LIMIT;
+  if (limitRaw !== null) {
+    const trimmed = limitRaw.trim();
+    if (!/^-?\d+$/.test(trimmed)) {
+      return Response.json({ error: "invalid_limit" }, { status: 400 });
+    }
+    const parsed = parseInt(trimmed, 10);
+    if (parsed <= 0) {
+      return Response.json({ error: "invalid_limit" }, { status: 400 });
+    }
+    limit = Math.min(parsed, GRAPH_LIMIT_MAX);
+  }
+
   // Fetch all memories
   const memoriesResult = await db.prepare(
     "SELECT id, content, metadata, tags, created_at, updated_at FROM memories"
@@ -333,7 +358,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     return Response.json({ error: "no_memories", message: "No memories to visualize" });
   }
 
-  const memories = memoriesResult.results;
+  let memories = memoriesResult.results;
 
   // Fetch all crossrefs (table may not exist on some D1 databases).
   // Fail CLOSED for lineage: unknown must not present as "all current".
@@ -491,6 +516,32 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
     if (isDocumentRoot(meta) && typeof meta.document_key === "string") rootByDocKey.set(meta.document_key, m.id);
   }
+
+  // Node cap: deterministic "newest first" subset. Eligible = not section and
+  // (not document-fragment unless ?docs=1), mirroring the node-building loop
+  // below. Order: created_at DESC, id DESC (stable, so a later re-run of the
+  // same limit returns the same set). All downstream steps
+  // (duplicate/cluster/edges/mappings) run over the truncated `memories`, which
+  // keeps edges and mappings closed over the included node set — no dangling
+  // edges to excluded nodes.
+  const eligibleMemories = memories.filter((m) => {
+    const meta = parseJson<Record<string, unknown>>(m.metadata, {});
+    if (isSection(meta)) return false;
+    if (isDocumentFragment(meta) && !includeDocs) return false;
+    return true;
+  });
+  const total = eligibleMemories.length;
+  const truncated = total > limit;
+  memories = eligibleMemories
+    .slice()
+    .sort((a, b) => {
+      const ta = a.created_at || "";
+      const tb = b.created_at || "";
+      if (ta < tb) return 1;
+      if (ta > tb) return -1;
+      return b.id - a.id;
+    })
+    .slice(0, limit);
 
   const nodes: GraphNode[] = [];
   for (const m of memories) {
@@ -821,6 +872,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     nodeTimestamps,
     minDate,
     maxDate,
+    /** True when ?limit=N truncated the graph; false when unbounded/fully included. */
+    truncated,
+    /** Renderable nodes in the full (unbounded) graph, so clients can gauge how much ?limit dropped. */
+    total,
     clusterToNodes: crossrefsAvailable ? clusterData.clusterToNodes : {},
     clusterColors: crossrefsAvailable ? clusterData.clusterColors : {},
     clusterMeta: crossrefsAvailable ? clusterData.clusterMeta : {},

@@ -47,6 +47,13 @@ from .todos import (  # noqa: E402
 # Similarity threshold for duplicate detection
 DUPLICATE_THRESHOLD = 0.85
 
+# Node cap for the graph ?limit= parameter. Without an explicit ?limit the
+# response is capped at DEFAULT_GRAPH_LIMIT so a large store can't produce an
+# unbounded graph that stalls the renderer. An explicit ?limit may raise this
+# up to GRAPH_LIMIT_MAX; higher values clamp.
+DEFAULT_GRAPH_LIMIT = 2000
+GRAPH_LIMIT_MAX = 5000
+
 # Stale styling
 STALE_COLOR = "#8b949e"  # Gray
 STALE_SIZE_FACTOR = 0.7  # Reduce size to 70%
@@ -319,12 +326,19 @@ def _build_section_mappings(memories: List[Dict]) -> tuple:
 
 
 def _build_edges(conn, memories: List[Dict], min_score: float) -> List[Dict]:
-    """Build vis.js edge objects from crossrefs."""
+    """Build vis.js edge objects from crossrefs.
+
+    Only emits an edge when BOTH endpoints are among the included ``memories``,
+    so a ?limit=N truncated graph never dangles an edge to an excluded node.
+    """
     edges = []
     seen = set()
     edge_id = 0
+    included_ids = {m["id"] for m in memories}
     for m in memories:
         for ref in get_crossrefs(conn, m["id"]):
+            if ref["id"] not in included_ids:
+                continue
             edge_key = tuple(sorted([m["id"], ref["id"]]))
             if edge_key not in seen and ref.get("score", 0) > min_score:
                 seen.add(edge_key)
@@ -500,12 +514,23 @@ def _build_sections_html(
     return sections_html
 
 
-def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, Any]:
+def get_graph_data(
+    min_score: float = 0.40,
+    rebuild: bool = False,
+    limit: Optional[int] = None,
+) -> Dict[str, Any]:
     """Get graph nodes, edges, and metadata for API response.
 
     Args:
         min_score: Minimum similarity score for edges
         rebuild: If True, rebuild crossrefs (slow). If False, use existing.
+        limit: Optional node cap (positive int). When set, only the `limit`
+            newest eligible memories are included, ordered by created_at DESC
+            then id DESC (stable). The result dict gains ``truncated`` (True when
+            eligible memories exceeded the cap) and ``total`` (the number of
+            eligible memories in the unbounded graph) so callers can gauge how
+            much was dropped. Mirrors the ?limit= behaviour of the Pages
+            ``/api/graph`` endpoint.
 
     Returns:
         Dict with nodes, edges, and various mappings.
@@ -515,6 +540,28 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
         memories = list_memories(conn, None, None, None, 0, None, None, None, None, None)
         if not memories:
             return {"error": "no_memories", "message": "No memories to visualize"}
+
+        # Node cap: deterministic "newest first" subset. Eligible = not section
+        # and not document-fragment, mirroring _build_nodes below. Without an
+        # explicit limit the default DEFAULT_GRAPH_LIMIT applies. Order:
+        # created_at DESC, id DESC (stable). Truncating before edges /
+        # duplicates / mappings keeps the result closed over the included node
+        # set — no dangling edges to excluded nodes.
+        eligible = [
+            m
+            for m in memories
+            if not is_section(m.get("metadata"))
+            and not _is_document_fragment(m.get("metadata"))
+        ]
+        total = len(eligible)
+        effective = DEFAULT_GRAPH_LIMIT if limit is None else min(limit, GRAPH_LIMIT_MAX)
+        truncated = total > effective
+        if truncated:
+            memories = sorted(
+                eligible,
+                key=lambda m: (m.get("created_at") or "", m.get("id") or 0),
+                reverse=True,
+            )[:effective]
 
         if rebuild:
             rebuild_crossrefs(conn)
@@ -560,6 +607,8 @@ def get_graph_data(min_score: float = 0.40, rebuild: bool = False) -> Dict[str, 
             "nodeTimestamps": node_timestamps,
             "minDate": min_date,
             "maxDate": max_date,
+            "truncated": truncated,
+            "total": total,
         }
         result.update(cluster_data)
         return result

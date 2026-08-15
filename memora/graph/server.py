@@ -121,6 +121,31 @@ def _get_memora_version() -> str:
         return ""
 
 
+# Sentinel for an invalid ?limit= value (non-numeric or <= 0).
+_INVALID_LIMIT = object()
+
+
+def _parse_graph_limit(raw: str | None):
+    """Validate the ?limit= query value.
+
+    Returns a positive int (None when absent), clamped by
+    ``data.GRAPH_LIMIT_MAX``, or the ``_INVALID_LIMIT`` sentinel for non-numeric
+    or non-positive values. Mirrors the Pages endpoint's 400 ``invalid_limit``
+    contract.
+    """
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return _INVALID_LIMIT
+    if value <= 0:
+        return _INVALID_LIMIT
+    from .data import GRAPH_LIMIT_MAX
+
+    return min(value, GRAPH_LIMIT_MAX)
+
+
 def _serialize_memory_api_result(memory: dict) -> dict:
     """Normalize a memory record to the graph API shape."""
     meta = memory.get("metadata") or {}
@@ -240,7 +265,10 @@ def start_graph_server(host: str, port: int) -> None:
         try:
             min_score = float(request.query_params.get("min_score", 0.25))
             rebuild = request.query_params.get("rebuild", "").lower() == "true"
-            result = get_graph_data(min_score, rebuild=rebuild)
+            limit = _parse_graph_limit(request.query_params.get("limit"))
+            if limit is _INVALID_LIMIT:
+                return JSONResponse({"error": "invalid_limit"}, status_code=400)
+            result = get_graph_data(min_score, rebuild=rebuild, limit=limit)
             return JSONResponse(result)
         except Exception as e:
             logger.exception("Graph API request failed: %s", e)

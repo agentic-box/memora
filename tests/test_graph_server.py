@@ -144,3 +144,109 @@ def test_patch_preserves_favorite(graph_request, memory_factory):
     assert status == 200
     assert data["metadata"]["favorite"] is True
     assert data["metadata"]["note"] == "updated"
+
+
+def test_graph_limit_returns_newest_subset(graph_request, memory_factory):
+    """?limit=N keeps only the N newest memories, newest first, and reports
+    truncation + total."""
+    for i in range(5):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph?limit=3")
+
+    assert status == 200
+    assert data["truncated"] is True
+    assert data["total"] == 5
+    # Newest first: all memories share created_at (same tick), so id DESC.
+    assert len(data["nodes"]) == 3
+    assert [n["id"] for n in data["nodes"]] == [5, 4, 3]
+
+
+def test_graph_limit_within_total_not_truncated(graph_request, memory_factory):
+    """?limit=N larger than the node count is not truncated."""
+    for i in range(3):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph?limit=10")
+
+    assert status == 200
+    assert data["truncated"] is False
+    assert data["total"] == 3
+    assert len(data["nodes"]) == 3
+
+
+def test_graph_limit_default_unbounded(graph_request, memory_factory):
+    """No ?limit= returns the full graph (below the default cap) untruncated."""
+    for i in range(4):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph")
+
+    assert status == 200
+    assert data["truncated"] is False
+    assert len(data["nodes"]) == 4
+
+
+def test_graph_default_cap_truncates(monkeypatch, graph_request, memory_factory):
+    """Without ?limit=, a store above the default cap is truncated.
+
+    Monkeypatch the default cap down to 2 so the test needs few memories
+    (mutation: removing the default cap returns all and truncated=false).
+    """
+    import memora.graph.data as graph_data
+
+    monkeypatch.setattr(graph_data, "DEFAULT_GRAPH_LIMIT", 2)
+    for i in range(5):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph")
+
+    assert status == 200
+    assert data["truncated"] is True
+    assert data["total"] == 5
+    assert len(data["nodes"]) == 2
+    # Newest first (same created_at tick, id DESC): the two newest ids.
+    assert [n["id"] for n in data["nodes"]] == [5, 4]
+
+
+def test_graph_limit_invalid_rejected(graph_request, memory_factory):
+    """Non-numeric, zero, and negative ?limit values return 400 invalid_limit."""
+    memory_factory(content="Limit memory")
+
+    for bad in ("abc", "0", "-5", "2.5"):
+        status, data = graph_request("GET", f"/api/graph?limit={bad}")
+        assert status == 400, f"limit={bad!r} should be 400"
+        assert data["error"] == "invalid_limit", f"limit={bad!r} error code"
+
+
+def test_graph_limit_clamps_to_hard_max(graph_request, memory_factory):
+    """?limit= above the hard cap is clamped, not rejected."""
+    for i in range(5):
+        memory_factory(content=f"Limit memory {i}")
+
+    status, data = graph_request("GET", "/api/graph?limit=999999")
+
+    assert status == 200
+    # Only 5 memories exist, so the clamp yields all 5 (not truncated).
+    assert data["truncated"] is False
+    assert len(data["nodes"]) == 5
+
+
+def test_graph_limit_no_dangling_edges(graph_request, local_db):
+    """Edges must never reference a node that was excluded by ?limit."""
+    with storage.connect() as conn:
+        a = storage.add_memory(conn, content="Limit edge A")
+        b = storage.add_memory(conn, content="Limit edge B")
+        storage.add_link(conn, a["id"], b["id"], edge_type="references")
+
+    # limit=1 keeps only the newest node; the reference edge to the excluded
+    # node must be dropped so no edge dangles.
+    status, data = graph_request("GET", "/api/graph?limit=1")
+
+    assert status == 200
+    assert len(data["nodes"]) == 1
+    node_ids = {n["id"] for n in data["nodes"]}
+    for edge in data["edges"]:
+        assert edge["from"] in node_ids and edge["to"] in node_ids, (
+            "mutation: edge dangles to an excluded node"
+        )
