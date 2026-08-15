@@ -61,6 +61,10 @@ GRAPH_LIMIT_MAX = 5000
 # no sign. Used by both the Python producer and the Pages endpoint.
 _GRAPH_LIMIT_RE = re.compile(r"^[0-9]+$")
 
+# Number.MAX_SAFE_INTEGER — matches the Pages env-parser bound so both
+# producers reject the same out-of-range values.
+_GRAPH_SAFE_INT_MAX = 9007199254740991
+
 # Sentinel for an invalid ?limit= value (malformed, non-ASCII, signed, or 0).
 _INVALID_LIMIT = object()
 
@@ -87,8 +91,9 @@ def parse_graph_limit_value(raw: str | None):
 def _env_positive_int(name: str, fallback: int) -> int:
     """Read a positive-int env override under the shared grammar.
 
-    Malformed (non-ASCII, signed, unsafe) or non-positive values fall back to
-    the default.
+    Malformed (non-ASCII, signed, scientific), non-positive, or out-of-range
+    (above Number.MAX_SAFE_INTEGER) values fall back to the default, matching
+    the Pages env-parser bound so both producers agree.
     """
     raw = os.environ.get(name)
     if raw is None:
@@ -100,7 +105,9 @@ def _env_positive_int(name: str, fallback: int) -> int:
         value = int(s)
     except ValueError:
         return fallback
-    return value if value > 0 else fallback
+    if value <= 0 or value > _GRAPH_SAFE_INT_MAX:
+        return fallback
+    return value
 
 
 def resolve_graph_limits() -> tuple:

@@ -268,21 +268,44 @@ def test_graph_effective_default_respects_max(monkeypatch, graph_request, memory
 
 
 def test_graph_limit_conformance(monkeypatch):
-    """Shared adversarial grammar matrix, exercised via the real parser."""
+    """Shared adversarial ?limit= grammar matrix, via the real parser."""
     import json
     from pathlib import Path
 
     from memora.graph.data import _INVALID_LIMIT, parse_graph_limit_value
 
-    cases = json.loads(
+    matrix = json.loads(
         Path(__file__).parent.joinpath("fixtures", "graph_limit_conformance.json").read_text()
     )
-    for case in cases:
+    for case in matrix["query"]:
         parsed = parse_graph_limit_value(case["value"])
         if case["valid"]:
             assert parsed == case["expected"], f"conformance {case['id']}: {case['value']!r}"
         else:
             assert parsed is _INVALID_LIMIT, f"conformance {case['id']}: {case['value']!r}"
+
+
+def test_graph_env_conformance(monkeypatch):
+    """Shared ?limit= env-parser matrix, via the real env reader.
+
+    Covers the JS-safe-integer bound: values at/under Number.MAX_SAFE_INTEGER
+    are accepted, above it fall back to the default (same as Pages).
+    """
+    import json
+    from pathlib import Path
+
+    from memora.graph.data import _env_positive_int
+
+    matrix = json.loads(
+        Path(__file__).parent.joinpath("fixtures", "graph_limit_conformance.json").read_text()
+    )
+    for case in matrix["env"]:
+        monkeypatch.setenv("GRAPH_LIMIT_MAX", case["value"])
+        parsed = _env_positive_int("GRAPH_LIMIT_MAX", 5000)
+        if case["valid"]:
+            assert parsed == case["expected"], f"env conformance {case['id']}: {case['value']!r}"
+        else:
+            assert parsed == 5000, f"env conformance {case['id']}: {case['value']!r} falls back"
 
 
 def test_graph_limit_no_dangling_edges(graph_request, local_db):
@@ -360,3 +383,20 @@ def test_graph_limit_nontruncated_excludes_hidden(graph_request, local_db):
         assert edge["from"] in node_ids and edge["to"] in node_ids, (
             "mutation: edge dangles to a hidden section"
         )
+
+
+def test_graph_env_above_safe_no_divergence(monkeypatch, local_db):
+    """Codex scenario: GRAPH_DEFAULT_LIMIT=6000 with GRAPH_LIMIT_MAX above
+    Number.MAX_SAFE_INTEGER. Both producers must fall back to max 5000 and an
+    effective default of 5000 (mutation: removing the safe-int bound makes
+    Python keep max=9007199254740992 and default=6000, diverging from Pages).
+    """
+    from memora.graph.data import resolve_graph_limits
+
+    monkeypatch.setenv("GRAPH_DEFAULT_LIMIT", "6000")
+    monkeypatch.setenv("GRAPH_LIMIT_MAX", "9007199254740992")
+
+    eff_default, eff_max = resolve_graph_limits()
+
+    assert eff_max == 5000
+    assert eff_default == 5000

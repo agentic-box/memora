@@ -1,12 +1,24 @@
-[
-  { "id": "float", "value": "2.5", "valid": false },
-  { "id": "blank", "value": " ", "valid": false },
-  { "id": "empty", "value": "", "valid": false },
-  { "id": "padded", "value": " 3 ", "valid": true, "expected": 3 },
-  { "id": "plus", "value": "+3", "valid": false },
-  { "id": "minus", "value": "-3", "valid": false },
-  { "id": "leading_zeros", "value": "0003", "valid": true, "expected": 3 },
-  { "id": "scientific", "value": "1e3", "valid": false },
-  { "id": "arabic_digit", "value": "٣", "valid": false },
-  { "id": "huge", "value": "123456789012", "valid": true, "expected": 123456789012 }
-]
+{
+  "query": [
+    { "id": "float", "value": "2.5", "valid": false },
+    { "id": "blank", "value": " ", "valid": false },
+    { "id": "empty", "value": "", "valid": false },
+    { "id": "padded", "value": " 3 ", "valid": true, "expected": 3 },
+    { "id": "plus", "value": "+3", "valid": false },
+    { "id": "minus", "value": "-3", "valid": false },
+    { "id": "leading_zeros", "value": "0003", "valid": true, "expected": 3 },
+    { "id": "scientific", "value": "1e3", "valid": false },
+    { "id": "arabic_digit", "value": "٣", "valid": false },
+    { "id": "huge", "value": "123456789012", "valid": true, "expected": 123456789012 }
+  ],
+  "env": [
+    { "id": "safe_max", "value": "9007199254740991", "valid": true, "expected": 9007199254740991 },
+    { "id": "over_safe", "value": "9007199254740992", "valid": false },
+    { "id": "way_over", "value": "99999999999999999999999999", "valid": false },
+    { "id": "junk", "value": "3junk", "valid": false },
+    { "id": "float_str", "value": "2.5", "valid": false },
+    { "id": "signed", "value": "+3", "valid": false },
+    { "id": "padded_env", "value": " 3 ", "valid": true, "expected": 3 },
+    { "id": "zero", "value": "0", "valid": false }
+  ]
+}

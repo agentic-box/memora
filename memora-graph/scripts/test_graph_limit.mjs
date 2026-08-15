@@ -246,7 +246,7 @@ for (const bad of ["abc", "0", "-5", "2.5", ""]) {
     memory(4, "2026-04-01T00:00:00Z"),
     memory(5, "2026-05-01T00:00:00Z"),
   ]);
-  for (const caseRow of conformance) {
+  for (const caseRow of conformance.query) {
     const res = await graph(
       { DB_MEMORA: db },
       `http://local/api/graph?limit=${encodeURIComponent(caseRow.value)}`,
@@ -263,6 +263,31 @@ for (const bad of ["abc", "0", "-5", "2.5", ""]) {
         );
       }
     }
+  }
+}
+
+// Env-parser conformance incl. the JS-safe-integer bound: a store larger than
+// the default max (5100) is used so the effective max is observable. Valid env
+// values cap ?limit=999999 to `expected`; invalid/out-of-range values fall back
+// to 5000. Red under the leader's mutation (no safe-int bound => 9007199254740992
+// accepted, so over_safe/way_over would yield 5100, not 5000).
+{
+  const many = [];
+  for (let i = 0; i < 5100; i++) {
+    many.push(memory(i + 1, new Date(2020, 0, 1 + i).toISOString()));
+  }
+  const db = new FakeDb(many);
+  for (const caseRow of conformance.env) {
+    const res = await graph(
+      { DB_MEMORA: db, GRAPH_LIMIT_MAX: caseRow.value },
+      "http://local/api/graph?limit=999999",
+    );
+    const data = await res.json();
+    const expected = Math.min(5100, caseRow.valid ? caseRow.expected : 5000);
+    assert(
+      data.nodes.length === expected,
+      `env conformance ${caseRow.id}: value ${JSON.stringify(caseRow.value)} yields ${expected} nodes, got ${data.nodes.length}`,
+    );
   }
 }
 
