@@ -2623,6 +2623,11 @@ def _write_tombstone(
 # Test hooks for delete/absorb interleave. Production leaves these None.
 _after_component_snapshot = None
 _after_absorb_resolve = None
+# Fires after resolve-time + pre-link retirement checks, immediately before
+# add_link. Lets tests land delete markers in the D1 window between those
+# checks and the link (delete's edge-clear has not run; the target row
+# still exists).
+_before_absorb_supersede_links = None
 _COMPONENT_RETIRE_REWALKS = 8
 
 
@@ -4277,6 +4282,9 @@ def absorb_memory(
                             "absorb UPDATE resolved no live targets "
                             f"(classifier target #{target_id})"
                         )
+                    prelink = _before_absorb_supersede_links
+                    if prelink is not None:
+                        prelink(record["id"], list(targets))
                     linked_ids: List[int] = []
                     try:
                         for tid in targets:

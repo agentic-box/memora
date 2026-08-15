@@ -906,6 +906,71 @@ def test_delete_absorb_interleave_new_leaf_not_current(fake_d1_backend):
         assert new["id"] in retired or still is None
 
 
+def test_absorb_postlink_recheck_compensates_after_delete_markers(fake_d1_backend, monkeypatch):
+    """Delete marks+rewalks complete BEFORE absorb links (target row still there).
+
+    D1 commits the marker statement before edge-clear. Resolve-time and
+    pre-link checks have already passed. The post-link recheck is the only
+    defense: it must compensate N (action=tombstoned, row absent).
+    Mutation: `if False:` on that recheck leaves N current.
+    """
+    with storage.connect() as conn:
+        ancestor = storage.add_memory(conn, content="Postcheck ancestor extra words")
+        leaf = storage.add_memory(conn, content="Postcheck leaf extra words")
+        storage.add_link(conn, leaf["id"], ancestor["id"], edge_type="supersedes")
+        monkeypatch.setattr(
+            storage,
+            "_search_by_vector",
+            lambda *a, **k: [{"score": 0.5, "memory": leaf}],
+        )
+        monkeypatch.setattr(
+            storage,
+            "_classify_fact_against_matches",
+            lambda fact, matches: ([{
+                "memory_id": leaf["id"],
+                "relationship": "UPDATE",
+                "reason": "stale resolve then delete marked",
+            }], []),
+        )
+        monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+
+        def before_link(new_id, targets):
+            assert leaf["id"] in targets
+            assert not storage._is_tombstoned_id(conn, leaf["id"])
+            # Just-before-edge-clear: markers + rewalks, leaf row still exists
+            # so add_link can succeed and the post-link recheck is reachable.
+            storage._tombstone_component(
+                conn, leaf["id"], reason="raced-delete",
+                content_by_id={leaf["id"]: leaf["content"]},
+            )
+            assert storage._is_tombstoned_id(conn, leaf["id"])
+            assert storage.get_memory(conn, leaf["id"]) is not None
+
+        storage._before_absorb_supersede_links = before_link
+        try:
+            result = storage.absorb_memory(conn, ["Postcheck incoming extra words"])
+        finally:
+            storage._before_absorb_supersede_links = None
+
+        assert any(d["action"] == "tombstoned" for d in result["decisions"]), (
+            "mutation: if False on post-link recheck reports superseded"
+        )
+        created = [d.get("memory_id") for d in result["decisions"] if d.get("memory_id")]
+        assert created == []
+        leftover = storage.list_memories(
+            conn, query="Postcheck incoming", follow="all"
+        )
+        assert leftover == [], (
+            "mutation: if False on post-link recheck leaves N in the store"
+        )
+        active = {m["id"] for m in storage.list_memories(conn, follow="active")}
+        incoming = [m for m in storage.list_memories(conn, follow="all")
+                    if "Postcheck incoming" in (m.get("content") or "")]
+        assert incoming == []
+        assert all("Postcheck incoming" not in (m.get("content") or "") for m in
+                   storage.list_memories(conn, follow="active"))
+
+
 def test_retired_memory_ids_fail_closed_on_operational_error(fake_d1_backend):
     with storage.connect() as conn:
         storage.add_memory(conn, content="Fail-closed retirement extra words")
