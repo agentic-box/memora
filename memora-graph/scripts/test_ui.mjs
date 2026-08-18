@@ -16,7 +16,7 @@ import { chromium } from "playwright";
 const BASE = process.argv[2] || "http://localhost:8788";
 const pass = [];
 const fail = [];
-const EXPECTED_CHECKS = 25;
+const EXPECTED_CHECKS = 35;
 const check = (name, ok, detail) =>
   (ok ? pass : fail).push(`${name}${detail ? ` — ${detail}` : ""}`);
 
@@ -62,11 +62,112 @@ check(
   `asked ${nonDefault}, got ${await page.$eval("#db-select", (s) => s.value)}`,
 );
 
+// ------------------------------------------------- index.html truncation banner
+
+// Truncation probes use the default/seeded database. nonDefault (ob1) is a
+// catalog-only binding here and /api/graph?db=ob1 is not a fixture JSON graph.
+const seededDb = configured.default || "memora";
+
+// Happy path (real fixture, truncated=false) must NOT sprout a banner.
+await page.goto(`${BASE}/?db=${seededDb}`, { waitUntil: "networkidle" });
+await page.waitForSelector("#truncation-banner", { state: "attached", timeout: 30000 });
+check(
+  "index: happy path (truncated=false) shows no truncation banner",
+  await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "none"),
+);
+
+// Inject truncated=true and drive the raise control through the real fetch path.
+let injectTruncated = true;
+const injectedTotal = 5000;
+let injectedNodeCount = 0;
+await page.route("**/api/graph*", async (route) => {
+  const url = route.request().url();
+  const path = new URL(url).pathname;
+  if (path !== "/api/graph") {
+    await route.continue();
+    return;
+  }
+  const resp = await fetch(url);
+  const text = await resp.text();
+  if (!text.startsWith("{") && !text.startsWith("[")) {
+    await route.continue();
+    return;
+  }
+  const json = JSON.parse(text);
+  injectedNodeCount = (json.nodes || []).length;
+  json.truncated = injectTruncated;
+  json.total = injectedTotal;
+  await route.fulfill({ json, status: 200, contentType: "application/json" });
+});
+
+await page.goto(`${BASE}/?db=${seededDb}`, { waitUntil: "networkidle" });
+await page.waitForSelector("#truncation-banner", { state: "visible", timeout: 30000 });
+const indexBannerVisible = await page.$eval(
+  "#truncation-banner",
+  (n) => getComputedStyle(n).display === "flex",
+);
+const indexBannerText = await page.$eval("#truncation-banner-text", (n) => n.textContent);
+check(
+  "index: truncated banner visible with showing N of 5000 nodes",
+  indexBannerVisible
+    && indexBannerText === `showing ${injectedNodeCount} of ${injectedTotal} nodes`,
+  `text="${indexBannerText}" count=${injectedNodeCount}`,
+);
+
+// Click raise -> the NEXT /api/graph request must carry ?limit=K (2000 < K <= 5000).
+const [indexRaiseResp] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.click("#truncation-raise"),
+]);
+const indexRaiseUrl = indexRaiseResp.url();
+const indexRaiseLimit = Number(new URL(indexRaiseUrl).searchParams.get("limit"));
+check(
+  "index: raise control sends ?limit=K with 2000 < K <= 5000",
+  indexRaiseLimit > 2000 && indexRaiseLimit <= 5000,
+  `url=${indexRaiseUrl} limit=${indexRaiseLimit}`,
+);
+
+// Second raise reaches the hard max (2000 → 3500 → 5000) while still truncated.
+const [indexMaxResp] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.click("#truncation-raise"),
+]);
+const indexMaxLimit = Number(new URL(indexMaxResp.url()).searchParams.get("limit"));
+const indexAtMax = await page.$eval("#truncation-raise", (n) => n.disabled);
+const indexMaxLabel = await page.$eval("#truncation-raise", (n) => n.textContent);
+check(
+  "index: at hard max + truncated, banner stays and control disabled",
+  indexMaxLimit === 5000
+    && indexAtMax
+    && /5000/.test(indexMaxLabel)
+    && await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "flex"),
+  `limit=${indexMaxLimit} disabled=${indexAtMax} label="${indexMaxLabel}"`,
+);
+
+// Follow-up with truncated=false -> banner is gone.
+injectTruncated = false;
+const [indexClearResp] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.evaluate(() => window.reloadGraphData()),
+]);
+await page.waitForTimeout(300);
+check(
+  "index: follow-up truncated=false hides the banner",
+  await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "none"),
+);
+await page.unroute("**/api/graph*");
+
 // ---------------------------------------------------------------- force-graph
 
 await page.goto(`${BASE}/force-graph.html`, { waitUntil: "networkidle" });
 await page.waitForFunction(() => !!window.MemoraDebug?.fg, null, { timeout: 45000 });
 await page.waitForTimeout(2500);
+
+// Happy path (real fixture, truncated=false) must NOT sprout a banner.
+check(
+  "force-graph: happy path (truncated=false) shows no truncation banner",
+  await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "none"),
+);
 
 // Open the detail drawer so BOTH drawers are open (timeline is open by default).
 await page.click(".trow", { timeout: 15000 }).catch(() => {});
@@ -330,6 +431,82 @@ check(
   await page.evaluate(() => document.querySelector("#panel h2")?.textContent || "no panel"),
 );
 await selectTl("all");
+
+// ------------------------------------------- force-graph truncation banner
+
+let fgInjectTruncated = true;
+const fgTotal = 5000;
+let fgNodeCount = 0;
+await page.route("**/api/graph*", async (route) => {
+  const url = route.request().url();
+  if (!/\/api\/graph(\?|$)/.test(new URL(url).pathname)) {
+    await route.continue();
+    return;
+  }
+  const resp = await fetch(url);
+  const json = await resp.json();
+  fgNodeCount = (json.nodes || []).length;
+  json.truncated = fgInjectTruncated;
+  json.total = fgTotal;
+  await route.fulfill({ json, status: 200, contentType: "application/json" });
+});
+
+await page.goto(`${BASE}/force-graph.html`, { waitUntil: "networkidle" });
+await page.waitForSelector("#truncation-banner-text", { timeout: 45000 });
+await page.waitForTimeout(1200);
+const fgBannerVisible = await page.$eval(
+  "#truncation-banner",
+  (n) => getComputedStyle(n).display === "flex",
+);
+const fgBannerText = await page.$eval("#truncation-banner-text", (n) => n.textContent);
+check(
+  "force-graph: truncated banner visible with showing N of 5000 nodes",
+  fgBannerVisible && fgBannerText === `showing ${fgNodeCount} of ${fgTotal} nodes`,
+  `text="${fgBannerText}" count=${fgNodeCount}`,
+);
+
+const [fgRaiseResp] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.click("#truncation-raise"),
+]);
+const fgRaiseUrl = fgRaiseResp.url();
+const fgRaiseLimit = Number(new URL(fgRaiseUrl).searchParams.get("limit"));
+check(
+  "force-graph: raise control sends ?limit=K with 2000 < K <= 5000",
+  fgRaiseLimit > 2000 && fgRaiseLimit <= 5000,
+  `url=${fgRaiseUrl} limit=${fgRaiseLimit}`,
+);
+
+// Second raise reaches the hard max (2000 → 3500 → 5000) while still truncated.
+const [fgRaise2] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.click("#truncation-raise"),
+]);
+const fgMaxLimit = Number(new URL(fgRaise2.url()).searchParams.get("limit"));
+const fgAtMax = await page.$eval("#truncation-raise", (n) => n.disabled);
+const fgMaxLabel = await page.$eval("#truncation-raise", (n) => n.textContent);
+const fgBannerStill = await page.$eval(
+  "#truncation-banner",
+  (n) => getComputedStyle(n).display === "flex",
+);
+check(
+  "force-graph: at hard max + truncated, banner stays and control disabled",
+  fgMaxLimit === 5000 && fgBannerStill && fgAtMax && /5000/.test(fgMaxLabel),
+  `limit=${fgMaxLimit} banner=${fgBannerStill} disabled=${fgAtMax} label="${fgMaxLabel}"`,
+);
+
+// Follow-up with truncated=false -> banner is gone.
+fgInjectTruncated = false;
+const [fgClearResp] = await Promise.all([
+  page.waitForResponse((r) => r.url().includes("/api/graph")),
+  page.evaluate(() => { window.doRefresh && window.doRefresh(); }),
+]);
+await page.waitForTimeout(300);
+check(
+  "force-graph: follow-up truncated=false hides the banner",
+  await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "none"),
+);
+await page.unroute("**/api/graph*");
 
 check("no uncaught page errors", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

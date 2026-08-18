@@ -340,6 +340,10 @@ div.vis-tooltip {
 
 /* Toolbar with database selector, version, and connection status */
 #toolbar { position: absolute; top: 10px; left: 440px; background: rgba(22,27,34,0.9); padding: 8px 12px; border-radius: 6px; display: flex; align-items: center; gap: 12px; z-index: 50; }
+#truncation-banner { display: none; align-items: center; gap: 8px; background: #2d1b4e; border: 1px solid #a855f7; border-radius: 6px; padding: 4px 10px; font-size: 12px; color: #e6edf3; }
+#truncation-banner .tb-text { color: #d8b4fe; }
+#truncation-banner button { padding: 3px 10px; font-size: 12px; }
+#truncation-banner button:disabled { opacity: .5; cursor: default; }
 #db-selector { display: flex; align-items: center; gap: 8px; }
 #db-selector label { color: #8b949e; font-size: 12px; }
 #db-selector select { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 6px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
@@ -663,6 +667,10 @@ div.vis-tooltip {
             <label><input type="checkbox" id="lineage-toggle" checked onchange="onLineageToggle()" /> <span>lineage</span></label>
         </div>
         <div id="lineage-stats"></div>
+        <div id="truncation-banner" role="status">
+            <span class="tb-text" id="truncation-banner-text"></span>
+            <button id="truncation-raise" type="button" onclick="raiseGraphLimit()">Show more</button>
+        </div>
         <div id="version"><span id="version-db">memora</span> | Cloudflare</div>
     </div>
     <div id="help">Click tag/section to filter | Click node to view | Scroll to zoom | Type to search (or #id) | Drag timeline</div>
@@ -702,6 +710,42 @@ div.vis-tooltip {
         var panelDraftMetadataRows = [];
         var panelDraftComplexMetadata = {};
         var currentDb = 'memora';
+
+        // Session-sticky ?limit= raise: null = not raised (server default 2000).
+        var graphLimit = null;
+        // Shipped pure helpers — source of truth is public/_graph_limit.mjs.
+        var _GraphLimitPromise = null;
+        function graphLimitModule() {
+            if (!_GraphLimitPromise) {
+                _GraphLimitPromise = import('./_graph_limit.mjs');
+            }
+            return _GraphLimitPromise;
+        }
+        function graphDbParam() {
+            return MEMORA_CONFIG.dbSelector ? currentDb : null;
+        }
+        function renderTruncationBanner(L) {
+            var banner = document.getElementById('truncation-banner');
+            if (!banner) return;
+            var res = L.formatTruncationBanner({
+                truncated: graphData && graphData.truncated,
+                shown: graphData && graphData.nodes ? graphData.nodes.length : 0,
+                total: graphData ? graphData.total : 0
+            });
+            banner.style.display = res.visible ? 'flex' : 'none';
+            document.getElementById('truncation-banner-text').textContent = res.text;
+            var btn = document.getElementById('truncation-raise');
+            var atMax = graphLimit != null && graphLimit >= L.GRAPH_LIMIT_MAX;
+            btn.disabled = !res.visible || atMax;
+            btn.textContent = atMax ? (L.GRAPH_LIMIT_MAX + ' is the hard maximum') : 'Show more';
+            btn.title = atMax ? (L.GRAPH_LIMIT_MAX + ' is the hard maximum') : '';
+        }
+        function raiseGraphLimit() {
+            graphLimitModule().then(function(L) {
+                graphLimit = L.nextGraphLimit({ current: graphLimit ?? L.GRAPH_DEFAULT_LIMIT, hardMax: L.GRAPH_LIMIT_MAX });
+                reloadGraphData();
+            });
+        }
 
         // ---- Lineage helpers (edge_type === "supersedes" only; never infer from directed) ----
         var SUPERSEDED_COLOR = '#6e5a2e';
@@ -2889,13 +2933,17 @@ div.vis-tooltip {
         // Main graph loading
         async function loadGraph() {
             try {
-                const response = await fetch('/api/graph' + getDbParam());
+                const L = await graphLimitModule();
+                const response = await fetch(L.buildGraphUrl({
+                    pathname: '/api/graph', db: graphDbParam(), docs: false, limit: graphLimit
+                }));
                 graphData = await response.json();
                 if (graphData.error) {
                     document.getElementById('loading').textContent = graphData.message || 'No memories found';
                     return;
                 }
                 processGraphLineage();
+                renderTruncationBanner(L);
                 initGraph();
             } catch (e) {
                 document.getElementById('loading').textContent = 'Error loading graph: ' + e.message;
@@ -3480,13 +3528,17 @@ div.vis-tooltip {
 
         async function reloadGraphData() {
             try {
-                var response = await fetch('/api/graph' + getDbParam());
+                const L = await graphLimitModule();
+                var response = await fetch(L.buildGraphUrl({
+                    pathname: '/api/graph', db: graphDbParam(), docs: false, limit: graphLimit
+                }));
                 var newData = await response.json();
                 if (newData.error) return;
 
                 // Update graphData
                 graphData = newData;
                 processGraphLineage();
+                renderTruncationBanner(L);
 
                 // Clear memory cache for fresh data
                 memoryCache = {};

@@ -88,6 +88,12 @@
   #lineage-warn { display: none; position: fixed; top: 52px; left: 12px; z-index: 40;
     background: #3d2e00; color: #ffe08a; border: 1px solid #d29922; border-radius: 8px;
     padding: 6px 12px; font-size: 12px; max-width: 480px; }
+  #truncation-banner { display: none; position: fixed; top: 52px; right: 12px; z-index: 40;
+    background: #2d1b4e; color: #e6edf3; border: 1px solid #a855f7; border-radius: 8px;
+    padding: 8px 12px; font-size: 12px; align-items: center; gap: 10px; }
+  #truncation-banner .tb-text { color: #d8b4fe; }
+  #truncation-banner button { padding: 4px 10px; font-size: 12px; }
+  #truncation-banner button:disabled { opacity: .5; cursor: default; }
   .trow.unknown-row { opacity: 0.65; }
   .trow.unknown-row .ttl { color: #8b949e; font-style: italic; }
   .trow .day .unk { color: #8b949e; }
@@ -150,6 +156,10 @@
 </div>
 
 <div id="refresh" onclick="doRefresh()"></div>
+<div id="truncation-banner" role="status">
+  <span class="tb-text" id="truncation-banner-text"></span>
+  <button id="truncation-raise" type="button">Show more</button>
+</div>
 <div id="lineage-warn">Lineage unavailable — cannot confirm which memories are current</div>
 <div id="graph"></div>
 
@@ -182,12 +192,22 @@ import {
   createDetailOwner,
   detailResponseMayWrite,
 } from "./_selection.mjs";
+import {
+  buildGraphUrl,
+  formatTruncationBanner,
+  nextGraphLimit,
+  GRAPH_DEFAULT_LIMIT,
+  GRAPH_LIMIT_MAX,
+} from "./_graph_limit.mjs";
 
 // Detail ownership session (K1) — module-private only (never on window — L1a).
 const detailOwner = createDetailOwner();
 
 const el = (id) => document.getElementById(id);
 const graphEl = el("graph"), statsEl = el("stats");
+// Session-sticky ?limit= raise: null = not raised (server default 2000). Once
+// the user raises it, load() keeps using it for refresh/polling.
+let graphLimit = null;
 const DATABASE_STORAGE_KEY = "memora-graph.database";
 const MODE_STORAGE_KEY = "memora-graph.mode";
 const DRAWER_MIN_WIDTH = 280;
@@ -565,6 +585,7 @@ function render() {
   const gd = applyFilters(freshGraphData());
   if (!raw) {
     statsEl.textContent = "no graph loaded";
+    const tb = el("truncation-banner"); if (tb) tb.style.display = "none";
     return;
   }
   // G6/H4: never claim exact counts when crossrefs are degraded (same principle as F1).
@@ -1351,6 +1372,32 @@ function applySelectionReconcile(plan) {
 
 // planSelectionReconcile: imported from ./_selection.mjs (shipped; tests import same file).
 
+// Render the truncation banner from the current graph response. Hidden when not
+// truncated (including truncated missing/false). Never claims completeness.
+function renderTruncationBanner() {
+  const banner = el("truncation-banner");
+  if (!banner) return;
+  const { visible, text } = formatTruncationBanner({
+    truncated: raw && raw.truncated,
+    shown: raw && raw.nodes ? raw.nodes.length : 0,
+    total: raw ? raw.total : 0,
+  });
+  banner.style.display = visible ? "flex" : "none";
+  el("truncation-banner-text").textContent = text;
+  const btn = el("truncation-raise");
+  const atMax = graphLimit != null && graphLimit >= GRAPH_LIMIT_MAX;
+  btn.disabled = !visible || atMax;
+  btn.textContent = atMax ? `${GRAPH_LIMIT_MAX} is the hard maximum` : "Show more";
+  btn.title = atMax ? `${GRAPH_LIMIT_MAX} is the hard maximum` : "";
+}
+
+// Raise the ?limit= and re-fetch, keeping the raised value session-sticky.
+function raiseGraphLimit() {
+  graphLimit = nextGraphLimit({ current: graphLimit ?? GRAPH_DEFAULT_LIMIT, hardMax: GRAPH_LIMIT_MAX });
+  load();
+}
+el("truncation-raise").addEventListener("click", raiseGraphLimit);
+
 async function load() {
   if (!el("db").value) return;
   const db = el("db").value;
@@ -1385,7 +1432,7 @@ async function load() {
 
   try {
     const r = await fetch(
-      `/api/graph?db=${encodeURIComponent(db)}${showDocs ? "&docs=1" : ""}`,
+      buildGraphUrl({ pathname: "/api/graph", db, docs: showDocs, limit: graphLimit }),
       { signal: loadAbort ? loadAbort.signal : undefined },
     );
     if (!r.ok) throw new Error("HTTP " + r.status);
@@ -1393,6 +1440,7 @@ async function load() {
     if (gen !== loadGen || el("db").value !== db) return; // stale response
     raw = data;
     raw.dupeCount = Array.isArray(raw.duplicateIds) ? raw.duplicateIds.length : 0;
+    renderTruncationBanner();
     // H4: one combined integrity banner from BOTH flags
     setIntegrityUiState(
       raw.lineageAvailable !== false,
@@ -1415,6 +1463,8 @@ async function load() {
   } catch (e) {
     if (e && e.name === "AbortError") return; // newer load owns the panel
     if (gen !== loadGen) return;
+    // Hide the truncation banner on failure (raw is stale).
+    const tb = el("truncation-banner"); if (tb) tb.style.display = "none";
     // F2: on failed load after DB switch, do not leave previous graph labelled as new DB
     if (dbChanged) clearCanvasForSwitch(`failed to load ${db}`);
     statsEl.innerHTML = `<span id="err">load failed: ${esc(e.message)} — serve same-origin</span>`;
