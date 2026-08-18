@@ -47,4 +47,4 @@ where = ["."]
 include = ["memora*"]
 
 [tool.setuptools.package-data]
-"memora.graph" = ["index.html"]
+"memora.graph" = ["index.html", "_graph_limit.mjs"]

@@ -1,6 +1,7 @@
 /**
  * Pure-logic tests for the truncation-banner / limit-raise helpers.
- * Imports the SHIPPED module (public/_graph_limit.mjs) — no mirrors.
+ * Imports the SHIPPED module (memora/graph/_graph_limit.mjs) — no mirrors.
+ * public/_graph_limit.mjs is a symlink to that file.
  * Run: node --experimental-strip-types scripts/test_graph_limit_ui.mjs
  */
 
@@ -10,7 +11,7 @@ import {
   nextGraphLimit,
   GRAPH_DEFAULT_LIMIT,
   GRAPH_LIMIT_MAX,
-} from "../public/_graph_limit.mjs";
+} from "../../memora/graph/_graph_limit.mjs";
 
 let failed = 0;
 function assert(cond, message) {
@@ -45,6 +46,19 @@ function assert(cond, message) {
 {
   const r = formatTruncationBanner({ truncated: true, shown: 7, total: 42 });
   assert(r.text === "showing 7 of 42 nodes", `banner uses provided shown/total: got "${r.text}"`);
+}
+
+// Missing/non-finite total must not interpolate undefined/NaN.
+{
+  const missing = formatTruncationBanner({ truncated: true, shown: 13 });
+  assert(missing.visible === true, "banner visible when truncated=true and total missing");
+  assert(
+    missing.text === "showing 13 nodes; more available",
+    `missing total fallback text: got "${missing.text}"`,
+  );
+  assert(!/undefined|NaN/.test(missing.text), `missing total must not invent M: got "${missing.text}"`);
+  const bad = formatTruncationBanner({ truncated: true, shown: 13, total: Number.NaN });
+  assert(!/undefined|NaN/.test(bad.text), `non-finite total must not invent M: got "${bad.text}"`);
 }
 
 // nextGraphLimit: current=2000, hardMax=5000 -> in (2000, 5000].

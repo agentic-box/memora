@@ -57,14 +57,17 @@ jobs:
         run: npx wrangler d1 execute memora-graph --local --persist-to=.wrangler/state --file=tests/fixture.sql
 
       - name: Resolve the index.html symlink
-        # public/index.html is a symlink to memora/graph/index.html. `wrangler pages
-        # dev` does NOT serve symlinked assets (the page 404s), while deploys DO
-        # follow it. Swapping in a resolved copy serves identical bytes.
+        # public/index.html and public/_graph_limit.mjs are symlinks into
+        # memora/graph/. `wrangler pages dev` does NOT serve symlinked assets
+        # (the page 404s), while deploys DO follow them. Swapping in resolved
+        # copies serves identical bytes.
         run: |
-          cp -L public/index.html /tmp/index.real.html
-          rm public/index.html
-          cp /tmp/index.real.html public/index.html
-          test -f public/index.html && ! test -L public/index.html
+          for f in public/index.html public/_graph_limit.mjs; do
+            cp -L "$f" "/tmp/$(basename "$f").real"
+            rm "$f"
+            cp "/tmp/$(basename "$f").real" "$f"
+            test -f "$f" && ! test -L "$f"
+          done
 
       - name: Start wrangler pages dev
         run: |

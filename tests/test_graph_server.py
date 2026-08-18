@@ -1,6 +1,20 @@
+import urllib.request
+
 import memora
 import memora.storage as storage
 from memora.graph.data import get_graph_data
+
+
+def test_graph_limit_module_route_returns_200(graph_server_url):
+    """SPA import('./_graph_limit.mjs') from /graph resolves to this URL."""
+    request = urllib.request.Request(f"{graph_server_url}/_graph_limit.mjs")
+    with urllib.request.urlopen(request, timeout=2) as response:
+        body = response.read().decode("utf-8")
+        assert response.status == 200
+        ctype = response.headers.get("Content-Type", "")
+        assert "javascript" in ctype, ctype
+        assert "formatTruncationBanner" in body
+        assert "export function buildGraphUrl" in body
 
 
 def test_graph_retired_ancestor_not_current(graph_request, local_db):

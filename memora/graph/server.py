@@ -240,6 +240,16 @@ def start_graph_server(host: str, port: int) -> None:
         """Serve the static graph SPA."""
         return HTMLResponse(GRAPH_HTML)
 
+    GRAPH_LIMIT_JS = _pkg_files("memora.graph").joinpath("_graph_limit.mjs").read_bytes()
+
+    async def graph_limit_module(request: Request):
+        """Serve the shared limit/banner helper the SPA imports from /graph."""
+        return Response(
+            GRAPH_LIMIT_JS,
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
+
     async def api_graph(request: Request):
         """API endpoint: Get graph nodes and edges."""
         try:
@@ -801,6 +811,7 @@ def start_graph_server(host: str, port: int) -> None:
     app = Starlette(
         routes=[
             Route("/graph", graph_handler),
+            Route("/_graph_limit.mjs", graph_limit_module),
             Route("/api/graph", api_graph),
             Route("/api/events", graph_events),
             Route("/api/chat", api_chat, methods=["POST"]),
