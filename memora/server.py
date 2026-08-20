@@ -42,6 +42,7 @@ from .storage import (
     get_statistics,
     hybrid_search,
     import_memories,
+    list_absorb_inflight,
     list_memories,
     poll_events,
     rebuild_crossrefs,
@@ -2004,10 +2005,18 @@ async def memory_verify_integrity() -> Dict[str, Any]:
     try:
         audit = verify_embedding_integrity(conn, stamp=False)
         status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
+        inflight = list_absorb_inflight(conn)
         response = {
             "status": status,
             "audit": audit,
+            "absorb_inflight": inflight,
         }
+        if inflight["orphaned"]:
+            response["absorb_inflight_remediation"] = (
+                "Expired absorb in-flight records own unreaped partial rows. "
+                "connect() reaps them on lease expiry; leaving a live lease is "
+                "intentional (fail-safe vs stealing another server's absorb)."
+            )
         if status["mismatch"]:
             response["remediation"] = (
                 "Repair or remove named orphan/unknown writer rows, then run an explicit "

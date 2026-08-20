@@ -17,16 +17,29 @@ import sys
 
 
 def cmd_health() -> None:
-    from .storage import connect, get_statistics
+    from .storage import connect, get_statistics, list_absorb_inflight
 
     try:
         conn = connect()
         try:
             stats = get_statistics(conn)
             count = stats.get("total_memories", 0)
+            inflight = list_absorb_inflight(conn)
         finally:
             conn.close()
-        json.dump({"status": "ok", "memory_count": count}, sys.stdout)
+        orphaned = inflight["orphaned"]
+        payload = {
+            "status": "degraded" if orphaned else "ok",
+            "memory_count": count,
+            "absorb_inflight": {
+                "live": len(inflight["live"]),
+                "orphaned": len(orphaned),
+                "orphaned_memory_ids": [
+                    mid for rec in orphaned for mid in rec["owned_memory_ids"]
+                ],
+            },
+        }
+        json.dump(payload, sys.stdout)
     except Exception as exc:
         json.dump({"status": "error", "message": str(exc)}, sys.stdout)
         sys.exit(1)

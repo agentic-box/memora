@@ -233,6 +233,221 @@ def _recover_absorb_owned_ids(conn: sqlite3.Connection, absorb_nonce: Optional[s
     return [int(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
 
 
+# Process-death recovery for absorb. Dead vs live is the lease, never PID:
+# two servers on one database must not reap each other's in-flight writes.
+# Fail-safe: an unexpired lease is live even if the writer is actually gone.
+ABSORB_INFLIGHT_LEASE_SECONDS = 120
+
+# Test hook: fires after each absorb-owned add_memory (and its inflight touch).
+_after_absorb_owned_insert = None
+
+
+def _absorb_now() -> datetime:
+    return datetime.utcnow()
+
+
+def _absorb_format_ts(when: datetime) -> str:
+    return when.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _row_field(row: Any, index: int, name: str) -> Any:
+    if isinstance(row, sqlite3.Row):
+        return row[name]
+    if isinstance(row, Mapping):
+        return row[name]
+    return row[index]
+
+
+def _begin_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
+    """Persist the absorb nonce BEFORE the first row write. Must commit.
+
+    On local SQLite this is a separate transaction so process death cannot
+    roll the in-flight record back with the uncommitted memory inserts.
+    D1 already autocommits per statement.
+    """
+    now = _absorb_now()
+    conn.execute(
+        """
+        INSERT INTO absorb_inflight
+            (nonce, started_at, lease_until, owner, owned_ids, status)
+        VALUES (?, ?, ?, ?, ?, 'in_flight')
+        """,
+        (
+            absorb_nonce,
+            _absorb_format_ts(now),
+            _absorb_format_ts(now + timedelta(seconds=ABSORB_INFLIGHT_LEASE_SECONDS)),
+            f"pid:{os.getpid()}",
+            json.dumps([]),
+        ),
+    )
+    conn.commit()
+
+
+def _touch_absorb_inflight(
+    conn: sqlite3.Connection,
+    absorb_nonce: str,
+    owned_ids: List[int],
+) -> None:
+    """Heartbeat: extend the lease and record known owned ids."""
+    lease = _absorb_format_ts(
+        _absorb_now() + timedelta(seconds=ABSORB_INFLIGHT_LEASE_SECONDS)
+    )
+    conn.execute(
+        """
+        UPDATE absorb_inflight
+           SET lease_until = ?, owned_ids = ?
+         WHERE nonce = ? AND status = 'in_flight'
+        """,
+        (lease, json.dumps([int(i) for i in owned_ids]), absorb_nonce),
+    )
+
+
+def _complete_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
+    """Mark success before dropping the record so a death in this window
+    cannot be mistaken for a partial write (reaper keeps the memory rows).
+    """
+    conn.execute(
+        "UPDATE absorb_inflight SET status = 'completed' WHERE nonce = ?",
+        (absorb_nonce,),
+    )
+    conn.execute("DELETE FROM absorb_inflight WHERE nonce = ?", (absorb_nonce,))
+    conn.commit()
+
+
+def _clear_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
+    conn.execute("DELETE FROM absorb_inflight WHERE nonce = ?", (absorb_nonce,))
+    conn.commit()
+
+
+def list_absorb_inflight(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Report durable in-flight absorbs. Live = unexpired lease; orphaned = expired.
+
+    Does not mutate. Owned ids are recovered from memory metadata, not the
+    hint column, so a death between INSERT and heartbeat is still visible.
+    """
+    now_s = _absorb_format_ts(now or _absorb_now())
+    rows = conn.execute(
+        """
+        SELECT nonce, started_at, lease_until, owner, owned_ids, status
+          FROM absorb_inflight
+        """
+    ).fetchall()
+    live: List[Dict[str, Any]] = []
+    orphaned: List[Dict[str, Any]] = []
+    for row in rows:
+        nonce = str(_row_field(row, 0, "nonce"))
+        lease_until = str(_row_field(row, 2, "lease_until") or "")
+        status = str(_row_field(row, 5, "status") or "in_flight")
+        rec = {
+            "nonce": nonce,
+            "started_at": _row_field(row, 1, "started_at"),
+            "lease_until": lease_until,
+            "owner": _row_field(row, 3, "owner"),
+            "owned_ids_hint": _row_field(row, 4, "owned_ids"),
+            "status": status,
+            "owned_memory_ids": _recover_absorb_owned_ids(conn, nonce),
+        }
+        # completed leftover: not an orphaned partial; still reportable.
+        if status == "completed":
+            rec["state"] = "completed"
+            live.append(rec)
+            continue
+        if status == "in_flight" and lease_until >= now_s:
+            rec["state"] = "live"
+            live.append(rec)
+        else:
+            rec["state"] = "orphaned"
+            orphaned.append(rec)
+    return {"live": live, "orphaned": orphaned}
+
+
+def reconcile_dead_absorbs(
+    conn: sqlite3.Connection,
+    *,
+    now: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Reap in-flight records no live process owns.
+
+    Dead = lease expired (or a previous reaper died mid-reap). Live leases
+    are never touched: leaving an orphan is better than deleting a live
+    absorb. A status='completed' leftover means the writes finished; only
+    the tracking row is dropped.
+    """
+    now_s = _absorb_format_ts(now or _absorb_now())
+    report = list_absorb_inflight(conn, now=now or _absorb_now())
+    reaped: List[str] = []
+    deleted_ids: List[int] = []
+    failed_ids: List[int] = []
+    cleared_completed: List[str] = []
+
+    for rec in report["live"]:
+        if rec.get("status") != "completed":
+            continue
+        _clear_absorb_inflight(conn, rec["nonce"])
+        cleared_completed.append(rec["nonce"])
+
+    for rec in report["orphaned"]:
+        nonce = rec["nonce"]
+        cur = conn.execute(
+            """
+            UPDATE absorb_inflight
+               SET status = 'reaping'
+             WHERE nonce = ?
+               AND (status = 'reaping' OR (status = 'in_flight' AND lease_until < ?))
+            """,
+            (nonce, now_s),
+        )
+        conn.commit()
+        claimed = (getattr(cur, "rowcount", 0) or 0) > 0
+        if not claimed:
+            row = conn.execute(
+                "SELECT status FROM absorb_inflight WHERE nonce = ?",
+                (nonce,),
+            ).fetchone()
+            if row is None:
+                continue
+            claimed = str(_row_field(row, 0, "status")) == "reaping"
+        if not claimed:
+            # Lease was renewed between list and claim — fail-safe skip.
+            continue
+        nonce_failed: List[int] = []
+        for mid in _recover_absorb_owned_ids(conn, nonce):
+            try:
+                ok = delete_memory(conn, mid, require_absorb_nonce=nonce)
+            except Exception:
+                logger.exception(
+                    "absorb inflight reap failed to delete memory #%s nonce=%s",
+                    mid,
+                    nonce,
+                )
+                nonce_failed.append(mid)
+                continue
+            if ok:
+                deleted_ids.append(mid)
+            else:
+                nonce_failed.append(mid)
+        failed_ids.extend(nonce_failed)
+        if nonce_failed:
+            # Leave the record so a later pass can retry. Do not claim success.
+            continue
+        _clear_absorb_inflight(conn, nonce)
+        reaped.append(nonce)
+
+    return {
+        "reaped_nonces": reaped,
+        "deleted_ids": deleted_ids,
+        "failed_ids": failed_ids,
+        "cleared_completed": cleared_completed,
+        "skipped_live": len(
+            [r for r in report["live"] if r.get("status") != "completed"]
+        ),
+    }
+
+
 def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: str) -> None:
     """Log an action to the actions history table. Never fails core operations."""
     try:
@@ -245,9 +460,18 @@ def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: 
 
 
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
-    """Create a database connection using the configured storage backend."""
+    """Create a database connection using the configured storage backend.
+
+    Expired absorb in-flight records are reaped here (boot / first-connect
+    reconciliation). Live leases are never touched.
+    """
     from .schema import connect as _connect
-    return _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
+    conn = _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
+    try:
+        reconcile_dead_absorbs(conn)
+    except Exception:
+        logger.exception("absorb inflight reconciliation failed on connect")
+    return conn
 
 
 def sync_to_cloud() -> None:
@@ -2623,6 +2847,7 @@ def _write_tombstone(
 # Test hooks for delete/absorb interleave. Production leaves these None.
 _after_component_snapshot = None
 _after_absorb_resolve = None
+# _after_absorb_owned_insert is defined with absorb inflight recovery above.
 # Fires after resolve-time + pre-link retirement checks, immediately before
 # add_link. Lets tests land delete markers in the D1 window between those
 # checks and the link (delete's edge-clear has not run; the target row
@@ -4225,6 +4450,9 @@ def absorb_memory(
             raise RuntimeError("absorb phase-3 embedding returned empty vector")
 
     # owned_ids tracks every INSERT id, even if add_memory fails mid-function (P1-1).
+    # Durable nonce first: process death skips the except handler, so the
+    # in-flight row must already be committed before the first memory INSERT.
+    _begin_absorb_inflight(conn, absorb_nonce)
     owned_ids: List[int] = []
     try:
         for job in phase3_jobs:
@@ -4239,6 +4467,10 @@ def absorb_memory(
                 absorb_nonce=absorb_nonce,
                 absorb_operation_key=str(uuid.uuid4()),
             )
+            _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
+            owned_hook = _after_absorb_owned_insert
+            if owned_hook is not None:
+                owned_hook(record["id"], absorb_nonce)
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 if edge_type == "supersedes":
@@ -4417,6 +4649,9 @@ def absorb_memory(
                     "reason": "new knowledge",
                 })
                 counts["created"] += 1
+        # Mark completed before dropping the tracking row so a death in this
+        # window cannot be reaped as a partial write.
+        _complete_absorb_inflight(conn, absorb_nonce)
         conn.commit()
     except Exception as write_exc:
         # A D1 INSERT can commit remotely while its response is lost before
@@ -4463,6 +4698,8 @@ def absorb_memory(
         )]
 
         if orphans:
+            _touch_absorb_inflight(conn, absorb_nonce, orphans)
+            conn.commit()
             return {
                 "decisions": decisions,
                 **counts,
@@ -4479,6 +4716,7 @@ def absorb_memory(
                 ),
             }
         # All owned rows cleaned — re-raise original for strict callers
+        _clear_absorb_inflight(conn, absorb_nonce)
         raise
 
     return {"decisions": decisions, **counts}
@@ -5755,6 +5993,13 @@ def get_statistics(conn: sqlite3.Connection) -> Dict[str, Any]:
     stats["most_connected"] = [
         {"memory_id": memory_id, "connections": count}
         for memory_id, count in crossref_counts[:10]
+    ]
+
+    inflight = list_absorb_inflight(conn)
+    stats["absorb_inflight_live"] = len(inflight["live"])
+    stats["absorb_inflight_orphaned"] = len(inflight["orphaned"])
+    stats["absorb_inflight_orphaned_ids"] = [
+        mid for rec in inflight["orphaned"] for mid in rec["owned_memory_ids"]
     ]
 
     # Date range

@@ -132,6 +132,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_importance_columns(conn)
     _ensure_updated_at_column(conn)
     _ensure_tombstones_table(conn)
+    _ensure_absorb_inflight_table(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -365,6 +366,32 @@ def _ensure_tombstones_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tombstone_components_hash "
         "ON tombstone_components(content_hash)"
+    )
+    conn.commit()
+
+
+def _ensure_absorb_inflight_table(conn: sqlite3.Connection) -> None:
+    """Durable in-flight absorb records so process death can be reconciled.
+
+    absorb_nonce lives only in the writer process today; this table is the
+    boot-visible counterpart. Lease, not PID, distinguishes live work from
+    a dead writer — two servers on the same database must not reap each other.
+    """
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS absorb_inflight (
+            nonce TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            lease_until TEXT NOT NULL,
+            owner TEXT,
+            owned_ids TEXT,
+            status TEXT NOT NULL DEFAULT 'in_flight'
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_absorb_inflight_lease "
+        "ON absorb_inflight(lease_until, status)"
     )
     conn.commit()
 
