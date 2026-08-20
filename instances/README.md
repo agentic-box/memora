@@ -44,25 +44,12 @@ connection.
 
 | instance | store | port | used by |
 |---|---|---|---|
-| `test-sqlite` | local sqlite in `~/repos/memora-test/data` | 8900 | pilot |
-| `test` | `memora-test-graph` (throwaway D1) | 8901 | pilot / memora-test |
 | `memora` | `memora-graph` | 8910 | agentic-box |
 | `ob1` | `ob1-graph` | 8911 | SAIL/ob1 + tarmacs/terminator |
 | `bestation` | `bestation-graph` | 8912 | bestation |
 | `re` | `re-graph` | 8913 | re |
 
-All six are deployed and supervised. Only `agentic-box` has actually been
-repointed at its container; `SAIL/ob1`, `tarmacs/terminator`, `bestation` and
-`re` still talk to memora directly, so their containers are running but idle.
-
-## Credentials are per instance, not shared
-
-`CRED_SOURCE` defaults to `~/.config/memora/credentials.mcp.json` but each
-instance can name its own, and the four real stores do. This is not tidiness:
-`bestation` and `re` do NOT set the AWS/R2 backup variables that `agentic-box`
-and `ob1` set. Feeding them one shared credential file would have switched cloud
-backup ON for two stores that never had it — silently, since nothing would have
-failed. Each workspace's `.mcp.json` env was copied to
-`~/.config/memora/<name>.credentials.mcp.json` (mode 0600) before its container
-was built, and the injected key set is verified against that file per container
-(18 keys for `memora`/`ob1`, 15 for `bestation`/`re`).
+All four are deployed, supervised, and repointed — every workspace reaches
+memora through its container. The two pilot instances (local sqlite on 8900, a
+throwaway D1 on 8901) were retired once the real stores were live; their
+containers, proxies and configs are gone.
