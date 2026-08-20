@@ -7,12 +7,19 @@ the same amount because both ran on the single asyncio thread.
 Named red PhantomCancelReleasedCooldown: raw asyncio.to_thread lets
 CancelledError hit the tool `finally` while the worker is still writing.
 Named red UploadBlocksEventLoop: memory_upload_image on the loop delays stats.
+Named red DoubleCancelDetachedWorker: await raw fut (not shield-in-a-loop) after one
+CancelledError; a second cancel detaches the thread.
+Named red WaitReraiseOnPy310: re-raise when Task.uncancel is missing.
+Named red CancelHidesWorkerError: cancel then worker raise reports CancelledError.
+Named red UploadPathToctou: reopen the pathname after validation.
 """
 from __future__ import annotations
 
 import asyncio
 import threading
 import time
+
+import pytest
 
 import memora.server as server
 
@@ -215,3 +222,147 @@ def test_gated_upload_does_not_block_stats(local_db, monkeypatch, tmp_path):
         "UploadBlocksEventLoop: memory_stats waited "
         f"{read_elapsed:.3f}s behind a {WRITE_STALL_S:.2f}s upload"
     )
+
+
+def test_double_cancel_keeps_worker_result(local_db, monkeypatch):
+    """A second CancelledError must not detach the executor thread."""
+    started = threading.Event()
+    gate = threading.Event()
+    real_export = server.export_memories
+
+    def gated_export(*args, **kwargs):
+        started.set()
+        assert gate.wait(timeout=5), "worker never released"
+        return real_export(*args, **kwargs)
+
+    monkeypatch.setattr(server, "export_memories", gated_export)
+    server._tool_running.clear()
+    server._tool_last_call.clear()
+
+    async def scenario():
+        task = asyncio.create_task(server.memory_export())
+        await _wait_flag(started)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert server._tool_running.get("memory_export") is True, (
+            "DoubleCancelDetachedWorker: single-flight cleared after the second cancel"
+        )
+        gate.set()
+        result = await task
+        assert "memories" in result, (
+            "DoubleCancelDetachedWorker: second cancel hid the worker result: "
+            f"{result!r}"
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        gate.set()
+        server._tool_running.clear()
+        server._tool_last_call.clear()
+
+
+def test_cancel_then_worker_error_propagates(local_db, monkeypatch):
+    """Worker exception must surface; cooldown stays held until the worker ends."""
+    started = threading.Event()
+    gate = threading.Event()
+
+    def gated_export(*args, **kwargs):
+        started.set()
+        assert gate.wait(timeout=5), "worker never released"
+        raise RuntimeError("worker-boom")
+
+    monkeypatch.setattr(server, "export_memories", gated_export)
+    server._tool_running.clear()
+    server._tool_last_call.clear()
+
+    async def scenario():
+        task = asyncio.create_task(server.memory_export())
+        await _wait_flag(started)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert server._tool_running.get("memory_export") is True, (
+            "CancelHidesWorkerError: cooldown released before the worker raised"
+        )
+        gate.set()
+        try:
+            await task
+            pytest.fail("worker should have raised")
+        except RuntimeError as exc:
+            assert "worker-boom" in str(exc)
+        except asyncio.CancelledError:
+            pytest.fail(
+                "CancelHidesWorkerError: cancel hid the worker exception"
+            )
+        assert server._tool_running.get("memory_export") is not True, (
+            "cooldown stuck after the worker's exception"
+        )
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        gate.set()
+        server._tool_running.clear()
+        server._tool_last_call.clear()
+
+
+def test_uncancel_missing_does_not_reraise():
+    """3.10 has no Task.uncancel; looking it up must not raise CancelledError.
+
+    Named red WaitReraiseOnPy310: `if uncancel is None: raise`.
+    """
+    class Task310:
+        pass
+
+    try:
+        server._uncancel_if_available(Task310())
+        server._uncancel_if_available(None)
+    except BaseException as exc:
+        pytest.fail(
+            f"WaitReraiseOnPy310: missing uncancel raised {type(exc).__name__}"
+        )
+
+
+def test_upload_validates_the_bytes_it_uploads(monkeypatch, tmp_path):
+    """Pathname swap after validation must not change the uploaded payload.
+
+    Named red UploadPathToctou: reopen the path for upload instead of using
+    the bytes already read from the O_NOFOLLOW fd.
+    """
+    from PIL import Image
+
+    import memora.image_storage as image_storage
+
+    good = tmp_path / "good.png"
+    evil = tmp_path / "evil.png"
+    Image.new("RGB", (2, 2), color=(1, 2, 3)).save(good)
+    Image.new("RGB", (8, 8), color=(9, 9, 9)).save(evil)
+    good_bytes = good.read_bytes()
+    evil_bytes = evil.read_bytes()
+    assert good_bytes != evil_bytes
+
+    captured = {}
+
+    class FakeStore:
+        def upload_image(self, **kwargs):
+            captured["data"] = kwargs.get("image_data")
+            return "r2://bucket/good.png"
+
+    monkeypatch.setattr(image_storage, "get_image_storage_instance", lambda: FakeStore())
+
+    def swap():
+        good.write_bytes(evil_bytes)
+
+    server._after_upload_bytes_validated = swap
+    try:
+        result = server._upload_image_blocking(str(good), memory_id=1)
+    finally:
+        server._after_upload_bytes_validated = None
+
+    assert result.get("r2_url") == "r2://bucket/good.png", result
+    assert captured.get("data") == good_bytes, (
+        "UploadPathToctou: uploaded bytes came from the swapped pathname"
+    )
+    assert captured.get("data") != evil_bytes

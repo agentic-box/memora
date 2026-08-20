@@ -268,29 +268,40 @@ def _with_connection(func=None, *, writes=False):
     return decorator
 
 
+def _uncancel_if_available(task) -> None:
+    """Clear 3.11+ cancellation count. 3.10 consumes cancel by catching; no-op."""
+    uncancel = getattr(task, "uncancel", None)
+    if task is None or not callable(uncancel):
+        return
+    cancelling = getattr(task, "cancelling", None)
+    if callable(cancelling):
+        while cancelling():
+            uncancel()
+    else:
+        uncancel()
+
+
 async def _wait_for_worker(fut: asyncio.Future) -> Any:
     """Wait for executor work. Cancellation does not abort it or hide its result.
 
     Contract: once submitted, the worker always runs to completion (including
-    connect/write/sync/close). If the calling task is cancelled, we still wait
-    for the worker and return its result — never CancelledError after a
-    commit. That is what keeps cooldown/single-flight `finally` from releasing
-    while a write is still running, and what prevents a phantom
-    cancelled-but-committed write.
+    connect/write/sync/close). Every CancelledError is swallowed and we keep
+    awaiting asyncio.shield(fut) until the worker finishes, then return its
+    result or raise the worker's exception — never CancelledError after a
+    commit. A second cancel (disconnect then teardown) must not detach the
+    thread. 3.10 has no Task.uncancel; catching is enough because that
+    version consumes the cancel. 3.11+ needs uncancel() before the next wait.
 
     (The default executor's thread *count* is not an admission cap; queued
     work can still grow without bound. That is a separate issue.)
     """
-    try:
-        return await asyncio.shield(fut)
-    except asyncio.CancelledError:
-        task = asyncio.current_task()
-        uncancel = getattr(task, "uncancel", None)
-        if task is None or uncancel is None:
-            raise
-        while task.cancelling():
-            uncancel()
-        return await fut
+    while True:
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            _uncancel_if_available(asyncio.current_task())
+            if fut.done():
+                return fut.result()
 
 
 async def _in_worker(fn, /, *args, **kwargs):
@@ -2835,13 +2846,20 @@ async def memory_export() -> Dict[str, Any]:
         _finish_tool("memory_export")
 
 
+# Test hook: after bytes are read+validated, before upload. Production is None.
+_after_upload_bytes_validated = None
+
+
 def _upload_image_blocking(
     file_path: str,
     memory_id: int,
     image_index: int = 0,
     caption: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Validate, read, and upload in one worker. Do not split across the thread boundary."""
+    """Open once (O_NOFOLLOW), validate those bytes, upload the same bytes."""
+    import errno
+    import stat as stat_mod
+    from io import BytesIO
     from pathlib import Path as _Path
 
     from PIL import Image as _PILImage
@@ -2861,14 +2879,14 @@ def _upload_image_blocking(
         if part.is_symlink():
             return {"error": "invalid_path", "message": "Symlinks are not supported"}
 
-    try:
-        resolved = raw_path.resolve(strict=True)
-    except (OSError, ValueError):
-        return {"error": "file_not_found", "message": "File not found"}
-
     _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-    if resolved.suffix.lower() not in _UPLOAD_EXTENSIONS:
+    if raw_path.suffix.lower() not in _UPLOAD_EXTENSIONS:
         return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
+
+    try:
+        resolved = raw_path.resolve(strict=False)
+    except (OSError, ValueError):
+        resolved = raw_path
 
     _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
     path_str = str(resolved).lower()
@@ -2876,10 +2894,33 @@ def _upload_image_blocking(
         if pattern in path_str:
             return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
 
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(str(raw_path), flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (getattr(errno, "ELOOP", None), getattr(errno, "EMLINK", None)):
+            return {"error": "invalid_path", "message": "Symlinks are not supported"}
+        return {"error": "file_not_found", "message": "File not found"}
+
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            return {"error": "invalid_path", "message": "File must be a regular file"}
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            image_data = fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
     _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
     try:
-        with _PILImage.open(str(resolved)) as img:
+        with _PILImage.open(BytesIO(image_data)) as img:
             img.verify()
+        with _PILImage.open(BytesIO(image_data)) as img:
             pillow_format = img.format
     except Exception:
         return {"error": "invalid_image", "message": "File is not a valid image"}
@@ -2888,10 +2929,11 @@ def _upload_image_blocking(
     if not content_type:
         return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
 
-    try:
-        with open(str(resolved), "rb") as f:
-            image_data = f.read()
+    hook = _after_upload_bytes_validated
+    if hook is not None:
+        hook()
 
+    try:
         r2_url = image_storage.upload_image(
             image_data=image_data,
             content_type=content_type,
