@@ -185,7 +185,11 @@ one_status() {
 
 cmd_status() {
   if [ "${1:-all}" = "all" ]; then
-    for f in "$INSTANCE_DIR"/*.env; do one_status "$(basename "$f" .env)"; done
+    for f in "$INSTANCE_DIR"/*.env; do
+      local n; n="$(basename "$f" .env)"
+      [ "$n" = "example" ] && continue   # a template, not a deployment
+      one_status "$n"
+    done
   else one_status "$1"; fi
 }
 
