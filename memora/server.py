@@ -8,6 +8,7 @@ import functools
 import logging
 import os
 import re
+import sys
 import time
 from typing import Any, Dict, List, Literal, Optional
 
@@ -3305,7 +3306,6 @@ def main(argv: Optional[list[str]] = None) -> None:
         # Pre-warm database connection (triggers cloud sync if needed)
         # This prevents "connection failed" on first MCP connection
         try:
-            import sys
             print("Initializing database...", file=sys.stderr)
             conn = connect()
             conn.close()
@@ -3325,6 +3325,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         # non-null branch in every registered tool's schema before
         # we start serving, so Claude Code (and any other strict
         # client) accepts the tools/list response.
+        #
+        # MEMORA_TOOL_PROFILE runs FIRST: prune gated tools so they are
+        # genuinely absent (not listed AND undispatchable) under reduced
+        # profiles. Default "full" keeps all 43 registered tools; an
+        # unknown value refuses to start (fail closed — a typo must not
+        # silently re-expose destructive maintenance tools).
+        from .tool_profile import ToolProfileError, apply_tool_profile
+        try:
+            apply_tool_profile(mcp)
+        except ToolProfileError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+
         _sanitize_tool_schemas(mcp)
 
         mcp.run(transport=args.transport)
