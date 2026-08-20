@@ -3303,6 +3303,19 @@ def main(argv: Optional[list[str]] = None) -> None:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
 
+        # MEMORA_TOOL_PROFILE is resolved and validated BEFORE any side
+        # effect (connect prewarm, graph server, mcp.run). An invalid
+        # value must abort startup, not run DB/cloud work or start a
+        # transient graph listener first — fail closed, early. The
+        # already-resolved value is applied later, after registration is
+        # complete, so the prune+attestation run against the live server.
+        from .tool_profile import ToolProfileError, apply_tool_profile, resolve_tool_profile
+        try:
+            resolved_profile = resolve_tool_profile()
+        except ToolProfileError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+
         # Pre-warm database connection (triggers cloud sync if needed)
         # This prevents "connection failed" on first MCP connection
         try:
@@ -3326,14 +3339,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         # we start serving, so Claude Code (and any other strict
         # client) accepts the tools/list response.
         #
-        # MEMORA_TOOL_PROFILE runs FIRST: prune gated tools so they are
+        # Prune gated tools to the already-resolved profile so they are
         # genuinely absent (not listed AND undispatchable) under reduced
-        # profiles. Default "full" keeps all 43 registered tools; an
-        # unknown value refuses to start (fail closed — a typo must not
-        # silently re-expose destructive maintenance tools).
-        from .tool_profile import ToolProfileError, apply_tool_profile
+        # profiles. apply_tool_profile also runs the startup attestation
+        # through the public list_tools/call_tool path (fail closed on
+        # private-implementation drift in the MCP SDK).
         try:
-            apply_tool_profile(mcp)
+            apply_tool_profile(mcp, resolved_profile)
         except ToolProfileError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)

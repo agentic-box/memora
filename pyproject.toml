@@ -11,7 +11,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     # mcp 2.0.0 removed mcp.server.fastmcp; see memora/server.py.
-    "mcp>=1.0.0,<2",
+    # Upper bound <1.28: MEMORA_TOOL_PROFILE prunes FastMCP's private
+    # _tool_manager._tools dict and attests through the public list_tools/
+    # call_tool path at startup; a 1.28+ release that routes listing/dispatch
+    # elsewhere would trip the attestation (fail closed). Bump only after
+    # re-running tests/test_tool_profile.py against the new release.
+    "mcp>=1.0.0,<1.28",
     "Pillow>=10.4.0",
     "boto3>=1.28.0",
     "filelock>=3.12.0",

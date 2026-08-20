@@ -222,3 +222,130 @@ class TestProfileMembershipIsData:
         # ghost entry; the result is the intersection with registered.
         registered = _tool_names()
         assert profile_tool_names("agent", registered) == (AGENT_TOOLS & frozenset(registered))
+
+
+class TestAttestationUsesPublicPath:
+    """The startup attestation goes through the ACTUAL public protocol path
+    (server.list_tools / server.call_tool), not the private _tool_manager
+    dict. If a future MCP SDK routes listing/dispatch elsewhere while
+    keeping the dict, the attestation MUST fail closed. These tests
+    simulate that drift by monkeypatching the PUBLIC methods and asserting
+    apply_tool_profile raises ToolProfileError — proving the attestation
+    actually exercises the public path (non-vacuous)."""
+
+    def test_listing_drift_fails_closed(self, _clean_env, monkeypatch):
+        # Drift: public list_tools ignores the prune and still returns all
+        # 43 names. The attestation must catch the mismatch and raise.
+        snap = dict(server.mcp._tool_manager._tools)
+        all_names = frozenset(snap.keys())
+
+        async def fake_list_tools(self_inner):
+            from mcp.types import Tool as MCPTool
+            return [MCPTool(name=n, inputSchema={}) for n in all_names]
+
+        monkeypatch.setattr(
+            type(server.mcp), "list_tools", fake_list_tools, raising=True
+        )
+        with pytest.raises(ToolProfileError, match="tools/list"):
+            apply_tool_profile(server.mcp, "agent")
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_dispatch_drift_fails_closed(self, _clean_env, monkeypatch):
+        # Drift: public call_tool does NOT raise for a gated name (the SDK
+        # routes dispatch elsewhere, ignoring the prune). The attestation
+        # must catch it and raise.
+        snap = dict(server.mcp._tool_manager._tools)
+
+        async def fake_call_tool(self_inner, name, arguments):
+            return {"ok": True}  # never raises — gated tool still callable
+
+        # list_tools is honest (reflects the prune), but call_tool lies.
+        monkeypatch.setattr(
+            type(server.mcp), "call_tool", fake_call_tool, raising=True
+        )
+        with pytest.raises(ToolProfileError, match="still dispatchable"):
+            apply_tool_profile(server.mcp, "agent")
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_attestation_passes_on_compatible_sdk(self, _clean_env):
+        # Sanity: with the REAL installed SDK (public path honours the
+        # prune), apply_tool_profile does NOT raise under any profile.
+        snap = dict(server.mcp._tool_manager._tools)
+        assert apply_tool_profile(server.mcp, "agent") == 12
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+        assert apply_tool_profile(server.mcp, "leader") == 18
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+        assert apply_tool_profile(server.mcp, "full") == 43
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+
+class TestInvalidProfileAbortsBeforeSideEffects:
+    """An invalid MEMORA_TOOL_PROFILE must abort BEFORE any side effect:
+    no DB connect/prewarm, no graph server thread, no mcp.run. The earlier
+    --no-graph test MASKED the ordering bug (it skipped start_graph_server
+    unconditionally); these tests run WITHOUT --no-graph and assert the
+    side-effect functions are never reached for an invalid value."""
+
+    def test_invalid_profile_aborts_before_connect_graph_and_run(
+        self, _clean_env, monkeypatch
+    ):
+        calls: list[str] = []
+
+        # Monkeypatch the three side-effect entry points in server's
+        # namespace. connect is `from .storage import connect` -> server.connect.
+        def fake_connect():
+            calls.append("connect")
+            raise AssertionError("connect must not run for an invalid profile")
+
+        def fake_start_graph_server(host, port):
+            calls.append("start_graph_server")
+
+        def fake_run(transport=None):
+            calls.append("mcp.run")
+
+        monkeypatch.setattr(server, "connect", fake_connect)
+        monkeypatch.setattr(server, "start_graph_server", fake_start_graph_server)
+        monkeypatch.setattr(server.mcp, "run", fake_run)
+        _clean_env.setenv("MEMORA_TOOL_PROFILE", "bogus")
+
+        # NOT passing --no-graph: graph startup is the default path.
+        with pytest.raises(SystemExit) as exc:
+            server.main(["--host", "127.0.0.1", "--port", "0"])
+        assert exc.value.code == 2, f"expected exit 2, got {exc.value.code}"
+        assert calls == [], (
+            f"invalid profile must abort before side effects, but ran: {calls}"
+        )
+
+    def test_valid_profile_still_runs_side_effects(self, _clean_env, monkeypatch):
+        # Contrast: a VALID profile must still reach connect (prewarm) and
+        # would reach mcp.run — the early validation must not short-circuit
+        # the happy path. We stub mcp.run to avoid actually serving.
+        calls: list[str] = []
+
+        class _FakeConn:
+            def close(self):
+                calls.append("close")
+
+        def fake_connect():
+            calls.append("connect")
+            return _FakeConn()
+
+        def fake_start_graph_server(host, port):
+            calls.append("start_graph_server")
+
+        def fake_run(transport=None):
+            calls.append("mcp.run")
+
+        monkeypatch.setattr(server, "connect", fake_connect)
+        monkeypatch.setattr(server, "start_graph_server", fake_start_graph_server)
+        monkeypatch.setattr(server.mcp, "run", fake_run)
+        _clean_env.setenv("MEMORA_TOOL_PROFILE", "agent")
+
+        server.main(["--host", "127.0.0.1", "--port", "0"])
+        assert "connect" in calls, "valid profile must still prewarm the DB"
+        assert "mcp.run" in calls, "valid profile must still serve"
