@@ -22,7 +22,7 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 </p>
 
 <p align="center">
-<b><a href="#features">Features</a></b> · <b><a href="#preview">Preview</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
+<b><a href="#features">Features</a></b> · <b><a href="#preview">Preview</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#container-deployment">Containers</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
 </p>
 
 ## Features
@@ -232,6 +232,7 @@ All 43 MCP tools register unconditionally, so every agent session is injected wi
 - `memory_list` is deliberately excluded from both reduced profiles (it measures 163-174s vs `memory_list_compact`'s 0.22s on the live 836-memory store; fixing it is a separate task).
 - The leader/agent boundary is **data** in `memora/tool_profile.py` (two frozensets). Editing it is one line, not a sweep of 43 decorators.
 - The prune deletes from FastMCP's private `_tool_manager._tools` dict, so `memora` pins `mcp>=1.27,<1.28` (the audited minor) and runs a startup **attestation** through the low-level registered MCP request handlers (`_mcp_server.request_handlers[ListToolsRequest]` / `[CallToolRequest]` — the actual dispatch callable real client requests use, not the `FastMCP.list_tools` / `call_tool` Python helpers) that refuses to start if the installed SDK routes listing/dispatch elsewhere (private-implementation drift). The pin is the static guard; the attestation is the runtime backstop. Bumping the upper bound requires re-running `tests/test_tool_profile.py`.
+- Under [container deployment](#container-deployment) the profile is per *container* while roles are per *agent*. One container serving a workspace's leader and its workers needs the **leader** superset; `agent` would strip `create_section`/`store_document`/`delete`/`digest`/`tags` from the leader.
 - `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 43 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
 
 ```bash
@@ -248,6 +249,58 @@ memora-server
 # MEMORA_TOOL_PROFILE=agnt memora-server
 # Error: unknown MEMORA_TOOL_PROFILE='agnt'; valid values: full, leader, agent
 ```
+
+</details>
+
+<details id="container-deployment">
+<summary><big><big><strong>Container Deployment</strong></big></big></summary>
+
+A `memora` process binds **one** database for its lifetime (`storage.py` resolves the
+backend at import from `MEMORA_STORAGE_URI`). So one store = one container = one port.
+Running several stores means running several containers, not one server that routes.
+
+`Dockerfile` builds a credential-free image; `scripts/memora-instance.sh` deploys one
+instance from `instances/<name>.env`:
+
+```bash
+./scripts/memora-instance.sh build   myinstance   # build the image
+./scripts/memora-instance.sh up      myinstance   # run the container
+./scripts/memora-instance.sh proxy   myinstance   # render a LaunchAgent + print install commands
+./scripts/memora-instance.sh status                # every instance at a glance
+```
+
+Then point the workspace at it — the whole client config, with no secrets in it:
+
+```json
+{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp"}}}
+```
+
+**Credentials never enter the image or the config.** They are read at run time from a
+`.mcp.json` outside the repo (`CRED_SOURCE`, per instance) and injected with `-e`. Pass
+through *every* variable the direct configuration defined, not a hand-picked few: a
+container started with only the embedding keys silently loses `memory_absorb`'s LLM
+consolidation instead of failing loudly.
+
+**Why the proxy exists — read this before deciding you do not need it.** Apple's
+`container` runtime reassigns a container's IP on *every start*, not just on recreate.
+An MCP client reads its config once at startup, so a moved address does not produce an
+error: it produces a permanent silent hang. `scripts/memora_proxy.py` holds a stable
+`127.0.0.1:<PORT>` in front of the moving address and re-resolves per connection.
+
+Two failure modes it distinguishes, which cost an outage to learn:
+
+- The lookup **ran** and the container is not listed → it really is gone. Refuse.
+- The lookup **could not run** (timeout under host memory pressure) → nothing new is
+  known. Keep serving the last known good address, bounded by `MEMORA_PROXY_STALE_GRACE`
+  (300s). Conflating the two took every workspace offline while the containers were
+  answering normally on unchanged addresses.
+
+Set `MEMORA_TOOL_PROFILE` per instance (see **Tool Profiles**). Note the profile is
+per *container* while roles are per *agent*: if one container serves a workspace's
+leader and its workers, it needs the leader superset.
+
+`instances/README.md` covers the config fields and `launchd/README.md` the supervised
+proxy. `REVERT.md` documents restoring a workspace to the direct stdio server.
 
 </details>
 

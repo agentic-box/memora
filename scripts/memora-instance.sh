@@ -22,6 +22,8 @@
 #   CONTAINER     optional: adopt an existing container name instead of memora-<INSTANCE>
 #   IMAGE         optional: pin this instance to its own image tag
 #   CRED_SOURCE   optional: this instance's own credential file (see below)
+#   MEMORY/CPUS   optional: per-instance VM size (defaults 512M / 2)
+#   TOOL_PROFILE  optional: full|leader|agent (default leader — see note below)
 #
 # CREDENTIALS are never in these files, never in the image, never in git. They
 # are read at run time from $CRED_SOURCE (a workspace .mcp.json, untracked).
@@ -38,9 +40,22 @@ DEFAULT_CRED_SOURCE="${CRED_SOURCE:-$HOME/.config/memora/credentials.mcp.json}"
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
 TARGET_PORT="${MEMORA_TARGET_PORT:-8000}"      # port memora listens on INSIDE the container
+# Each container is a VM. 1024MB was the runtime default; measured use inside a
+# live container is 116-230MB, and ~250MB of any figure is VM overhead. 512MB is
+# generous and halves the per-VM ceiling on a 16GB host running five workspaces.
+DEFAULT_MEMORY="${MEMORA_MEMORY:-512M}"
+DEFAULT_CPUS="${MEMORA_CPUS:-2}"
+# One container serves EVERY agent in a workspace, leader and workers alike,
+# so the profile must be the SUPERSET the leader needs. 'agent' (12 tools)
+# would strip create_section/store_document/delete/digest/tags from the leader.
+DEFAULT_TOOL_PROFILE="${MEMORA_TOOL_PROFILE:-leader}"
 MAX_CONN="${MEMORA_PROXY_MAX_CONN:-64}"
-RESOLVE_TIMEOUT="${MEMORA_PROXY_RESOLVE_TIMEOUT:-2}"
+# 2s was calibrated on an idle host. Forking a subprocess under memory pressure
+# legitimately takes seconds, and on 2026-08-20 that took every workspace offline
+# (memora #982). The lookup is cached, so a larger budget costs almost nothing.
+RESOLVE_TIMEOUT="${MEMORA_PROXY_RESOLVE_TIMEOUT:-10}"
 CONNECT_TIMEOUT="${MEMORA_PROXY_CONNECT_TIMEOUT:-2}"
+STALE_GRACE="${MEMORA_PROXY_STALE_GRACE:-300}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -54,7 +69,7 @@ load() {  # load instances/<name>.env into INSTANCE/PORT/STORAGE_URI/VOLUME
   # sharing one credential file would silently switch cloud backup ON for
   # stores that never had it. Reset it every load so one instance cannot
   # inherit the previous one's source during `status all`.
-  INSTANCE=""; PORT=""; STORAGE_URI=""; VOLUME=""; CONTAINER=""; IMAGE=""; CRED_SOURCE=""
+  INSTANCE=""; PORT=""; STORAGE_URI=""; VOLUME=""; CONTAINER=""; IMAGE=""; CRED_SOURCE=""; MEMORY=""; CPUS=""; TOOL_PROFILE=""
   # shellcheck disable=SC1090
   set -a; . "$f"; set +a
   VOLUME="${VOLUME/#\$HOME/$HOME}"
@@ -66,6 +81,9 @@ load() {  # load instances/<name>.env into INSTANCE/PORT/STORAGE_URI/VOLUME
   # A config may pin its own image tag so rebuilding for one instance cannot
   # change what a different instance gets on its next restart.
   IMAGE="${IMAGE:-$DEFAULT_IMAGE}"
+  TOOL_PROFILE="${TOOL_PROFILE:-$DEFAULT_TOOL_PROFILE}"
+  MEMORY="${MEMORY:-$DEFAULT_MEMORY}"
+  CPUS="${CPUS:-$DEFAULT_CPUS}"
   CRED_SOURCE="${CRED_SOURCE:-$DEFAULT_CRED_SOURCE}"
   CRED_SOURCE="${CRED_SOURCE/#\$HOME/$HOME}"
   LABEL="com.memora.proxy.$CONTAINER"
@@ -105,7 +123,7 @@ cmd_up() {
   load "$1"
   container stop "$CONTAINER" >/dev/null 2>&1 || true
   container rm   "$CONTAINER" >/dev/null 2>&1 || true
-  local args=(run -d --name "$CONTAINER")
+  local args=(run -d --name "$CONTAINER" --memory "$MEMORY" --cpus "$CPUS" -e "MEMORA_TOOL_PROFILE=$TOOL_PROFILE")
   if [ -n "$STORAGE_URI" ]; then
     # CLOUDFLARE_API_TOKEN comes through cred_args with everything else.
     args+=(-e "MEMORA_STORAGE_URI=$STORAGE_URI")
@@ -146,6 +164,7 @@ cmd_proxy() {
         <key>MEMORA_PROXY_MAX_CONN</key><string>$MAX_CONN</string>
         <key>MEMORA_PROXY_RESOLVE_TIMEOUT</key><string>$RESOLVE_TIMEOUT</string>
         <key>MEMORA_PROXY_CONNECT_TIMEOUT</key><string>$CONNECT_TIMEOUT</string>
+        <key>MEMORA_PROXY_STALE_GRACE</key><string>$STALE_GRACE</string>
         <key>MEMORA_PROXY_LOG</key><string>$LOG_DIR/memora-proxy-$INSTANCE.log</string>
     </dict>
     <key>ProcessType</key><string>Background</string>
@@ -198,6 +217,8 @@ cmd_config() {
   echo "instance      $INSTANCE"
   echo "container     $CONTAINER"
   echo "image         $IMAGE"
+  echo "resources     memory=$MEMORY cpus=$CPUS"
+  echo "tool profile  $TOOL_PROFILE"
   echo "proxy port    $PORT  (http://127.0.0.1:$PORT/mcp)"
   [ -n "$STORAGE_URI" ] && echo "storage       $STORAGE_URI" || echo "storage       sqlite $VOLUME"
   echo "credentials   $CRED_SOURCE (read at run time, never baked in)"
