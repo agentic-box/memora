@@ -197,7 +197,7 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_TAG_FILE`      | Path to a JSON file containing an array of allowed tags, e.g. `["plan", "memora/issues"]` |
 | `MEMORA_TAGS`          | Comma-separated list of allowed tags                                       |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
-| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 43), `leader` (18), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
+| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 43), `leader` (19), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
 | `MEMORA_STALE_DAYS`    | Days before an open TODO/issue counts as stale in `memory_insights` (default: `14`) |
 | `MEMORA_EMBEDDING_MODEL` | Embedding backend: `openai` (default), `sentence-transformers`, or `tfidf` |
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
@@ -224,12 +224,12 @@ All 43 MCP tools register unconditionally, so every agent session is injected wi
 | Value | Tools | Use |
 |-------|-------|-----|
 | `full` (default) | all 43 | Direct stdio use; every existing deployment is byte-for-byte unchanged |
-| `leader` | 18 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest` |
+| `leader` | 19 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest`, `memory_list` |
 | `agent` | 12 | The read/create surface a worker agent needs: `memory_absorb`, `memory_semantic_search`, `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`, `memory_link`, `memory_stats`, `memory_create`, `memory_create_issue`, `memory_create_todo`, `memory_update` |
 
 - **Unset / empty = `full`.** No existing deployment changes behaviour.
 - **An unknown value aborts startup** with a message naming the valid values. It never silently falls back to `full` — a typo must not re-expose destructive maintenance tools (`memory_rebuild_embeddings`, `memory_delete_batch`) to every worker. Fail closed.
-- `memory_list` is deliberately excluded from both reduced profiles (it measures 163-174s vs `memory_list_compact`'s 0.22s on the live 836-memory store; fixing it is a separate task).
+- `memory_list` is in `leader` but not `agent`. It was excluded from both while it cost 163-174s on a D1 store against `memory_list_compact`'s 0.22s; #973 fixed that (now ~1.1s). It stays out of `agent` because a worker's read surface is deliberately narrow, not for speed.
 - The leader/agent boundary is **data** in `memora/tool_profile.py` (two frozensets). Editing it is one line, not a sweep of 43 decorators.
 - The prune deletes from FastMCP's private `_tool_manager._tools` dict, so `memora` pins `mcp>=1.27,<1.28` (the audited minor) and runs a startup **attestation** through the low-level registered MCP request handlers (`_mcp_server.request_handlers[ListToolsRequest]` / `[CallToolRequest]` — the actual dispatch callable real client requests use, not the `FastMCP.list_tools` / `call_tool` Python helpers) that refuses to start if the installed SDK routes listing/dispatch elsewhere (private-implementation drift). The pin is the static guard; the attestation is the runtime backstop. Bumping the upper bound requires re-running `tests/test_tool_profile.py`.
 - Under [container deployment](#container-deployment) the profile is per *container* while roles are per *agent*. One container serving a workspace's leader and its workers needs the **leader** superset; `agent` would strip `create_section`/`store_document`/`delete`/`digest`/`tags` from the leader.
