@@ -5234,6 +5234,15 @@ _SCAN_CAP = 5000
 _SCAN_WINDOW = 5000
 _SCAN_HARD_CAP = 100_000
 _FOLLOW_OVERFETCH_FACTOR = 3
+# Smallest first window for a followed list. The follow scan used to open with
+# _SCAN_WINDOW (5000) rows, so a `limit=3` list fetched the ENTIRE store before
+# slicing back down to 3 -- invisible on local SQLite, but on D1 every row is
+# HTTPS traffic and memory_list measured 163-174s against memory_list_compact's
+# 0.22s, flat in limit (memora #973). Start proportional to the page actually
+# requested and grow geometrically, so a store with many superseded rows still
+# converges in a few queries instead of hundreds of tiny ones.
+_SCAN_MIN_WINDOW = 100
+_SCAN_WINDOW_GROWTH = 4
 
 
 class LineageScanLimitError(RuntimeError):
@@ -5445,9 +5454,17 @@ def list_memories(
         # full followed set (windowed up to _SCAN_HARD_CAP) even for limit=1.
         # SQL-side importance sort is a future round.
         needed = None if sort_by_importance or limit is None else offset + limit
+        # `needed is None` means the full followed set is required anyway
+        # (importance ranking is computed in Python), so there is nothing to be
+        # gained by starting small. A bounded page starts proportional to it.
+        next_window = (
+            _SCAN_WINDOW
+            if needed is None
+            else min(_SCAN_WINDOW, max(_SCAN_MIN_WINDOW, needed * _FOLLOW_OVERFETCH_FACTOR))
+        )
         while True:
             remaining_budget = _SCAN_HARD_CAP - raw_scanned
-            window = min(_SCAN_WINDOW, remaining_budget)
+            window = min(next_window, remaining_budget)
             if window <= 0:
                 break
             rows = _list_memory_sql_rows(
@@ -5470,6 +5487,10 @@ def list_memories(
             exhausted = len(rows) < window
             if needed is not None and len(followed) >= needed:
                 break
+            # Not filled yet: widen the next window so a store dense with
+            # superseded rows converges quickly rather than paying a round-trip
+            # per small window.
+            next_window = min(_SCAN_WINDOW, next_window * _SCAN_WINDOW_GROWTH)
             if exhausted:
                 break
             if raw_scanned >= _SCAN_HARD_CAP and not exhausted:
