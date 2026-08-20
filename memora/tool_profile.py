@@ -144,7 +144,7 @@ def profile_tool_names(profile: str, registered: Any) -> frozenset[str]:
 async def _attest_tool_profile(
     server: Any,
     allowed: frozenset[str],
-    registered: list[str],
+    gated_probe: Optional[str],
 ) -> None:
     """Runtime backstop against private-implementation drift in the MCP SDK.
 
@@ -155,6 +155,29 @@ async def _attest_tool_profile(
     dispatch elsewhere while keeping the dict, this raises and the server
     refuses to start (fail closed) rather than reporting a misleading
     ``exposed_tools=`` count.
+
+    DISPATCH PROBE SAFETY (P1b): the gated-name probe must NEVER execute a
+    real tool, even under drift. The probe is chosen BEFORE pruning from the
+    gated tools that have at least one REQUIRED argument (see
+    ``apply_tool_profile``), so ``call_tool(probe, {})`` fails at pydantic
+    argument VALIDATION (missing required arg) BEFORE the tool function body
+    runs — it raises a validation ``ToolError``, not an execution. Under
+    drift (dispatch intact), this validation error does NOT match the
+    unknown-tool signal, so the attestation fails correctly without ever
+    having executed the tool. If no gated tool has required args, the
+    gated-name probe is skipped (the listing + unknown-name probe still
+    guard the path); a log note is emitted.
+
+    UNKNOWN-TOOL DISCRIMINATOR (P1): FastMCP raises ``ToolError`` for BOTH
+    an unknown tool (``"Unknown tool: <name>"``) AND a tool that exists but
+    fails validation/execution (``"Error executing tool <name>: ..."``).
+    Accepting any ``ToolError`` as "gated" is vacuous: under drift, a gated
+    tool with required args raises a VALIDATION ``ToolError`` on empty args
+    and the attestation would wrongly pass. We match the ``"Unknown tool"``
+    signal specifically (the exact prefix from
+    ``ToolManager.call_tool``); anything else — including a validation
+    error — FAILS the attestation, because it does not prove the tool is
+    gated.
     """
     listed = {t.name for t in await server.list_tools()}
     if listed != allowed:
@@ -165,20 +188,79 @@ async def _attest_tool_profile(
             "pruned _tool_manager._tools registry — pin mcp to a "
             "compatible release (see pyproject.toml)"
         )
-    gated = [n for n in registered if n not in allowed]
-    if gated:
-        probe = gated[0]
-        try:
-            await server.call_tool(probe, {})
-        except _ToolError:
-            pass  # good — gated name is genuinely undispatchable
-        else:
+    # Establish the unknown-tool signal via a name that cannot exist in any
+    # registry. This probe can NEVER execute (no tool by that name), so it
+    # is always safe.
+    sentinel = "__memora_tool_profile_not_a_tool__"
+    sentinel_error = await _capture_dispatch_error(server, sentinel)
+    if sentinel_error is None or not _is_unknown_tool_signal(sentinel_error, sentinel):
+        raise ToolProfileError(
+            "profile attestation failed: call_tool("
+            f"{sentinel!r}) did not raise the expected unknown-tool "
+            f"signal (got {sentinel_error!r}); the installed MCP SDK's "
+            "dispatch path does not reject absent names as expected"
+        )
+    # Probe a gated name through the ACTUAL dispatch path. Under the prune
+    # (no drift), this raises the SAME unknown-tool signal at the get_tool
+    # lookup — before tool.run — so nothing is dispatched. Under drift
+    # (dispatch intact), the gated tool is found and either executes (no
+    # required args — avoided by probe choice) or raises a validation error
+    # (required args — the chosen probe shape); either way the signal
+    # differs from unknown-tool and the attestation fails.
+    if gated_probe is not None:
+        probe_error = await _capture_dispatch_error(server, gated_probe)
+        if probe_error is None or not _is_unknown_tool_signal(probe_error, gated_probe):
             raise ToolProfileError(
-                f"profile attestation failed: gated tool {probe!r} is still "
-                "dispatchable via call_tool; the installed MCP SDK does not "
-                "route dispatch through the pruned _tool_manager._tools "
-                "registry"
+                f"profile attestation failed: gated tool {gated_probe!r} is "
+                f"still dispatchable via call_tool (got {probe_error!r}); the "
+                "installed MCP SDK does not route dispatch through the pruned "
+                "_tool_manager._tools registry"
             )
+    else:
+        logger.info(
+            "tool_profile attestation: no gated tool with required args found; "
+            "gated-name dispatch probe skipped (listing + unknown-name probe "
+            "still guard the path)"
+        )
+
+
+async def _capture_dispatch_error(server: Any, name: str) -> Optional[Any]:
+    """Call ``server.call_tool(name, {})`` and return the ToolError it
+    raises, or None if it did not raise (the tool executed / returned)."""
+    try:
+        await server.call_tool(name, {})
+    except _ToolError as e:
+        return e
+    return None
+
+
+def _is_unknown_tool_signal(err: Any, expected_name: str) -> bool:
+    """True if ``err`` is FastMCP's unknown-tool signal — the exact message
+    raised by ``ToolManager.call_tool`` for a name missing from ``_tools``:
+    ``"Unknown tool: <name>"``. A validation/execution error raises a
+    DIFFERENT ``ToolError`` (``"Error executing tool <name>: ..."``) and
+    must NOT be accepted as evidence of gating.
+    """
+    msg = str(err)
+    return msg.startswith("Unknown tool:") and expected_name in msg
+
+
+def _choose_gated_probe(
+    tools: dict[str, Any],
+    allowed: frozenset[str],
+) -> Optional[str]:
+    """Pick a gated tool name that has at least one REQUIRED argument, so
+    ``call_tool(name, {})`` fails at pydantic validation (missing required
+    arg) BEFORE the tool function body runs — guaranteeing the probe never
+    executes even under drift (P1b). Returns None if no gated tool has
+    required args (the gated-name probe is then skipped)."""
+    for name, tool in tools.items():
+        if name in allowed:
+            continue
+        params = getattr(tool, "parameters", None)
+        if isinstance(params, dict) and params.get("required"):
+            return name
+    return None
 
 
 def apply_tool_profile(server: Any, profile: Optional[str] = None) -> int:
@@ -200,6 +282,10 @@ def apply_tool_profile(server: Any, profile: Optional[str] = None) -> int:
         )
     registered = list(tools.keys())
     allowed = profile_tool_names(resolved, registered)
+    # Choose the gated dispatch probe BEFORE pruning — after prune the tool
+    # objects (and their schemas) are gone. The probe must have required
+    # args so the empty-args probe fails at validation, not execution.
+    gated_probe = _choose_gated_probe(tools, allowed)
     for name in registered:
         if name not in allowed:
             del tools[name]
@@ -207,7 +293,7 @@ def apply_tool_profile(server: Any, profile: Optional[str] = None) -> int:
     # Runtime backstop: confirm the public protocol path honours the prune.
     # asyncio.run is safe here — main() calls this before mcp.run(), so no
     # event loop is running yet.
-    asyncio.run(_attest_tool_profile(server, allowed, registered))
+    asyncio.run(_attest_tool_profile(server, allowed, gated_probe))
     _log_startup(resolved, exposed, len(registered))
     return exposed
 

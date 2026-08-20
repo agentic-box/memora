@@ -227,11 +227,11 @@ class TestProfileMembershipIsData:
 class TestAttestationUsesPublicPath:
     """The startup attestation goes through the ACTUAL public protocol path
     (server.list_tools / server.call_tool), not the private _tool_manager
-    dict. If a future MCP SDK routes listing/dispatch elsewhere while
+    dict. If a future MCP SDK routes listing or dispatch elsewhere while
     keeping the dict, the attestation MUST fail closed. These tests
-    simulate that drift by monkeypatching the PUBLIC methods and asserting
-    apply_tool_profile raises ToolProfileError — proving the attestation
-    actually exercises the public path (non-vacuous)."""
+    simulate that drift and assert apply_tool_profile raises
+    ToolProfileError — proving the attestation actually exercises the
+    public path (non-vacuous)."""
 
     def test_listing_drift_fails_closed(self, _clean_env, monkeypatch):
         # Drift: public list_tools ignores the prune and still returns all
@@ -252,15 +252,58 @@ class TestAttestationUsesPublicPath:
         server.mcp._tool_manager._tools.update(snap)
 
     def test_dispatch_drift_fails_closed(self, _clean_env, monkeypatch):
-        # Drift: public call_tool does NOT raise for a gated name (the SDK
-        # routes dispatch elsewhere, ignoring the prune). The attestation
-        # must catch it and raise.
+        # REAL drift shape (the leader's repro): listing is pruned (list_tools
+        # returns only the allowed set) but dispatch is LEFT INTACT through
+        # the real _tool_manager (all 43 tools still dispatchable). This is
+        # the exact SDK-drift scenario the feature exists to catch — a
+        # compatible-looking SDK that routes listing and dispatch to
+        # different registries.
+        #
+        # RED at a45668a (the old attestation accepted any ToolError, and
+        # the gated probe memory_create_section raises a VALIDATION ToolError
+        # on empty args, so the drift was not caught); GREEN after the fix
+        # (the attestation matches the "Unknown tool" signal specifically and
+        # rejects the validation error as evidence of drift).
+        # Confirmed red at a45668a before applying the fix.
+        from memora.tool_profile import (
+            _attest_tool_profile,
+            _choose_gated_probe,
+            profile_tool_names,
+        )
+
+        snap = dict(server.mcp._tool_manager._tools)
+        allowed = profile_tool_names("agent", list(snap.keys()))
+        gated_probe = _choose_gated_probe(snap, allowed)
+
+        # Fake list_tools to reflect the prune (listing honours the profile).
+        async def fake_list_tools(self_inner):
+            from mcp.types import Tool as MCPTool
+            return [MCPTool(name=n, inputSchema={}) for n in allowed]
+
+        monkeypatch.setattr(
+            type(server.mcp), "list_tools", fake_list_tools, raising=True
+        )
+        # Leave call_tool INTACT and _tools unpruned (drift: dispatch through
+        # the real, unpruned _tool_manager with all 43 tools).
+        with pytest.raises(ToolProfileError, match="still dispatchable"):
+            asyncio.run(_attest_tool_profile(server.mcp, allowed, gated_probe))
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_attestation_rejects_validation_error_as_gated(self, _clean_env, monkeypatch):
+        # The discriminator: a gated tool that raises a VALIDATION ToolError
+        # (not "Unknown tool") must FAIL the attestation, not be swallowed
+        # as "gated." This is the P1 the leader found — FastMCP raises
+        # ToolError for both unknown-tool and validation errors.
         snap = dict(server.mcp._tool_manager._tools)
 
         async def fake_call_tool(self_inner, name, arguments):
-            return {"ok": True}  # never raises — gated tool still callable
+            if name == "__memora_tool_profile_not_a_tool__":
+                raise ToolError(f"Unknown tool: {name}")
+            # Simulate drift: a gated name is found and raises a VALIDATION
+            # error (missing required arg), NOT unknown-tool.
+            raise ToolError(f"Error executing tool {name}: 1 validation error")
 
-        # list_tools is honest (reflects the prune), but call_tool lies.
         monkeypatch.setattr(
             type(server.mcp), "call_tool", fake_call_tool, raising=True
         )
@@ -268,6 +311,49 @@ class TestAttestationUsesPublicPath:
             apply_tool_profile(server.mcp, "agent")
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
+
+    def test_gated_probe_has_required_args_so_cannot_execute(self, _clean_env):
+        # P1b: the gated dispatch probe must have required args so
+        # call_tool(probe, {}) fails at pydantic VALIDATION (missing required
+        # arg) BEFORE the tool body runs — never executing the tool, even
+        # under drift. Confirm the chosen probe has a non-empty `required`
+        # list in its schema.
+        from memora.tool_profile import _choose_gated_probe, profile_tool_names
+        snap = dict(server.mcp._tool_manager._tools)
+        allowed = profile_tool_names("agent", list(snap.keys()))
+        probe = _choose_gated_probe(snap, allowed)
+        assert probe is not None, "agent profile must gate out at least one tool with required args"
+        params = snap[probe].parameters
+        assert isinstance(params, dict) and params.get("required"), (
+            f"gated probe {probe!r} must have required args so the empty-args "
+            "probe fails at validation, not execution"
+        )
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_choose_gated_probe_skips_no_required_args_tools(self):
+        # Non-vacuous P1b test: if the FIRST gated tool has NO required args
+        # (e.g. memory_list — would execute on empty args, 163s hang), the
+        # chooser MUST skip it and return a gated tool WITH required args.
+        # A mutation that returns gated[0] unconditionally (the a45668a P1b
+        # bug) would return the no-args tool here and this test fails.
+        from memora.tool_profile import _choose_gated_probe
+
+        class FakeTool:
+            def __init__(self, required):
+                self.parameters = {"required": required} if required else {}
+
+        # Order matters: first gated tool has NO required args, second does.
+        fake_tools = {
+            "memory_list": FakeTool(required=[]),  # no required args — would execute
+            "memory_create_section": FakeTool(required=["content"]),  # safe
+        }
+        allowed = frozenset()  # both are gated
+        probe = _choose_gated_probe(fake_tools, allowed)
+        assert probe == "memory_create_section", (
+            f"_choose_gated_probe must skip no-required-args tools and return "
+            f"one with required args; got {probe!r}"
+        )
 
     def test_attestation_passes_on_compatible_sdk(self, _clean_env):
         # Sanity: with the REAL installed SDK (public path honours the
