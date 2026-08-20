@@ -2014,8 +2014,9 @@ async def memory_verify_integrity() -> Dict[str, Any]:
         if inflight["orphaned"]:
             response["absorb_inflight_remediation"] = (
                 "Expired absorb in-flight records own unreaped partial rows. "
-                "connect() reaps them on lease expiry; leaving a live lease is "
-                "intentional (fail-safe vs stealing another server's absorb)."
+                "Automatic delete is disabled: an orphan is preferable to "
+                "silently deleting a slow-but-live absorb. Investigate the "
+                "owned_memory_ids and the writer; do not assume they are dead."
             )
         if status["mismatch"]:
             response["remediation"] = (

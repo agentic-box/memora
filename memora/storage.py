@@ -214,6 +214,10 @@ class MemoryWriteError(Exception):
         super().__init__(f"memory write failed for id={memory_id}: {cause}")
 
 
+class AbsorbInflightLostError(RuntimeError):
+    """Writer no longer owns the absorb_inflight row (status is not in_flight)."""
+
+
 def _recover_absorb_owned_ids(conn: sqlite3.Connection, absorb_nonce: Optional[str]) -> List[int]:
     """Recover D1 inserts whose HTTP response was lost after remote commit."""
     if not absorb_nonce:
@@ -233,9 +237,10 @@ def _recover_absorb_owned_ids(conn: sqlite3.Connection, absorb_nonce: Optional[s
     return [int(row["id"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows]
 
 
-# Process-death recovery for absorb. Dead vs live is the lease, never PID:
-# two servers on one database must not reap each other's in-flight writes.
-# Fail-safe: an unexpired lease is live even if the writer is actually gone.
+# Process-death *detection* for absorb. Automatic delete is disabled: a
+# 120s host-clock lease is not a fence, and connect() on another tool call
+# must not delete a slow-but-live absorb. Dead vs live is still the lease
+# for reporting. Fail-safe: an orphan is preferable to deleting live work.
 ABSORB_INFLIGHT_LEASE_SECONDS = 120
 
 # Test hook: fires after each absorb-owned add_memory (and its inflight touch).
@@ -283,16 +288,42 @@ def _begin_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
     conn.commit()
 
 
+def _update_matched(
+    conn: sqlite3.Connection,
+    cur: Any,
+    absorb_nonce: str,
+    *,
+    expect_status: str,
+) -> bool:
+    """True if an UPDATE hit a row. Falls back to a SELECT when rowcount is unknown."""
+    n = getattr(cur, "rowcount", None)
+    if n is not None and n > 0:
+        return True
+    if n == 0:
+        return False
+    row = conn.execute(
+        "SELECT status FROM absorb_inflight WHERE nonce = ?",
+        (absorb_nonce,),
+    ).fetchone()
+    if row is None:
+        return False
+    return str(_row_field(row, 0, "status")) == expect_status
+
+
 def _touch_absorb_inflight(
     conn: sqlite3.Connection,
     absorb_nonce: str,
     owned_ids: List[int],
 ) -> None:
-    """Heartbeat: extend the lease and record known owned ids."""
+    """Heartbeat: extend the lease and record known owned ids.
+
+    Requires status='in_flight'. A zero-row UPDATE means we lost the
+    tracking row; the writer must not proceed as if it still owns it.
+    """
     lease = _absorb_format_ts(
         _absorb_now() + timedelta(seconds=ABSORB_INFLIGHT_LEASE_SECONDS)
     )
-    conn.execute(
+    cur = conn.execute(
         """
         UPDATE absorb_inflight
            SET lease_until = ?, owned_ids = ?
@@ -300,22 +331,49 @@ def _touch_absorb_inflight(
         """,
         (lease, json.dumps([int(i) for i in owned_ids]), absorb_nonce),
     )
+    if not _update_matched(conn, cur, absorb_nonce, expect_status="in_flight"):
+        logger.error(
+            "absorb inflight heartbeat lost ownership nonce=%s", absorb_nonce
+        )
+        raise AbsorbInflightLostError(
+            f"absorb inflight heartbeat lost ownership nonce={absorb_nonce}"
+        )
 
 
 def _complete_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
-    """Mark success before dropping the record so a death in this window
-    cannot be mistaken for a partial write (reaper keeps the memory rows).
+    """Drop the tracking row only if we still own it as in_flight.
+
+    Must not flip a 'reaping' (or missing) row to completed — that is how a
+    writer reports success after another connection has taken the nonce.
     """
-    conn.execute(
-        "UPDATE absorb_inflight SET status = 'completed' WHERE nonce = ?",
+    cur = conn.execute(
+        """
+        UPDATE absorb_inflight
+           SET status = 'completed'
+         WHERE nonce = ? AND status = 'in_flight'
+        """,
         (absorb_nonce,),
     )
-    conn.execute("DELETE FROM absorb_inflight WHERE nonce = ?", (absorb_nonce,))
+    if not _update_matched(conn, cur, absorb_nonce, expect_status="completed"):
+        logger.error(
+            "absorb inflight complete lost ownership nonce=%s", absorb_nonce
+        )
+        raise AbsorbInflightLostError(
+            f"absorb inflight complete lost ownership nonce={absorb_nonce}"
+        )
+    conn.execute(
+        "DELETE FROM absorb_inflight WHERE nonce = ? AND status = 'completed'",
+        (absorb_nonce,),
+    )
     conn.commit()
 
 
 def _clear_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
-    conn.execute("DELETE FROM absorb_inflight WHERE nonce = ?", (absorb_nonce,))
+    """Writer-side cleanup after in-process compensation. Own in_flight only."""
+    conn.execute(
+        "DELETE FROM absorb_inflight WHERE nonce = ? AND status = 'in_flight'",
+        (absorb_nonce,),
+    )
     conn.commit()
 
 
@@ -370,81 +428,31 @@ def reconcile_dead_absorbs(
     *,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Reap in-flight records no live process owns.
+    """Detection only — does not delete memory rows or inflight records.
 
-    Dead = lease expired (or a previous reaper died mid-reap). Live leases
-    are never touched: leaving an orphan is better than deleting a live
-    absorb. A status='completed' leftover means the writes finished; only
-    the tracking row is dropped.
+    Automatic reap is deferred until a fenced, independently renewable
+    lease exists (and preferably uses database time, not host clocks).
+    An orphan is preferable to silently deleting live work.
     """
-    now_s = _absorb_format_ts(now or _absorb_now())
-    report = list_absorb_inflight(conn, now=now or _absorb_now())
-    reaped: List[str] = []
-    deleted_ids: List[int] = []
-    failed_ids: List[int] = []
-    cleared_completed: List[str] = []
-
-    for rec in report["live"]:
-        if rec.get("status") != "completed":
-            continue
-        _clear_absorb_inflight(conn, rec["nonce"])
-        cleared_completed.append(rec["nonce"])
-
-    for rec in report["orphaned"]:
-        nonce = rec["nonce"]
-        cur = conn.execute(
-            """
-            UPDATE absorb_inflight
-               SET status = 'reaping'
-             WHERE nonce = ?
-               AND (status = 'reaping' OR (status = 'in_flight' AND lease_until < ?))
-            """,
-            (nonce, now_s),
+    report = list_absorb_inflight(conn, now=now)
+    orphaned = report["orphaned"]
+    if orphaned:
+        logger.warning(
+            "absorb inflight orphaned nonces=%s owned_ids=%s "
+            "(detection only; not deleting)",
+            [rec["nonce"] for rec in orphaned],
+            [mid for rec in orphaned for mid in rec["owned_memory_ids"]],
         )
-        conn.commit()
-        claimed = (getattr(cur, "rowcount", 0) or 0) > 0
-        if not claimed:
-            row = conn.execute(
-                "SELECT status FROM absorb_inflight WHERE nonce = ?",
-                (nonce,),
-            ).fetchone()
-            if row is None:
-                continue
-            claimed = str(_row_field(row, 0, "status")) == "reaping"
-        if not claimed:
-            # Lease was renewed between list and claim — fail-safe skip.
-            continue
-        nonce_failed: List[int] = []
-        for mid in _recover_absorb_owned_ids(conn, nonce):
-            try:
-                ok = delete_memory(conn, mid, require_absorb_nonce=nonce)
-            except Exception:
-                logger.exception(
-                    "absorb inflight reap failed to delete memory #%s nonce=%s",
-                    mid,
-                    nonce,
-                )
-                nonce_failed.append(mid)
-                continue
-            if ok:
-                deleted_ids.append(mid)
-            else:
-                nonce_failed.append(mid)
-        failed_ids.extend(nonce_failed)
-        if nonce_failed:
-            # Leave the record so a later pass can retry. Do not claim success.
-            continue
-        _clear_absorb_inflight(conn, nonce)
-        reaped.append(nonce)
-
     return {
-        "reaped_nonces": reaped,
-        "deleted_ids": deleted_ids,
-        "failed_ids": failed_ids,
-        "cleared_completed": cleared_completed,
+        "reaped_nonces": [],
+        "deleted_ids": [],
+        "failed_ids": [],
+        "cleared_completed": [],
         "skipped_live": len(
             [r for r in report["live"] if r.get("status") != "completed"]
         ),
+        "orphaned": orphaned,
+        "live": report["live"],
     }
 
 
@@ -462,16 +470,11 @@ def _log_action(conn: sqlite3.Connection, memory_id: int, action: str, summary: 
 def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
     """Create a database connection using the configured storage backend.
 
-    Expired absorb in-flight records are reaped here (boot / first-connect
-    reconciliation). Live leases are never touched.
+    Does not auto-reap absorb in-flight records. Detection is via
+    list_absorb_inflight / health / memory_verify_integrity.
     """
     from .schema import connect as _connect
-    conn = _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
-    try:
-        reconcile_dead_absorbs(conn)
-    except Exception:
-        logger.exception("absorb inflight reconciliation failed on connect")
-    return conn
+    return _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
 
 
 def sync_to_cloud() -> None:
@@ -4467,10 +4470,13 @@ def absorb_memory(
                 absorb_nonce=absorb_nonce,
                 absorb_operation_key=str(uuid.uuid4()),
             )
-            _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
+            # Abort hook sits on the write boundary, before heartbeat, so a
+            # SIGKILL still simulates process death after the INSERT even if
+            # the tracking row was never begun.
             owned_hook = _after_absorb_owned_insert
             if owned_hook is not None:
                 owned_hook(record["id"], absorb_nonce)
+            _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 if edge_type == "supersedes":
@@ -4698,7 +4704,13 @@ def absorb_memory(
         )]
 
         if orphans:
-            _touch_absorb_inflight(conn, absorb_nonce, orphans)
+            try:
+                _touch_absorb_inflight(conn, absorb_nonce, orphans)
+            except AbsorbInflightLostError:
+                logger.error(
+                    "absorb partial_write lost inflight ownership nonce=%s",
+                    absorb_nonce,
+                )
             conn.commit()
             return {
                 "decisions": decisions,

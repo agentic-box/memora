@@ -1,4 +1,4 @@
-"""Absorb process-death recovery: durable in-flight records + fail-safe reap."""
+"""Absorb process-death detection: durable in-flight records, no auto-delete."""
 
 from __future__ import annotations
 
@@ -92,12 +92,14 @@ def _nonce_rows(conn):
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "fake_d1"])
-def test_process_death_orphan_detected_and_reaped(tmp_path, monkeypatch, kind):
-    """SIGKILL mid-absorb: fresh connection detects the orphan, then reaps it.
+def test_process_death_orphan_detected(tmp_path, monkeypatch, kind):
+    """SIGKILL mid-absorb: fresh connection detects the inflight record.
 
     Named red ProcessDeathOrphanUndetected: skip `_begin_absorb_inflight`
     (c32b40e — nonce is in-memory only) and this assertion fails on FakeD1,
     where per-statement autocommit left the row and nothing reported it.
+
+    Detection only: expired records stay; reconcile must not delete them.
     """
     db_path = tmp_path / ("absorb-d1.db" if kind == "fake_d1" else "absorb.db")
     proc = _spawn_absorb_sigkill(db_path, kind=kind)
@@ -125,20 +127,23 @@ def test_process_death_orphan_detected_and_reaped(tmp_path, monkeypatch, kind):
         future = storage._absorb_now() + timedelta(
             seconds=storage.ABSORB_INFLIGHT_LEASE_SECONDS + 5
         )
-        live_reap = storage.reconcile_dead_absorbs(conn, now=storage._absorb_now())
-        assert live_reap["reaped_nonces"] == [], (
-            "LiveAbsorbStolen: reap with a live lease deleted in-flight work"
+        expired = storage.list_absorb_inflight(conn, now=future)
+        assert expired["orphaned"], (
+            "ProcessDeathOrphanUndetected: clock-jumped lease was not reported "
+            "as orphaned"
         )
-
-        dead_reap = storage.reconcile_dead_absorbs(conn, now=future)
-        assert dead_reap["reaped_nonces"], (
-            "ProcessDeathOrphanUnreaped: expired in-flight record was not reaped"
+        result = storage.reconcile_dead_absorbs(conn, now=future)
+        assert result["reaped_nonces"] == [] and result["deleted_ids"] == [], (
+            "ExpiredInflightDeleted: detection-only reconcile deleted rows"
         )
-        leftover = storage.list_absorb_inflight(conn, now=future)
-        assert leftover["live"] == [] and leftover["orphaned"] == []
-        assert _nonce_rows(conn) == [], (
-            "ProcessDeathOrphanUnreaped: absorb-owned rows survived reconciliation"
+        still = storage.list_absorb_inflight(conn, now=future)
+        assert still["orphaned"], (
+            "ExpiredInflightDeleted: tracking row vanished after reconcile"
         )
+        if kind == "fake_d1":
+            assert _nonce_rows(conn), (
+                "ExpiredInflightDeleted: absorb-owned memory rows were deleted"
+            )
     finally:
         conn.close()
 
@@ -168,37 +173,6 @@ def test_reconcile_does_not_steal_live_absorb(tmp_path, monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "fake_d1"])
-def test_reaper_cas_does_not_steal_renewed_lease(tmp_path, monkeypatch, kind):
-    """Second guard: even if listing is stale, the claim UPDATE must see the live lease.
-
-    Named red LiveAbsorbStolen: drop `AND lease_until < ?` from the reaper
-    UPDATE and a heartbeat that won the race is deleted anyway.
-    """
-    db_path = tmp_path / ("cas-d1.db" if kind == "fake_d1" else "cas.db")
-    _fresh_backend(db_path, kind, monkeypatch)
-    with storage.connect() as conn:
-        nonce = "renewed-lease-nonce"
-        storage._begin_absorb_inflight(conn, nonce)
-        mem = storage.add_memory(
-            conn,
-            content="Renewed absorb row extra words for cas probe",
-            metadata={"absorb_nonce": nonce},
-        )
-        real_list = storage.list_absorb_inflight
-
-        def stale_list(connection, *, now=None):
-            recs = real_list(connection, now=now)
-            return {"live": [], "orphaned": recs["live"] + recs["orphaned"]}
-
-        monkeypatch.setattr(storage, "list_absorb_inflight", stale_list)
-        result = storage.reconcile_dead_absorbs(conn)
-        assert result["reaped_nonces"] == [], (
-            "LiveAbsorbStolen: reaper claim ignored a still-valid lease"
-        )
-        assert storage.get_memory(conn, mem["id"]) is not None
-
-
-@pytest.mark.parametrize("kind", ["sqlite", "fake_d1"])
 def test_successful_absorb_clears_inflight(tmp_path, monkeypatch, kind):
     db_path = tmp_path / ("ok-d1.db" if kind == "fake_d1" else "ok.db")
     _fresh_backend(db_path, kind, monkeypatch)
@@ -214,15 +188,22 @@ def test_successful_absorb_clears_inflight(tmp_path, monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "fake_d1"])
-def test_connect_reaps_expired_inflight(tmp_path, monkeypatch, kind):
-    db_path = tmp_path / ("boot-d1.db" if kind == "fake_d1" else "boot.db")
+def test_expired_inflight_is_reported_not_deleted(tmp_path, monkeypatch, kind):
+    """Expired-but-present in-flight work is loud and left alone.
+
+    Named red ExpiredInflightDeleted: restore delete_memory / tracking-row
+    DELETE in reconcile_dead_absorbs (or connect) and this goes red.
+    Named red ExpiredInflightUnreported: drop orphaned classification and
+    health/list stay quiet.
+    """
+    db_path = tmp_path / ("expired-d1.db" if kind == "fake_d1" else "expired.db")
     _fresh_backend(db_path, kind, monkeypatch)
     with storage.connect() as conn:
-        nonce = "expired-boot-nonce"
+        nonce = "expired-but-live-nonce"
         storage._begin_absorb_inflight(conn, nonce)
         mem = storage.add_memory(
             conn,
-            content="Expired inflight row extra words for boot reap",
+            content="Expired inflight row extra words for report-only probe",
             metadata={"absorb_nonce": nonce},
         )
         conn.execute(
@@ -231,13 +212,21 @@ def test_connect_reaps_expired_inflight(tmp_path, monkeypatch, kind):
         )
         conn.commit()
         mem_id = mem["id"]
-    # Fresh connection is the boot path.
+
     with storage.connect() as conn:
-        assert storage.get_memory(conn, mem_id) is None, (
-            "mutation: skip reconcile_dead_absorbs in connect() and the orphan remains"
-        )
         report = storage.list_absorb_inflight(conn)
-        assert report["live"] == [] and report["orphaned"] == []
+        assert any(r["nonce"] == nonce for r in report["orphaned"]), (
+            "ExpiredInflightUnreported: connect() hid the expired tracking row"
+        )
+        assert storage.get_memory(conn, mem_id) is not None, (
+            "ExpiredInflightDeleted: connect() deleted a still-present absorb row"
+        )
+        result = storage.reconcile_dead_absorbs(conn)
+        assert result["reaped_nonces"] == [] and result["deleted_ids"] == []
+        assert storage.get_memory(conn, mem_id) is not None, (
+            "ExpiredInflightDeleted: reconcile_dead_absorbs deleted the absorb row"
+        )
+        assert any(r["nonce"] == nonce for r in result["orphaned"])
 
 
 def test_health_reports_live_inflight(tmp_path, monkeypatch):
@@ -256,8 +245,89 @@ def test_health_reports_live_inflight(tmp_path, monkeypatch):
     assert payload["status"] in ("ok", "degraded")
 
 
+def test_health_reports_orphaned_after_connect(tmp_path, monkeypatch):
+    """connect() must not eat the incident before health can report it.
+
+    Named red ExpiredInflightUnreported: auto-reap on connect() (the previous
+    design) leaves health status=ok and orphaned=0.
+    """
+    from memora.cli import cmd_health
+
+    _fresh_backend(tmp_path / "health-orphan.db", "sqlite", monkeypatch)
+    with storage.connect() as conn:
+        nonce = "health-orphan-nonce"
+        storage._begin_absorb_inflight(conn, nonce)
+        mem = storage.add_memory(
+            conn,
+            content="Health orphan row extra words for degraded probe",
+            metadata={"absorb_nonce": nonce},
+        )
+        conn.execute(
+            "UPDATE absorb_inflight SET lease_until = ? WHERE nonce = ?",
+            ("2000-01-01 00:00:00", nonce),
+        )
+        conn.commit()
+        mem_id = mem["id"]
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", buf)
+    cmd_health()
+    payload = json.loads(buf.getvalue())
+    assert payload["status"] == "degraded", (
+        "ExpiredInflightUnreported: health was ok after connect(); "
+        f"payload={payload}"
+    )
+    assert payload["absorb_inflight"]["orphaned"] >= 1
+    assert mem_id in payload["absorb_inflight"]["orphaned_memory_ids"]
+    with storage.connect() as conn:
+        assert storage.get_memory(conn, mem_id) is not None, (
+            "ExpiredInflightDeleted: health/connect deleted the absorb row"
+        )
+
+
+def test_complete_requires_in_flight_status(tmp_path, monkeypatch):
+    """Writer must not flip a non-owned tracking row to completed.
+
+    Named red CompleteStoleReapingRow: drop `AND status = 'in_flight'` from
+    the complete UPDATE and a reaping/foreign nonce is overwritten.
+    """
+    _fresh_backend(tmp_path / "complete-own.db", "sqlite", monkeypatch)
+    with storage.connect() as conn:
+        nonce = "reaping-nonce"
+        storage._begin_absorb_inflight(conn, nonce)
+        conn.execute(
+            "UPDATE absorb_inflight SET status = 'reaping' WHERE nonce = ?",
+            (nonce,),
+        )
+        conn.commit()
+        with pytest.raises(storage.AbsorbInflightLostError):
+            storage._complete_absorb_inflight(conn, nonce)
+        row = conn.execute(
+            "SELECT status FROM absorb_inflight WHERE nonce = ?", (nonce,)
+        ).fetchone()
+        assert row is not None
+        assert row["status"] == "reaping", (
+            "CompleteStoleReapingRow: complete() overwrote a non-in_flight row"
+        )
+
+
+def test_touch_requires_in_flight_status(tmp_path, monkeypatch):
+    """Heartbeat must notice lost ownership instead of updating any status.
+
+    Named red TouchIgnoredOwnership: drop `AND status = 'in_flight'` / skip
+    the rowcount check and this stays green while a foreign row is renewed.
+    """
+    _fresh_backend(tmp_path / "touch-own.db", "sqlite", monkeypatch)
+    with storage.connect() as conn:
+        nonce = "gone-nonce"
+        storage._begin_absorb_inflight(conn, nonce)
+        conn.execute("DELETE FROM absorb_inflight WHERE nonce = ?", (nonce,))
+        conn.commit()
+        with pytest.raises(storage.AbsorbInflightLostError):
+            storage._touch_absorb_inflight(conn, nonce, [1])
+
+
 def test_completed_inflight_is_not_deleted_as_partial(tmp_path, monkeypatch):
-    """Death after status=completed must keep memory rows and only drop tracking."""
+    """Detection-only reconcile must not drop a completed leftover or its rows."""
     _fresh_backend(tmp_path / "completed.db", "sqlite", monkeypatch)
     with storage.connect() as conn:
         nonce = "completed-nonce"
@@ -274,8 +344,11 @@ def test_completed_inflight_is_not_deleted_as_partial(tmp_path, monkeypatch):
         )
         conn.commit()
         result = storage.reconcile_dead_absorbs(conn)
-        assert nonce in result["cleared_completed"]
-        assert mem["id"] not in result["deleted_ids"]
+        assert result["cleared_completed"] == []
+        assert result["deleted_ids"] == []
         assert storage.get_memory(conn, mem["id"]) is not None
-        assert storage.list_absorb_inflight(conn)["live"] == []
-        assert storage.list_absorb_inflight(conn)["orphaned"] == []
+        leftover = storage.list_absorb_inflight(conn)
+        assert any(r["nonce"] == nonce for r in leftover["live"]), (
+            "completed leftover must stay visible until the writer or an "
+            "operator clears it; reconcile must not delete it"
+        )
