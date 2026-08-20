@@ -3166,6 +3166,84 @@ def _serialise_memory_for_follow(
     return _serialise_row(row)
 
 
+# Cloudflare D1 rejects a query with more than 100 bound parameters.
+# https://developers.cloudflare.com/d1/platform/limits/
+# This is not a 5000-row edge case: list_memories(limit=34, follow="active")
+# already opens with 102 candidates, so an unchunked IN (...) fails on an
+# ordinary page and turns a valid memory_list into a RuntimeError -- worse than
+# the slowness this batching exists to fix.
+_D1_MAX_BOUND_PARAMS = 100
+
+
+def _chunked(values: List[int], size: int = _D1_MAX_BOUND_PARAMS):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
+    """Which of `memory_ids` are superseded, without probing per row.
+
+    Statement count is O((candidates + distinct referenced ids) / 100), not
+    O(page/100): the two chunked phases are bounded separately, and one page of
+    candidates can reference many more distinct superseders than it has rows.
+
+    `_is_superseded` called get_crossrefs() per memory and then _memory_exists()
+    per matching edge. Locally that is free; on D1 every one is an authenticated
+    HTTPS round-trip, so a 100-row page cost ~100 of them (~20s measured on the
+    live store, memora #973) even after the scan window was made proportional to
+    the page.
+
+    `retired_memory_ids` already carries the rule this restores: "Two statements
+    total -- callers must not probe per row on D1." Chunked at
+    _D1_MAX_BOUND_PARAMS because D1 caps bound parameters at 100.
+    """
+    if not memory_ids:
+        return set()
+    unique = list(dict.fromkeys(memory_ids))
+
+    # candidate -> the ids that claim to supersede it
+    claims: Dict[int, List[int]] = {}
+    referenced: set[int] = set()
+    for chunk in _chunked(unique):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT memory_id, related FROM memories_crossrefs "
+            f"WHERE memory_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            try:
+                data = json.loads(row["related"]) if row["related"] else []
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, list):
+                continue
+            for ref in data:
+                if not isinstance(ref, dict) or ref.get("edge_type") != "superseded_by":
+                    continue
+                ref_id = ref.get("id")
+                if ref_id is None:
+                    continue
+                claims.setdefault(row["memory_id"], []).append(ref_id)
+                referenced.add(ref_id)
+
+    if not referenced:
+        return set()
+    # A supersession only counts if the superseding memory still EXISTS --
+    # same rule as _is_superseded's _memory_exists check. Chunked too: the
+    # candidates of one page can reference far more than 100 distinct ids.
+    existing: set[int] = set()
+    for chunk in _chunked(list(referenced)):
+        placeholders = ",".join("?" for _ in chunk)
+        existing.update(
+            r["id"]
+            for r in conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+        )
+    return {mid for mid, refs in claims.items() if any(r in existing for r in refs)}
+
+
 def apply_follow(
     conn: sqlite3.Connection,
     results: List[Dict[str, Any]],
@@ -3209,9 +3287,10 @@ def apply_follow(
         # them. Graph-only quarantine (authority_unknown on multi-leaf tips)
         # is the approved middle scope; storage-side quarantine is a follow-up.
         retired_ids = retired_memory_ids(conn)
+        superseded = _superseded_ids_batch(conn, [_get_id(item) for item in results])
         return [
             item for item in results
-            if not _is_superseded(conn, _get_id(item))
+            if _get_id(item) not in superseded
             and _get_id(item) not in retired_ids
         ]
 
@@ -5234,6 +5313,15 @@ _SCAN_CAP = 5000
 _SCAN_WINDOW = 5000
 _SCAN_HARD_CAP = 100_000
 _FOLLOW_OVERFETCH_FACTOR = 3
+# Smallest first window for a followed list. The follow scan used to open with
+# _SCAN_WINDOW (5000) rows, so a `limit=3` list fetched the ENTIRE store before
+# slicing back down to 3 -- invisible on local SQLite, but on D1 every row is
+# HTTPS traffic and memory_list measured 163-174s against memory_list_compact's
+# 0.22s, flat in limit (memora #973). Start proportional to the page actually
+# requested and grow geometrically, so a store with many superseded rows still
+# converges in a few queries instead of hundreds of tiny ones.
+_SCAN_MIN_WINDOW = 100
+_SCAN_WINDOW_GROWTH = 4
 
 
 class LineageScanLimitError(RuntimeError):
@@ -5445,9 +5533,17 @@ def list_memories(
         # full followed set (windowed up to _SCAN_HARD_CAP) even for limit=1.
         # SQL-side importance sort is a future round.
         needed = None if sort_by_importance or limit is None else offset + limit
+        # `needed is None` means the full followed set is required anyway
+        # (importance ranking is computed in Python), so there is nothing to be
+        # gained by starting small. A bounded page starts proportional to it.
+        next_window = (
+            _SCAN_WINDOW
+            if needed is None
+            else min(_SCAN_WINDOW, max(_SCAN_MIN_WINDOW, needed * _FOLLOW_OVERFETCH_FACTOR))
+        )
         while True:
             remaining_budget = _SCAN_HARD_CAP - raw_scanned
-            window = min(_SCAN_WINDOW, remaining_budget)
+            window = min(next_window, remaining_budget)
             if window <= 0:
                 break
             rows = _list_memory_sql_rows(
@@ -5470,6 +5566,10 @@ def list_memories(
             exhausted = len(rows) < window
             if needed is not None and len(followed) >= needed:
                 break
+            # Not filled yet: widen the next window so a store dense with
+            # superseded rows converges quickly rather than paying a round-trip
+            # per small window.
+            next_window = min(_SCAN_WINDOW, next_window * _SCAN_WINDOW_GROWTH)
             if exhausted:
                 break
             if raw_scanned >= _SCAN_HARD_CAP and not exhausted:
