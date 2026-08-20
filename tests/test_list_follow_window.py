@@ -113,3 +113,50 @@ def test_window_widens_when_a_page_needs_more_than_one_fetch(conn, monkeypatch):
         f"window did not widen on refill: {seen}; a dense store would pay one "
         "round-trip per fixed window"
     )
+
+
+class _CountingConn:
+    """Wrap a connection and count execute() calls — the D1 round-trip proxy.
+
+    sqlite3.Connection.execute is read-only, so it cannot be monkeypatched;
+    wrap instead of patch.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.count = 0
+
+    def execute(self, *a, **kw):
+        self.count += 1
+        return self._inner.execute(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_active_follow_does_not_probe_per_row(conn, monkeypatch):
+    """NoPerRowSupersessionProbe: the second half of #973.
+
+    _is_superseded called get_crossrefs() per memory and _memory_exists() per
+    edge. Locally free; on D1 each is an HTTPS round-trip, so a 100-row page
+    cost ~100 of them (~20s measured on the live store even after the scan
+    window was fixed). Statement count must not scale with the page.
+    """
+    from memora.storage import apply_follow
+
+    rows = list_memories(conn, limit=-1)
+    small = rows[:5]
+    large = rows[:100]
+
+    counting = _CountingConn(conn)
+    apply_follow(counting, small, "active", is_search=False)
+    for_small = counting.count
+
+    counting.count = 0
+    apply_follow(counting, large, "active", is_search=False)
+    for_large = counting.count
+
+    assert for_large <= for_small + 2, (
+        f"statements grew with page size: {for_small} for 5 rows, "
+        f"{for_large} for 100 — that is a per-row probe"
+    )

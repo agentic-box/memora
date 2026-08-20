@@ -3166,6 +3166,61 @@ def _serialise_memory_for_follow(
     return _serialise_row(row)
 
 
+def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
+    """Which of `memory_ids` are superseded, in TWO statements, not one per row.
+
+    `_is_superseded` calls get_crossrefs() per memory and then _memory_exists()
+    per matching edge. Locally that is free; on D1 every one of those is an
+    authenticated HTTPS round-trip, so a 100-row page cost ~100 round-trips
+    (~20s measured on the live store, memora #973) even after the scan window
+    was made proportional to the page.
+
+    `retired_memory_ids` already carries the rule this restores: "Two statements
+    total -- callers must not probe per row on D1."
+    """
+    if not memory_ids:
+        return set()
+    unique = list(dict.fromkeys(memory_ids))
+    placeholders = ",".join("?" for _ in unique)
+    rows = conn.execute(
+        f"SELECT memory_id, related FROM memories_crossrefs WHERE memory_id IN ({placeholders})",
+        unique,
+    ).fetchall()
+
+    # candidate -> the ids that claim to supersede it
+    claims: Dict[int, List[int]] = {}
+    referenced: set[int] = set()
+    for row in rows:
+        try:
+            data = json.loads(row["related"]) if row["related"] else []
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, list):
+            continue
+        for ref in data:
+            if not isinstance(ref, dict) or ref.get("edge_type") != "superseded_by":
+                continue
+            ref_id = ref.get("id")
+            if ref_id is None:
+                continue
+            claims.setdefault(row["memory_id"], []).append(ref_id)
+            referenced.add(ref_id)
+
+    if not referenced:
+        return set()
+    # A supersession only counts if the superseding memory still EXISTS --
+    # same rule as _is_superseded's _memory_exists check, one statement.
+    ref_list = list(referenced)
+    ref_placeholders = ",".join("?" for _ in ref_list)
+    existing = {
+        r["id"]
+        for r in conn.execute(
+            f"SELECT id FROM memories WHERE id IN ({ref_placeholders})", ref_list
+        ).fetchall()
+    }
+    return {mid for mid, refs in claims.items() if any(r in existing for r in refs)}
+
+
 def apply_follow(
     conn: sqlite3.Connection,
     results: List[Dict[str, Any]],
@@ -3209,9 +3264,10 @@ def apply_follow(
         # them. Graph-only quarantine (authority_unknown on multi-leaf tips)
         # is the approved middle scope; storage-side quarantine is a follow-up.
         retired_ids = retired_memory_ids(conn)
+        superseded = _superseded_ids_batch(conn, [_get_id(item) for item in results])
         return [
             item for item in results
-            if not _is_superseded(conn, _get_id(item))
+            if _get_id(item) not in superseded
             and _get_id(item) not in retired_ids
         ]
 
