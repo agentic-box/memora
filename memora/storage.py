@@ -3181,7 +3181,11 @@ def _chunked(values: List[int], size: int = _D1_MAX_BOUND_PARAMS):
 
 
 def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
-    """Which of `memory_ids` are superseded, in O(page/100) statements.
+    """Which of `memory_ids` are superseded, without probing per row.
+
+    Statement count is O((candidates + distinct referenced ids) / 100), not
+    O(page/100): the two chunked phases are bounded separately, and one page of
+    candidates can reference many more distinct superseders than it has rows.
 
     `_is_superseded` called get_crossrefs() per memory and then _memory_exists()
     per matching edge. Locally that is free; on D1 every one is an authenticated

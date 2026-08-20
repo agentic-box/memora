@@ -221,3 +221,19 @@ def test_batch_respects_the_limit_on_the_second_statement(conn):
     got = _superseded_ids_batch(guarded, victims)
     assert guarded.max_params <= _ParamLimitConn.LIMIT
     assert got == set(victims), f"chunking lost rows: {len(got)} of {len(victims)}"
+
+
+def test_limit_34_page_path_respects_the_param_cap(conn):
+    """D1ParamLimitViaListPath: drive the real list path, not just the helper.
+
+    The helper test calls _superseded_ids_batch with 300 ids directly. This one
+    exercises the exact case from the docstring — list_memories(limit=34) opens
+    with 34*3=102 candidates — through the code path a caller actually takes.
+    """
+    guarded = _ParamLimitConn(conn)
+    rows = list_memories(guarded, limit=34, follow="active")
+    assert len(rows) == 34
+    assert guarded.max_params <= _ParamLimitConn.LIMIT, (
+        f"list path issued {guarded.max_params} bound params; D1 caps at "
+        f"{_ParamLimitConn.LIMIT}"
+    )
