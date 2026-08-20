@@ -81,7 +81,10 @@ if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
 if len(sys.argv) > 2:
     LISTEN_PORT = int(sys.argv[2])
 
-_cache = {"ip": None, "at": 0.0}  # at=0 means empty; None ip can be negative-cached
+# good_at = when we last SAW a real address. Distinct from `at` (last lookup
+# attempt) because the stale-grace window must measure the age of the ADDRESS,
+# not the age of the failed attempt that keeps refreshing `at`.
+_cache = {"ip": None, "at": 0.0, "good_at": 0.0}
 _cache_lock = threading.Lock()
 _log_lock = threading.Lock()
 _warn_at = {}
@@ -146,11 +149,50 @@ def parse_ipv4(token: str) -> Optional[str]:
     return "%d.%d.%d.%d" % tuple(octs)
 
 
-def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
-    """Current container IP. Negative-cached when the name is absent.
+# How long a last-known-good IP may be served after the lookup stopped working.
+# Fail SAFE first (a healthy container keeps serving), then fail CLOSED, so a
+# permanently broken `container list` does not pin a wrong address forever.
+STALE_GRACE = float(os.environ.get("MEMORA_PROXY_STALE_GRACE", "300"))
 
-    On `container list` timeout/absence: do NOT return a stale IP. A cached
-    Apple-bridge address of a dead container blackholes rather than refusing.
+
+def _serve_stale(reason: str) -> Optional[str]:
+    """Lookup unavailable: keep the last known good IP, bounded by STALE_GRACE."""
+    with _cache_lock:
+        ip = _cache.get("ip")
+        good_at = _cache.get("good_at") or 0.0
+    age = time.time() - good_at
+    if ip and age <= STALE_GRACE:
+        warn_limited("stale-serve", "%s; serving last known good %s (%.0fs old)" % (reason, ip, age))
+        return ip
+    if ip:
+        warn_limited("stale-expired", "%s; last known good %s is %.0fs old (> %.0fs), refusing"
+                     % (reason, ip, age, STALE_GRACE))
+    else:
+        warn_limited("stale-none", "%s; no last known good address" % reason)
+    with _cache_lock:
+        _cache.update(ip=None, at=time.time())
+    return None
+
+
+def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
+    """Current container IP.
+
+    Two failure modes that MUST be handled differently (memora #982):
+
+    * The lookup RAN and the name was absent -> the container really is gone.
+      Negative-cache it and refuse.
+    * The lookup could not run (timeout, exec failure) -> we know NOTHING new.
+      Keep serving the last known good IP.
+
+    Conflating them caused a production outage on 2026-08-20: host memory
+    pressure made `container list` exceed the timeout, all four proxies
+    concluded "container gone", and MCP went dark across every workspace while
+    the containers sat there answering on their unchanged addresses.
+
+    Serving a stale IP is safe because a genuinely moved address is caught one
+    connection later: handle() poisons the cache on CONNECT failure and forces
+    a fresh lookup. STALE_GRACE bounds it, so a permanently broken lookup does
+    eventually surface instead of pinning a wrong address forever.
     """
     now = time.time()
     with _cache_lock:
@@ -175,15 +217,9 @@ def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
             _cache.update(ip=None, at=time.time())
         return None
     except subprocess.TimeoutExpired:
-        warn_limited("list-timeout", "container list timed out after %.1ss" % RESOLVE_TIMEOUT)
-        with _cache_lock:
-            _cache.update(ip=None, at=time.time())
-        return None
+        return _serve_stale("container list timed out after %.1ss" % RESOLVE_TIMEOUT)
     except Exception as exc:
-        warn_limited("list-exc", "container list failed: %s: %s" % (type(exc).__name__, exc))
-        with _cache_lock:
-            _cache.update(ip=None, at=time.time())
-        return None
+        return _serve_stale("container list failed: %s: %s" % (type(exc).__name__, exc))
 
     found = None
     for line in out.splitlines():
@@ -197,8 +233,15 @@ def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
                 break
         if found:
             break
+    now2 = time.time()
     with _cache_lock:
-        _cache.update(ip=found, at=time.time())
+        if found is not None:
+            _cache.update(ip=found, at=now2, good_at=now2)
+        else:
+            # The lookup RAN and the name was not there: a positive statement
+            # that the container is gone. Negative-cache and clear good_at so a
+            # later lookup failure cannot resurrect the dead address.
+            _cache.update(ip=None, at=now2, good_at=0.0)
     if found is None:
         warn_limited("list-miss", "container %r not in `container list`" % NAME)
     return found
