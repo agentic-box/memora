@@ -16,9 +16,11 @@ Profiles (see memora issue #981):
 * ``leader``  (18): the agent set plus section/document/tag/delete/digest.
 * ``agent``   (12): the read/create surface a worker agent needs.
 
-``memory_list`` is deliberately excluded from both reduced profiles: issue
-#973 measures it at 163-174s vs ``memory_list_compact``'s 0.22s on the
-live 836-memory store. Fixing ``memory_list`` is a separate task.
+``memory_list`` is in ``leader`` but not ``agent``. It was excluded from both
+while it cost 163-174s on a D1 store against ``memory_list_compact``'s 0.22s;
+#973 fixed that (now ~1.1s) and it returned to ``leader``. It stays out of
+``agent`` because a worker's read surface is deliberately narrow, not because
+of speed.
 
 PRIVATE-IMPLEMENTATION COMPATIBILITY (load-bearing, not cosmetic)
 ------------------------------------------------------------------
@@ -84,6 +86,12 @@ LEADER_TOOLS: frozenset[str] = AGENT_TOOLS | frozenset({
     "memory_tags",
     "memory_delete",
     "memory_digest",
+    # Restored to `leader` once #973 landed: memory_list was excluded purely
+    # because it cost 163-174s on a D1 store against memory_list_compact's
+    # 0.22s. It is now ~1.1s. It stays OUT of `agent` -- not for speed, but
+    # because a worker's read surface is deliberately narrow and
+    # memory_list_compact covers it.
+    "memory_list",
 })
 
 # `full` is NOT a fixed list — it is every tool actually registered on the

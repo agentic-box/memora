@@ -69,10 +69,10 @@ class TestProfileCounts:
         assert n == 43, f"full must expose all 43 registered tools, got {n}"
         assert _count() == 43
 
-    def test_leader_exposes_exactly_18(self, _clean_env):
+    def test_leader_exposes_exactly_19(self, _clean_env):
         n = apply_tool_profile(server.mcp, "leader")
-        assert n == 18, f"leader must expose exactly 18 tools, got {n}"
-        assert _count() == 18
+        assert n == 19, f"leader must expose exactly 19 tools, got {n}"
+        assert _count() == 19
 
     def test_agent_exposes_exactly_12(self, _clean_env):
         n = apply_tool_profile(server.mcp, "agent")
@@ -159,13 +159,16 @@ class TestLeaderAgentBoundary:
         )
         assert server.mcp._tool_manager.get_tool(AGENT_TOOL) is not None
 
-    def test_memory_list_excluded_from_reduced_profiles(self, _clean_env):
-        # memory_list is deliberately excluded (#973: 163-174s vs
-        # memory_list_compact's 0.22s). Assert it is NOT in either set.
+    def test_memory_list_is_leader_only(self, _clean_env):
+        # memory_list was excluded from BOTH reduced profiles while it cost
+        # 163-174s on D1; #973 fixed that (now ~1.1s) and it returned to
+        # `leader`. It stays out of `agent` because a worker's read surface is
+        # deliberately narrow, not for speed — so this asserts the boundary in
+        # both directions rather than a blanket exclusion.
+        assert "memory_list" in LEADER_TOOLS
         assert "memory_list" not in AGENT_TOOLS
-        assert "memory_list" not in LEADER_TOOLS
         apply_tool_profile(server.mcp, "leader")
-        assert "memory_list" not in _tool_names()
+        assert "memory_list" in _tool_names()
         apply_tool_profile(server.mcp, "agent")
         assert "memory_list" not in _tool_names()
 
@@ -203,7 +206,7 @@ class TestProfileMembershipIsData:
     """The profile sets are DATA: leader is agent + 6 explicit additions;
     profile_tool_names(full) tracks the actually-registered tools."""
 
-    def test_leader_is_agent_plus_six_additions(self):
+    def test_leader_is_agent_plus_seven_additions(self):
         assert LEADER_TOOLS - AGENT_TOOLS == frozenset({
             "memory_create_section",
             "memory_store_document",
@@ -211,6 +214,7 @@ class TestProfileMembershipIsData:
             "memory_tags",
             "memory_delete",
             "memory_digest",
+            "memory_list",
         })
 
     def test_full_tracks_registered_not_a_constant(self, _clean_env):
@@ -435,7 +439,7 @@ class TestAttestationUsesLowlevelHandlers:
         assert apply_tool_profile(server.mcp, "agent") == 12
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
-        assert apply_tool_profile(server.mcp, "leader") == 18
+        assert apply_tool_profile(server.mcp, "leader") == 19
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
         assert apply_tool_profile(server.mcp, "full") == 43
