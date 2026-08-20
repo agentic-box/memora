@@ -224,27 +224,59 @@ class TestProfileMembershipIsData:
         assert profile_tool_names("agent", registered) == (AGENT_TOOLS & frozenset(registered))
 
 
-class TestAttestationUsesPublicPath:
-    """The startup attestation goes through the ACTUAL public protocol path
-    (server.list_tools / server.call_tool), not the private _tool_manager
-    dict. If a future MCP SDK routes listing or dispatch elsewhere while
-    keeping the dict, the attestation MUST fail closed. These tests
-    simulate that drift and assert apply_tool_profile raises
-    ToolProfileError — proving the attestation actually exercises the
-    public path (non-vacuous)."""
+class TestAttestationUsesLowlevelHandlers:
+    """The startup attestation exercises the LOW-LEVEL registered MCP request
+    handlers (server._mcp_server.request_handlers[ListToolsRequest] /
+    [CallToolRequest]) — the actual dispatch callable real client requests
+    use — NOT the FastMCP.list_tools / FastMCP.call_tool Python helpers.
+    In mcp 1.27.0 those helpers are what _setup_handlers registers, so the
+    paths coincide; a future SDK could register a different callable while
+    leaving the helpers intact. These tests prove the attestation goes
+    through the lowlevel handlers (monkeypatching the helpers must NOT
+    affect the attestation) and fails closed on drift."""
 
-    def test_listing_drift_fails_closed(self, _clean_env, monkeypatch):
-        # Drift: public list_tools ignores the prune and still returns all
-        # 43 names. The attestation must catch the mismatch and raise.
+    def test_faking_fastmcp_helpers_does_not_affect_attestation(self, _clean_env, monkeypatch):
+        # NON-VACUITY for the lowlevel path: if the attestation used the
+        # FastMCP helpers, faking them to lie would flip the result. It
+        # does NOT — the attestation reads the lowlevel handlers, so faking
+        # the helpers is inert. This proves the attestation is NOT routed
+        # through the helpers.
         snap = dict(server.mcp._tool_manager._tools)
-        all_names = frozenset(snap.keys())
 
         async def fake_list_tools(self_inner):
             from mcp.types import Tool as MCPTool
-            return [MCPTool(name=n, inputSchema={}) for n in all_names]
+            return [MCPTool(name=n, inputSchema={}) for n in snap.keys()]
 
-        monkeypatch.setattr(
-            type(server.mcp), "list_tools", fake_list_tools, raising=True
+        async def fake_call_tool(self_inner, name, arguments):
+            raise ToolError(f"Unknown tool: {name}")
+
+        monkeypatch.setattr(type(server.mcp), "list_tools", fake_list_tools, raising=True)
+        monkeypatch.setattr(type(server.mcp), "call_tool", fake_call_tool, raising=True)
+        # With the helpers faked to lie, the attestation still PASSES
+        # (because it does not use them) under the real installed SDK:
+        assert apply_tool_profile(server.mcp, "agent") == 12
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_listing_drift_fails_closed(self, _clean_env, monkeypatch):
+        # Drift via the LOWLEVEL handler: the registered ListToolsRequest
+        # handler ignores the prune and returns all 43 names. The
+        # attestation must catch the mismatch and raise.
+        snap = dict(server.mcp._tool_manager._tools)
+        all_names = frozenset(snap.keys())
+
+        async def fake_list_handler(req):
+            from mcp.types import ListToolsResult, ServerResult
+            from mcp.types import Tool as MCPTool
+            return ServerResult(ListToolsResult(
+                tools=[MCPTool(name=n, inputSchema={}) for n in all_names]
+            ))
+
+        from mcp.types import ListToolsRequest
+        monkeypatch.setitem(
+            server.mcp._mcp_server.request_handlers,
+            ListToolsRequest,
+            fake_list_handler,
         )
         with pytest.raises(ToolProfileError, match="tools/list"):
             apply_tool_profile(server.mcp, "agent")
@@ -252,19 +284,17 @@ class TestAttestationUsesPublicPath:
         server.mcp._tool_manager._tools.update(snap)
 
     def test_dispatch_drift_fails_closed(self, _clean_env, monkeypatch):
-        # REAL drift shape (the leader's repro): listing is pruned (list_tools
-        # returns only the allowed set) but dispatch is LEFT INTACT through
-        # the real _tool_manager (all 43 tools still dispatchable). This is
-        # the exact SDK-drift scenario the feature exists to catch — a
-        # compatible-looking SDK that routes listing and dispatch to
-        # different registries.
-        #
-        # RED at a45668a (the old attestation accepted any ToolError, and
-        # the gated probe memory_create_section raises a VALIDATION ToolError
-        # on empty args, so the drift was not caught); GREEN after the fix
-        # (the attestation matches the "Unknown tool" signal specifically and
-        # rejects the validation error as evidence of drift).
-        # Confirmed red at a45668a before applying the fix.
+        # REAL drift shape: the lowlevel ListToolsRequest handler reflects
+        # the prune (returns only allowed), but the lowlevel CallToolRequest
+        # handler is LEFT INTACT (all 43 dispatchable). This is the exact
+        # SDK-drift scenario — a future SDK that routes listing and dispatch
+        # to different callables. Confirmed red at a45668a (helper-based
+        # attestation did not catch this); GREEN after the lowlevel fix.
+        import asyncio
+
+        from mcp.types import ListToolsRequest, ListToolsResult, ServerResult
+        from mcp.types import Tool as MCPTool
+
         from memora.tool_profile import (
             _attest_tool_profile,
             _choose_gated_probe,
@@ -275,37 +305,80 @@ class TestAttestationUsesPublicPath:
         allowed = profile_tool_names("agent", list(snap.keys()))
         gated_probe = _choose_gated_probe(snap, allowed)
 
-        # Fake list_tools to reflect the prune (listing honours the profile).
-        async def fake_list_tools(self_inner):
-            from mcp.types import Tool as MCPTool
-            return [MCPTool(name=n, inputSchema={}) for n in allowed]
+        # Fake the LOWLEVEL list handler to reflect the prune; leave the
+        # lowlevel call handler INTACT (dispatch through the real unpruned
+        # _tool_manager with all 43 tools).
+        async def fake_list_handler(req):
+            return ServerResult(ListToolsResult(
+                tools=[MCPTool(name=n, inputSchema={}) for n in allowed]
+            ))
 
-        monkeypatch.setattr(
-            type(server.mcp), "list_tools", fake_list_tools, raising=True
+        monkeypatch.setitem(
+            server.mcp._mcp_server.request_handlers,
+            ListToolsRequest,
+            fake_list_handler,
         )
-        # Leave call_tool INTACT and _tools unpruned (drift: dispatch through
-        # the real, unpruned _tool_manager with all 43 tools).
+        # Do NOT prune _tools — leave all 43 dispatchable (drift).
         with pytest.raises(ToolProfileError, match="still dispatchable"):
-            asyncio.run(_attest_tool_profile(server.mcp, allowed, gated_probe))
+            asyncio.run(_attest_tool_profile(server.mcp, "agent", allowed, gated_probe))
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
 
-    def test_attestation_rejects_validation_error_as_gated(self, _clean_env, monkeypatch):
-        # The discriminator: a gated tool that raises a VALIDATION ToolError
-        # (not "Unknown tool") must FAIL the attestation, not be swallowed
-        # as "gated." This is the P1 the leader found — FastMCP raises
-        # ToolError for both unknown-tool and validation errors.
+    def test_attestation_rejects_non_unknown_error_as_gated(self, _clean_env, monkeypatch):
+        # The discriminator: a gated tool that returns a NON-unknown-tool
+        # error (e.g. validation) must FAIL the attestation, not be accepted
+        # as "gated." Goes through the lowlevel call handler.
+        from mcp.types import CallToolRequest, CallToolResult, ServerResult, TextContent
         snap = dict(server.mcp._tool_manager._tools)
 
-        async def fake_call_tool(self_inner, name, arguments):
-            if name == "__memora_tool_profile_not_a_tool__":
-                raise ToolError(f"Unknown tool: {name}")
-            # Simulate drift: a gated name is found and raises a VALIDATION
-            # error (missing required arg), NOT unknown-tool.
-            raise ToolError(f"Error executing tool {name}: 1 validation error")
+        async def fake_call_handler(req):
+            name = req.params.name
+            if name.startswith("__memora_tool_profile_not_a_tool"):
+                return ServerResult(CallToolResult(
+                    content=[TextContent(type="text", text=f"Unknown tool: {name}")],
+                    isError=True,
+                ))
+            # Drift: gated name is found, raises a VALIDATION error (not unknown-tool).
+            return ServerResult(CallToolResult(
+                content=[TextContent(type="text", text=f"Error executing tool {name}: 1 validation error")],
+                isError=True,
+            ))
 
-        monkeypatch.setattr(
-            type(server.mcp), "call_tool", fake_call_tool, raising=True
+        monkeypatch.setitem(
+            server.mcp._mcp_server.request_handlers,
+            CallToolRequest,
+            fake_call_handler,
+        )
+        with pytest.raises(ToolProfileError, match="still dispatchable"):
+            apply_tool_profile(server.mcp, "agent")
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+    def test_exact_match_not_substring(self, _clean_env, monkeypatch):
+        # Item 4: "Unknown tool: wrapper-for-memory_create_section" must NOT
+        # be accepted as gating "memory_create_section" — exact equality,
+        # not startswith + substring.
+        from mcp.types import CallToolRequest, CallToolResult, ServerResult, TextContent
+        snap = dict(server.mcp._tool_manager._tools)
+
+        async def fake_call_handler(req):
+            name = req.params.name
+            if name.startswith("__memora_tool_profile_not_a_tool"):
+                return ServerResult(CallToolResult(
+                    content=[TextContent(type="text", text=f"Unknown tool: {name}")],
+                    isError=True,
+                ))
+            # A message that contains the gated name but is NOT the exact
+            # unknown-tool signal — prefix/substring match would wrongly accept.
+            return ServerResult(CallToolResult(
+                content=[TextContent(type="text", text=f"Unknown tool: wrapper-for-{name}")],
+                isError=True,
+            ))
+
+        monkeypatch.setitem(
+            server.mcp._mcp_server.request_handlers,
+            CallToolRequest,
+            fake_call_handler,
         )
         with pytest.raises(ToolProfileError, match="still dispatchable"):
             apply_tool_profile(server.mcp, "agent")
@@ -314,7 +387,7 @@ class TestAttestationUsesPublicPath:
 
     def test_gated_probe_has_required_args_so_cannot_execute(self, _clean_env):
         # P1b: the gated dispatch probe must have required args so
-        # call_tool(probe, {}) fails at pydantic VALIDATION (missing required
+        # call_tool(probe, {}) fails at argument VALIDATION (missing required
         # arg) BEFORE the tool body runs — never executing the tool, even
         # under drift. Confirm the chosen probe has a non-empty `required`
         # list in its schema.
@@ -356,7 +429,7 @@ class TestAttestationUsesPublicPath:
         )
 
     def test_attestation_passes_on_compatible_sdk(self, _clean_env):
-        # Sanity: with the REAL installed SDK (public path honours the
+        # Sanity: with the REAL installed SDK (lowlevel handlers honour the
         # prune), apply_tool_profile does NOT raise under any profile.
         snap = dict(server.mcp._tool_manager._tools)
         assert apply_tool_profile(server.mcp, "agent") == 12
@@ -366,6 +439,48 @@ class TestAttestationUsesPublicPath:
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
         assert apply_tool_profile(server.mcp, "full") == 43
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(snap)
+
+
+class TestNoSafeProbeFailsClosed:
+    """Item 3: a reduced profile with gated tools but NO gated tool carrying
+    schema.required cannot establish a non-executing dispatch probe — the
+    dispatch backstop is silently skipped, reintroducing the fail-open class.
+    apply_tool_profile MUST raise ToolProfileError in that case. `full` is
+    the only legitimate no-gated-probe case (no gated tools exist)."""
+
+    def test_reduced_profile_with_no_required_arg_gated_tools_raises(self, _clean_env, monkeypatch):
+        # Construct a server whose gated tools all have NO required args.
+        # We monkeypatch _tools with a fake set where the only gated tool
+        # has no required args, then call apply_tool_profile.
+        from memora.tool_profile import ToolProfileError
+
+        class FakeTool:
+            def __init__(self, required):
+                self.parameters = {"required": required} if required else {}
+
+        snap = dict(server.mcp._tool_manager._tools)
+        # Allowed = agent set (has required-arg tools, all KEPT); gated = a
+        # single no-required-arg tool. We replace _tools entirely.
+        fake_tools = {
+            "memory_absorb": FakeTool(required=["content"]),  # in agent set, kept
+            "memory_list": FakeTool(required=[]),  # gated, NO required args
+        }
+        server.mcp._tool_manager._tools.clear()
+        server.mcp._tool_manager._tools.update(fake_tools)
+        try:
+            with pytest.raises(ToolProfileError, match="no non-executing dispatch probe"):
+                apply_tool_profile(server.mcp, "agent")
+        finally:
+            server.mcp._tool_manager._tools.clear()
+            server.mcp._tool_manager._tools.update(snap)
+
+    def test_full_profile_with_no_gated_tools_does_not_raise(self, _clean_env):
+        # `full` is the only legitimate no-gated-probe case: no gated tools
+        # exist, so no probe is needed. apply_tool_profile must NOT raise.
+        snap = dict(server.mcp._tool_manager._tools)
+        assert apply_tool_profile(server.mcp, "full") == 43  # all kept, no gated
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
 
