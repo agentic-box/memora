@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextvars
 import functools
 import logging
 import os
@@ -256,7 +257,7 @@ def _with_connection(func=None, *, writes=False):
 
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            return await asyncio.to_thread(_run, *args, **kwargs)
+            return await _in_worker(_run, *args, **kwargs)
 
         wrapper.__memora_blocking__ = _run  # type: ignore[attr-defined]
         return wrapper
@@ -267,9 +268,41 @@ def _with_connection(func=None, *, writes=False):
     return decorator
 
 
+async def _wait_for_worker(fut: asyncio.Future) -> Any:
+    """Wait for executor work. Cancellation does not abort it or hide its result.
+
+    Contract: once submitted, the worker always runs to completion (including
+    connect/write/sync/close). If the calling task is cancelled, we still wait
+    for the worker and return its result — never CancelledError after a
+    commit. That is what keeps cooldown/single-flight `finally` from releasing
+    while a write is still running, and what prevents a phantom
+    cancelled-but-committed write.
+
+    (The default executor's thread *count* is not an admission cap; queued
+    work can still grow without bound. That is a separate issue.)
+    """
+    try:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        task = asyncio.current_task()
+        uncancel = getattr(task, "uncancel", None)
+        if task is None or uncancel is None:
+            raise
+        while task.cancelling():
+            uncancel()
+        return await fut
+
+
 async def _in_worker(fn, /, *args, **kwargs):
-    """Run a blocking connect()/storage body off the event loop."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    """Run a blocking connect()/storage body off the event loop.
+
+    See `_wait_for_worker` for the cancellation contract.
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, fn, *args, **kwargs)
+    fut = loop.run_in_executor(None, call)
+    return await _wait_for_worker(fut)
 
 
 @_with_connection(writes=True)
@@ -2802,6 +2835,86 @@ async def memory_export() -> Dict[str, Any]:
         _finish_tool("memory_export")
 
 
+def _upload_image_blocking(
+    file_path: str,
+    memory_id: int,
+    image_index: int = 0,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate, read, and upload in one worker. Do not split across the thread boundary."""
+    from pathlib import Path as _Path
+
+    from PIL import Image as _PILImage
+
+    from . import image_storage as image_storage_mod
+
+    image_storage = image_storage_mod.get_image_storage_instance()
+    if not image_storage:
+        return {
+            "error": "r2_not_configured",
+            "message": "R2 storage is not configured. Set MEMORA_STORAGE_URI to s3:// and configure AWS credentials.",
+        }
+
+    raw_path = _Path(file_path)
+
+    for part in [raw_path] + list(raw_path.parents):
+        if part.is_symlink():
+            return {"error": "invalid_path", "message": "Symlinks are not supported"}
+
+    try:
+        resolved = raw_path.resolve(strict=True)
+    except (OSError, ValueError):
+        return {"error": "file_not_found", "message": "File not found"}
+
+    _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    if resolved.suffix.lower() not in _UPLOAD_EXTENSIONS:
+        return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
+
+    _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
+    path_str = str(resolved).lower()
+    for pattern in _BLOCKED_PATTERNS:
+        if pattern in path_str:
+            return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
+
+    _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
+    try:
+        with _PILImage.open(str(resolved)) as img:
+            img.verify()
+            pillow_format = img.format
+    except Exception:
+        return {"error": "invalid_image", "message": "File is not a valid image"}
+
+    content_type = _PILLOW_TO_MIME.get(pillow_format)
+    if not content_type:
+        return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
+
+    try:
+        with open(str(resolved), "rb") as f:
+            image_data = f.read()
+
+        r2_url = image_storage.upload_image(
+            image_data=image_data,
+            content_type=content_type,
+            memory_id=memory_id,
+            image_index=image_index,
+        )
+
+        image_obj = {"src": r2_url}
+        if caption:
+            image_obj["caption"] = caption
+
+        return {
+            "r2_url": r2_url,
+            "image": image_obj,
+            "content_type": content_type,
+            "size_bytes": len(image_data),
+        }
+
+    except Exception as e:
+        logger.error("Failed to upload image for memory %s: %s", memory_id, e)
+        return {"error": "upload_failed", "message": "Image upload failed. Check server logs for details."}
+
+
 @mcp.tool()
 async def memory_upload_image(
     file_path: str,
@@ -2823,85 +2936,9 @@ async def memory_upload_image(
     Returns:
         Dictionary with r2_url (the r2:// reference) and image object ready for metadata
     """
-    from pathlib import Path as _Path
-
-    from PIL import Image as _PILImage
-
-    from .image_storage import get_image_storage_instance
-
-    image_storage = get_image_storage_instance()
-    if not image_storage:
-        return {
-            "error": "r2_not_configured",
-            "message": "R2 storage is not configured. Set MEMORA_STORAGE_URI to s3:// and configure AWS credentials.",
-        }
-
-    # --- Path validation (defense in depth) ---
-    raw_path = _Path(file_path)
-
-    # 1. Reject symlinks anywhere in the path chain
-    for part in [raw_path] + list(raw_path.parents):
-        if part.is_symlink():
-            return {"error": "invalid_path", "message": "Symlinks are not supported"}
-
-    try:
-        resolved = raw_path.resolve(strict=True)
-    except (OSError, ValueError):
-        return {"error": "file_not_found", "message": "File not found"}
-
-    # 2. Validate extension — aligned with image_storage.py ext_map
-    _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-    if resolved.suffix.lower() not in _UPLOAD_EXTENSIONS:
-        return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
-
-    # 3. Block known sensitive directories
-    _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
-    path_str = str(resolved).lower()
-    for pattern in _BLOCKED_PATTERNS:
-        if pattern in path_str:
-            return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
-
-    # 4. Verify file is actually an image and derive MIME from content
-    _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
-    try:
-        with _PILImage.open(str(resolved)) as img:
-            img.verify()
-            pillow_format = img.format
-    except Exception:
-        return {"error": "invalid_image", "message": "File is not a valid image"}
-
-    content_type = _PILLOW_TO_MIME.get(pillow_format)
-    if not content_type:
-        return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
-
-    try:
-        # Read file and upload
-        with open(str(resolved), "rb") as f:
-            image_data = f.read()
-
-        r2_url = image_storage.upload_image(
-            image_data=image_data,
-            content_type=content_type,
-            memory_id=memory_id,
-            image_index=image_index,
-        )
-
-        # Build image object for metadata
-        image_obj = {"src": r2_url}
-        if caption:
-            image_obj["caption"] = caption
-
-        # Don't echo local file_path in response (path disclosure fix)
-        return {
-            "r2_url": r2_url,
-            "image": image_obj,
-            "content_type": content_type,
-            "size_bytes": len(image_data),
-        }
-
-    except Exception as e:
-        logger.error("Failed to upload image for memory %s: %s", memory_id, e)
-        return {"error": "upload_failed", "message": "Image upload failed. Check server logs for details."}
+    return await _in_worker(
+        _upload_image_blocking, file_path, memory_id, image_index, caption,
+    )
 
 
 @mcp.tool()
