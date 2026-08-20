@@ -160,3 +160,64 @@ def test_active_follow_does_not_probe_per_row(conn, monkeypatch):
         f"statements grew with page size: {for_small} for 5 rows, "
         f"{for_large} for 100 — that is a per-row probe"
     )
+
+
+class _ParamLimitConn:
+    """Reject any statement with >100 bound parameters, like D1 does.
+
+    The earlier statement-count test used plain local SQLite with no
+    supersession edges, so it exercised neither D1's cap nor the second batch
+    statement — it passed while an ordinary page (limit=34 → 102 candidates)
+    would have failed in production.
+    https://developers.cloudflare.com/d1/platform/limits/
+    """
+
+    LIMIT = 100
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.max_params = 0
+
+    def execute(self, sql, params=()):
+        n = len(params) if params is not None else 0
+        self.max_params = max(self.max_params, n)
+        if n > self.LIMIT:
+            raise RuntimeError(f"too many SQL variables: {n} > {self.LIMIT}")
+        return self._inner.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_batch_respects_the_d1_bound_parameter_limit(conn):
+    """D1ParamLimitCandidates: limit=34 opens with 102 candidates — over the cap."""
+    from memora.storage import _superseded_ids_batch
+
+    ids = [r["id"] for r in list_memories(conn, limit=-1)]
+    assert len(ids) > 150
+    guarded = _ParamLimitConn(conn)
+    _superseded_ids_batch(guarded, ids)          # 300 candidates
+    assert guarded.max_params <= _ParamLimitConn.LIMIT
+
+
+def test_batch_respects_the_limit_on_the_second_statement(conn):
+    """D1ParamLimitReferenced: >100 DISTINCT superseders must chunk too.
+
+    The candidate chunking alone does not cover this: one page of candidates can
+    reference far more distinct superseding ids than the cap.
+    """
+    from memora.storage import _superseded_ids_batch
+
+    ids = sorted(r["id"] for r in list_memories(conn, limit=-1))
+    # 150 distinct superseders, each superseding one distinct victim, so the
+    # referenced set is 150 > 100 while candidates stay modest.
+    victims = ids[:150]
+    supers = ids[150:300]
+    for victim, superseder in zip(victims, supers):
+        storage.add_link(conn, superseder, victim, edge_type="supersedes", commit=False)
+    conn.commit()
+
+    guarded = _ParamLimitConn(conn)
+    got = _superseded_ids_batch(guarded, victims)
+    assert guarded.max_params <= _ParamLimitConn.LIMIT
+    assert got == set(victims), f"chunking lost rows: {len(got)} of {len(victims)}"

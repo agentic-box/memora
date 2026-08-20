@@ -3166,58 +3166,77 @@ def _serialise_memory_for_follow(
     return _serialise_row(row)
 
 
-def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
-    """Which of `memory_ids` are superseded, in TWO statements, not one per row.
+# Cloudflare D1 rejects a query with more than 100 bound parameters.
+# https://developers.cloudflare.com/d1/platform/limits/
+# This is not a 5000-row edge case: list_memories(limit=34, follow="active")
+# already opens with 102 candidates, so an unchunked IN (...) fails on an
+# ordinary page and turns a valid memory_list into a RuntimeError -- worse than
+# the slowness this batching exists to fix.
+_D1_MAX_BOUND_PARAMS = 100
 
-    `_is_superseded` calls get_crossrefs() per memory and then _memory_exists()
-    per matching edge. Locally that is free; on D1 every one of those is an
-    authenticated HTTPS round-trip, so a 100-row page cost ~100 round-trips
-    (~20s measured on the live store, memora #973) even after the scan window
-    was made proportional to the page.
+
+def _chunked(values: List[int], size: int = _D1_MAX_BOUND_PARAMS):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _superseded_ids_batch(conn: sqlite3.Connection, memory_ids: List[int]) -> set[int]:
+    """Which of `memory_ids` are superseded, in O(page/100) statements.
+
+    `_is_superseded` called get_crossrefs() per memory and then _memory_exists()
+    per matching edge. Locally that is free; on D1 every one is an authenticated
+    HTTPS round-trip, so a 100-row page cost ~100 of them (~20s measured on the
+    live store, memora #973) even after the scan window was made proportional to
+    the page.
 
     `retired_memory_ids` already carries the rule this restores: "Two statements
-    total -- callers must not probe per row on D1."
+    total -- callers must not probe per row on D1." Chunked at
+    _D1_MAX_BOUND_PARAMS because D1 caps bound parameters at 100.
     """
     if not memory_ids:
         return set()
     unique = list(dict.fromkeys(memory_ids))
-    placeholders = ",".join("?" for _ in unique)
-    rows = conn.execute(
-        f"SELECT memory_id, related FROM memories_crossrefs WHERE memory_id IN ({placeholders})",
-        unique,
-    ).fetchall()
 
     # candidate -> the ids that claim to supersede it
     claims: Dict[int, List[int]] = {}
     referenced: set[int] = set()
-    for row in rows:
-        try:
-            data = json.loads(row["related"]) if row["related"] else []
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(data, list):
-            continue
-        for ref in data:
-            if not isinstance(ref, dict) or ref.get("edge_type") != "superseded_by":
+    for chunk in _chunked(unique):
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT memory_id, related FROM memories_crossrefs "
+            f"WHERE memory_id IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for row in rows:
+            try:
+                data = json.loads(row["related"]) if row["related"] else []
+            except json.JSONDecodeError:
                 continue
-            ref_id = ref.get("id")
-            if ref_id is None:
+            if not isinstance(data, list):
                 continue
-            claims.setdefault(row["memory_id"], []).append(ref_id)
-            referenced.add(ref_id)
+            for ref in data:
+                if not isinstance(ref, dict) or ref.get("edge_type") != "superseded_by":
+                    continue
+                ref_id = ref.get("id")
+                if ref_id is None:
+                    continue
+                claims.setdefault(row["memory_id"], []).append(ref_id)
+                referenced.add(ref_id)
 
     if not referenced:
         return set()
     # A supersession only counts if the superseding memory still EXISTS --
-    # same rule as _is_superseded's _memory_exists check, one statement.
-    ref_list = list(referenced)
-    ref_placeholders = ",".join("?" for _ in ref_list)
-    existing = {
-        r["id"]
-        for r in conn.execute(
-            f"SELECT id FROM memories WHERE id IN ({ref_placeholders})", ref_list
-        ).fetchall()
-    }
+    # same rule as _is_superseded's _memory_exists check. Chunked too: the
+    # candidates of one page can reference far more than 100 distinct ids.
+    existing: set[int] = set()
+    for chunk in _chunked(list(referenced)):
+        placeholders = ",".join("?" for _ in chunk)
+        existing.update(
+            r["id"]
+            for r in conn.execute(
+                f"SELECT id FROM memories WHERE id IN ({placeholders})", chunk
+            ).fetchall()
+        )
     return {mid for mid, refs in claims.items() if any(r in existing for r in refs)}
 
 
