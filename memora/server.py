@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextvars
+import functools
 import logging
 import os
 import re
@@ -234,32 +237,83 @@ def _with_connection(func=None, *, writes=False):
     """Decorator that manages database connections and cloud sync.
 
     Opens a connection, runs the function, closes the connection,
-    and syncs to cloud storage only after write operations.
+    and syncs to cloud storage only after write operations — all on a
+    worker thread. sqlite3 connections are created and closed inside that
+    same thread (no shared pool). Callers must await the wrapper.
 
     Args:
         writes: If True, syncs to cloud after operation. If False, skips sync (read-only).
     """
     def decorator(func):
-        def wrapper(*args, **kwargs):
+        def _run(*args, **kwargs):
             conn = connect()
             try:
                 result = func(conn, *args, **kwargs)
-                # Only sync to cloud after write operations
                 if writes:
                     sync_to_cloud()
                 return result
             finally:
                 conn.close()
 
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            return await _in_worker(_run, *args, **kwargs)
+
+        wrapper.__memora_blocking__ = _run  # type: ignore[attr-defined]
         return wrapper
 
     # Allow using as @_with_connection or @_with_connection(writes=True)
     if func is not None:
-        # Called as @_with_connection (default: read-only, no sync)
         return decorator(func)
+    return decorator
+
+
+def _uncancel_if_available(task) -> None:
+    """Clear 3.11+ cancellation count. 3.10 consumes cancel by catching; no-op."""
+    uncancel = getattr(task, "uncancel", None)
+    if task is None or not callable(uncancel):
+        return
+    cancelling = getattr(task, "cancelling", None)
+    if callable(cancelling):
+        while cancelling():
+            uncancel()
     else:
-        # Called as @_with_connection(writes=True)
-        return decorator
+        uncancel()
+
+
+async def _wait_for_worker(fut: asyncio.Future) -> Any:
+    """Wait for executor work. Cancellation does not abort it or hide its result.
+
+    Contract: once submitted, the worker always runs to completion (including
+    connect/write/sync/close). Every CancelledError is swallowed and we keep
+    awaiting asyncio.shield(fut) until the worker finishes, then return its
+    result or raise the worker's exception — never CancelledError after a
+    commit. A second cancel (disconnect then teardown) must not detach the
+    thread. 3.10 has no Task.uncancel; catching is enough because that
+    version consumes the cancel. 3.11+ needs uncancel() before the next wait.
+
+    (The default executor's thread *count* is not an admission cap; queued
+    work can still grow without bound. That is a separate issue.)
+    """
+    while True:
+        try:
+            return await asyncio.shield(fut)
+        except asyncio.CancelledError:
+            _uncancel_if_available(asyncio.current_task())
+            if fut.done():
+                return fut.result()
+
+
+async def _in_worker(fn, /, *args, **kwargs):
+    """Run a blocking connect()/storage body off the event loop.
+
+    See `_wait_for_worker` for the cancellation contract.
+    """
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    call = functools.partial(ctx.run, fn, *args, **kwargs)
+    fut = loop.run_in_executor(None, call)
+    return await _wait_for_worker(fut)
 
 
 @_with_connection(writes=True)
@@ -887,7 +941,7 @@ async def memory_create(
     # Check hierarchy path BEFORE creating to detect new paths
     new_path = extract_hierarchy_path(metadata)
     existing_paths = (
-        _get_hierarchy_paths()
+        await _get_hierarchy_paths()
         if new_path
         else []
     )
@@ -906,7 +960,7 @@ async def memory_create(
         logger.warning("Secret redaction failed, storing original content: %s", exc)
 
     try:
-        record = _create_memory(content=redacted_content, metadata=metadata, tags=tags or [])
+        record = await _create_memory(content=redacted_content, metadata=metadata, tags=tags or [])
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -962,7 +1016,7 @@ async def memory_create(
         # (only if user didn't provide a hierarchy path)
         if not new_path and related_memories:
             related_ids = [m["id"] for m in related_memories if m.get("id") is not None]
-            metadata_batch = _get_memories_metadata_batch(related_ids) if related_ids else {}
+            metadata_batch = await _get_memories_metadata_batch(related_ids) if related_ids else {}
             hierarchy_suggestions = suggest_hierarchy_from_similar(
                 related_memories,
                 metadata_by_id=metadata_batch,
@@ -979,7 +1033,7 @@ async def memory_create(
                     if auto_meta:
                         memory_id = record.get("id") if record else None
                         if memory_id is not None:
-                            _update_memory(memory_id, None, auto_meta, None)
+                            await _update_memory(memory_id, None, auto_meta, None)
                             result["auto_hierarchy"] = {
                                 "path": top["path"],
                                 "section": top.get("section"),
@@ -1083,7 +1137,7 @@ async def memory_create_issue(
     tags = ["memora/issues"]
 
     try:
-        record = _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1144,7 +1198,7 @@ async def memory_create_todo(
     tags = ["memora/todos"]
 
     try:
-        record = _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1186,7 +1240,7 @@ async def memory_create_section(
     tags = ["memora/sections"]
 
     try:
-        record = _create_memory(content.strip(), metadata, tags)
+        record = await _create_memory(content.strip(), metadata, tags)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
 
@@ -1333,7 +1387,7 @@ async def memory_list(
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     try:
-        items = _list_memories(
+        items = await _list_memories(
             query, metadata_filters, limit, offset,
             date_from, date_to, tags_any, tags_all, tags_none,
             sort_by_importance,
@@ -1391,7 +1445,7 @@ async def memory_list_compact(
         tags_none: Exclude memories with ANY of these tags (NOT logic)
     """
     try:
-        items = _list_memories(query, metadata_filters, limit, offset, date_from, date_to, tags_any, tags_all, tags_none)
+        items = await _list_memories(query, metadata_filters, limit, offset, date_from, date_to, tags_any, tags_all, tags_none)
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
 
@@ -1414,7 +1468,7 @@ async def memory_list_compact(
 async def memory_create_batch(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Create multiple memories in one call."""
     try:
-        records = _create_memories(entries)
+        records = await _create_memories(entries)
     except ValueError as exc:
         return {"error": "invalid_batch", "message": str(exc)}
     _schedule_cloud_graph_sync()
@@ -1429,7 +1483,7 @@ async def memory_delete_batch(ids: List[int], reason: Optional[str] = None) -> D
         ids: Memory IDs to delete
         reason: Optional tombstone reason (default "deleted")
     """
-    deleted = _delete_memories(ids, reason=reason)
+    deleted = await _delete_memories(ids, reason=reason)
     _schedule_cloud_graph_sync()
     return {"deleted": deleted}
 
@@ -1466,7 +1520,7 @@ async def memory_absorb(
         return {"error": "invalid_input", "message": "max 20 facts per call"}
 
     try:
-        result = _absorb_memory(
+        result = await _absorb_memory(
             facts, source, confidence, context, metadata, tags, dry_run,
         )
     except ValueError as exc:
@@ -1524,7 +1578,7 @@ async def memory_store_document(
 
     # 1. Create document root
     try:
-        root = _create_memory(
+        root = await _create_memory(
             content=plan.root_content,
             metadata=plan.root_metadata,
             tags=plan.root_tags,
@@ -1549,7 +1603,7 @@ async def memory_store_document(
 
     if fragment_entries:
         try:
-            records = _create_memories(fragment_entries)
+            records = await _create_memories(fragment_entries)
         except ValueError as exc:
             return {
                 "error": "fragment_error",
@@ -1566,16 +1620,16 @@ async def memory_store_document(
 
             # Link fragment → root
             try:
-                _add_link(fid, root_id, "extends", bidirectional=True)
+                await _add_link(fid, root_id, "extends", bidirectional=True)
             except Exception:
                 pass  # non-fatal — link failure shouldn't block storage
 
         # 4. Link claims to references by matching URLs
-        _link_claims_to_references(records, plan.fragments, node_map)
+        await _link_claims_to_references(records, plan.fragments, node_map)
 
     # 5. If version > 1, find and supersede previous root
     if version > 1:
-        _supersede_previous_version(root_id, document_key, version)
+        await _supersede_previous_version(root_id, document_key, version)
 
     _schedule_cloud_graph_sync()
 
@@ -1588,7 +1642,7 @@ async def memory_store_document(
     }
 
 
-def _link_claims_to_references(
+async def _link_claims_to_references(
     records: List[Dict[str, Any]],
     fragments: list,
     node_map: Dict[str, List[int]],
@@ -1613,19 +1667,19 @@ def _link_claims_to_references(
         for url, ref_id in url_to_ref.items():
             if url.lower() in content_lower:
                 try:
-                    _add_link(record["id"], ref_id, "references", bidirectional=True)
+                    await _add_link(record["id"], ref_id, "references", bidirectional=True)
                 except Exception:
                     pass
 
 
-def _supersede_previous_version(
+async def _supersede_previous_version(
     new_root_id: int,
     document_key: str,
     new_version: int,
 ) -> None:
     """Find the immediate predecessor root and create a supersedes link (chain, not fan-out)."""
     try:
-        results = _list_memories(
+        results = await _list_memories(
             query=None,
             metadata_filters={"document_key": document_key, "type": "document_root"},
             limit=50, offset=0,
@@ -1643,7 +1697,7 @@ def _supersede_previous_version(
                 predecessor_id = mem["id"]
                 predecessor_version = v
         if predecessor_id is not None:
-            _add_link(new_root_id, predecessor_id, "supersedes", bidirectional=True)
+            await _add_link(new_root_id, predecessor_id, "supersedes", bidirectional=True)
     except Exception:
         pass  # non-fatal
 
@@ -1674,7 +1728,7 @@ async def memory_get_document(
 
     # Don't use follow="active" — it would hide superseded roots,
     # breaking historical version retrieval. Filter manually instead.
-    results = _list_memories(
+    results = await _list_memories(
         query=None,
         metadata_filters=filters,
         limit=-1, offset=0,
@@ -1760,7 +1814,7 @@ async def memory_delete_document(
     if version is not None:
         filters["document_version"] = version
 
-    results = _list_memories(
+    results = await _list_memories(
         query=None,
         metadata_filters=filters,
         limit=-1, offset=0,
@@ -1787,7 +1841,7 @@ async def memory_delete_document(
     )
     fragment_count = len(ids) - root_count
 
-    deleted = _delete_memories(ids)
+    deleted = await _delete_memories(ids)
     _schedule_cloud_graph_sync()
 
     return {
@@ -1848,7 +1902,7 @@ async def memory_get(
     """
     try:
         effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_GET, for_get=True)
-        record = _get_memory(memory_id, follow=effective_follow)
+        record = await _get_memory(memory_id, follow=effective_follow)
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     if not record:
@@ -1895,7 +1949,7 @@ async def memory_update(
     intentionally replacing the whole metadata object.
     """
     try:
-        record = _update_memory(memory_id, content, metadata, tags, replace_metadata)
+        record = await _update_memory(memory_id, content, metadata, tags, replace_metadata)
     except ValueError as exc:
         return {"error": "invalid_input", "message": str(exc)}
     if not record:
@@ -1919,7 +1973,7 @@ async def memory_delete(
         reason: Optional tombstone reason (default "deleted")
     """
     if not force:
-        mem = _get_memory(memory_id)
+        mem = await _get_memory(memory_id)
         if mem and _is_doc_memory(mem.get("metadata")):
             doc_key = (mem.get("metadata") or {}).get("document_key", "unknown")
             return {
@@ -1931,7 +1985,7 @@ async def memory_delete(
                 ),
             }
 
-    if _delete_memory(memory_id, reason=reason):
+    if await _delete_memory(memory_id, reason=reason):
         _schedule_cloud_graph_sync()
         return {"status": "deleted", "id": memory_id}
     return {"error": "not_found", "id": memory_id}
@@ -1949,7 +2003,7 @@ async def memory_tags() -> Dict[str, Any]:
 async def memory_tag_hierarchy(include_root: bool = False) -> Dict[str, Any]:
     """Return stored tags organised as a namespace hierarchy."""
 
-    tags = _collect_tags()
+    tags = await _collect_tags()
     tree = build_tag_hierarchy(tags)
     if not include_root and isinstance(tree, dict):
         tree = tree.get("children", [])
@@ -1961,9 +2015,9 @@ async def memory_validate_tags(include_memories: bool = True) -> Dict[str, Any]:
     """Validate stored tags against the allowlist and report invalid entries."""
     from . import list_allowed_tags
 
-    invalid_full = _find_invalid_tags()
+    invalid_full = await _find_invalid_tags()
     allowed = list_allowed_tags()
-    existing = _collect_tags()
+    existing = await _collect_tags()
     response: Dict[str, Any] = {"allowed": allowed, "existing": existing, "invalid_count": len(invalid_full)}
     if include_memories:
         response["invalid"] = invalid_full
@@ -1989,7 +2043,7 @@ async def memory_hierarchy(
                  per memory to reduce response size. Set to False for full memory data.
     """
     try:
-        items = _list_memories(query, metadata_filters, None, 0, date_from, date_to, tags_any, tags_all, tags_none)
+        items = await _list_memories(query, metadata_filters, None, 0, date_from, date_to, tags_any, tags_all, tags_none)
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
 
@@ -2000,35 +2054,38 @@ async def memory_hierarchy(
 @mcp.tool()
 async def memory_verify_integrity() -> Dict[str, Any]:
     """Read-only embedding integrity doctor with bounded offending ids."""
-    from .embeddings import get_embedding_integrity_status, verify_embedding_integrity
-    conn = connect()
-    try:
-        audit = verify_embedding_integrity(conn, stamp=False)
-        status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
-        inflight = list_absorb_inflight(conn)
-        response = {
-            "status": status,
-            "audit": audit,
-            "absorb_inflight": inflight,
-        }
-        if inflight["orphaned"]:
-            response["absorb_inflight_remediation"] = (
-                "Expired absorb in-flight records own unreaped partial rows. "
-                "Automatic delete is disabled: an orphan is preferable to "
-                "silently deleting a slow-but-live absorb. Investigate the "
-                "owned_memory_ids and the writer; do not assume they are dead."
-            )
-        if status["mismatch"]:
-            response["remediation"] = (
-                "Repair or remove named orphan/unknown writer rows, then run an explicit "
-                "embedding rebuild. External writers must populate representation, dimension, "
-                "encoding_source, and writer_token."
-            )
-        else:
-            response["remediation"] = "no action needed"
-        return response
-    finally:
-        conn.close()
+    def _run() -> Dict[str, Any]:
+        from .embeddings import get_embedding_integrity_status, verify_embedding_integrity
+        conn = connect()
+        try:
+            audit = verify_embedding_integrity(conn, stamp=False)
+            status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
+            inflight = list_absorb_inflight(conn)
+            response = {
+                "status": status,
+                "audit": audit,
+                "absorb_inflight": inflight,
+            }
+            if inflight["orphaned"]:
+                response["absorb_inflight_remediation"] = (
+                    "Expired absorb in-flight records own unreaped partial rows. "
+                    "Automatic delete is disabled: an orphan is preferable to "
+                    "silently deleting a slow-but-live absorb. Investigate the "
+                    "owned_memory_ids and the writer; do not assume they are dead."
+                )
+            if status["mismatch"]:
+                response["remediation"] = (
+                    "Repair or remove named orphan/unknown writer rows, then run an explicit "
+                    "embedding rebuild. External writers must populate representation, dimension, "
+                    "encoding_source, and writer_token."
+                )
+            else:
+                response["remediation"] = "no action needed"
+            return response
+        finally:
+            conn.close()
+
+    return await _in_worker(_run)
 
 
 @mcp.tool()
@@ -2069,7 +2126,7 @@ async def memory_semantic_search(
 
     cap = _resolve_search_cap(limit=limit, top_k=top_k, default=5)
     try:
-        results = _semantic_search(
+        results = await _semantic_search(
             query,
             metadata_filters,
             cap,
@@ -2156,7 +2213,7 @@ async def memory_hybrid_search(
         return {"error": "invalid_follow", "message": str(exc)}
     cap = _resolve_search_cap(limit=limit, top_k=top_k, default=10)
     try:
-        results = _hybrid_search(
+        results = await _hybrid_search(
             query,
             semantic_weight,
             cap,
@@ -2255,7 +2312,7 @@ async def memory_digest(
             return {"error": "invalid_input", "message": "seed_ids must be positive integer ids"}
 
     try:
-        digest = _build_memory_digest(
+        digest = await _build_memory_digest(
             topic,
             k,
             include_lineage,
@@ -2304,7 +2361,7 @@ async def memory_rebuild_embeddings() -> Dict[str, Any]:
     if msg := _check_tool_cooldown("memory_rebuild_embeddings"):
         return {"error": "rate_limited", "message": msg}
     try:
-        updated = _rebuild_embeddings()
+        updated = await _rebuild_embeddings()
         return {"updated": updated}
     finally:
         _finish_tool("memory_rebuild_embeddings")
@@ -2323,7 +2380,7 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
     ``memory_rebuild_crossrefs``.
     """
 
-    related = _get_related(memory_id, refresh)
+    related = await _get_related(memory_id, refresh)
     return {"id": memory_id, "related": related}
 
 
@@ -2337,7 +2394,7 @@ async def memory_rebuild_crossrefs() -> Dict[str, Any]:
     if msg := _check_tool_cooldown("memory_rebuild_crossrefs"):
         return {"error": "rate_limited", "message": msg}
     try:
-        updated = _rebuild_crossrefs()
+        updated = await _rebuild_crossrefs()
         return {"updated": updated}
     finally:
         _finish_tool("memory_rebuild_crossrefs")
@@ -2347,7 +2404,7 @@ async def memory_rebuild_crossrefs() -> Dict[str, Any]:
 async def memory_stats() -> Dict[str, Any]:
     """Get statistics and analytics about stored memories."""
 
-    return _get_statistics()
+    return await _get_statistics()
 
 
 @mcp.tool()
@@ -2376,7 +2433,7 @@ async def memory_insights(
         return {"error": "rate_limited", "message": msg}
     try:
         stale_days = int(os.getenv("MEMORA_STALE_DAYS", "14"))
-        return _generate_insights(period, stale_days, include_llm_analysis)
+        return await _generate_insights(period, stale_days, include_llm_analysis)
     finally:
         _finish_tool("memory_insights")
 
@@ -2399,7 +2456,7 @@ async def memory_boost(
     Returns:
         Updated memory with new importance score, or error if not found
     """
-    record = _boost_memory(memory_id, boost_amount)
+    record = await _boost_memory(memory_id, boost_amount)
     if not record:
         return {"error": "not_found", "id": memory_id}
     _schedule_cloud_graph_sync()
@@ -2446,7 +2503,7 @@ async def memory_link(
         Dict with created links and their types
     """
     try:
-        result = _add_link(from_id, to_id, edge_type, bidirectional)
+        result = await _add_link(from_id, to_id, edge_type, bidirectional)
         _schedule_cloud_graph_sync()
         return result
     except ValueError as e:
@@ -2469,7 +2526,7 @@ async def memory_unlink(
     Returns:
         Dict with removed links
     """
-    result = _remove_link(from_id, to_id, bidirectional)
+    result = await _remove_link(from_id, to_id, bidirectional)
     _schedule_cloud_graph_sync()
     return result
 
@@ -2491,7 +2548,7 @@ async def memory_clusters(
     Returns:
         List of clusters with member IDs, sizes, and common tags
     """
-    clusters = _detect_clusters(min_cluster_size, min_score, algorithm)
+    clusters = await _detect_clusters(min_cluster_size, min_score, algorithm)
     return {
         "count": len(clusters),
         "clusters": clusters,
@@ -2537,63 +2594,70 @@ async def memory_find_duplicates(
 async def _find_duplicates_impl(
     min_similarity: float, max_similarity: float, limit: int, use_llm: bool
 ) -> Dict[str, Any]:
-    from .storage import compare_memories_llm, connect, find_duplicate_pairs
+    def _run() -> Dict[str, Any]:
+        return _find_duplicates_blocking(min_similarity, max_similarity, limit, use_llm)
+
+    return await _in_worker(_run)
+
+
+def _find_duplicates_blocking(
+    min_similarity: float, max_similarity: float, limit: int, use_llm: bool
+) -> Dict[str, Any]:
+    from .storage import compare_memories_llm, connect, find_duplicate_pairs, get_memory
 
     with connect() as conn:
         duplicate_result = find_duplicate_pairs(conn, min_similarity, limit * 2)
         candidates = duplicate_result["pairs"]
 
-    total_candidates = duplicate_result["total_pairs"]
-    pairs = []
-    llm_available = False
+        total_candidates = duplicate_result["total_pairs"]
+        pairs = []
+        llm_available = False
 
-    for candidate in candidates[:limit]:
-        mem_a = _get_memory(candidate["memory_a_id"])
-        mem_b = _get_memory(candidate["memory_b_id"])
+        for candidate in candidates[:limit]:
+            mem_a = get_memory(conn, candidate["memory_a_id"])
+            mem_b = get_memory(conn, candidate["memory_b_id"])
+            if not mem_a or not mem_b:
+                continue
 
-        if not mem_a or not mem_b:
-            continue
+            pair_result = {
+                "memory_a": {
+                    "id": mem_a["id"],
+                    "preview": mem_a["content"][:150] + "..." if len(mem_a["content"]) > 150 else mem_a["content"],
+                    "tags": mem_a.get("tags", []),
+                },
+                "memory_b": {
+                    "id": mem_b["id"],
+                    "preview": mem_b["content"][:150] + "..." if len(mem_b["content"]) > 150 else mem_b["content"],
+                    "tags": mem_b.get("tags", []),
+                },
+                "similarity_score": round(candidate["similarity_score"], 3),
+            }
 
-        pair_result = {
-            "memory_a": {
-                "id": mem_a["id"],
-                "preview": mem_a["content"][:150] + "..." if len(mem_a["content"]) > 150 else mem_a["content"],
-                "tags": mem_a.get("tags", []),
-            },
-            "memory_b": {
-                "id": mem_b["id"],
-                "preview": mem_b["content"][:150] + "..." if len(mem_b["content"]) > 150 else mem_b["content"],
-                "tags": mem_b.get("tags", []),
-            },
-            "similarity_score": round(candidate["similarity_score"], 3),
+            if use_llm:
+                llm_result = compare_memories_llm(
+                    mem_a["content"],
+                    mem_b["content"],
+                    mem_a.get("metadata"),
+                    mem_b.get("metadata"),
+                )
+                if llm_result:
+                    llm_available = True
+                    pair_result["llm_verdict"] = llm_result.get("verdict", "review")
+                    pair_result["llm_confidence"] = llm_result.get("confidence", 0)
+                    pair_result["llm_reasoning"] = llm_result.get("reasoning", "")
+                    pair_result["suggested_action"] = llm_result.get("suggested_action", "review")
+                    if llm_result.get("merge_suggestion"):
+                        pair_result["merge_suggestion"] = llm_result["merge_suggestion"]
+
+            pairs.append(pair_result)
+
+        return {
+            "pairs": pairs,
+            "total_candidates": total_candidates,
+            "affected_node_count": duplicate_result["affected_node_count"],
+            "analyzed": len(pairs),
+            "llm_available": llm_available,
         }
-
-        # Run LLM comparison if enabled
-        if use_llm:
-            llm_result = compare_memories_llm(
-                mem_a["content"],
-                mem_b["content"],
-                mem_a.get("metadata"),
-                mem_b.get("metadata"),
-            )
-            if llm_result:
-                llm_available = True
-                pair_result["llm_verdict"] = llm_result.get("verdict", "review")
-                pair_result["llm_confidence"] = llm_result.get("confidence", 0)
-                pair_result["llm_reasoning"] = llm_result.get("reasoning", "")
-                pair_result["suggested_action"] = llm_result.get("suggested_action", "review")
-                if llm_result.get("merge_suggestion"):
-                    pair_result["merge_suggestion"] = llm_result["merge_suggestion"]
-
-        pairs.append(pair_result)
-
-    return {
-        "pairs": pairs,
-        "total_candidates": total_candidates,
-        "affected_node_count": duplicate_result["affected_node_count"],
-        "analyzed": len(pairs),
-        "llm_available": llm_available,
-    }
 
 
 @mcp.tool()
@@ -2629,7 +2693,7 @@ async def memory_detect_supersessions(
     if msg := _check_tool_cooldown("memory_detect_supersessions"):
         return {"error": "rate_limited", "message": msg}
     try:
-        result = _detect_supersessions(
+        result = await _detect_supersessions(
             min_similarity, limit, dry_run, tags_any, min_confidence,
         )
     except Exception as exc:
@@ -2667,8 +2731,12 @@ async def memory_backfill_tags(
         return {"error": "rate_limited", "message": msg}
     try:
         from .storage import backfill_tags
-        with connect() as conn:
-            result = backfill_tags(conn, dry_run=dry_run)
+
+        def _run():
+            with connect() as conn:
+                return backfill_tags(conn, dry_run=dry_run)
+
+        result = await _in_worker(_run)
     except Exception as exc:
         logger.error("memory_backfill_tags failed: %s", exc, exc_info=True)
         return _safe_error(exc, "memory_backfill_tags")
@@ -2704,8 +2772,8 @@ async def memory_merge(
     """
     from .storage import connect, delete_memory, update_memory
 
-    source = _get_memory(source_id)
-    target = _get_memory(target_id)
+    source = await _get_memory(source_id)
+    target = await _get_memory(target_id)
 
     if not source:
         return {"error": "not_found", "message": f"Source memory #{source_id} not found"}
@@ -2738,23 +2806,23 @@ async def memory_merge(
     target_tags = set(target.get("tags") or [])
     merged_tags = list(source_tags | target_tags)
 
-    # Update target memory
-    with connect() as conn:
-        updated = update_memory(
-            conn,
-            target_id,
-            content=new_content,
-            metadata=merged_metadata,
-            tags=merged_tags,
-        )
-        conn.commit()
+    def _merge_write():
+        with connect() as conn:
+            updated = update_memory(
+                conn,
+                target_id,
+                content=new_content,
+                metadata=merged_metadata,
+                tags=merged_tags,
+            )
+            conn.commit()
+            delete_memory(conn, source_id, reason="merged")
+            from .storage import _log_action
+            _log_action(conn, target_id, "merge", f"Merged #{source_id} into #{target_id}")
+            conn.commit()
+            return updated
 
-        # Delete source memory (tombstone reason records the merge decision)
-        delete_memory(conn, source_id, reason="merged")
-
-        from .storage import _log_action
-        _log_action(conn, target_id, "merge", f"Merged #{source_id} into #{target_id}")
-        conn.commit()
+    updated = await _in_worker(_merge_write)
 
     _schedule_cloud_graph_sync()
     return {
@@ -2772,10 +2840,121 @@ async def memory_export() -> Dict[str, Any]:
     if msg := _check_tool_cooldown("memory_export"):
         return {"error": "rate_limited", "message": msg}
     try:
-        memories = _export_memories()
+        memories = await _export_memories()
         return {"count": len(memories), "memories": memories}
     finally:
         _finish_tool("memory_export")
+
+
+# Test hook: after bytes are read+validated, before upload. Production is None.
+_after_upload_bytes_validated = None
+
+
+def _upload_image_blocking(
+    file_path: str,
+    memory_id: int,
+    image_index: int = 0,
+    caption: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Open once (O_NOFOLLOW), validate those bytes, upload the same bytes."""
+    import errno
+    import stat as stat_mod
+    from io import BytesIO
+    from pathlib import Path as _Path
+
+    from PIL import Image as _PILImage
+
+    from . import image_storage as image_storage_mod
+
+    image_storage = image_storage_mod.get_image_storage_instance()
+    if not image_storage:
+        return {
+            "error": "r2_not_configured",
+            "message": "R2 storage is not configured. Set MEMORA_STORAGE_URI to s3:// and configure AWS credentials.",
+        }
+
+    raw_path = _Path(file_path)
+
+    for part in [raw_path] + list(raw_path.parents):
+        if part.is_symlink():
+            return {"error": "invalid_path", "message": "Symlinks are not supported"}
+
+    _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+    if raw_path.suffix.lower() not in _UPLOAD_EXTENSIONS:
+        return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
+
+    try:
+        resolved = raw_path.resolve(strict=False)
+    except (OSError, ValueError):
+        resolved = raw_path
+
+    _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
+    path_str = str(resolved).lower()
+    for pattern in _BLOCKED_PATTERNS:
+        if pattern in path_str:
+            return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = -1
+    try:
+        fd = os.open(str(raw_path), flags)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (getattr(errno, "ELOOP", None), getattr(errno, "EMLINK", None)):
+            return {"error": "invalid_path", "message": "Symlinks are not supported"}
+        return {"error": "file_not_found", "message": "File not found"}
+
+    try:
+        st = os.fstat(fd)
+        if not stat_mod.S_ISREG(st.st_mode):
+            return {"error": "invalid_path", "message": "File must be a regular file"}
+        with os.fdopen(fd, "rb") as fh:
+            fd = -1
+            image_data = fh.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+    _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
+    try:
+        with _PILImage.open(BytesIO(image_data)) as img:
+            img.verify()
+        with _PILImage.open(BytesIO(image_data)) as img:
+            pillow_format = img.format
+    except Exception:
+        return {"error": "invalid_image", "message": "File is not a valid image"}
+
+    content_type = _PILLOW_TO_MIME.get(pillow_format)
+    if not content_type:
+        return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
+
+    hook = _after_upload_bytes_validated
+    if hook is not None:
+        hook()
+
+    try:
+        r2_url = image_storage.upload_image(
+            image_data=image_data,
+            content_type=content_type,
+            memory_id=memory_id,
+            image_index=image_index,
+        )
+
+        image_obj = {"src": r2_url}
+        if caption:
+            image_obj["caption"] = caption
+
+        return {
+            "r2_url": r2_url,
+            "image": image_obj,
+            "content_type": content_type,
+            "size_bytes": len(image_data),
+        }
+
+    except Exception as e:
+        logger.error("Failed to upload image for memory %s: %s", memory_id, e)
+        return {"error": "upload_failed", "message": "Image upload failed. Check server logs for details."}
 
 
 @mcp.tool()
@@ -2799,85 +2978,9 @@ async def memory_upload_image(
     Returns:
         Dictionary with r2_url (the r2:// reference) and image object ready for metadata
     """
-    from pathlib import Path as _Path
-
-    from PIL import Image as _PILImage
-
-    from .image_storage import get_image_storage_instance
-
-    image_storage = get_image_storage_instance()
-    if not image_storage:
-        return {
-            "error": "r2_not_configured",
-            "message": "R2 storage is not configured. Set MEMORA_STORAGE_URI to s3:// and configure AWS credentials.",
-        }
-
-    # --- Path validation (defense in depth) ---
-    raw_path = _Path(file_path)
-
-    # 1. Reject symlinks anywhere in the path chain
-    for part in [raw_path] + list(raw_path.parents):
-        if part.is_symlink():
-            return {"error": "invalid_path", "message": "Symlinks are not supported"}
-
-    try:
-        resolved = raw_path.resolve(strict=True)
-    except (OSError, ValueError):
-        return {"error": "file_not_found", "message": "File not found"}
-
-    # 2. Validate extension — aligned with image_storage.py ext_map
-    _UPLOAD_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
-    if resolved.suffix.lower() not in _UPLOAD_EXTENSIONS:
-        return {"error": "invalid_type", "message": "File must be an image (jpg, jpeg, png, gif, webp)"}
-
-    # 3. Block known sensitive directories
-    _BLOCKED_PATTERNS = [".ssh", ".gnupg", ".aws", ".config/gcloud", "id_rsa", "id_ed25519", ".env"]
-    path_str = str(resolved).lower()
-    for pattern in _BLOCKED_PATTERNS:
-        if pattern in path_str:
-            return {"error": "blocked_path", "message": "Cannot upload files from sensitive directories"}
-
-    # 4. Verify file is actually an image and derive MIME from content
-    _PILLOW_TO_MIME = {"JPEG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif", "WEBP": "image/webp"}
-    try:
-        with _PILImage.open(str(resolved)) as img:
-            img.verify()
-            pillow_format = img.format
-    except Exception:
-        return {"error": "invalid_image", "message": "File is not a valid image"}
-
-    content_type = _PILLOW_TO_MIME.get(pillow_format)
-    if not content_type:
-        return {"error": "unsupported_format", "message": f"Unsupported image format: {pillow_format}"}
-
-    try:
-        # Read file and upload
-        with open(str(resolved), "rb") as f:
-            image_data = f.read()
-
-        r2_url = image_storage.upload_image(
-            image_data=image_data,
-            content_type=content_type,
-            memory_id=memory_id,
-            image_index=image_index,
-        )
-
-        # Build image object for metadata
-        image_obj = {"src": r2_url}
-        if caption:
-            image_obj["caption"] = caption
-
-        # Don't echo local file_path in response (path disclosure fix)
-        return {
-            "r2_url": r2_url,
-            "image": image_obj,
-            "content_type": content_type,
-            "size_bytes": len(image_data),
-        }
-
-    except Exception as e:
-        logger.error("Failed to upload image for memory %s: %s", memory_id, e)
-        return {"error": "upload_failed", "message": "Image upload failed. Check server logs for details."}
+    return await _in_worker(
+        _upload_image_blocking, file_path, memory_id, image_index, caption,
+    )
 
 
 @mcp.tool()
@@ -2898,7 +3001,7 @@ async def memory_migrate_images(dry_run: bool = False) -> Dict[str, Any]:
     if msg := _check_tool_cooldown("memory_migrate_images"):
         return {"error": "rate_limited", "message": msg}
     try:
-        return _migrate_images_to_r2(dry_run=dry_run)
+        return await _migrate_images_to_r2(dry_run=dry_run)
     finally:
         _finish_tool("memory_migrate_images")
 
@@ -3019,7 +3122,7 @@ async def memory_export_graph(
     if output_path is None:
         output_path = os.path.expanduser("~/memories_graph.html")
 
-    return export_graph_html(output_path, min_score)
+    return await _in_worker(export_graph_html, output_path, min_score)
 
 
 # Removed ~400 lines of old _export_graph_html code - now in graph/data.py
@@ -3048,7 +3151,7 @@ async def memory_import(
     if msg := _check_tool_cooldown("memory_import"):
         return {"error": "rate_limited", "message": msg}
     try:
-        result = _import_memories(data, strategy)
+        result = await _import_memories(data, strategy)
         _schedule_cloud_graph_sync()
         return result
     except ValueError as exc:
@@ -3088,7 +3191,7 @@ async def memory_events_poll(
     Returns:
         Dictionary with count and list of events
     """
-    events = _poll_events(since_timestamp, tags_filter, unconsumed_only)
+    events = await _poll_events(since_timestamp, tags_filter, unconsumed_only)
     return {"count": len(events), "events": events}
 
 
@@ -3102,7 +3205,7 @@ async def memory_events_clear(event_ids: List[int]) -> Dict[str, Any]:
     Returns:
         Dictionary with count of cleared events
     """
-    cleared = _clear_events(event_ids)
+    cleared = await _clear_events(event_ids)
     return {"cleared": cleared}
 
 
@@ -3323,7 +3426,7 @@ def _handle_migrate_images(dry_run: bool = False) -> None:
 
     print(f"{'[DRY RUN] ' if dry_run else ''}Migrating base64 images to R2 storage...")
 
-    result = _migrate_images_to_r2(dry_run=dry_run)
+    result = asyncio.run(_migrate_images_to_r2(dry_run=dry_run))
 
     if "error" in result:
         print(f"Error: {result['message']}")
