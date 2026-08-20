@@ -197,6 +197,7 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_TAG_FILE`      | Path to a JSON file containing an array of allowed tags, e.g. `["plan", "memora/issues"]` |
 | `MEMORA_TAGS`          | Comma-separated list of allowed tags                                       |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
+| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 43), `leader` (18), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
 | `MEMORA_STALE_DAYS`    | Days before an open TODO/issue counts as stale in `memory_insights` (default: `14`) |
 | `MEMORA_EMBEDDING_MODEL` | Embedding backend: `openai` (default), `sentence-transformers`, or `tfidf` |
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
@@ -212,6 +213,41 @@ Add to `~/.codex/config.toml`:
 | `AWS_PROFILE`          | AWS credentials profile from `~/.aws/credentials` (useful for R2)          |
 | `AWS_ENDPOINT_URL`     | S3-compatible endpoint for R2/MinIO                                        |
 | `R2_PUBLIC_DOMAIN`     | Public domain for R2 image URLs                                            |
+
+</details>
+
+<details id="tool-profiles">
+<summary><big><big><strong>Tool Profiles (MEMORA_TOOL_PROFILE)</strong></big></big></summary>
+
+All 43 MCP tools register unconditionally, so every agent session is injected with the full ~12,700-token tool schema even when most tools are never called. `MEMORA_TOOL_PROFILE` exposes a subset per deployment so a gated tool is **genuinely absent** — missing from `tools/list` AND undispatchable (`call_tool` returns `unknown-tool`, not a hidden execution). The profile is applied and attested at startup; the active profile and exposed tool count are logged to stderr.
+
+| Value | Tools | Use |
+|-------|-------|-----|
+| `full` (default) | all 43 | Direct stdio use; every existing deployment is byte-for-byte unchanged |
+| `leader` | 18 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest` |
+| `agent` | 12 | The read/create surface a worker agent needs: `memory_absorb`, `memory_semantic_search`, `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`, `memory_link`, `memory_stats`, `memory_create`, `memory_create_issue`, `memory_create_todo`, `memory_update` |
+
+- **Unset / empty = `full`.** No existing deployment changes behaviour.
+- **An unknown value aborts startup** with a message naming the valid values. It never silently falls back to `full` — a typo must not re-expose destructive maintenance tools (`memory_rebuild_embeddings`, `memory_delete_batch`) to every worker. Fail closed.
+- `memory_list` is deliberately excluded from both reduced profiles (it measures 163-174s vs `memory_list_compact`'s 0.22s on the live 836-memory store; fixing it is a separate task).
+- The leader/agent boundary is **data** in `memora/tool_profile.py` (two frozensets). Editing it is one line, not a sweep of 43 decorators.
+- The prune deletes from FastMCP's private `_tool_manager._tools` dict, so `memora` pins `mcp>=1.27,<1.28` (the audited minor) and runs a startup **attestation** through the low-level registered MCP request handlers (`_mcp_server.request_handlers[ListToolsRequest]` / `[CallToolRequest]` — the actual dispatch callable real client requests use, not the `FastMCP.list_tools` / `call_tool` Python helpers) that refuses to start if the installed SDK routes listing/dispatch elsewhere (private-implementation drift). The pin is the static guard; the attestation is the runtime backstop. Bumping the upper bound requires re-running `tests/test_tool_profile.py`.
+- `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 43 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
+
+```bash
+# Leader deployment — exposes 18 tools
+MEMORA_TOOL_PROFILE=leader memora-server
+
+# Agent worker — exposes 12 tools
+MEMORA_TOOL_PROFILE=agent memora-server
+
+# Full (default) — all 43 tools, existing behaviour
+memora-server
+
+# Typo refuses to start:
+# MEMORA_TOOL_PROFILE=agnt memora-server
+# Error: unknown MEMORA_TOOL_PROFILE='agnt'; valid values: full, leader, agent
+```
 
 </details>
 
