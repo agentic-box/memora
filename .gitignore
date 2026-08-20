@@ -29,3 +29,11 @@ plans/
 
 # Research output
 research/
+
+# plists rendered by scripts/memora-instance.sh (host-specific paths)
+launchd/generated/
+
+# Real per-store configs: they name a Cloudflare account and D1 databases.
+# The example file is committed; the real ones are not.
+instances/*.env
+!instances/example.env

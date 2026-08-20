@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.memora.proxy.memora-pilot-d1</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/spok/.local/libexec/memora/memora_proxy.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MEMORA_PROXY_CONTAINER</key>
+        <string>memora-pilot-d1</string>
+        <key>MEMORA_PROXY_LISTEN_HOST</key>
+        <string>127.0.0.1</string>
+        <key>MEMORA_PROXY_LISTEN_PORT</key>
+        <string>8901</string>
+        <key>MEMORA_PROXY_TARGET_PORT</key>
+        <string>8000</string>
+        <key>MEMORA_PROXY_LOG</key>
+        <string>/Users/spok/.local/var/log/memora-proxy-pilot-d1.log</string>
+        <key>MEMORA_PROXY_MAX_CONN</key>
+        <string>64</string>
+        <key>MEMORA_PROXY_CONNECT_TIMEOUT</key>
+        <string>2</string>
+        <key>MEMORA_PROXY_RESOLVE_TIMEOUT</key>
+        <string>2</string>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/spok/.local/var/log/memora-proxy-pilot-d1.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/spok/.local/var/log/memora-proxy-pilot-d1.stderr.log</string>
+</dict>
+</plist>
