@@ -98,19 +98,33 @@ class TestRoutingIsInstanceOwned:
         )
         (tmp_path / "cred.json").write_text(
             _json.dumps({"mcpServers": {"memora": {"env": cred_env}}}))
+        # The fake records EVERY runtime call, not just `run`. codex P1:
+        # intercepting only `run` left `container stop` and `container rm`
+        # hitting the real host runtime, so this test could stop and delete a
+        # genuine container that happened to be named memora-t.
         fake = tmp_path / "fakecontainer"
-        fake.write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$ARGV_OUT"\n')
+        fake.write_text(
+            '#!/bin/bash\n'
+            'echo "$1" >> "$CALL_LOG"\n'
+            'if [ "$1" = run ]; then printf "%s\\n" "$@" > "$ARGV_OUT"; fi\n'
+        )
         fake.chmod(0o755)
         argv_out = tmp_path / "argv.txt"
+        call_log = tmp_path / "calls.txt"
 
         proc = subprocess.run(
             ["bash", "-c",
              f'export MEMORA_INSTANCE_DIR="{inst}" MEMORA_CONTAINER_BIN="{fake}" '
-             f'MEMORA_SECRET_DIR="{tmp_path / "sec"}" ARGV_OUT="{argv_out}"; '
+             f'MEMORA_SECRET_DIR="{tmp_path / "sec"}" ARGV_OUT="{argv_out}" '
+             f'CALL_LOG="{call_log}"; '
              f'"{SCRIPT}" up t'],
             capture_output=True, text=True,
         )
         assert proc.returncode == 0, proc.stderr
+        # Every runtime verb cmd_up issues must have been intercepted. If stop
+        # or rm is missing here they went to the real runtime instead.
+        calls = call_log.read_text().split()
+        assert calls == ["stop", "rm", "run"], f"runtime calls escaped the fake: {calls}"
         return argv_out.read_text().splitlines(), proc.stdout, good
 
     def test_a_credential_file_cannot_override_the_instance_registry(self, tmp_path):

@@ -132,7 +132,7 @@ cmd_build() {  # build [name] -- with a name, build that instance's image tag
   local tag="$DEFAULT_IMAGE"
   if [ -n "${1:-}" ]; then load "$1"; tag="$IMAGE"; fi
   echo "building $tag from $ROOT"
-  container build -t "$tag" -f "$ROOT/Dockerfile" "$ROOT"
+  "$CONTAINER_BIN" build -t "$tag" -f "$ROOT/Dockerfile" "$ROOT"
 }
 
 health_token() {  # per-instance secret so an operator can read health DETAIL
@@ -173,8 +173,11 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
 
 cmd_up() {
   load "$1"
-  container stop "$CONTAINER" >/dev/null 2>&1 || true
-  container rm   "$CONTAINER" >/dev/null 2>&1 || true
+  # Every runtime call goes through $CONTAINER_BIN, not just the final `run`.
+  # Intercepting only `run` left stop/rm hitting the REAL runtime, so a test
+  # could delete a genuine container that happened to share the instance name.
+  "$CONTAINER_BIN" stop "$CONTAINER" >/dev/null 2>&1 || true
+  "$CONTAINER_BIN" rm   "$CONTAINER" >/dev/null 2>&1 || true
   local args=(run -d --name "$CONTAINER" --memory "$MEMORY" --cpus "$CPUS" -e "MEMORA_TOOL_PROFILE=$TOOL_PROFILE")
   args+=(-e "MEMORA_HEALTH_TOKEN=$(health_token)")
   args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
@@ -256,7 +259,7 @@ PLIST
 
 one_status() {
   load "$1"
-  local state; state=$(container list 2>/dev/null | awk -v n="$CONTAINER" '$1==n{print $5" "$6}')
+  local state; state=$("$CONTAINER_BIN" list 2>/dev/null | awk -v n="$CONTAINER" '$1==n{print $5" "$6}')
   # On a connection failure curl still PRINTS 000 and exits non-zero, so a
   # `|| echo 000` fallback would concatenate into "000000". Swallow the status
   # instead and let the printed code stand on its own.
@@ -339,7 +342,7 @@ case "${1:-}" in
   status) cmd_status "${2:-all}" ;;
   config) cmd_config "${2:-}" ;;
   health) cmd_health "${2:-}" ;;
-  down)   load "${2:-}"; container stop "$CONTAINER" >/dev/null 2>&1 || true; echo "$CONTAINER stopped" ;;
-  logs)   load "${2:-}"; container logs "$CONTAINER" ;;
+  down)   load "${2:-}"; "$CONTAINER_BIN" stop "$CONTAINER" >/dev/null 2>&1 || true; echo "$CONTAINER stopped" ;;
+  logs)   load "${2:-}"; "$CONTAINER_BIN" logs "$CONTAINER" ;;
   *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
