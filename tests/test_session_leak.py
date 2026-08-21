@@ -73,7 +73,8 @@ def server(monkeypatch, tmp_path):
     from memora.health import register_health_routes
     register_health_routes(mcp)
 
-    app = session_guard.guard_sessions(mcp.streamable_http_app())
+    app = session_guard.guard_sessions(mcp.streamable_http_app(),
+                                       **session_guard.session_wiring(mcp))
     # A FRESH port per test. Reusing one fixed port made later tests hammer a
     # socket the previous server had not released yet, turning every request
     # into a 10s timeout -- the suite hung rather than failing, which is the
@@ -269,7 +270,11 @@ class TestHeaderPrevalidation:
                 "Accept": "application/json, text/event-stream"}
         base.update(headers)
         status = _post(port, "/mcp", INITIALIZE, headers=base)
-        assert status in (406, 415), f"{label}: unexpected {status}"
+        # 400 comes from the SDK's own TransportSecurityMiddleware, which
+        # validates Content-Type BEFORE the transport's Accept check; 406 is
+        # the Accept refusal. Mirroring the SDK means inheriting its statuses,
+        # and the property under test is the session count either way.
+        assert status in (400, 406, 415), f"{label}: unexpected {status}"
         assert _sessions(mcp) == 0, f"{label} left a session behind"
 
     def test_accept_with_parameters_is_still_accepted(self, server):
@@ -346,7 +351,15 @@ class TestAdmissionIsChargedOnlyWhenEligible:
         # deployed server charged admission for unknown databases.
         from memora import db_routing
 
+        class _FakeManager:
+            _server_instances: dict = {}
+
         class _FakeMCP:
+            # session_wiring reads these; a fake without them silently broke
+            # this test when the guard grew a ceiling and a security mirror.
+            session_manager = _FakeManager()
+            settings = type("S", (), {"transport_security": None})()
+
             def streamable_http_app(self):
                 return inner
 
@@ -422,7 +435,8 @@ class TestIdleReapingIsRealAndWired:
         session_guard._reset_admissions()
 
         mcp = FastMCP("reap-probe")
-        app = session_guard.guard_sessions(mcp.streamable_http_app())
+        app = session_guard.guard_sessions(mcp.streamable_http_app(),
+                                           **session_guard.session_wiring(mcp))
         mcp.session_manager.session_idle_timeout = 2.0
 
         with socket.socket() as probe:
@@ -519,3 +533,160 @@ class TestNamedDatabasePathsAreGuardedToo:
         mcp, port = routed_server
         assert _post(port, "/mcp/alpha", INITIALIZE) == 200
         assert _sessions(mcp) == 1
+
+
+class TestHardSessionCeiling:
+    """codex round 4 P0: a creation RATE plus an idle timeout does not BOUND
+    retained sessions. The manager refreshes a known session's idle deadline
+    BEFORE validating the request, so an attacker who keeps the ids can hold
+    every session alive with cheap rejected requests -- about two per second
+    for a thousand sessions -- and keep creating more at the rate limit. Only
+    a ceiling checked before allocation bounds it."""
+
+    @pytest.fixture
+    def capped(self, monkeypatch, tmp_path):
+        import socket
+        import threading
+        import time as _t
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        session_guard._reset_admissions()
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 3)
+
+        mcp = FastMCP("cap-probe")
+        app = session_guard.guard_sessions(mcp.streamable_http_app(),
+                                           **session_guard.session_wiring(mcp))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+        threading.Thread(target=srv.run, daemon=True).start()
+        for _ in range(80):
+            if getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+        yield mcp, port
+        srv.should_exit = True
+        for _ in range(50):
+            if not getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+        storage._registry_cache = None
+        storage._registry_source = None
+
+    def test_sessions_stop_at_the_ceiling_however_many_are_attempted(self, capped):
+        mcp, port = capped
+        codes = [_post(port, "/mcp", INITIALIZE) for _ in range(8)]
+        assert codes[:3] == [200, 200, 200], f"the ceiling refused real traffic: {codes}"
+        assert codes[3:] == [503] * 5, f"the ceiling did not hold: {codes}"
+        assert _sessions(mcp) == 3, (
+            f"retained {_sessions(mcp)} sessions against a ceiling of 3"
+        )
+
+    def test_keeping_old_sessions_alive_does_not_buy_new_capacity(self, capped):
+        """The attack itself: hold the existing sessions active and try again."""
+        mcp, port = capped
+        for _ in range(3):
+            assert _post(port, "/mcp", INITIALIZE) == 200
+        held = list(mcp.session_manager._server_instances.keys())
+        assert len(held) == 3
+
+        for sid in held:                      # cheap keepalives on known ids
+            _request(port, "/mcp", method="GET", headers={"mcp-session-id": sid})
+        assert _post(port, "/mcp", INITIALIZE) == 503
+        assert _sessions(mcp) == 3, "keepalives bought new session capacity"
+
+    def test_capacity_returns_when_a_session_goes_away(self, capped):
+        """A ceiling that never releases would be an outage after one burst."""
+        mcp, port = capped
+        for _ in range(3):
+            assert _post(port, "/mcp", INITIALIZE) == 200
+        assert _post(port, "/mcp", INITIALIZE) == 503
+
+        victim = next(iter(mcp.session_manager._server_instances))
+        mcp.session_manager._server_instances.pop(victim)
+
+        assert _post(port, "/mcp", INITIALIZE) == 200, "capacity never came back"
+
+    def test_a_zero_ceiling_disables_the_cap(self, capped, monkeypatch):
+        mcp, port = capped
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 0)
+        codes = [_post(port, "/mcp", INITIALIZE) for _ in range(5)]
+        assert codes == [200] * 5, f"the disabled cap still refused: {codes}"
+
+
+class TestTransportSecurityIsMirrored:
+    """codex round 4 P1: TransportSecurityMiddleware.validate_request runs at
+    streamable_http.py:382 -- AFTER allocation -- and enforces Host/Origin
+    when DNS-rebinding protection is on, which is FastMCP's default. A fully
+    typed initialize with a forged Host allocated a session and then took a
+    421, staying retained until idle expiry."""
+
+    @pytest.mark.parametrize("headers,label", [
+        ({"Host": "evil.example"}, "forged Host"),
+        ({"Origin": "http://evil.example"}, "disallowed Origin"),
+    ])
+    def test_a_rejected_host_or_origin_retains_no_session(self, server, headers, label):
+        mcp, port = server
+        base = {"Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream"}
+        base.update(headers)
+        status = _post(port, "/mcp", INITIALIZE, headers=base)
+        assert status in (400, 403, 421), f"{label}: unexpected {status}"
+        assert _sessions(mcp) == 0, f"{label} left a session behind"
+
+
+class TestAdmissionIsRefundedWhenNoSessionResults:
+    """codex round 4 P1: admission was charged before FastMCP authentication,
+    so unauthenticated-but-well-formed initializes could consume the whole
+    minute budget and lock out authorised clients while creating zero
+    sessions. Charging optimistically and refunding when no session appears
+    covers auth and every other downstream refusal without the guard having to
+    know what they are."""
+
+    def test_a_downstream_refusal_gives_the_slot_back(self, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 2)
+        session_guard._reset_admissions()
+        count = {"n": 0}
+
+        async def refusing_inner(scope, receive, send):
+            # stands in for auth rejecting before the manager allocates
+            await send({"type": "http.response.start", "status": 401, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        app = session_guard.guard_sessions(refusing_inner,
+                                           session_count=lambda: count["n"])
+        body = json.dumps(INITIALIZE).encode()
+
+        async def drive():
+            sent = []
+            done = {"v": False}
+
+            async def receive():
+                if not done["v"]:
+                    done["v"] = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(msg):
+                sent.append(msg)
+
+            scope = {"type": "http", "method": "POST", "path": "/mcp",
+                     "headers": [(b"content-type", b"application/json"),
+                                 (b"accept", b"application/json, text/event-stream")]}
+            await app(scope, receive, send)
+            return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+        # Ten refusals against a budget of two: without refunding, the budget
+        # is gone after two and everything later is 429 instead of 401.
+        codes = [asyncio.run(drive()) for _ in range(10)]
+        assert codes == [401] * 10, f"the budget was consumed by refusals: {codes}"

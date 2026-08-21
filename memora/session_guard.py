@@ -66,6 +66,13 @@ MAX_INIT_BODY_BYTES = _int_env("MEMORA_MAX_INIT_BODY_BYTES", "65536", minimum=10
 # New sessions admitted per minute. 0 disables. Well above any real workload
 # (six workspaces reconnecting is a handful) and far below exhaustion.
 MAX_INIT_PER_MIN = _int_env("MEMORA_MAX_INIT_PER_MIN", "120", minimum=0)
+# HARD CEILING on concurrent sessions. A creation RATE plus an idle timeout is
+# not a bound: the manager refreshes a known session's idle deadline BEFORE
+# validating the request, so an attacker who keeps the session ids can hold
+# every one of them alive with cheap rejected requests -- about two per second
+# for a thousand sessions -- and grow without limit at the creation rate. Only
+# a ceiling checked before allocation actually bounds it. 0 disables.
+MAX_SESSIONS = _int_env("MEMORA_MAX_SESSIONS", "512", minimum=0)
 
 _admissions: list[float] = []
 
@@ -98,6 +105,19 @@ def _admit() -> bool:
 def _reset_admissions() -> None:
     """Test seam: the window is process-global, so tests must clear it."""
     _admissions.clear()
+
+
+def _refund() -> None:
+    """Give back a slot charged for a request that produced no session.
+
+    Downstream can still refuse after the guard -- authentication being the
+    important case -- and those refusals must not consume the budget that
+    authorised clients need. Charging optimistically and refunding on "no
+    session appeared" covers every such rejection without the guard needing to
+    know what they are.
+    """
+    if _admissions:
+        _admissions.pop()
 
 
 async def _respond(send: Callable, status: int, message: str) -> None:
@@ -210,7 +230,8 @@ async def _buffer_body(receive: Callable, limit: int):
     return body, replay
 
 
-def guard_sessions(inner: Any) -> Callable:
+def guard_sessions(inner: Any, *, session_count: Callable | None = None,
+                   security: Any = None) -> Callable:
     """Wrap a stateful streamable-http app so refusals cost nothing.
 
     Guards the EXACT /mcp endpoint. In registry deployments this sits INSIDE
@@ -241,6 +262,23 @@ def guard_sessions(inner: Any) -> Callable:
             await _respond(send, 406, "session required")
             return
 
+        # TRANSPORT SECURITY FIRST, because that is the SDK's real order:
+        # TransportSecurityMiddleware.validate_request runs at
+        # streamable_http.py:382 and checks Content-Type and, with DNS-rebinding
+        # protection enabled (FastMCP's default on a loopback bind), Host and
+        # Origin. A fully typed initialize with Host: evil.example passed the
+        # earlier guard, allocated, then took a 421 and stayed retained.
+        if security is not None:
+            from starlette.requests import Request
+
+            async def _no_body():
+                return {"type": "http.request", "body": b"", "more_body": False}
+
+            error = await security.validate_request(Request(scope, _no_body), is_post=True)
+            if error is not None:
+                await error(scope, receive, send)
+                return
+
         if not _headers_acceptable(scope):
             await _respond(send, 406, "client must accept application/json and text/event-stream")
             return
@@ -254,6 +292,14 @@ def guard_sessions(inner: Any) -> Callable:
         if not _is_initialize(body):
             await _respond(send, 400, "expected an initialize request")
             return
+        # HARD CEILING before anything is allocated. This is the only check
+        # that actually bounds retained sessions; the rate below merely paces
+        # them.
+        if MAX_SESSIONS > 0 and session_count is not None and session_count() >= MAX_SESSIONS:
+            logger.warning("refusing initialize: %d sessions already open", session_count())
+            await _respond(send, 503, "session capacity reached")
+            return
+
         # Charged LAST: only a request that is fully eligible to reach the
         # session manager consumes capacity.
         if not _admit():
@@ -261,9 +307,33 @@ def guard_sessions(inner: Any) -> Callable:
             await _respond(send, 429, "too many new sessions")
             return
 
+        before = session_count() if session_count is not None else None
         await inner(scope, replay, send)
+        if before is not None and session_count() <= before:
+            # Something downstream refused it -- authentication, most likely --
+            # so no session was created and the slot must go back.
+            _refund()
 
     return app
+
+
+def session_wiring(mcp: Any) -> dict:
+    """The live-server hooks the guard needs from a FastMCP instance.
+
+    session_count reads the manager's instance map. That map is private and
+    there is no public count, but the ceiling is worthless without it -- and
+    the alternative, tracking our own count, would drift from the truth the
+    moment the SDK reaped or terminated a session. security reuses the SDK's
+    OWN configured middleware rather than a second copy of its rules.
+    """
+    from mcp.server.transport_security import TransportSecurityMiddleware
+
+    manager = mcp.session_manager
+    settings = getattr(mcp.settings, "transport_security", None)
+    return {
+        "session_count": lambda: len(manager._server_instances),
+        "security": TransportSecurityMiddleware(settings),
+    }
 
 
 def idle_timeout_seconds() -> float:

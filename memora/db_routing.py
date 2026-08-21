@@ -139,9 +139,9 @@ def routed_streamable_http_app(mcp: Any) -> Callable:
     outside let 120 requests to a nonexistent path block every legitimate
     workspace for a minute while creating zero sessions.
     """
-    from .session_guard import guard_sessions
+    from .session_guard import guard_sessions, session_wiring
 
-    return make_router(guard_sessions(mcp.streamable_http_app()))
+    return make_router(guard_sessions(mcp.streamable_http_app(), **session_wiring(mcp)))
 
 
 def describe_routes() -> str:

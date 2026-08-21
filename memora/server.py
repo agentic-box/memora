@@ -3392,7 +3392,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             import uvicorn
 
             from .db_routing import describe_routes, routed_streamable_http_app
-            from .session_guard import guard_sessions, idle_timeout_seconds
+            from .session_guard import (
+                guard_sessions,
+                idle_timeout_seconds,
+                session_wiring,
+            )
 
             if os.getenv("MEMORA_DATABASES", "").strip():
                 # routed_streamable_http_app puts the guard INSIDE the router,
@@ -3401,7 +3405,8 @@ def main(argv: Optional[list[str]] = None) -> None:
                 print(f"Serving {describe_routes()}", file=sys.stderr)
                 served = routed_streamable_http_app(mcp)
             else:
-                served = guard_sessions(mcp.streamable_http_app())
+                served = guard_sessions(mcp.streamable_http_app(),
+                                        **session_wiring(mcp))
 
             # Bound abandoned-but-VALID sessions. Body prevalidation cannot
             # help there: a client that handshakes correctly and vanishes
