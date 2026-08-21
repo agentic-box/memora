@@ -36,6 +36,9 @@ DEFAULT_IMAGE="${MEMORA_IMAGE:-memora-pilot}"
 # bare {type,url} http entry once a workspace is pointed at a container -- the
 # env block would have nowhere to live and nothing would read it.
 DEFAULT_CRED_SOURCE="${CRED_SOURCE:-$HOME/.config/memora/credentials.mcp.json}"
+# Per-instance health tokens live beside the credentials they are peers of,
+# never in the repo and never in an instance .env (those are readable config).
+SECRET_DIR="${MEMORA_SECRET_DIR:-$HOME/.config/memora}"
 [ -f "$DEFAULT_CRED_SOURCE" ] || DEFAULT_CRED_SOURCE="$HOME/repos/agentic-box/.mcp.json"
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
@@ -119,11 +122,27 @@ cmd_build() {  # build [name] -- with a name, build that instance's image tag
   container build -t "$tag" -f "$ROOT/Dockerfile" "$ROOT"
 }
 
+health_token() {  # per-instance secret so an operator can read health DETAIL
+  # Requests reach the container through the proxy, so their peer address is
+  # the bridge host, never loopback -- without a token the detailed readiness
+  # body is unreachable and only an aggregate status is served (memora #996).
+  local f="$SECRET_DIR/$INSTANCE.health-token"
+  if [ ! -s "$f" ]; then
+    mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$f"
+    chmod 600 "$f"
+  fi
+  cat "$f"
+}
+
 cmd_up() {
   load "$1"
   container stop "$CONTAINER" >/dev/null 2>&1 || true
   container rm   "$CONTAINER" >/dev/null 2>&1 || true
   local args=(run -d --name "$CONTAINER" --memory "$MEMORY" --cpus "$CPUS" -e "MEMORA_TOOL_PROFILE=$TOOL_PROFILE")
+  args+=(-e "MEMORA_HEALTH_TOKEN=$(health_token)")
+  args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
+  args+=(-e "MEMORA_HEALTH_REFRESH_INTERVAL=${MEMORA_HEALTH_REFRESH_INTERVAL:-15}")
   if [ -n "$STORAGE_URI" ]; then
     # CLOUDFLARE_API_TOKEN comes through cred_args with everything else.
     args+=(-e "MEMORA_STORAGE_URI=$STORAGE_URI")
@@ -212,6 +231,31 @@ cmd_status() {
   else one_status "$1"; fi
 }
 
+cmd_health() {  # health [name] -- per-database readiness, with detail
+  load "$1"
+  local tok; tok="$(health_token)"
+  curl -fsS --max-time 30 -H "Authorization: Bearer $tok" \
+       "http://127.0.0.1:$PORT/health/db" 2>/dev/null \
+    | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print("  no readiness body (is the container up?)"); raise SystemExit(1)
+if "databases" not in d:
+    # Aggregate-only means the token did not authorise -- say so rather than
+    # printing a bare "unknown", which is what #996 looked like.
+    print("  status %s (aggregate only -- token not accepted)" % d.get("status"))
+    raise SystemExit(1)
+print("  status %s   age %ss%s" % (d.get("status"), d.get("age_seconds"),
+                                   "  STALE" if d.get("stale") else ""))
+for n, v in sorted(d["databases"].items()):
+    line = "  %-12s %-8s %sms" % (n, v.get("status"), v.get("latency_ms"))
+    if v.get("message"): line += "  " + str(v["message"])[:80]
+    print(line)
+' || echo "  readiness unavailable on :$PORT"
+}
+
 cmd_config() {
   load "$1"
   echo "instance      $INSTANCE"
@@ -231,6 +275,7 @@ case "${1:-}" in
   proxy)  cmd_proxy "${2:-}" ;;
   status) cmd_status "${2:-all}" ;;
   config) cmd_config "${2:-}" ;;
+  health) cmd_health "${2:-}" ;;
   down)   load "${2:-}"; container stop "$CONTAINER" >/dev/null 2>&1 || true; echo "$CONTAINER stopped" ;;
   logs)   load "${2:-}"; container logs "$CONTAINER" ;;
   *) sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 1 ;;

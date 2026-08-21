@@ -23,10 +23,16 @@ def _reset_health_state():
     health._snapshot = None
     health._snapshot_at = 0.0
     health._refreshing = False
+    # The refresher is a module global bound to whichever loop created it.
+    # Leaking one between tests made an unrelated readiness test fail 2 runs
+    # in 3 -- the same defect production would hit on a loop replacement.
+    health.stop_refresher()
     yield
     health._snapshot = None
     health._snapshot_at = 0.0
     health._refreshing = False
+    health.stop_refresher()
+    health.stop_refresher()
 
 
 class TestLivenessNeverTouchesADatabase:
@@ -670,3 +676,226 @@ class TestRegistryFailureIsNotAMissingName:
         assert resp.status_code == 503, "a broken registry reported a missing name"
         assert b"registry_error" in resp.body
         assert b"bad" not in resp.body, "leaked registry detail to a remote peer"
+
+
+class TestReadinessRefreshesWithoutAnAuthorisedCaller:
+    """memora #996: readiness refreshed ONLY for an authorised caller, and in
+    the deployed shape there is none.
+
+    Clients reach the container through the host proxy, so no peer address is
+    loopback, and no MEMORA_HEALTH_TOKEN was deployed. `may_refresh=authorised`
+    therefore evaluated False for every caller that exists, nothing ever
+    scheduled a probe, and /health/db reported status "unknown" with zero
+    databases indefinitely -- identical to what it reports when every database
+    is unreachable, so the one signal it exists to give was unreadable.
+    """
+
+    def _routes(self, monkeypatch, tmp_path):
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        app = FastMCP("refresh-probe")
+        health.register_health_routes(app)
+        by_path = {r.path: r for r in app._custom_starlette_routes}
+        return by_path["/health"], by_path["/health/db"]
+
+    class _RemoteReq:
+        """A caller the server must NOT treat as privileged: not loopback, no
+        token. This is every real client in the deployed topology."""
+        headers = {}
+        path_params = {}
+        client = type("C", (), {"host": "10.0.0.7"})()
+
+    @staticmethod
+    def _body(response):
+        return json.loads(bytes(response.body).decode())
+
+    def test_unauthorised_polling_alone_makes_readiness_report_real_databases(
+            self, monkeypatch, tmp_path):
+        """The bug, stated as a test: poll ONLY as an unprivileged caller and
+        readiness must still stop saying "unknown"."""
+        import asyncio
+
+        _, db_route = self._routes(monkeypatch, tmp_path)
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)
+
+        async def scenario():
+            first = self._body(await db_route.endpoint(self._RemoteReq()))
+            # Nothing has been probed yet, so this call legitimately knows
+            # nothing -- that part was never the defect.
+            assert first["database_count"] == 0
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                body = self._body(await db_route.endpoint(self._RemoteReq()))
+                if body["database_count"]:
+                    return body
+            return body
+
+        try:
+            body = asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+        assert body["database_count"] == 1, (
+            "readiness never refreshed for an unprivileged caller -- the #996 bug"
+        )
+        assert body["status"] == "ok"
+        # Still redacted: the fix is about FRESHNESS, not about widening who
+        # may see names and error text.
+        assert "databases" not in body
+
+    def test_liveness_polling_alone_is_enough_to_start_it(self, monkeypatch, tmp_path):
+        """The watchdog only ever polls /health. If that did not start the
+        refresher, production would depend on a human curling /health/db."""
+        import asyncio
+
+        live_route, db_route = self._routes(monkeypatch, tmp_path)
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)
+
+        async def scenario():
+            await live_route.endpoint(self._RemoteReq())
+            # Observe the SNAPSHOT, never /health/db: that route starts the
+            # refresher itself, so polling it would keep this test green even
+            # when /health does nothing -- which is exactly how the first
+            # version of this test passed under mutation.
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                if health._snapshot is not None:
+                    return health._snapshot
+            return health._snapshot
+
+        try:
+            snap = asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+        assert snap is not None, "polling /health alone never started the refresher"
+        assert set(snap["databases"]) == {"alpha"}
+
+    def test_a_dead_refresher_is_replaced_not_inherited(self, monkeypatch):
+        """A crashed task left in place would silently restore the bug: the
+        flag says "running", nothing refreshes, readiness freezes."""
+        import asyncio
+
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)
+
+        async def scenario():
+            async def boom():
+                raise RuntimeError("refresher died")
+
+            dead = asyncio.ensure_future(boom())
+            await asyncio.sleep(0.05)
+            assert dead.done()
+            dead.exception()  # retrieve, so the loop does not warn
+            health._refresher_task = dead
+
+            assert health.ensure_refresher() is True
+            replacement = health._refresher_task
+            assert replacement is not dead
+            assert not replacement.done()
+            replacement.cancel()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+
+    def test_zero_interval_disables_the_refresher(self, monkeypatch):
+        """Poll-only behaviour stays available; it must not start a task."""
+        import asyncio
+
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0)
+
+        async def scenario():
+            assert health.ensure_refresher() is False
+            assert health._refresher_task is None
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+
+    def test_no_running_loop_is_not_an_error(self, monkeypatch):
+        """readiness_payload() is called from the CLI, with no loop at all."""
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 15)
+        assert health.ensure_refresher() is False
+
+
+class TestProbeDeadlineClearsARealColdConnect:
+    """memora #996 second cause: MEMORA_HEALTH_TIMEOUT defaulted to 5s while a
+    COLD probe measured 6.48s in the deployed container (warm 0.20s -- the cost
+    is backend construction, not the SELECT 1). Every database therefore
+    published unknown/probe_timeout on a fresh process."""
+
+    def test_the_default_deadline_clears_the_measured_cold_connect(self):
+        # Measured 2026-08-21 inside the running container: 6.48s cold.
+        # This is the constant the outage turned on, so it is asserted
+        # directly rather than left to a comment.
+        assert health.REFRESH_DEADLINE_S >= 10
+
+    def test_a_probe_slower_than_the_deadline_is_reported_timed_out(
+            self, monkeypatch, tmp_path):
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.5)
+        monkeypatch.setattr(health, "_probe_one", lambda name: (_t.sleep(2.0), {"status": "ok"})[1])
+
+        started = _t.time()
+        payload = health._build_snapshot()
+        elapsed = _t.time() - started
+
+        assert payload["databases"]["alpha"]["reason"] == "probe_timeout"
+        # The deadline must actually BOUND the call. An earlier version of this
+        # module waited on the very probe it had just labelled timed-out.
+        assert elapsed < 1.5, f"deadline did not bound the refresh: {elapsed:.2f}s"
+
+    def test_a_probe_inside_the_deadline_is_reported_ok(self, monkeypatch, tmp_path):
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 2.0)
+        monkeypatch.setattr(health, "_probe_one",
+                            lambda name: (_t.sleep(0.3), {"status": "ok", "latency_ms": 300.0})[1])
+
+        payload = health._build_snapshot()
+        assert payload["status"] == "ok"
+        assert payload["databases"]["alpha"]["status"] == "ok"
+
+
+class TestRefreshIntervalConfig:
+    @pytest.mark.parametrize("value", ["-1", "notanumber", "1e9"])
+    def test_bad_interval_fails_closed(self, monkeypatch, value):
+        monkeypatch.setenv("MEMORA_HEALTH_REFRESH_INTERVAL", value)
+        with pytest.raises(health.HealthConfigError):
+            health._interval_seconds("MEMORA_HEALTH_REFRESH_INTERVAL", "15", cap=3600)
+
+    def test_zero_is_legal_and_means_disabled(self, monkeypatch):
+        monkeypatch.setenv("MEMORA_HEALTH_REFRESH_INTERVAL", "0")
+        assert health._interval_seconds("MEMORA_HEALTH_REFRESH_INTERVAL", "15", cap=3600) == 0
+
+    def test_an_interval_that_cannot_beat_max_staleness_is_refused(self):
+        """A refresher slower than MAX_STALE can never keep a verdict usable:
+        readiness would report "unknown" on a schedule while healthy. Refusing
+        the config is better than running a refresher that cannot work."""
+        import subprocess
+        import sys
+
+        env = dict(os.environ)
+        env["MEMORA_HEALTH_MAX_STALE"] = "30"
+        env["MEMORA_HEALTH_REFRESH_INTERVAL"] = "30"
+        env.pop("MEMORA_HEALTH_TTL", None)
+        proc = subprocess.run(
+            [sys.executable, "-c", "import memora.health"],
+            capture_output=True, text=True, env=env,
+        )
+        assert proc.returncode != 0
+        assert "MEMORA_HEALTH_REFRESH_INTERVAL" in proc.stderr

@@ -72,7 +72,7 @@ def _positive_seconds(env: str, default: str, *, cap: float) -> float:
 # How long a readiness snapshot may be served before a refresh is triggered.
 SNAPSHOT_TTL_S = _positive_seconds("MEMORA_HEALTH_TTL", "10", cap=3600)
 # Bound on one refresh pass and on each individual store probe.
-REFRESH_DEADLINE_S = _positive_seconds("MEMORA_HEALTH_TIMEOUT", "5", cap=300)
+REFRESH_DEADLINE_S = _positive_seconds("MEMORA_HEALTH_TIMEOUT", "15", cap=300)
 # Beyond this age a cached per-database result may no longer be reported READY.
 MAX_STALENESS_S = _positive_seconds("MEMORA_HEALTH_MAX_STALE", "60", cap=3600)
 if MAX_STALENESS_S < SNAPSHOT_TTL_S:
@@ -84,12 +84,48 @@ if MAX_STALENESS_S < SNAPSHOT_TTL_S:
         f"MEMORA_HEALTH_TTL ({SNAPSHOT_TTL_S})"
     )
 
+def _interval_seconds(env: str, default: str, *, cap: float) -> float:
+    """Like _positive_seconds but 0 is legal and means "no periodic refresh"."""
+    raw = os.getenv(env, default).strip() or default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise HealthConfigError(f"{env}={raw!r} is not a number") from exc
+    if value != value or value < 0 or value > cap:
+        raise HealthConfigError(f"{env}={raw!r} must be >= 0 and <= {cap}")
+    return value
+
+
+# How often the server refreshes readiness ON ITS OWN. Without this the
+# snapshot is only ever as fresh as the last authorised caller -- and in the
+# deployed shape (clients reach the container through a proxy, so no peer is
+# loopback and no token need be set) there IS no authorised caller, so the
+# alert surface reported "unknown" forever while every database was fine.
+# 0 disables it, for tests and for anyone who wants poll-only behaviour.
+REFRESH_INTERVAL_S = _interval_seconds("MEMORA_HEALTH_REFRESH_INTERVAL", "15", cap=3600)
+if REFRESH_INTERVAL_S and REFRESH_INTERVAL_S >= MAX_STALENESS_S:
+    # A refresher slower than max staleness cannot keep the snapshot usable:
+    # every verdict would age out of evidence before its replacement arrived,
+    # so readiness would report "unknown" on a schedule. Refuse the config
+    # rather than run a refresher that cannot achieve its own purpose.
+    raise HealthConfigError(
+        f"MEMORA_HEALTH_REFRESH_INTERVAL ({REFRESH_INTERVAL_S}) must be < "
+        f"MEMORA_HEALTH_MAX_STALE ({MAX_STALENESS_S})"
+    )
+
 _PROCESS_START = time.monotonic()
+
+_logger = __import__("logging").getLogger("memora.health")
 
 _snapshot: Optional[Dict[str, Any]] = None
 _snapshot_at: float = 0.0
 _refresh_lock = threading.Lock()
 _refreshing = False
+# Bumped whenever the refresher is stopped. A refresh pass that began under a
+# superseded generation must NOT publish: cancellation is asynchronous, so an
+# already-running probe can otherwise land after its configuration is gone and
+# overwrite the snapshot with verdicts nobody asked for.
+_generation = 0
 
 
 def liveness_payload() -> Dict[str, Any]:
@@ -208,10 +244,15 @@ def _build_snapshot() -> Dict[str, Any]:
 
 def _refresh_snapshot() -> None:
     global _snapshot, _snapshot_at, _refreshing
+    with _refresh_lock:
+        generation = _generation
     try:
         built = _build_snapshot()
         with _refresh_lock:
-            _snapshot, _snapshot_at = built, time.monotonic()
+            if generation == _generation:
+                _snapshot, _snapshot_at = built, time.monotonic()
+            else:
+                _logger.debug("discarding readiness refresh from generation %d", generation)
     finally:
         with _refresh_lock:
             _refreshing = False
@@ -240,6 +281,19 @@ async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]
                 await asyncio.wait_for(asyncio.shield(task), REFRESH_DEADLINE_S)
             except asyncio.TimeoutError:
                 pass  # fall through and report what exists, if anything
+    elif snap is None and may_refresh:
+        # A refresh is ALREADY in flight -- started by the periodic refresher
+        # or by a concurrent request -- so single-flight correctly refused to
+        # start another. Without waiting for that one, adding the refresher
+        # made the first readiness request after startup answer "unknown"
+        # while the real answer was a second away: the refresher stole the
+        # refresh this caller used to perform itself.
+        deadline = time.monotonic() + REFRESH_DEADLINE_S
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+            with _refresh_lock:
+                if _snapshot is not None:
+                    break
 
     with _refresh_lock:
         snap, age = _snapshot, time.monotonic() - _snapshot_at
@@ -259,6 +313,81 @@ async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]
 def readiness_payload() -> Dict[str, Any]:
     """Synchronous readiness, for the CLI and tests. Always probes."""
     return _build_snapshot()
+
+
+_refresher_task: Optional[Any] = None
+
+
+async def _refresh_periodically() -> None:
+    """Keep the snapshot fresh regardless of who is asking, or whether anyone is.
+
+    Readiness used to refresh ONLY on an authorised request. Behind the
+    deployment's proxy no caller is loopback and no token was set, so nothing
+    could ever schedule a refresh and /health/db reported "unknown" forever --
+    indistinguishable from every database being unreachable, which is the one
+    thing it exists to tell you apart.
+    """
+    while True:
+        try:
+            await readiness_payload_async(may_refresh=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A refresher that dies on one bad pass leaves readiness frozen at
+            # its last value, which reads as healthy. Log and keep the loop.
+            _logger.warning("readiness refresh failed", exc_info=True)
+        await asyncio.sleep(REFRESH_INTERVAL_S)
+
+
+def ensure_refresher() -> bool:
+    """Start the periodic refresh once, on the serving loop. Idempotent.
+
+    Started lazily from the health routes rather than from a lifespan hook so
+    it works identically under mcp.run() and under the #965 path router. The
+    watchdog polls /health continuously, so in production it always starts.
+    Returns True if a task is running afterwards.
+    """
+    global _refresher_task
+    if REFRESH_INTERVAL_S <= 0:
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    with _refresh_lock:
+        task = _refresher_task
+        # A task is only useful if it is alive AND belongs to the loop now
+        # serving. A task from a previous loop reports not-done forever while
+        # never running again, so trusting `done()` alone silently restores
+        # the never-refreshes bug on any loop replacement.
+        if task is not None and not task.done() and task.get_loop() is loop:
+            return True
+        # A crashed task is replaced, not inherited: leaving a dead refresher
+        # in place would silently restore the never-refreshes bug.
+        _refresher_task = loop.create_task(_refresh_periodically())
+        return True
+
+
+def stop_refresher() -> None:
+    """Cancel the periodic refresh, from any thread.
+
+    A refresher outlives the app that started it unless something stops it: it
+    keeps probing on its own loop and keeps writing into the module-global
+    snapshot. That surfaced as an unrelated readiness test failing 2 runs in 3,
+    because a previous server's refresher published verdicts gathered against a
+    torn-down configuration.
+    """
+    global _refresher_task, _generation
+    with _refresh_lock:
+        task, _refresher_task = _refresher_task, None
+        _generation += 1
+    if task is None:
+        return
+    try:
+        task.get_loop().call_soon_threadsafe(task.cancel)
+    except RuntimeError:
+        # Loop already closed: the task cannot run again anyway.
+        pass
 
 
 def _is_authorised(request: Any) -> bool:
@@ -305,10 +434,14 @@ def register_health_routes(mcp: Any) -> None:
 
     @mcp.custom_route("/health", methods=["GET"])
     async def _health(_request):
+        # Liveness itself stays database-free; this only starts the background
+        # refresher, which is what makes readiness self-sustaining.
+        ensure_refresher()
         return JSONResponse(liveness_payload())
 
     @mcp.custom_route("/health/db", methods=["GET"])
     async def _health_db(request):
+        ensure_refresher()
         authorised = _is_authorised(request)
         payload = await readiness_payload_async(may_refresh=authorised)
         if payload.get("status") == "degraded":
