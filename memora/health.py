@@ -40,6 +40,7 @@ import hmac
 import ipaddress
 import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from typing import Any, Dict, Optional
 
@@ -74,6 +75,14 @@ SNAPSHOT_TTL_S = _positive_seconds("MEMORA_HEALTH_TTL", "10", cap=3600)
 REFRESH_DEADLINE_S = _positive_seconds("MEMORA_HEALTH_TIMEOUT", "5", cap=300)
 # Beyond this age a cached per-database result may no longer be reported READY.
 MAX_STALENESS_S = _positive_seconds("MEMORA_HEALTH_MAX_STALE", "60", cap=3600)
+if MAX_STALENESS_S < SNAPSHOT_TTL_S:
+    # Otherwise there is a window where per-database readiness reports 503
+    # "too stale" while no authorised request will schedule a refresh yet --
+    # a signal the operator cannot act on and the server cannot clear.
+    raise HealthConfigError(
+        f"MEMORA_HEALTH_MAX_STALE ({MAX_STALENESS_S}) must be >= "
+        f"MEMORA_HEALTH_TTL ({SNAPSHOT_TTL_S})"
+    )
 
 _PROCESS_START = time.monotonic()
 
@@ -124,37 +133,57 @@ def _probe_one(name: Optional[str]) -> Dict[str, Any]:
             CURRENT_DB.reset(token)
 
 
+# One persistent pool. A `with ThreadPoolExecutor(...)` block calls
+# shutdown(wait=True) on exit, so the previous version WAITED for the very
+# probe it had just labelled timed-out -- a 0.5s deadline took 5.03s to
+# return, and with a genuinely hung backend the single refresh slot stuck
+# forever. The test asserted the payload but not the elapsed time, so it was
+# vacuous for the property it claimed.
+_probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="memora-health")
+# name -> in-flight future. A name is never resubmitted while its previous
+# probe is still running; shutdown(wait=False) alone would leak one thread per
+# refresh against a permanently hung store.
+_inflight: Dict[str, Any] = {}
+
+
 def _probe_all(names) -> Dict[str, Dict[str, Any]]:
-    """Probe every store CONCURRENTLY with a per-store deadline.
+    """Probe every store concurrently, publishing at the deadline.
 
-    Sequential probing meant a hung alpha hid beta entirely -- the exact
-    property this endpoint claims. Each store gets its own future and its own
-    deadline, and a store that does not answer in time is published as
-    unknown/timeout while the finished ones stay visible.
-
-    A timeout cannot cancel blocked I/O, so the executor is bounded and the
-    caller never waits on the stuck future again; it is left to finish and be
-    discarded rather than resubmitted indefinitely.
+    Completed futures are merged immediately; unfinished names publish
+    unknown/probe_timeout and their futures are RETAINED so a later refresh
+    does not submit the same name again. Nothing waits on a stuck probe.
     """
-    from concurrent.futures import ThreadPoolExecutor, wait
+    from concurrent.futures import wait
+
+    labels = {(n or "(default)"): n for n in names}
+    with _refresh_lock:
+        for label, name in labels.items():
+            fut = _inflight.get(label)
+            if fut is not None and fut.done():
+                _inflight.pop(label, None)
+                fut = None
+            if fut is None:
+                _inflight[label] = _probe_pool.submit(_probe_one, name)
+        pending = {label: _inflight[label] for label in labels}
+
+    wait(list(pending.values()), timeout=REFRESH_DEADLINE_S)
 
     out: Dict[str, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(names)))) as pool:
-        futures = {pool.submit(_probe_one, n): (n or "(default)") for n in names}
-        done, not_done = wait(futures, timeout=REFRESH_DEADLINE_S)
-        for fut in done:
-            label = futures[fut]
-            try:
-                out[label] = fut.result()
-            except Exception as exc:  # pragma: no cover - _probe_one catches
-                out[label] = {"status": "error", "error": type(exc).__name__}
-        for fut in not_done:
-            out[futures[fut]] = {
-                "status": "unknown",
-                "reason": "probe_timeout",
-                "latency_ms": round(REFRESH_DEADLINE_S * 1000, 1),
-            }
-            fut.cancel()
+    with _refresh_lock:
+        for label, fut in pending.items():
+            if fut.done():
+                _inflight.pop(label, None)
+                try:
+                    out[label] = fut.result()
+                except Exception as exc:  # pragma: no cover - _probe_one catches
+                    out[label] = {"status": "error", "error": type(exc).__name__}
+            else:
+                # Still running: report it, keep the future, do not resubmit.
+                out[label] = {
+                    "status": "unknown",
+                    "reason": "probe_timeout",
+                    "latency_ms": round(REFRESH_DEADLINE_S * 1000, 1),
+                }
     return out
 
 
@@ -300,8 +329,16 @@ def register_health_routes(mcp: Any) -> None:
         # with no fresh result is "known but unproven" -- 503, not 404.
         try:
             registry = database_registry()
-        except DatabaseRegistryError:
-            registry = {}
+        except DatabaseRegistryError as exc:
+            # A CONFIGURATION failure is not "this database does not exist".
+            # Returning 404 would tell an operator the name is wrong when the
+            # registry itself is broken.
+            return JSONResponse(
+                {"status": "unknown", "reason": "registry_error"}
+                if not _is_authorised(request)
+                else {"status": "unknown", "reason": "registry_error", "message": str(exc)},
+                status_code=503,
+            )
         known = name in registry or (not registry and name == "(default)")
 
         payload = await readiness_payload_async(may_refresh=authorised)

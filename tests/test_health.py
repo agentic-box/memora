@@ -5,6 +5,7 @@ not that the live server can. Under one-process-serves-everything that gap is
 the operator's only warning before agents go quiet.
 """
 import json
+import os
 
 import pytest
 
@@ -554,3 +555,118 @@ class TestPerDatabaseRouteHonoursStaleness:
             missing = asyncio.run(route.endpoint(self._Req("nosuch")))
         assert known.status_code == 503
         assert missing.status_code == 404
+
+
+class TestTimedOutProbesAreTrulyAbandoned:
+    """codex P0: the previous version WAITED for the probe it had just labelled
+    timed-out, because `with ThreadPoolExecutor(...)` calls shutdown(wait=True)
+    on exit. A 0.5s deadline took 5.03s to return, and my test asserted the
+    payload but not the ELAPSED TIME — vacuous for the property claimed."""
+
+    def _slow_alpha(self, monkeypatch, tmp_path, sleep_s):
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "alpha": str(tmp_path / "a.db"), "beta": str(tmp_path / "b.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.4)
+        health._inflight.clear()
+
+        real = storage.connect
+
+        def selective(*a, **k):
+            if CURRENT_DB.get() == "alpha":
+                _t.sleep(sleep_s)
+            return real(*a, **k)
+
+        monkeypatch.setattr(storage, "connect", selective)
+
+    def test_publication_happens_at_the_deadline_not_after_the_hang(
+            self, monkeypatch, tmp_path):
+        import time as _t
+
+        self._slow_alpha(monkeypatch, tmp_path, 4.0)
+        started = _t.monotonic()
+        payload = health.readiness_payload()
+        elapsed = _t.monotonic() - started
+
+        assert payload["databases"]["beta"]["status"] == "ok"
+        assert payload["databases"]["alpha"]["reason"] == "probe_timeout"
+        assert elapsed < 2.0, (
+            f"returned in {elapsed:.2f}s with a 0.4s deadline: the hung probe "
+            "was waited on, so a healthy store cannot be published on time"
+        )
+        _t.sleep(4.2)          # let the abandoned probe finish before teardown
+
+    def test_a_hung_name_is_not_resubmitted_by_the_next_refresh(
+            self, monkeypatch, tmp_path):
+        """shutdown(wait=False) alone would leak one thread per refresh
+        against a permanently hung store."""
+        import time as _t
+
+        self._slow_alpha(monkeypatch, tmp_path, 3.0)
+        submitted = []
+        real_submit = health._probe_pool.submit
+
+        def counting(fn, name, *a, **k):
+            submitted.append(name)
+            return real_submit(fn, name, *a, **k)
+
+        monkeypatch.setattr(health._probe_pool, "submit", counting)
+
+        health.readiness_payload()          # alpha times out, future retained
+        health.readiness_payload()          # second refresh
+
+        assert submitted.count("alpha") == 1, (
+            f"alpha was probed {submitted.count('alpha')} times while its "
+            "previous probe was still running"
+        )
+        _t.sleep(3.2)
+
+
+class TestTuningRelationship:
+    def test_max_stale_below_ttl_is_refused(self):
+        """codex P1: that window reports 503 'too stale' while no authorised
+        request will schedule a refresh yet — unactionable and unclearable."""
+        import subprocess
+        import sys
+
+        out = subprocess.run(
+            [sys.executable, "-c", "import memora.health"],
+            env={**os.environ, "MEMORA_HEALTH_TTL": "30",
+                 "MEMORA_HEALTH_MAX_STALE": "10"},
+            capture_output=True, text=True,
+        )
+        assert out.returncode != 0
+        assert "must be >=" in out.stderr, out.stderr
+
+
+class TestRegistryFailureIsNotAMissingName:
+    def test_broken_registry_returns_503_not_404(self, monkeypatch):
+        """codex P1: 404 tells an operator the NAME is wrong when the registry
+        itself is broken."""
+        import asyncio
+
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", "{bad")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        app = FastMCP("registry-error-probe")
+        health.register_health_routes(app)
+        route = next(r for r in app._custom_starlette_routes
+                     if r.path == "/health/db/{name}")
+
+        class _Req:
+            headers = {}
+            path_params = {"name": "alpha"}
+            client = type("C", (), {"host": "10.0.0.7"})()
+
+        resp = asyncio.run(route.endpoint(_Req()))
+        assert resp.status_code == 503, "a broken registry reported a missing name"
+        assert b"registry_error" in resp.body
+        assert b"bad" not in resp.body, "leaked registry detail to a remote peer"
