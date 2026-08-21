@@ -106,8 +106,10 @@ _registry_source: Optional[str] = None
 # section.
 _registry_lock = threading.Lock()
 
-# The database bound to the current context. None = use the module default,
-# which is what keeps every existing caller (and every test that monkeypatches
+# The database bound to the current context. None means "no explicit binding":
+# with a registry CONFIGURED that resolves to the registry's default, and with
+# no registry it falls back to the module-level STORAGE_BACKEND -- which is what
+# keeps every existing caller (and every test that monkeypatches
 # STORAGE_BACKEND) working unchanged.
 CURRENT_DB: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "memora_current_db", default=None
@@ -201,11 +203,16 @@ def backend_for(name: str):
 def current_backend():
     """The backend this call should use.
 
-    Order matters and is the compatibility contract: a context-bound database
-    wins, otherwise the module-level STORAGE_BACKEND. Reading the module
-    attribute (rather than closing over its import-time value) is what keeps
-    every test that monkeypatches storage.STORAGE_BACKEND working, and what
-    makes Phase 1 a no-op when no database is bound.
+    Order matters and is the compatibility contract:
+      1. a context-bound database wins;
+      2. else, if MEMORA_DATABASES is CONFIGURED, its validated default -- this
+         is what makes a malformed or ambiguous registry fail on the connect
+         path instead of silently opening the legacy database;
+      3. else the module-level STORAGE_BACKEND.
+    Reading the module attribute in (3) rather than closing over its
+    import-time value is what keeps every test that monkeypatches
+    storage.STORAGE_BACKEND working, and what makes this a no-op when no
+    registry is configured.
     """
     name = CURRENT_DB.get()
     if name is not None:

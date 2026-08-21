@@ -301,3 +301,43 @@ class TestEmbeddingCacheKeyFollowsTheBinding:
             f"both databases share cache key {keys['alpha']!r}; one could reuse "
             "the other's cached integrity result"
         )
+
+
+class TestStartupRefusesBadRegistry:
+    """codex P2: a configuration error must not leave a running server.
+
+    current_backend() raised correctly, but main() caught every Exception and
+    warned, then started the graph server and mcp.run — leaving a server whose
+    storage tools fail on every call. Modelled on the tool-profile test.
+    """
+
+    def test_registry_error_aborts_before_graph_and_run(self, monkeypatch):
+        from memora import server
+
+        calls = []
+        monkeypatch.setattr(server, "start_graph_server",
+                            lambda *a, **k: calls.append("start_graph_server"))
+        monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append("mcp.run"))
+        monkeypatch.setenv("MEMORA_DATABASES", "{bad")
+        monkeypatch.setenv("MEMORA_TRANSPORT", "stdio")
+
+        with pytest.raises(SystemExit) as exc:
+            server.main([])
+        assert exc.value.code == 2
+        assert calls == [], f"side effects ran before the abort: {calls}"
+
+    def test_transient_prewarm_failure_still_only_warns(self, monkeypatch):
+        """The legacy behaviour must survive: a flaky backend is not fatal."""
+        from memora import server
+
+        calls = []
+        monkeypatch.setattr(server, "start_graph_server",
+                            lambda *a, **k: calls.append("start_graph_server"))
+        monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append("mcp.run"))
+        monkeypatch.setattr(server, "connect",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("flaky")))
+        monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+        monkeypatch.setenv("MEMORA_TRANSPORT", "stdio")
+
+        server.main([])
+        assert "mcp.run" in calls, f"a transient failure must not abort startup: {calls}"
