@@ -77,6 +77,32 @@ async def _reject(send: Callable, status: int, message: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
+_SESSION_HEADER = b"mcp-session-id"
+
+
+def _would_leak_a_session(scope) -> bool:
+    """Would the SDK allocate a session for a request it is going to reject?
+
+    memora #999. The session manager creates AND REGISTERS a transport for any
+    request carrying no Mcp-Session-Id, BEFORE validating it -- then rejects a
+    bare GET with 406 and keeps the session forever. Measured cost: 41.3 kB per
+    rejected probe, which exhausted the 768 MB container in ~3.2 hours under
+    clmux's 88 probes/min sidebar liveness check, matching the observed crash
+    interval. An unauthenticated GET loop is therefore a denial of service
+    against a container serving every workspace.
+
+    A session-less POST is the ONE case that must still reach the SDK: that is
+    `initialize`, the request whose whole job is to create a session. Anything
+    else without a session id cannot be served and must not cost anything.
+    """
+    if scope.get("method") == "POST":
+        return False
+    for key, _ in scope.get("headers", ()):
+        if key.lower() == _SESSION_HEADER:
+            return False
+    return True
+
+
 def make_router(inner: Any) -> Callable:
     """Wrap FastMCP's streamable-http app with /mcp/<db> selection."""
 
@@ -92,9 +118,19 @@ def make_router(inner: Any) -> Callable:
         try:
             name = parse_db_from_path(path)
         except NotAnMcpPath:
+            # Not an MCP path at all (/health and friends). Never guard these.
             # Not our route. Delegate unchanged rather than rewriting it.
             await inner(scope, receive, send)
             return
+        # #999: drop a request the SDK would allocate a session for and then
+        # reject anyway. 406 is preserved deliberately -- clmux's sidebar
+        # reachability probe (#969) reads 406 as "MCP is answering", so
+        # changing the status would break a working liveness check while
+        # fixing the leak. Same answer, no allocation.
+        if _would_leak_a_session(scope):
+            await _reject(send, 406, "session required")
+            return
+
         if name is None:
             # Bare /mcp: the registry default, resolved (and validated) by
             # current_backend(). No binding to set.

@@ -53,11 +53,17 @@ class _Recorder:
         self.seen_path = scope.get("path")
 
 
-def _drive(app, path):
-    """Run one request through the router.
+def _drive(app, path, method="POST", headers=None):
+    """Run one LEGITIMATE request through the router.
 
     Driven with asyncio.run rather than pytest-asyncio: the repo does not
     depend on that plugin and a routing test is not worth adding one for.
+
+    The scope carries a method and headers because a real one always does.
+    An earlier version passed neither, which made every request look like the
+    session-less GET that #999 must refuse -- these tests are about BINDING,
+    so they have to be driven with traffic the server would actually serve.
+    A session-less POST is `initialize`, the ordinary first request.
     """
     import asyncio
 
@@ -66,7 +72,9 @@ def _drive(app, path):
     async def send(msg):
         sent.append(msg)
 
-    asyncio.run(app({"type": "http", "path": path}, None, send))
+    scope = {"type": "http", "path": path, "method": method,
+             "headers": list(headers or ())}
+    asyncio.run(app(scope, None, send))
     return sent
 
 
