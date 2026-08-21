@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Deploy one memora container + its supervised proxy, from a per-instance config.
 #
-# One store per instance: a memora process binds ONE database for its lifetime
-# (storage.py resolves STORAGE_BACKEND at import), so each database gets its own
-# container, its own proxy port, and its own LaunchAgent. Adding a store is a new
-# file in instances/, not a fork of this script.
+# An instance is one container + one supervised proxy + one LaunchAgent.
+# It serves EITHER a single store (STORAGE_URI or VOLUME) or, since memora #965,
+# a REGISTRY of stores selected per session by URL path (MEMORA_DATABASES), which
+# is how one container serves every workspace. Adding a store is a new file in
+# instances/ -- or a new entry in an existing registry -- not a fork of this script.
 #
 #   ./memora-instance.sh build   [name]        # build the shared image, or one instance's tag
 #   ./memora-instance.sh up      <name>        # run the container
@@ -17,8 +18,12 @@
 # instances/<name>.env fields:
 #   INSTANCE      short name (container becomes memora-<INSTANCE>)
 #   PORT          host port the proxy listens on (127.0.0.1:<PORT>)
-#   STORAGE_URI   d1://account/database   (omit for local sqlite)
-#   VOLUME        host dir mounted at /data (local sqlite only)
+#   STORAGE_URI   d1://account/database   (single-store instance)
+#   VOLUME        host dir mounted at /data (single-store, local sqlite)
+#   MEMORA_DATABASES   {"name":"uri",...} registry; serves /mcp/<name> per session
+#   MEMORA_DEFAULT_DB  which registry entry a bare /mcp resolves to
+#                 Exactly one of STORAGE_URI, VOLUME or MEMORA_DATABASES is required.
+#                 Routing is INSTANCE-owned: a credential file may not supply it.
 #   CONTAINER     optional: adopt an existing container name instead of memora-<INSTANCE>
 #   IMAGE         optional: pin this instance to its own image tag
 #   CRED_SOURCE   optional: this instance's own credential file (see below)
@@ -40,6 +45,8 @@ DEFAULT_CRED_SOURCE="${CRED_SOURCE:-$HOME/.config/memora/credentials.mcp.json}"
 # never in the repo and never in an instance .env (those are readable config).
 SECRET_DIR="${MEMORA_SECRET_DIR:-$HOME/.config/memora}"
 TOKEN_LEN=48                                   # exact health-token length
+# Overridable so a test can capture the argv cmd_up would run.
+CONTAINER_BIN="${MEMORA_CONTAINER_BIN:-container}"
 [ -f "$DEFAULT_CRED_SOURCE" ] || DEFAULT_CRED_SOURCE="$HOME/repos/agentic-box/.mcp.json"
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
@@ -106,7 +113,12 @@ cred_args() {
   python3 - "$CRED_SOURCE" <<'PYEOF'
 import json, sys
 env = json.load(open(sys.argv[1]))["mcpServers"]["memora"].get("env", {})
-skip = {"MEMORA_STORAGE_URI", "MEMORA_DB_PATH"}
+# ROUTING IS INSTANCE-OWNED. cmd_up appends the instance's registry FIRST and
+# credentials AFTER, so a stale MEMORA_DATABASES left in a credential file
+# would win as the later duplicate -e and start the container against the
+# wrong set of databases -- silently, and with cross-database consequences.
+skip = {"MEMORA_STORAGE_URI", "MEMORA_DB_PATH",
+        "MEMORA_DATABASES", "MEMORA_DEFAULT_DB"}
 out = []
 for k, v in env.items():
     if k in skip or v == "":
@@ -179,8 +191,16 @@ cmd_up() {
   fi
   while IFS= read -r -d '' a; do args+=("$a"); done < <(cred_args)
   args+=("$IMAGE")
-  container "${args[@]}" >/dev/null
-  echo "$CONTAINER up ($( [ -n "$STORAGE_URI" ] && echo "D1 ${STORAGE_URI##*/}" || echo "sqlite $VOLUME" )) -- proxy :$PORT"
+  "$CONTAINER_BIN" "${args[@]}" >/dev/null
+  local what
+  if [ -n "$MEMORA_DATABASES" ]; then
+    what="registry: $(python3 -c "import json,sys;print(', '.join(sorted(json.loads(sys.argv[1]))))" "$MEMORA_DATABASES") (default=${MEMORA_DEFAULT_DB:-})"
+  elif [ -n "$STORAGE_URI" ]; then
+    what="D1 ${STORAGE_URI##*/}"
+  else
+    what="sqlite $VOLUME"
+  fi
+  echo "$CONTAINER up ($what) -- proxy :$PORT"
 }
 
 cmd_proxy() {
