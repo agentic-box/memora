@@ -3363,7 +3363,23 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         _sanitize_tool_schemas(mcp)
 
-        mcp.run(transport=args.transport)
+        if args.transport == "streamable-http" and os.getenv("MEMORA_DATABASES", "").strip():
+            # Multi-database mode: serve FastMCP's streamable-http app behind
+            # the /mcp/<db> router (memora #965 phase 2). mcp.run() would mount
+            # the app directly and there would be no place to bind CURRENT_DB.
+            import uvicorn
+
+            from .db_routing import describe_routes, routed_streamable_http_app
+
+            print(f"Serving {describe_routes()}", file=sys.stderr)
+            uvicorn.run(
+                routed_streamable_http_app(mcp),
+                host=args.host,
+                port=args.port,
+                log_level="warning",
+            )
+        else:
+            mcp.run(transport=args.transport)
 
 
 def _handle_sync_pull() -> None:
