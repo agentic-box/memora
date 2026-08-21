@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.memora.watchdog.memora-all</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>REPLACE_WATCHDOG_BIN</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- PATH must contain the `container` CLI: launchd gives a job a
+             minimal PATH and the watchdog shells out to it. -->
+        <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>MEMORA_WATCHDOG_CONTAINER</key><string>memora-all</string>
+        <!-- REQUIRED and validated: must be exactly /health. /health/db reports
+             DATABASE health and must never restart the shared container. -->
+        <key>MEMORA_WATCHDOG_URL</key><string>http://127.0.0.1:8920/health</string>
+        <key>MEMORA_WATCHDOG_LOCK</key><string>REPLACE_HOME/.local/var/run/memora-watchdog-memora-all.lock</string>
+        <key>MEMORA_WATCHDOG_INTERVAL</key><string>10</string>
+        <key>MEMORA_WATCHDOG_THRESHOLD</key><string>3</string>
+        <key>MEMORA_WATCHDOG_TIMEOUT</key><string>5</string>
+        <key>MEMORA_WATCHDOG_GRACE</key><string>15</string>
+        <key>MEMORA_WATCHDOG_STARTUP</key><string>60</string>
+        <key>MEMORA_WATCHDOG_BACKOFF</key><string>30</string>
+        <key>MEMORA_WATCHDOG_BACKOFF_MAX</key><string>600</string>
+        <key>MEMORA_WATCHDOG_HEALTHY_RUN</key><string>3</string>
+        <!-- Alerting is CONFIGURED, not merely available: log-only supervision
+             of a process six workspaces share is a silent outage. -->
+        <key>MEMORA_WATCHDOG_ALERT</key><string>REPLACE_HOME/.local/libexec/memora/memora_watchdog_alert.sh</string>
+        <key>MEMORA_WATCHDOG_ALERT_LOG</key><string>REPLACE_HOME/.local/var/log/memora-watchdog-alerts.log</string>
+        <key>MEMORA_WATCHDOG_LOG</key><string>REPLACE_HOME/.local/var/log/memora-watchdog-memora-all.log</string>
+    </dict>
+    <key>ProcessType</key><string>Background</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>30</integer>
+    <key>StandardOutPath</key><string>REPLACE_HOME/.local/var/log/memora-watchdog-memora-all.stdout.log</string>
+    <key>StandardErrorPath</key><string>REPLACE_HOME/.local/var/log/memora-watchdog-memora-all.stderr.log</string>
+</dict>
+</plist>
