@@ -116,6 +116,16 @@ CURRENT_DB: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
 )
 
 
+_ROUTE_SAFE_DB_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _is_route_safe_db_name(name: str) -> bool:
+    """A database name must be addressable as one URL path segment."""
+    if not _ROUTE_SAFE_DB_NAME.match(name):
+        return False
+    return name not in (".", "..")
+
+
 def database_registry() -> Dict[str, str]:
     """Parse MEMORA_DATABASES into {name: uri}. Empty when unset.
 
@@ -148,6 +158,15 @@ def database_registry() -> Dict[str, str]:
     for name, uri in parsed.items():
         if not isinstance(name, str) or not name:
             raise DatabaseRegistryError(f"MEMORA_DATABASES has a non-string database name: {name!r}")
+        if not _is_route_safe_db_name(name):
+            # A database is addressed as ONE url path segment (/mcp/<name>), so
+            # a name containing "/" or a path-normalising value like ".." can
+            # never be reached. Reject at validation rather than accepting a
+            # name the router cannot serve.
+            raise DatabaseRegistryError(
+                f"MEMORA_DATABASES name {name!r} is not usable as a URL path "
+                "segment; use letters, digits, '-', '_' or '.'"
+            )
         if not isinstance(uri, str) or not uri.strip():
             raise DatabaseRegistryError(f"MEMORA_DATABASES['{name}'] must be a non-empty URI string")
         out[name] = uri.strip()
