@@ -891,3 +891,87 @@ class TestRefundIsAttributedToTheRightRequest:
         assert not (set(session_guard._admissions) & set(charged["no"])), (
             "a refused request kept its charge"
         )
+
+
+class TestTerminatedTransportsArePurged:
+    """codex round 6 P0: excluding terminated transports from the COUNT left
+    them in the map. Every initialize+DELETE cycle strongly referenced another
+    transport, so a client could grow the map for the life of the process --
+    the original OOM class, just paced by the rate limit instead of the probe
+    rate. The earlier DELETE test asserted only that capacity came back; it
+    never looked at the retained map size, which is the thing that OOMs."""
+
+    @pytest.fixture
+    def live(self, monkeypatch, tmp_path):
+        import socket
+        import threading
+        import time as _t
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        session_guard._reset_admissions()
+        monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 0)
+
+        mcp = FastMCP("purge-probe")
+        app = session_guard.guard_sessions(mcp.streamable_http_app(),
+                                           **session_guard.session_wiring(mcp))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+        threading.Thread(target=srv.run, daemon=True).start()
+        for _ in range(80):
+            if getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+        yield mcp, port
+        srv.should_exit = True
+        for _ in range(50):
+            if not getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+
+    def test_repeated_initialize_and_DELETE_does_not_grow_the_map(self, live):
+        import time as _t
+
+        mcp, port = live
+        instances = mcp.session_manager._server_instances
+
+        for cycle in range(12):
+            assert _post(port, "/mcp", INITIALIZE) == 200, f"cycle {cycle} failed"
+            sid = next(s for s, t in instances.items()
+                       if not getattr(t, "is_terminated", False))
+            assert _request(port, "/mcp", method="DELETE",
+                            headers={"mcp-session-id": sid}) in (200, 204)
+            _t.sleep(0.05)
+
+        # One more initialize forces the purge, then nothing terminated may
+        # remain: 12 cycles must not leave 12 corpses referenced.
+        assert _post(port, "/mcp", INITIALIZE) == 200
+        assert len(instances) <= 2, (
+            f"{len(instances)} transports retained after 12 initialize+DELETE "
+            "cycles -- terminated sessions are still being kept"
+        )
+
+    def test_the_purge_runs_even_when_the_ceiling_is_disabled(self, live, monkeypatch):
+        """The garbage must not depend on the cap being switched on."""
+        import time as _t
+
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 0)
+        mcp, port = live
+        instances = mcp.session_manager._server_instances
+
+        for _ in range(6):
+            assert _post(port, "/mcp", INITIALIZE) == 200
+            sid = next(s for s, t in instances.items()
+                       if not getattr(t, "is_terminated", False))
+            _request(port, "/mcp", method="DELETE", headers={"mcp-session-id": sid})
+            _t.sleep(0.05)
+
+        assert _post(port, "/mcp", INITIALIZE) == 200
+        assert len(instances) <= 2, (
+            f"{len(instances)} retained with the ceiling disabled -- the purge "
+            "is gated on the cap"
+        )

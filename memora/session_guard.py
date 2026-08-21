@@ -323,10 +323,14 @@ def guard_sessions(inner: Any, *, session_count: Callable | None = None,
         # every request has already passed this point by then.
         global _pending
         reserved = False
-        if MAX_SESSIONS > 0 and session_count is not None:
-            if session_count() + _pending >= MAX_SESSIONS:
+        # Called even when the ceiling is disabled: session_count() is also
+        # what purges terminated transports, and that garbage must not depend
+        # on the cap being switched on.
+        active = session_count() if session_count is not None else None
+        if MAX_SESSIONS > 0 and active is not None:
+            if active + _pending >= MAX_SESSIONS:
                 logger.warning("refusing initialize: %d sessions open, %d pending",
-                               session_count(), _pending)
+                               active, _pending)
                 await _respond(send, 503, "session capacity reached")
                 return
             _pending += 1
@@ -393,13 +397,26 @@ def session_wiring(mcp: Any) -> dict:
     manager = mcp.session_manager
     settings = getattr(mcp.settings, "transport_security", None)
     def live_sessions() -> int:
-        # Count only LIVE transports. On DELETE the SDK calls terminate() and
-        # its cleanup deletes the map entry only when the transport is NOT
-        # terminated, so a cleanly closed session stays in the map forever --
-        # counting len() would let ordinary clients drive the service to a
-        # permanent 503. Idle reaping is different: that path pops first.
-        return sum(1 for t in manager._server_instances.values()
-                   if not getattr(t, "is_terminated", False))
+        """Purge terminated transports, then report what is left.
+
+        Ignoring terminated entries in the COUNT was not enough: on DELETE the
+        SDK terminates the transport and its cleanup deletes the map entry
+        only when the transport is NOT terminated, so every initialize+DELETE
+        cycle left another transport strongly referenced. Excluding them from
+        the count merely made that growth invisible to the ceiling -- a client
+        could repeat the cycle for the life of the process and the map would
+        grow without bound. They have to be REMOVED, not overlooked.
+
+        Purging here is safe and stays atomic: it is synchronous with no
+        await, and the SDK's own cleanup guards its `del` with a membership
+        check, so removing an entry first cannot make it raise.
+        """
+        instances = manager._server_instances
+        dead = [sid for sid, t in instances.items()
+                if getattr(t, "is_terminated", False)]
+        for sid in dead:
+            instances.pop(sid, None)
+        return len(instances)
 
     return {
         "session_count": live_sessions,
