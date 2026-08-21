@@ -27,25 +27,30 @@ logger = logging.getLogger(__name__)
 
 
 def _db_key_namespace() -> str:
-    """Object-key namespace for the CURRENTLY BOUND database, or "" for legacy.
+    """Object-key namespace for the database this call resolves to.
 
-    Image keys were images/{memory_id}/..., with no database in them. Row ids
+    Image keys were images/{memory_id}/... with no database in them. Row ids
     are small integers and every store uses them, so alpha memory 1 and beta
     memory 1 shared one external prefix -- and delete_memory_images() deletes a
-    whole prefix, so deleting alpha/1 destroyed beta/1's images. That is a
-    DESTRUCTIVE cross-database failure, and unlike the SQL paths it is invisible
-    to a routing mutation because the key is derived from the id alone.
+    whole prefix, so deleting alpha/1 destroyed beta/1's images.
 
-    Returns "" when no database is bound so existing single-database
+    Uses effective_database_name(), NOT raw CURRENT_DB. With a registry
+    configured, a session opened on bare /mcp leaves CURRENT_DB None while
+    /mcp/alpha sets it -- the same store, two spellings. Keying on the raw
+    value gave that store TWO key shapes, so an upload through one route and a
+    delete through the other silently orphaned objects.
+
+    Returns "" only when NO registry is configured, so existing single-database
     deployments keep their current keys and their already-uploaded images stay
-    reachable. Namespacing unconditionally would orphan every existing object.
-    """
-    try:
-        from .storage import CURRENT_DB
+    reachable. Namespacing those unconditionally would orphan every object.
 
-        name = CURRENT_DB.get()
-    except Exception:  # pragma: no cover - storage import cycles
-        return ""
+    Does NOT swallow errors: a config or import failure here would collapse
+    every named database back onto images/{id}, which is the destructive shape
+    this function exists to prevent. Fail closed.
+    """
+    from .storage import effective_database_name
+
+    name = effective_database_name()
     if not name:
         return ""
     return f"db/{name}/"
@@ -332,11 +337,53 @@ def get_image_storage() -> Optional[R2ImageStorage]:
 # Global instance (lazy initialization)
 _image_storage: Optional[R2ImageStorage] = None
 _image_storage_initialized = False
+# Per-database image storage, so two named s3 backends reach two buckets.
+_image_storage_by_db: dict = {}
+
+
+def _image_storage_for_uri(storage_uri: str) -> Optional[R2ImageStorage]:
+    """Build image storage from ONE backend URI, or None if it is not s3://."""
+    if not storage_uri.startswith("s3://"):
+        return None
+    parts = storage_uri[5:].split("/", 1)
+    if not parts or not parts[0]:
+        return None
+    try:
+        return R2ImageStorage(
+            bucket=parts[0],
+            endpoint_url=os.getenv("AWS_ENDPOINT_URL"),
+            public_domain=os.getenv("R2_PUBLIC_DOMAIN"),
+        )
+    except Exception as e:
+        logger.warning(f"Failed to initialize R2 image storage for {parts[0]}: {e}")
+        return None
 
 
 def get_image_storage_instance() -> Optional[R2ImageStorage]:
-    """Get or create the global R2ImageStorage instance."""
+    """Image storage for the database this call resolves to.
+
+    A namespace inside ONE bucket prevents collisions but not DISCLOSURE. With
+    alpha=s3://private-a and beta=s3://public-b, a process-global singleton
+    derived from the legacy MEMORA_STORAGE_URI sent every database's bytes to
+    whichever bucket happened to initialize it -- crossing the configured
+    storage and access-policy boundary, and silently losing image storage
+    entirely for named s3 backends when MEMORA_STORAGE_URI is absent.
+
+    Selection is therefore per RESOLVED DATABASE, cached by name. The legacy
+    process-global path is used only when no registry is configured.
+    """
     global _image_storage, _image_storage_initialized
+
+    from .storage import database_registry, effective_database_name
+
+    registry = database_registry()
+    if registry:
+        name = effective_database_name()
+        if name is None:
+            return None
+        if name not in _image_storage_by_db:
+            _image_storage_by_db[name] = _image_storage_for_uri(registry.get(name, ""))
+        return _image_storage_by_db[name]
 
     if not _image_storage_initialized:
         _image_storage = get_image_storage()

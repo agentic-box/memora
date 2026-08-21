@@ -110,3 +110,82 @@ def test_unbound_delete_does_not_reach_a_namespaced_object(store):
     assert len(remaining) == 1 and "alpha" in remaining[0], (
         f"unbound delete reached a namespaced object: {remaining}"
     )
+
+
+class TestRouteSpellingDoesNotChangeIdentity:
+    """codex P0: the same store reached two ways must have ONE key shape.
+
+    With a registry configured, bare /mcp leaves CURRENT_DB None and resolves
+    the registry default later, while /mcp/alpha sets it explicitly. Keying on
+    raw CURRENT_DB gave that one store TWO key shapes, so an upload through one
+    route and a delete through the other silently orphaned objects.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _registry(self, monkeypatch, tmp_path):
+        import json
+
+        from memora import storage
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "alpha": str(tmp_path / "a.db"), "beta": str(tmp_path / "b.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        yield
+        storage._registry_cache = None
+        storage._registry_source = None
+
+    def test_bare_default_and_named_default_share_a_prefix(self, store):
+        bare = store._generate_key(1, 0, "x" * 64, "png")
+        with _bind("alpha"):
+            named = store._generate_key(1, 0, "x" * 64, "png")
+        assert bare.rsplit("/", 1)[0] == named.rsplit("/", 1)[0], (
+            f"the same store has two key shapes: bare={bare} named={named}"
+        )
+
+    def test_delete_through_either_route_reaches_the_same_objects(self, store):
+        with _bind("alpha"):
+            key = store._generate_key(1, 0, "x" * 64, "png")
+            store.s3_client.put_object(Bucket="test", Key=key, Body=b"A")
+        store.delete_memory_images(1)          # bare/default route
+        assert store.s3_client.objects == {}, (
+            "an object uploaded via /mcp/alpha survived a delete via bare /mcp"
+        )
+
+
+class TestPerDatabaseBucketSelection:
+    """codex P0: a namespace inside ONE bucket prevents collisions, not disclosure."""
+
+    def test_two_named_backends_reach_two_buckets(self, monkeypatch, tmp_path):
+        import json
+
+        from memora import image_storage as mod
+        from memora import storage
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "alpha": "s3://private-a/db", "beta": "s3://public-b/db"}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        mod._image_storage_by_db.clear()
+
+        built = {}
+
+        def fake_for_uri(uri):
+            obj = object()
+            built[uri] = obj
+            return obj
+
+        monkeypatch.setattr(mod, "_image_storage_for_uri", fake_for_uri)
+
+        with _bind("alpha"):
+            a = mod.get_image_storage_instance()
+        with _bind("beta"):
+            b = mod.get_image_storage_instance()
+
+        assert a is not b, "both databases resolved to one image store"
+        assert set(built) == {"s3://private-a/db", "s3://public-b/db"}, (
+            f"wrong buckets selected: {set(built)}"
+        )
+        mod._image_storage_by_db.clear()

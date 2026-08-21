@@ -232,6 +232,24 @@ def backend_for(name: str):
         return backend
 
 
+def effective_database_name() -> Optional[str]:
+    """The database this call resolves to, bound or defaulted.
+
+    CURRENT_DB alone is NOT a stable identity: with a registry configured, a
+    session opened on bare /mcp leaves it None and resolves the registry
+    default later, while /mcp/alpha sets it explicitly -- the SAME store
+    reached two ways. Anything that derives an external identity (object-key
+    namespaces, per-database resource selection) must use this, or the same
+    store gets two identities depending on how a client spelled its URL.
+    """
+    name = CURRENT_DB.get()
+    if name is not None:
+        return name
+    if os.getenv("MEMORA_DATABASES", "").strip():
+        return default_database_name()
+    return None
+
+
 def current_backend():
     """The backend this call should use.
 
