@@ -25,6 +25,32 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+
+def _db_key_namespace() -> str:
+    """Object-key namespace for the CURRENTLY BOUND database, or "" for legacy.
+
+    Image keys were images/{memory_id}/..., with no database in them. Row ids
+    are small integers and every store uses them, so alpha memory 1 and beta
+    memory 1 shared one external prefix -- and delete_memory_images() deletes a
+    whole prefix, so deleting alpha/1 destroyed beta/1's images. That is a
+    DESTRUCTIVE cross-database failure, and unlike the SQL paths it is invisible
+    to a routing mutation because the key is derived from the id alone.
+
+    Returns "" when no database is bound so existing single-database
+    deployments keep their current keys and their already-uploaded images stay
+    reachable. Namespacing unconditionally would orphan every existing object.
+    """
+    try:
+        from .storage import CURRENT_DB
+
+        name = CURRENT_DB.get()
+    except Exception:  # pragma: no cover - storage import cycles
+        return ""
+    if not name:
+        return ""
+    return f"db/{name}/"
+
+
 class R2ImageStorageError(Exception):
     """Raised when R2 image operations fail."""
     pass
@@ -82,7 +108,11 @@ class R2ImageStorage:
         """
         timestamp = int(time.time())
         short_hash = content_hash[:8]
-        return f"images/{memory_id}/{timestamp}_{image_index}_{short_hash}.{extension}"
+        ns = _db_key_namespace()
+        return (
+            f"images/{ns}{memory_id}/"
+            f"{timestamp}_{image_index}_{short_hash}.{extension}"
+        )
 
     def _compute_hash(self, data: bytes) -> str:
         """Compute SHA256 hash of image data."""
@@ -181,7 +211,8 @@ class R2ImageStorage:
         Returns:
             Number of images deleted
         """
-        prefix = f"images/{memory_id}/"
+        # Namespaced prefix: deleting alpha's memory 1 must not touch beta's.
+        prefix = f"images/{_db_key_namespace()}{memory_id}/"
         deleted_count = 0
 
         try:
