@@ -3363,6 +3363,15 @@ def main(argv: Optional[list[str]] = None) -> None:
 
         _sanitize_tool_schemas(mcp)
 
+        # /health (liveness) and /health/db (per-database readiness) on the
+        # RUNNING server. `memora.cli health` spawns a fresh process and proves
+        # nothing about this one -- which matters far more once a single
+        # process serves every workspace.
+        if args.transport in ("streamable-http", "sse"):
+            from .health import register_health_routes
+
+            register_health_routes(mcp)
+
         if args.transport == "streamable-http" and os.getenv("MEMORA_DATABASES", "").strip():
             # Multi-database mode: serve FastMCP's streamable-http app behind
             # the /mcp/<db> router (memora #965 phase 2). mcp.run() would mount
