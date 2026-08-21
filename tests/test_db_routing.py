@@ -10,7 +10,7 @@ import json
 import pytest
 
 from memora import storage
-from memora.db_routing import make_router, parse_db_from_path
+from memora.db_routing import NotAnMcpPath, make_router, parse_db_from_path
 from memora.storage import CURRENT_DB
 
 
@@ -18,13 +18,27 @@ class TestPathParsing:
     @pytest.mark.parametrize("path,expected", [
         ("/mcp/ob1", "ob1"),
         ("/mcp/ob1/", "ob1"),
-        ("/mcp/ob1/extra", "ob1"),
         ("/mcp", None),
         ("/mcp/", None),
-        ("/other", None),
     ])
     def test_extracts_the_database_name(self, path, expected):
         assert parse_db_from_path(path) == expected
+
+    @pytest.mark.parametrize("path", [
+        "/mcpbeta",       # prefix-matched to "beta" before the boundary fix
+        "/mcp-other",     # prefix-matched to "-other"
+        "/other",
+        "/mcp/ob1/extra",  # extra segments are NOT an alias for ob1
+    ])
+    def test_non_route_paths_are_rejected(self, path):
+        """A string prefix made any /mcp* URL an alternate database alias.
+
+        That bypasses proxy or routing rules written for the canonical path,
+        so matching is on a path-COMPONENT boundary and anything else is
+        delegated unchanged rather than rewritten.
+        """
+        with pytest.raises(NotAnMcpPath):
+            parse_db_from_path(path)
 
 
 class _Recorder:
@@ -93,7 +107,12 @@ class TestRouting:
         sent = _drive(make_router(inner), "/mcp/does-not-exist")
         assert inner.seen_db == "<never called>", "request reached the app anyway"
         assert sent[0]["status"] == 404
-        assert b"does-not-exist" in sent[1]["body"]
+        # GENERIC body: this router runs OUTSIDE the inner app's auth, so
+        # echoing the registry error would let an unauthenticated caller
+        # enumerate database names and read backend configuration detail.
+        body = sent[1]["body"]
+        assert b"does-not-exist" not in body, "404 leaked the requested name"
+        assert b"alpha" not in body and b"beta" not in body, "404 leaked the registry"
 
     def test_binding_is_released_after_the_request(self):
         inner = _Recorder()
@@ -196,3 +215,238 @@ class TestStickyPerSession:
             f"the session followed the PATH to {second!r}; the binding became "
             "per-request, which opens a cross-database window mid-conversation"
         )
+
+
+class TestProductionWiring:
+    """codex: all routing tests called make_router directly, so a typo in
+    server.main() would leave every one of them green and Phase 2 inert in
+    production — the same integration gap as #969's discovery bug."""
+
+    def _stub(self, monkeypatch):
+        from memora import server
+
+        calls = {"uvicorn_app": None, "mcp_run": False}
+        monkeypatch.setattr(server, "start_graph_server", lambda *a, **k: None)
+        monkeypatch.setattr(server, "connect", lambda *a, **k: _FakeConn())
+        monkeypatch.setattr(server.mcp, "run",
+                            lambda *a, **k: calls.__setitem__("mcp_run", True))
+        import uvicorn
+        monkeypatch.setattr(uvicorn, "run",
+                            lambda app, **k: calls.__setitem__("uvicorn_app", app))
+        return server, calls
+
+    def test_configured_http_serves_the_routed_app(self, monkeypatch, tmp_path):
+        server, calls = self._stub(monkeypatch)
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        # MEMORA_TRANSPORT is read at MODULE IMPORT into DEFAULT_TRANSPORT, so
+        # setting it here would not reach args.transport. Pass it explicitly.
+        server.main(["--transport", "streamable-http"])
+        assert calls["uvicorn_app"] is not None, "routed app was never served"
+        assert calls["mcp_run"] is False, "fell through to mcp.run; routing is inert"
+
+    def test_unconfigured_http_stays_on_mcp_run(self, monkeypatch):
+        server, calls = self._stub(monkeypatch)
+        monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+        # MEMORA_TRANSPORT is read at MODULE IMPORT into DEFAULT_TRANSPORT, so
+        # setting it here would not reach args.transport. Pass it explicitly.
+        server.main(["--transport", "streamable-http"])
+        assert calls["mcp_run"] is True
+        assert calls["uvicorn_app"] is None
+
+    def test_configured_stdio_stays_on_mcp_run(self, monkeypatch, tmp_path):
+        server, calls = self._stub(monkeypatch)
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        server.main(["--transport", "stdio"])
+        assert calls["mcp_run"] is True
+        assert calls["uvicorn_app"] is None
+
+
+class _FakeConn:
+    def close(self):
+        pass
+
+
+class TestRouteSafeNames:
+    """codex: Phase 1 accepted names the router cannot address."""
+
+    @pytest.mark.parametrize("name", ["with/slash", "..", ".", "has space", ""])
+    def test_unroutable_names_are_rejected_at_validation(self, monkeypatch, name):
+        from memora.storage import DatabaseRegistryError, database_registry
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({name: "/tmp/x.db"}))
+        with pytest.raises(DatabaseRegistryError):
+            database_registry()
+
+    def test_ordinary_names_are_accepted(self, monkeypatch):
+        from memora.storage import database_registry
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "ob1": "/tmp/a.db", "my-db_2.x": "/tmp/b.db"}))
+        assert set(database_registry()) == {"ob1", "my-db_2.x"}
+
+    def test_bare_initialize_then_named_call_uses_the_default(self, monkeypatch, tmp_path):
+        """codex: the most surprising disagreement, and it was unasserted.
+
+        FastMCP creates the long-lived session task while handling INITIALIZE,
+        and AnyIO copies that task's context into it. So a session that
+        initializes on bare /mcp captures CURRENT_DB=None, and a later
+        /mcp/beta call on the same session still executes tools unbound —
+        resolving the registry DEFAULT, not beta. "First session path wins" is
+        the rule; this pins the case where that surprises someone.
+        """
+        first, second = self._run_session(monkeypatch, tmp_path,
+                                          "/mcp", "/mcp/beta", port=8874)
+        assert first == "<unbound>"
+        assert second == "<unbound>", (
+            f"a later /mcp/beta call switched the session to {second!r}; "
+            "the binding became per-request"
+        )
+
+    def test_two_concurrent_sessions_do_not_cross_talk(self, monkeypatch, tmp_path):
+        """Cross-session isolation is the primary safety property here."""
+        import json as _json
+        import threading
+        import time
+        import urllib.request
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", _json.dumps({
+            "alpha": str(tmp_path / "alpha.db"),
+            "beta": str(tmp_path / "beta.db"),
+        }))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        probe = FastMCP("conc-probe", host="127.0.0.1", port=8875)
+
+        @probe.tool()
+        async def which_db() -> str:
+            return CURRENT_DB.get() or "<unbound>"
+
+        app = make_router(probe.streamable_http_app())
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=8875,
+                                               log_level="error"))
+        threading.Thread(target=server.run, daemon=True).start()
+        for _ in range(50):
+            if getattr(server, "started", False):
+                break
+            time.sleep(0.1)
+
+        results = {}
+        ready = threading.Barrier(2, timeout=10)
+
+        def session(db):
+            sid = {"v": None}
+
+            def rpc(method, params, notify=False):
+                body = _json.dumps({"jsonrpc": "2.0", "method": method,
+                                    "params": params,
+                                    **({} if notify else {"id": 1})}).encode()
+                h = {"Content-Type": "application/json",
+                     "Accept": "application/json, text/event-stream"}
+                if sid["v"]:
+                    h["Mcp-Session-Id"] = sid["v"]
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:8875/mcp/{db}", data=body, headers=h)
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    sid["v"] = r.headers.get("Mcp-Session-Id") or sid["v"]
+                    raw = r.read().decode()
+                if notify or not raw.strip():
+                    return None
+                for line in raw.splitlines():
+                    if line.startswith("data: "):
+                        raw = line[6:]
+                        break
+                return _json.loads(raw)
+
+            rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                               "clientInfo": {"name": db, "version": "0"}})
+            rpc("notifications/initialized", {}, notify=True)
+            ready.wait()                       # overlap the tool calls
+            results[db] = rpc("tools/call", {"name": "which_db", "arguments": {}}
+                              )["result"]["content"][0]["text"]
+
+        threads = [threading.Thread(target=session, args=(d,)) for d in ("alpha", "beta")]
+        try:
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=30)
+        finally:
+            server.should_exit = True
+
+        assert results == {"alpha": "alpha", "beta": "beta"}, (
+            f"sessions crossed databases: {results}"
+        )
+
+    def _run_session(self, monkeypatch, tmp_path, first_path, second_path, port):
+        import json as _json
+        import threading
+        import time
+        import urllib.request
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", _json.dumps({
+            "alpha": str(tmp_path / "alpha.db"),
+            "beta": str(tmp_path / "beta.db"),
+        }))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        probe = FastMCP("path-probe", host="127.0.0.1", port=port)
+
+        @probe.tool()
+        async def which_db() -> str:
+            return CURRENT_DB.get() or "<unbound>"
+
+        app = make_router(probe.streamable_http_app())
+        server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port,
+                                               log_level="error"))
+        threading.Thread(target=server.run, daemon=True).start()
+        for _ in range(50):
+            if getattr(server, "started", False):
+                break
+            time.sleep(0.1)
+
+        sid = {"v": None}
+
+        def rpc(path, method, params, notify=False):
+            body = _json.dumps({"jsonrpc": "2.0", "method": method, "params": params,
+                                **({} if notify else {"id": 1})}).encode()
+            h = {"Content-Type": "application/json",
+                 "Accept": "application/json, text/event-stream"}
+            if sid["v"]:
+                h["Mcp-Session-Id"] = sid["v"]
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                         data=body, headers=h)
+            with urllib.request.urlopen(req, timeout=20) as r:
+                sid["v"] = r.headers.get("Mcp-Session-Id") or sid["v"]
+                raw = r.read().decode()
+            if notify or not raw.strip():
+                return None
+            for line in raw.splitlines():
+                if line.startswith("data: "):
+                    raw = line[6:]
+                    break
+            return _json.loads(raw)
+
+        try:
+            rpc(first_path, "initialize", {"protocolVersion": "2024-11-05",
+                                           "capabilities": {},
+                                           "clientInfo": {"name": "t", "version": "0"}})
+            rpc(first_path, "notifications/initialized", {}, notify=True)
+            a = rpc(first_path, "tools/call",
+                    {"name": "which_db", "arguments": {}})["result"]["content"][0]["text"]
+            b = rpc(second_path, "tools/call",
+                    {"name": "which_db", "arguments": {}})["result"]["content"][0]["text"]
+        finally:
+            server.should_exit = True
+        return a, b

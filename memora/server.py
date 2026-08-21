@@ -3376,7 +3376,10 @@ def main(argv: Optional[list[str]] = None) -> None:
                 routed_streamable_http_app(mcp),
                 host=args.host,
                 port=args.port,
-                log_level="warning",
+                # FastMCP's configured level, not a hardcoded one: mcp.run()
+                # uses mcp.settings.log_level and bypassing it silently changes
+                # logging behaviour for multi-database deployments only.
+                log_level=mcp.settings.log_level.lower(),
             )
         else:
             mcp.run(transport=args.transport)

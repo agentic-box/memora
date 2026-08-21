@@ -28,21 +28,42 @@ exists to prevent.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Callable, Optional
 
 from .storage import CURRENT_DB, DatabaseRegistryError, backend_for, default_database_name
 
+logger = logging.getLogger("memora.db_routing")
+
 _MCP_PREFIX = "/mcp"
 
 
+class NotAnMcpPath(Exception):
+    """The path is not under the MCP route at all; delegate it unchanged."""
+
+
 def parse_db_from_path(path: str) -> Optional[str]:
-    """The database name in an /mcp/<db> path, or None for a bare /mcp."""
-    if not path.startswith(_MCP_PREFIX):
+    """The database name in an /mcp/<db> path, or None for a bare /mcp.
+
+    Matches on a PATH-COMPONENT boundary, not a string prefix. "/mcpbeta"
+    prefix-matched to "beta" and "/mcp-other" to "-other", so any URL merely
+    starting with the four characters "/mcp" became an alternate alias for a
+    database route -- bypassing proxy or routing rules written for the
+    canonical path.
+
+    Raises NotAnMcpPath for anything outside the route, and rejects extra
+    segments: /mcp/alpha/anything is not an alias for alpha.
+    """
+    if path == _MCP_PREFIX or path == _MCP_PREFIX + "/":
         return None
-    rest = path[len(_MCP_PREFIX):].strip("/")
+    if not path.startswith(_MCP_PREFIX + "/"):
+        raise NotAnMcpPath(path)
+    rest = path[len(_MCP_PREFIX) + 1:].rstrip("/")
     if not rest:
         return None
-    return rest.split("/", 1)[0]
+    if "/" in rest:
+        raise NotAnMcpPath(path)
+    return rest
 
 
 async def _reject(send: Callable, status: int, message: str) -> None:
@@ -68,7 +89,12 @@ def make_router(inner: Any) -> Callable:
             return
 
         path = scope.get("path", "")
-        name = parse_db_from_path(path)
+        try:
+            name = parse_db_from_path(path)
+        except NotAnMcpPath:
+            # Not our route. Delegate unchanged rather than rewriting it.
+            await inner(scope, receive, send)
+            return
         if name is None:
             # Bare /mcp: the registry default, resolved (and validated) by
             # current_backend(). No binding to set.
@@ -81,7 +107,14 @@ def make_router(inner: Any) -> Callable:
         try:
             backend_for(name)
         except DatabaseRegistryError as exc:
-            await _reject(send, 404, str(exc))
+            # GENERIC body. This router sits OUTSIDE the inner app's auth
+            # middleware, so serialising the exception would let an
+            # unauthenticated caller enumerate database names (the unknown-name
+            # error lists the whole known set) and, for a misconfigured entry,
+            # read URI/account detail out of parse_backend_uri. Details go to
+            # the server log only.
+            logger.warning("rejected MCP request for database %r: %s", name, exc)
+            await _reject(send, 404, "unknown database")
             return
 
         # Rewrite the path so FastMCP's fixed route still matches.
