@@ -11,6 +11,7 @@ import hashlib
 import logging
 import os
 import re
+import threading
 import time
 from typing import Optional
 
@@ -338,7 +339,9 @@ def get_image_storage() -> Optional[R2ImageStorage]:
 _image_storage: Optional[R2ImageStorage] = None
 _image_storage_initialized = False
 # Per-database image storage, so two named s3 backends reach two buckets.
+# Keyed by (name, uri); selection runs on concurrent worker threads.
 _image_storage_by_db: dict = {}
+_image_storage_lock = threading.Lock()
 
 
 def _image_storage_for_uri(storage_uri: str) -> Optional[R2ImageStorage]:
@@ -381,9 +384,17 @@ def get_image_storage_instance() -> Optional[R2ImageStorage]:
         name = effective_database_name()
         if name is None:
             return None
-        if name not in _image_storage_by_db:
-            _image_storage_by_db[name] = _image_storage_for_uri(registry.get(name, ""))
-        return _image_storage_by_db[name]
+        uri = registry.get(name, "")
+        # Keyed by (name, URI), not name alone. backend_for() already rebuilds
+        # when a same-named entry's URI changes; keying only on the name here
+        # meant row connections moved to the new bucket while images kept going
+        # to the OLD one -- wrong placement across a configuration boundary,
+        # the same class as the singleton bug, just slower to appear.
+        key = (name, uri)
+        with _image_storage_lock:
+            if key not in _image_storage_by_db:
+                _image_storage_by_db[key] = _image_storage_for_uri(uri)
+            return _image_storage_by_db[key]
 
     if not _image_storage_initialized:
         _image_storage = get_image_storage()

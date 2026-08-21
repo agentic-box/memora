@@ -189,3 +189,39 @@ class TestPerDatabaseBucketSelection:
             f"wrong buckets selected: {set(built)}"
         )
         mod._image_storage_by_db.clear()
+
+    def test_changing_a_names_uri_reselects_the_bucket(self, monkeypatch):
+        """codex P1: keyed by name alone, images kept going to the OLD bucket.
+
+        backend_for() already rebuilds when a same-named entry's URI changes, so
+        row connections moved to the new bucket while image writes did not --
+        wrong placement across a configuration boundary, the same class as the
+        singleton bug but slower to appear.
+        """
+        import json
+
+        from memora import image_storage as mod
+        from memora import storage
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": "s3://private-a/db"}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        mod._image_storage_by_db.clear()
+
+        built = []
+        monkeypatch.setattr(mod, "_image_storage_for_uri",
+                            lambda uri: built.append(uri) or object())
+
+        with _bind("alpha"):
+            mod.get_image_storage_instance()
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": "s3://private-b/db"}))
+        storage._registry_cache = None
+        storage._registry_source = None
+        with _bind("alpha"):
+            mod.get_image_storage_instance()
+
+        assert built == ["s3://private-a/db", "s3://private-b/db"], (
+            f"images kept going to the old bucket after a URI change: {built}"
+        )
+        mod._image_storage_by_db.clear()
