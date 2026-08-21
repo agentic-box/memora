@@ -372,7 +372,8 @@ def get_image_storage_instance() -> Optional[R2ImageStorage]:
     storage and access-policy boundary, and silently losing image storage
     entirely for named s3 backends when MEMORA_STORAGE_URI is absent.
 
-    Selection is therefore per RESOLVED DATABASE, cached by name. The legacy
+    Selection is therefore per RESOLVED DATABASE, cached by (name, URI) so a
+    registry entry that changes bucket reselects. The legacy
     process-global path is used only when no registry is configured.
     """
     global _image_storage, _image_storage_initialized
