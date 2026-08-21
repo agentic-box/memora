@@ -5,6 +5,7 @@ import base64
 import hashlib
 import io
 import contextvars
+import threading
 import json
 import logging
 import math
@@ -97,6 +98,13 @@ class DatabaseRegistryError(RuntimeError):
 
 _registry_cache: Optional[Dict[str, Any]] = None
 _registry_source: Optional[str] = None
+# connect() now runs on worker threads (#968), so two threads can miss the
+# cache for the same name and each construct a backend. That is not merely
+# wasted work: duplicate D1 backends split the shared latest-bookmark state, so
+# a write through the discarded instance need not advance the one later calls
+# use. Invalidation, lookup, construction and insertion are one critical
+# section.
+_registry_lock = threading.Lock()
 
 # The database bound to the current context. None = use the module default,
 # which is what keeps every existing caller (and every test that monkeypatches
@@ -116,8 +124,20 @@ def database_registry() -> Dict[str, str]:
     raw = os.getenv("MEMORA_DATABASES", "").strip()
     if not raw:
         return {}
+    def _no_duplicate_names(pairs):
+        # {"x":"/a","x":"/b"} parses last-wins by default, which silently picks
+        # ONE store for an ambiguous mapping. Ambiguity must fail closed.
+        seen: set = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise DatabaseRegistryError(
+                    f"MEMORA_DATABASES defines database {key!r} more than once"
+                )
+            seen.add(key)
+        return dict(pairs)
+
     try:
-        parsed = json.loads(raw)
+        parsed = json.loads(raw, object_pairs_hook=_no_duplicate_names)
     except json.JSONDecodeError as exc:
         raise DatabaseRegistryError(f"MEMORA_DATABASES is not valid JSON: {exc}") from exc
     if not isinstance(parsed, dict) or not parsed:
@@ -161,19 +181,21 @@ def backend_for(name: str):
     """
     global _registry_cache, _registry_source
     raw = os.getenv("MEMORA_DATABASES", "").strip()
-    if _registry_cache is None or _registry_source != raw:
-        _registry_cache = {}
-        _registry_source = raw
-    if name in _registry_cache:
-        return _registry_cache[name]
-    registry = database_registry()
-    if name not in registry:
-        raise DatabaseRegistryError(
-            f"unknown database {name!r}; known: {sorted(registry)}"
-        )
-    backend = parse_backend_uri(registry[name])
-    _registry_cache[name] = backend
-    return backend
+    with _registry_lock:
+        if _registry_cache is None or _registry_source != raw:
+            _registry_cache = {}
+            _registry_source = raw
+        cached = _registry_cache.get(name)
+        if cached is not None:
+            return cached
+        registry = database_registry()
+        if name not in registry:
+            raise DatabaseRegistryError(
+                f"unknown database {name!r}; known: {sorted(registry)}"
+            )
+        backend = parse_backend_uri(registry[name])
+        _registry_cache[name] = backend
+        return backend
 
 
 def current_backend():
@@ -186,9 +208,19 @@ def current_backend():
     makes Phase 1 a no-op when no database is bound.
     """
     name = CURRENT_DB.get()
-    if name is None:
-        return STORAGE_BACKEND
-    return backend_for(name)
+    if name is not None:
+        return backend_for(name)
+    # No binding. If a registry is CONFIGURED, resolve its default -- which
+    # validates it. Without this, malformed or ambiguous MEMORA_DATABASES never
+    # reached database_registry() on the connect path at all, so a broken
+    # configuration silently opened the LEGACY database instead of failing.
+    # The documented fail-closed contract has to hold where connections are
+    # actually made, not only where a caller happens to call a helper.
+    if os.getenv("MEMORA_DATABASES", "").strip():
+        default_name = default_database_name()
+        if default_name is not None:
+            return backend_for(default_name)
+    return STORAGE_BACKEND
 
 
 # Embedding backend configuration
