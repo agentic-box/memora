@@ -103,15 +103,26 @@ def _interval_seconds(env: str, default: str, *, cap: float) -> float:
 # alert surface reported "unknown" forever while every database was fine.
 # 0 disables it, for tests and for anyone who wants poll-only behaviour.
 REFRESH_INTERVAL_S = _interval_seconds("MEMORA_HEALTH_REFRESH_INTERVAL", "15", cap=3600)
-if REFRESH_INTERVAL_S and REFRESH_INTERVAL_S >= MAX_STALENESS_S:
-    # A refresher slower than max staleness cannot keep the snapshot usable:
-    # every verdict would age out of evidence before its replacement arrived,
-    # so readiness would report "unknown" on a schedule. Refuse the config
-    # rather than run a refresher that cannot achieve its own purpose.
+if REFRESH_INTERVAL_S and (REFRESH_INTERVAL_S + REFRESH_DEADLINE_S) >= MAX_STALENESS_S:
+    # The interval ALONE proves too little. A replacement verdict does not
+    # arrive when the next cycle starts, it arrives up to a full deadline
+    # later, so the worst case a healthy verdict must survive is
+    # interval + deadline. interval=50/deadline=15/max_stale=60 satisfies
+    # "interval < max_stale" and still ages evidence out before its
+    # replacement can land, reporting "unknown" on a schedule while every
+    # database is fine. Shipped defaults (15 + 15 < 60) are safe.
     raise HealthConfigError(
-        f"MEMORA_HEALTH_REFRESH_INTERVAL ({REFRESH_INTERVAL_S}) must be < "
+        f"MEMORA_HEALTH_REFRESH_INTERVAL ({REFRESH_INTERVAL_S}) + "
+        f"MEMORA_HEALTH_TIMEOUT ({REFRESH_DEADLINE_S}) must be < "
         f"MEMORA_HEALTH_MAX_STALE ({MAX_STALENESS_S})"
     )
+if REFRESH_INTERVAL_S and REFRESH_INTERVAL_S > SNAPSHOT_TTL_S:
+    # Not an error, but stated rather than left to be discovered: between the
+    # TTL and the next cycle a perfectly healthy snapshot reports stale=True
+    # (~5s of every 15s cycle on the defaults). "stale" means "past its
+    # refresh due date", NOT "no longer evidence" -- that is MAX_STALE, and it
+    # is what the routes actually gate on. Raise the TTL to make it rare.
+    pass
 
 _PROCESS_START = time.monotonic()
 
@@ -120,7 +131,11 @@ _logger = __import__("logging").getLogger("memora.health")
 _snapshot: Optional[Dict[str, Any]] = None
 _snapshot_at: float = 0.0
 _refresh_lock = threading.Lock()
-_refreshing = False
+# Ownership of the single refresh slot. A bare boolean could not say WHICH
+# refresh held it: a superseded pass would clear a live pass's flag on its way
+# out and let a third start. 0 means the slot is free.
+_refresh_owner = 0
+_refresh_seq = 0
 # Bumped whenever the refresher is stopped. A refresh pass that began under a
 # superseded generation must NOT publish: cancellation is asynchronous, so an
 # already-running probe can otherwise land after its configuration is gone and
@@ -242,20 +257,28 @@ def _build_snapshot() -> Dict[str, Any]:
     }
 
 
-def _refresh_snapshot() -> None:
-    global _snapshot, _snapshot_at, _refreshing
-    with _refresh_lock:
-        generation = _generation
+def _refresh_snapshot(owner: int, generation: int) -> None:
+    """Run one refresh pass on behalf of a specific claim.
+
+    Both the owner token and the generation are captured when the pass is
+    CLAIMED, never here: this function starts whenever an executor thread
+    picks it up, and a stop between claim and start would otherwise let a
+    superseded pass read the NEW generation and publish anyway.
+    """
+    global _snapshot, _snapshot_at, _refresh_owner
     try:
         built = _build_snapshot()
         with _refresh_lock:
-            if generation == _generation:
+            if owner == _refresh_owner and generation == _generation:
                 _snapshot, _snapshot_at = built, time.monotonic()
             else:
-                _logger.debug("discarding readiness refresh from generation %d", generation)
+                _logger.debug("discarding superseded readiness refresh %d", owner)
     finally:
         with _refresh_lock:
-            _refreshing = False
+            # Only the OWNER may free the slot. Clearing unconditionally let a
+            # stale pass release a newer pass's claim.
+            if _refresh_owner == owner:
+                _refresh_owner = 0
 
 
 async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]:
@@ -266,16 +289,19 @@ async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]
     refresh per TTL forever. An unauthorised request now reads whatever
     snapshot exists and never schedules work.
     """
-    global _refreshing
+    global _refresh_owner, _refresh_seq
     with _refresh_lock:
         snap, age = _snapshot, time.monotonic() - _snapshot_at
         need = snap is None or age > SNAPSHOT_TTL_S
-        start = need and not _refreshing and may_refresh
+        start = need and _refresh_owner == 0 and may_refresh
         if start:
-            _refreshing = True
+            _refresh_seq += 1
+            owner, generation = _refresh_seq, _generation
+            _refresh_owner = owner
 
     if start:
-        task = asyncio.get_running_loop().run_in_executor(None, _refresh_snapshot)
+        task = asyncio.get_running_loop().run_in_executor(
+            None, _refresh_snapshot, owner, generation)
         if snap is None:
             try:
                 await asyncio.wait_for(asyncio.shield(task), REFRESH_DEADLINE_S)
@@ -362,10 +388,37 @@ def ensure_refresher() -> bool:
         # the never-refreshes bug on any loop replacement.
         if task is not None and not task.done() and task.get_loop() is loop:
             return True
+        if task is not None:
+            # Replacing a dead or foreign-loop refresher. Its executor pass may
+            # still be running and would otherwise publish into the snapshot
+            # this loop is about to own, so retire it explicitly.
+            _invalidate_locked()
+            try:
+                task.get_loop().call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass
         # A crashed task is replaced, not inherited: leaving a dead refresher
         # in place would silently restore the never-refreshes bug.
         _refresher_task = loop.create_task(_refresh_periodically())
         return True
+
+
+def _invalidate_locked() -> None:
+    """Retire every in-flight refresh. Caller holds _refresh_lock.
+
+    Bumping the generation fences publication; freeing the slot lets a new
+    owner claim it (the retired pass can no longer publish OR clear, because
+    both checks compare against values it can never match again). _inflight is
+    dropped so a probe started under the OLD configuration is not reused for
+    the new one purely because its database NAME matches -- a permanently hung
+    'alpha' future outliving the config that created it. Abandoned probes hold
+    pool threads until they return; that is bounded by the pool and happens
+    only on stop/replace, never per refresh.
+    """
+    global _generation, _refresh_owner
+    _generation += 1
+    _refresh_owner = 0
+    _inflight.clear()
 
 
 def stop_refresher() -> None:
@@ -377,10 +430,10 @@ def stop_refresher() -> None:
     because a previous server's refresher published verdicts gathered against a
     torn-down configuration.
     """
-    global _refresher_task, _generation
+    global _refresher_task
     with _refresh_lock:
         task, _refresher_task = _refresher_task, None
-        _generation += 1
+        _invalidate_locked()
     if task is None:
         return
     try:
@@ -455,6 +508,11 @@ def register_health_routes(mcp: Any) -> None:
 
     @mcp.custom_route("/health/db/{name}", methods=["GET"])
     async def _health_db_one(request):
+        # The module doc recommends THIS route for workspace-specific probes,
+        # so a deployment may never touch /health or aggregate /health/db. If
+        # it did not start the refresher, such a deployment would sit at 503
+        # unknown forever -- #996 again, on the route built for the job.
+        ensure_refresher()
         name = request.path_params["name"]
         authorised = _is_authorised(request)
 

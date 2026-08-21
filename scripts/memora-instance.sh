@@ -127,8 +127,14 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
   # the bridge host, never loopback -- without a token the detailed readiness
   # body is unreachable and only an aggregate status is served (memora #996).
   local f="$SECRET_DIR/$INSTANCE.health-token"
-  if [ ! -s "$f" ]; then
-    mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
+  mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
+  # Validate on EVERY read, not only at creation: a pre-existing file with a
+  # one-character token, or one left world-readable by an earlier tool, was
+  # previously trusted purely because it was non-empty.
+  if [ -s "$f" ] && LC_ALL=C grep -Eq '^[A-Za-z0-9]{32,}$' "$f"; then
+    chmod 600 "$f"
+  else
+    [ -e "$f" ] && echo "replacing unusable health token at $f" >&2
     LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$f"
     chmod 600 "$f"
   fi
@@ -233,8 +239,13 @@ cmd_status() {
 
 cmd_health() {  # health [name] -- per-database readiness, with detail
   load "$1"
-  local tok; tok="$(health_token)"
-  curl -fsS --max-time 30 -H "Authorization: Bearer $tok" \
+  # The token goes through a 0600 curl config file, never argv: process
+  # arguments are readable by any local process for the life of the call.
+  local cfg; cfg="$(mktemp "${TMPDIR:-/tmp}/memora-health.XXXXXX")"
+  chmod 600 "$cfg"
+  trap 'rm -f "$cfg"' RETURN
+  printf 'header = "Authorization: Bearer %s"\n' "$(health_token)" > "$cfg"
+  curl -fsS --max-time 30 --config "$cfg" \
        "http://127.0.0.1:$PORT/health/db" 2>/dev/null \
     | python3 -c '
 import json, sys

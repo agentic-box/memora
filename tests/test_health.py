@@ -22,7 +22,7 @@ def _reset_health_state():
     """
     health._snapshot = None
     health._snapshot_at = 0.0
-    health._refreshing = False
+    health._refresh_owner = 0
     # The refresher is a module global bound to whichever loop created it.
     # Leaking one between tests made an unrelated readiness test fail 2 runs
     # in 3 -- the same defect production would hit on a loop replacement.
@@ -30,7 +30,7 @@ def _reset_health_state():
     yield
     health._snapshot = None
     health._snapshot_at = 0.0
-    health._refreshing = False
+    health._refresh_owner = 0
     health.stop_refresher()
     health.stop_refresher()
 
@@ -774,33 +774,99 @@ class TestReadinessRefreshesWithoutAnAuthorisedCaller:
         assert snap is not None, "polling /health alone never started the refresher"
         assert set(snap["databases"]) == {"alpha"}
 
-    def test_a_dead_refresher_is_replaced_not_inherited(self, monkeypatch):
-        """A crashed task left in place would silently restore the bug: the
-        flag says "running", nothing refreshes, readiness freezes."""
+    def test_a_refresher_on_a_FOREIGN_loop_is_replaced(self, monkeypatch):
+        """codex P1: the first version of this test built a DONE task on the
+        SAME loop, so `task.done()` alone already forced a replacement and the
+        test passed with the loop-identity check deleted -- it could not
+        attest the property it was named for.
+
+        The real hazard is a task that is ALIVE (never done) on a loop that is
+        no longer serving: `done()` says "running" forever while it can never
+        run again. So build a pending task on loop A, then ask loop B.
+        """
         import asyncio
+        import threading
 
         monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)
+        made = threading.Event()
+        holder = {}
+
+        def loop_a():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def forever():
+                await asyncio.sleep(3600)
+
+            async def build():
+                holder["task"] = loop.create_task(forever())
+                made.set()
+                await asyncio.sleep(2)
+
+            loop.run_until_complete(build())
+            loop.close()
+
+        t = threading.Thread(target=loop_a, daemon=True)
+        t.start()
+        assert made.wait(5)
+        foreign = holder["task"]
+        assert not foreign.done(), "the point of the test is a LIVE foreign task"
 
         async def scenario():
-            async def boom():
-                raise RuntimeError("refresher died")
-
-            dead = asyncio.ensure_future(boom())
-            await asyncio.sleep(0.05)
-            assert dead.done()
-            dead.exception()  # retrieve, so the loop does not warn
-            health._refresher_task = dead
-
+            health._refresher_task = foreign
+            before = health._generation
             assert health.ensure_refresher() is True
             replacement = health._refresher_task
-            assert replacement is not dead
-            assert not replacement.done()
+            assert replacement is not foreign
+            assert replacement.get_loop() is asyncio.get_running_loop()
+            # Replacement must also FENCE the old pass, or loop A's in-flight
+            # refresh could publish into loop B's snapshot.
+            assert health._generation > before
             replacement.cancel()
 
         try:
             asyncio.run(scenario())
         finally:
             health.stop_refresher()
+
+    def test_a_superseded_refresh_cannot_publish_or_free_the_slot(self):
+        """codex P1: _generation had no direct test at all.
+
+        Claim the slot, retire it mid-flight, and assert the retired pass
+        neither writes the snapshot nor releases the claim the new owner holds.
+        """
+        health._snapshot = None
+        health._refresh_owner = 0
+        health._refresh_seq = 0
+
+        with health._refresh_lock:
+            health._refresh_seq += 1
+            owner, generation = health._refresh_seq, health._generation
+            health._refresh_owner = owner
+
+        # Someone stops/replaces the refresher while that pass is in flight.
+        with health._refresh_lock:
+            health._invalidate_locked()
+        # A NEW owner claims the freed slot.
+        with health._refresh_lock:
+            health._refresh_seq += 1
+            new_owner = health._refresh_seq
+            health._refresh_owner = new_owner
+
+        original = health._build_snapshot
+        health._build_snapshot = lambda: {"status": "ok", "databases": {"ghost": {}},
+                                          "degraded": [], "default_database": None}
+        try:
+            health._refresh_snapshot(owner, generation)
+        finally:
+            # RESTORE, never `del`: deleting removed the module's real function
+            # and broke every later test that called it.
+            health._build_snapshot = original
+
+        assert health._snapshot is None, "a superseded pass published its result"
+        assert health._refresh_owner == new_owner, (
+            "a superseded pass released the live owner's claim"
+        )
 
     def test_zero_interval_disables_the_refresher(self, monkeypatch):
         """Poll-only behaviour stays available; it must not start a task."""
@@ -839,8 +905,13 @@ class TestProbeDeadlineClearsARealColdConnect:
             self, monkeypatch, tmp_path):
         import time as _t
 
-        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
-        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        # A DISTINCT database name per test. codex P2: both deadline tests
+        # used "alpha", and _probe_all RETAINS an unfinished future under its
+        # label, so the 2s future left behind here could satisfy the next test
+        # without its own probe ever being submitted -- passing for entirely
+        # the wrong reason.
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"slowdb": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "slowdb")
         storage._registry_cache = None
         storage._registry_source = None
         monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.5)
@@ -850,7 +921,7 @@ class TestProbeDeadlineClearsARealColdConnect:
         payload = health._build_snapshot()
         elapsed = _t.time() - started
 
-        assert payload["databases"]["alpha"]["reason"] == "probe_timeout"
+        assert payload["databases"]["slowdb"]["reason"] == "probe_timeout"
         # The deadline must actually BOUND the call. An earlier version of this
         # module waited on the very probe it had just labelled timed-out.
         assert elapsed < 1.5, f"deadline did not bound the refresh: {elapsed:.2f}s"
@@ -858,17 +929,27 @@ class TestProbeDeadlineClearsARealColdConnect:
     def test_a_probe_inside_the_deadline_is_reported_ok(self, monkeypatch, tmp_path):
         import time as _t
 
-        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
-        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"fastdb": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "fastdb")
         storage._registry_cache = None
         storage._registry_source = None
         monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 2.0)
-        monkeypatch.setattr(health, "_probe_one",
-                            lambda name: (_t.sleep(0.3), {"status": "ok", "latency_ms": 300.0})[1])
+        calls = []
+
+        def probe(name):
+            calls.append(name)
+            _t.sleep(0.3)
+            return {"status": "ok", "latency_ms": 300.0}
+
+        monkeypatch.setattr(health, "_probe_one", probe)
 
         payload = health._build_snapshot()
         assert payload["status"] == "ok"
-        assert payload["databases"]["alpha"]["status"] == "ok"
+        entry = payload["databases"]["fastdb"]
+        assert entry["status"] == "ok"
+        # Prove THIS probe ran, rather than a retained future answering for it.
+        assert calls == ["fastdb"], f"probe was not submitted: {calls}"
+        assert entry["latency_ms"] == 300.0
 
 
 class TestRefreshIntervalConfig:
@@ -899,3 +980,74 @@ class TestRefreshIntervalConfig:
         )
         assert proc.returncode != 0
         assert "MEMORA_HEALTH_REFRESH_INTERVAL" in proc.stderr
+
+
+class TestPerDatabaseRouteAlsoSelfRefreshes:
+    """codex P1: /health and aggregate /health/db started the refresher but
+    /health/db/{name} did not -- and the module doc recommends THAT route for
+    workspace-specific probing. A deployment following the doc, with a remote
+    caller and no watchdog liveness poll, would sit at 503 unknown forever:
+    the #996 failure reproduced on the route built to avoid it."""
+
+    class _RemoteReq:
+        headers = {}
+        client = type("C", (), {"host": "10.0.0.7"})()
+
+        def __init__(self, name):
+            self.path_params = {"name": name}
+
+    def test_polling_only_the_per_database_route_makes_it_go_ready(
+            self, monkeypatch, tmp_path):
+        import asyncio
+
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 0.05)
+
+        app = FastMCP("per-db-probe")
+        health.register_health_routes(app)
+        route = next(r for r in app._custom_starlette_routes
+                     if r.path == "/health/db/{name}")
+
+        async def scenario():
+            for _ in range(100):
+                resp = await route.endpoint(self._RemoteReq("alpha"))
+                if resp.status_code == 200:
+                    return 200
+                await asyncio.sleep(0.05)
+            return resp.status_code
+
+        try:
+            status = asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+        assert status == 200, (
+            "the per-database route never became ready -- nothing refreshed it"
+        )
+
+
+class TestStalenessBudgetIsValidatedAsAWhole:
+    def test_codex_counterexample_interval_50_deadline_15_max_stale_60(self):
+        """Passes "interval < max_stale" yet a replacement verdict cannot land
+        before the previous one stops being evidence, so readiness would report
+        "unknown" on a schedule while every database is healthy."""
+        import subprocess
+        import sys
+
+        env = dict(os.environ)
+        env["MEMORA_HEALTH_MAX_STALE"] = "60"
+        env["MEMORA_HEALTH_REFRESH_INTERVAL"] = "50"
+        env["MEMORA_HEALTH_TIMEOUT"] = "15"
+        env["MEMORA_HEALTH_TTL"] = "10"
+        proc = subprocess.run([sys.executable, "-c", "import memora.health"],
+                              capture_output=True, text=True, env=env)
+        assert proc.returncode != 0, "a self-defeating staleness budget was accepted"
+        assert "MEMORA_HEALTH_REFRESH_INTERVAL" in proc.stderr
+
+    def test_the_shipped_defaults_satisfy_the_whole_budget(self):
+        assert health.REFRESH_INTERVAL_S + health.REFRESH_DEADLINE_S < health.MAX_STALENESS_S
