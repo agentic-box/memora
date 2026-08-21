@@ -132,12 +132,16 @@ def make_router(inner: Any) -> Callable:
 def routed_streamable_http_app(mcp: Any) -> Callable:
     """FastMCP's streamable-http app with database routing in front.
 
-    The pre-session guard (#999) is NOT applied here: it belongs to every
-    streamable-http deployment, routed or not, so server.main() wraps it
-    around whichever app it is about to serve. Layering it here would protect
-    only registry deployments -- the mistake the first fix made.
+    The pre-session guard (#999) sits INSIDE the router, not outside it: the
+    router resolves and validates the database first and rewrites the path to
+    the exact /mcp the guard watches, so a request to an UNKNOWN database is
+    refused before it can consume the guard's admission budget. Wrapping the
+    outside let 120 requests to a nonexistent path block every legitimate
+    workspace for a minute while creating zero sessions.
     """
-    return make_router(mcp.streamable_http_app())
+    from .session_guard import guard_sessions
+
+    return make_router(guard_sessions(mcp.streamable_http_app()))
 
 
 def describe_routes() -> str:

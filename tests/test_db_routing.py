@@ -270,6 +270,34 @@ class TestProductionWiring:
         assert calls["mcp_run"] is False, "unconfigured http bypassed the guard"
         assert calls["uvicorn_app"] is not None
 
+    def test_the_idle_timeout_is_applied_to_the_session_manager(self, monkeypatch, tmp_path):
+        """memora #999 / codex round 3: idle reaping is one of the two controls
+        bounding valid abandoned sessions, and NOTHING asserted it was wired --
+        deleting the wiring left the whole suite green."""
+        server, calls = self._stub(monkeypatch)
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        monkeypatch.setenv("MEMORA_SESSION_IDLE_TIMEOUT", "77")
+        server.mcp.session_manager.session_idle_timeout = None
+
+        server.main(["--transport", "streamable-http"])
+
+        assert calls["uvicorn_app"] is not None
+        assert server.mcp.session_manager.session_idle_timeout == 77.0, (
+            "the idle timeout never reached the session manager"
+        )
+
+    def test_a_zero_idle_timeout_leaves_the_manager_alone(self, monkeypatch, tmp_path):
+        server, calls = self._stub(monkeypatch)
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        monkeypatch.setenv("MEMORA_SESSION_IDLE_TIMEOUT", "0")
+        server.mcp.session_manager.session_idle_timeout = None
+
+        server.main(["--transport", "streamable-http"])
+
+        assert server.mcp.session_manager.session_idle_timeout is None
+
     def test_configured_stdio_stays_on_mcp_run(self, monkeypatch, tmp_path):
         server, calls = self._stub(monkeypatch)
         monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))

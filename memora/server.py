@@ -3392,13 +3392,16 @@ def main(argv: Optional[list[str]] = None) -> None:
             import uvicorn
 
             from .db_routing import describe_routes, routed_streamable_http_app
-            from .session_guard import guard_sessions
+            from .session_guard import guard_sessions, idle_timeout_seconds
 
             if os.getenv("MEMORA_DATABASES", "").strip():
+                # routed_streamable_http_app puts the guard INSIDE the router,
+                # so an unknown database is refused before it can consume the
+                # admission budget.
                 print(f"Serving {describe_routes()}", file=sys.stderr)
                 served = routed_streamable_http_app(mcp)
             else:
-                served = mcp.streamable_http_app()
+                served = guard_sessions(mcp.streamable_http_app())
 
             # Bound abandoned-but-VALID sessions. Body prevalidation cannot
             # help there: a client that handshakes correctly and vanishes
@@ -3406,13 +3409,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             # FastMCP surface and session_idle_timeout a supported knob, so
             # this uses the pinned SDK's own mechanism rather than reaching
             # past it. 0 disables.
-            idle = float(os.getenv("MEMORA_SESSION_IDLE_TIMEOUT", "1800"))
+            idle = idle_timeout_seconds()
             if idle > 0:
                 mcp.session_manager.session_idle_timeout = idle
                 print(f"Session idle timeout: {idle:.0f}s", file=sys.stderr)
 
             uvicorn.run(
-                guard_sessions(served),
+                served,
                 host=args.host,
                 port=args.port,
                 # FastMCP's configured level, not a hardcoded one: mcp.run()
