@@ -34,6 +34,14 @@ class TestLivenessNeverTouchesADatabase:
         from memora import __version__
         assert health.liveness_payload()["version"] == __version__
 
+    def test_uptime_is_monotonic_not_wall_clock(self):
+        """codex P2: pid_uptime_hint was time.time() -- current wall clock, not
+        uptime, and different on every call."""
+        a = health.liveness_payload()["uptime_seconds"]
+        b = health.liveness_payload()["uptime_seconds"]
+        assert 0 <= a < 10 ** 6, f"looks like wall clock: {a}"
+        assert b >= a
+
 
 class TestReadinessIsPerDatabase:
     @pytest.fixture(autouse=True)
@@ -62,6 +70,27 @@ class TestReadinessIsPerDatabase:
         assert set(payload["databases"]) == {"alpha", "beta"}
         assert payload["status"] == "ok"
         assert payload["default_database"] == "alpha"
+
+    def test_probe_does_not_count_rows(self, monkeypatch):
+        """codex: COUNT(*) is costlier AND unnecessary inventory leakage."""
+        seen = []
+        real = storage.connect
+
+        class _Spy:
+            def __init__(self, inner):
+                self._i = inner
+
+            def execute(self, sql, *a, **k):
+                seen.append(sql)
+                return self._i.execute(sql, *a, **k)
+
+            def __getattr__(self, k):
+                return getattr(self._i, k)
+
+        monkeypatch.setattr(storage, "connect", lambda *a, **k: _Spy(real(*a, **k)))
+        health.readiness_payload()
+        assert seen, "no statement issued"
+        assert not any("COUNT" in s.upper() for s in seen), seen
 
     def test_one_broken_database_does_not_hide_the_healthy_ones(self, monkeypatch):
         """The whole point: a slow D1 must show as THAT database degraded."""
@@ -177,16 +206,132 @@ class TestEndpointsOverHttp:
             server.should_exit = True
         assert status == 200 and body["status"] == "ok"
 
-    def test_readiness_route_returns_503_when_a_database_is_down(self, monkeypatch, tmp_path):
-        """A probe reading only the status CODE must still learn the truth."""
+    def test_aggregate_readiness_is_200_even_when_degraded(self, monkeypatch, tmp_path):
+        """codex P1: a 503 here makes a load balancer withdraw the WHOLE
+        process because one store is degraded, taking healthy databases down
+        with the broken one -- the exact blast radius the split exists to
+        avoid. Aggregate /health/db is an ALERT surface, always 200."""
         server = self._serve(monkeypatch, tmp_path, 8882, break_beta=True)
         try:
             live_status, _ = self._get(8882, "/health")
-            ready_status, body = self._get(8882, "/health/db")
+            agg_status, body = self._get(8882, "/health/db")
         finally:
             server.should_exit = True
 
         assert live_status == 200, "a down database made the server look dead"
-        assert ready_status == 503
+        assert agg_status == 200, "aggregate readiness withdrew the whole process"
+        assert body["status"] == "degraded"
         assert body["degraded"] == ["beta"]
         assert body["databases"]["alpha"]["status"] == "ok"
+
+    def test_per_database_readiness_does_503(self, monkeypatch, tmp_path):
+        """Withdrawing on THIS affects only the workspaces bound to beta."""
+        server = self._serve(monkeypatch, tmp_path, 8883, break_beta=True)
+        try:
+            ok_status, _ = self._get(8883, "/health/db/alpha")
+            bad_status, _ = self._get(8883, "/health/db/beta")
+            missing_status, _ = self._get(8883, "/health/db/nosuch")
+        finally:
+            server.should_exit = True
+
+        assert ok_status == 200
+        assert bad_status == 503
+        assert missing_status == 404
+
+    def test_unauthorised_caller_gets_no_names_counts_or_messages(self, monkeypatch, tmp_path):
+        """codex P0: custom_route() is unauthenticated even when MCP auth is
+        configured. Names, counts and backend exception text are inventory and
+        configuration -- the same boundary Phase 2 fixed for the 404 body.
+
+        Drives the ROUTE with a non-loopback peer. The first version of this
+        test called health._redact() directly, so removing the authorisation
+        branch from the route left it GREEN -- it tested the redactor, not the
+        decision to use it.
+        """
+        import asyncio
+
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "alpha": str(tmp_path / "alpha.db"), "beta": str(tmp_path / "beta.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        health._snapshot = None
+        health._snapshot_at = 0.0
+
+        app = FastMCP("redact-probe")
+        health.register_health_routes(app)
+        route = next(r for r in app._custom_starlette_routes if r.path == "/health/db")
+
+        class _RemoteReq:
+            headers = {}
+            client = type("C", (), {"host": "10.0.0.7"})()
+
+        resp = asyncio.run(route.endpoint(_RemoteReq()))
+        blob = resp.body.decode()
+
+        assert "alpha" not in blob and "beta" not in blob, f"leaked names: {blob}"
+        assert "latency_ms" not in blob, f"leaked per-store detail: {blob}"
+        assert "\"status\"" in blob
+
+    def test_loopback_is_authorised_and_a_remote_peer_is_not(self):
+        class _Req:
+            def __init__(self, host):
+                self.headers = {}
+                self.client = type("C", (), {"host": host})()
+
+        assert health._is_authorised(_Req("127.0.0.1"))
+        assert not health._is_authorised(_Req("10.0.0.7"))
+
+    def test_bearer_token_authorises_a_remote_peer(self, monkeypatch):
+        monkeypatch.setenv("MEMORA_HEALTH_TOKEN", "s3cret")
+
+        class _Req:
+            def __init__(self, header):
+                self.headers = {"authorization": header}
+                self.client = type("C", (), {"host": "10.0.0.7"})()
+
+        assert health._is_authorised(_Req("Bearer s3cret"))
+        assert not health._is_authorised(_Req("Bearer wrong"))
+
+
+class TestProductionRegistration:
+    """codex P1: deleting the block from server.main() left all 10 tests green.
+
+    Same integration gap Phase 2 fixed — and the same one that let #969's
+    discovery bug survive a full review.
+    """
+
+    def _stub(self, monkeypatch):
+        from memora import server
+
+        registered = []
+        monkeypatch.setattr(server, "start_graph_server", lambda *a, **k: None)
+        monkeypatch.setattr(server, "connect", lambda *a, **k: type("C", (), {"close": lambda s: None})())
+        monkeypatch.setattr(server.mcp, "run", lambda *a, **k: None)
+        import uvicorn
+        monkeypatch.setattr(uvicorn, "run", lambda app, **k: None)
+        import memora.health as h
+        monkeypatch.setattr(h, "register_health_routes",
+                            lambda mcp: registered.append(mcp))
+        return server, registered
+
+    def test_streamable_http_registers_health_routes(self, monkeypatch):
+        server, registered = self._stub(monkeypatch)
+        monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+        server.main(["--transport", "streamable-http"])
+        assert registered, "health routes were never registered in production"
+
+    def test_sse_registers_health_routes(self, monkeypatch):
+        server, registered = self._stub(monkeypatch)
+        monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+        server.main(["--transport", "sse"])
+        assert registered
+
+    def test_stdio_does_not_register_them(self, monkeypatch):
+        server, registered = self._stub(monkeypatch)
+        monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+        server.main(["--transport", "stdio"])
+        assert registered == [], "stdio has no HTTP surface to register on"
