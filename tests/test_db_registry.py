@@ -341,3 +341,43 @@ class TestStartupRefusesBadRegistry:
 
         server.main([])
         assert "mcp.run" in calls, f"a transient failure must not abort startup: {calls}"
+
+
+class TestUnusableRegisteredBackendIsConfiguration:
+    """codex P2: valid registry JSON can still name an unusable backend.
+
+    parse_backend_uri raises ValueError for invalid d1:// syntax, a missing
+    Cloudflare token, or a malformed s3:// URI. As ValueError those hit main()'s
+    generic prewarm handler and the server started anyway.
+    """
+
+    def test_invalid_d1_uri_is_a_registry_error(self, monkeypatch):
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"x": "d1://broken"}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "x")
+        with pytest.raises(DatabaseRegistryError) as exc:
+            backend_for("x")
+        assert "x" in str(exc.value)
+
+    def test_missing_d1_credentials_is_a_registry_error(self, monkeypatch):
+        monkeypatch.delenv("CLOUDFLARE_API_TOKEN", raising=False)
+        monkeypatch.delenv("CF_API_TOKEN", raising=False)
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"x": "d1://acct/db"}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "x")
+        with pytest.raises(DatabaseRegistryError):
+            backend_for("x")
+
+    def test_unusable_backend_aborts_startup_before_side_effects(self, monkeypatch):
+        from memora import server
+
+        calls = []
+        monkeypatch.setattr(server, "start_graph_server",
+                            lambda *a, **k: calls.append("start_graph_server"))
+        monkeypatch.setattr(server.mcp, "run", lambda *a, **k: calls.append("mcp.run"))
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"x": "d1://broken"}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "x")
+        monkeypatch.setenv("MEMORA_TRANSPORT", "stdio")
+
+        with pytest.raises(SystemExit) as exc:
+            server.main([])
+        assert exc.value.code == 2
+        assert calls == [], f"side effects ran before the abort: {calls}"

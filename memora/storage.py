@@ -195,7 +195,20 @@ def backend_for(name: str):
             raise DatabaseRegistryError(
                 f"unknown database {name!r}; known: {sorted(registry)}"
             )
-        backend = parse_backend_uri(registry[name])
+        try:
+            backend = parse_backend_uri(registry[name])
+        except ValueError as exc:
+            # parse_backend_uri raises ValueError for CONFIGURATION problems --
+            # invalid d1:// syntax, a missing CLOUDFLARE_API_TOKEN, a malformed
+            # s3:// URI. Left as ValueError those reach main()'s generic prewarm
+            # handler, which warns and starts the server anyway, so an unusable
+            # registry entry still leaves a running server whose storage tools
+            # fail on every call. Translate at the registry boundary, naming the
+            # database, rather than making every prewarm ValueError fatal --
+            # that would misclassify operational failures as configuration ones.
+            raise DatabaseRegistryError(
+                f"database {name!r} is misconfigured: {exc}"
+            ) from exc
         _registry_cache[name] = backend
         return backend
 
