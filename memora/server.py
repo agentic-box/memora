@@ -28,6 +28,7 @@ from .storage import (
     _redact_secrets,
     absorb_memory,
     add_link,
+    bound_database,
     add_memories,
     add_memory,
     boost_memory,
@@ -2404,9 +2405,17 @@ async def memory_rebuild_crossrefs() -> Dict[str, Any]:
 
 @mcp.tool()
 async def memory_stats() -> Dict[str, Any]:
-    """Get statistics and analytics about stored memories."""
+    """Get statistics and analytics about stored memories.
 
-    return await _get_statistics()
+    Also reports WHICH DATABASE this session is bound to (memora #997). A
+    valid-but-wrong database name in a workspace's .mcp.json is otherwise
+    undetectable: every tool works, reads succeed, and writes land silently in
+    another project's store. Reporting the bound identity is what makes that
+    drift visible to an agent or an operator at all.
+    """
+    stats = await _get_statistics()
+    stats.update(bound_database())
+    return stats
 
 
 @mcp.tool()

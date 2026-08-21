@@ -250,6 +250,29 @@ def effective_database_name() -> Optional[str]:
     return None
 
 
+def bound_database() -> dict:
+    """How this session resolved its database, for identity assertion (#997).
+
+    `database` is the name the caller is ACTUALLY bound to, which is the whole
+    point: a workspace pointed at the wrong-but-valid name gets that name back,
+    so the mismatch with what it expected becomes visible. `database_source`
+    says HOW it was chosen, because "I asked for ob1" and "I said nothing and
+    got the default" are different facts and only the first is an assertion the
+    caller can make.
+
+    Deliberately reports only the CALLER'S OWN database. It must never
+    enumerate the others -- see #985 (name enumeration) and #996, where the
+    health surface redacts names from unauthorised callers. Telling a caller
+    the name it already spelled in its own URL leaks nothing.
+    """
+    explicit = CURRENT_DB.get()
+    if explicit is not None:
+        return {"database": explicit, "database_source": "path"}
+    if os.getenv("MEMORA_DATABASES", "").strip():
+        return {"database": default_database_name(), "database_source": "registry_default"}
+    return {"database": None, "database_source": "unconfigured"}
+
+
 def current_backend():
     """The backend this call should use.
 
