@@ -39,6 +39,7 @@ DEFAULT_CRED_SOURCE="${CRED_SOURCE:-$HOME/.config/memora/credentials.mcp.json}"
 # Per-instance health tokens live beside the credentials they are peers of,
 # never in the repo and never in an instance .env (those are readable config).
 SECRET_DIR="${MEMORA_SECRET_DIR:-$HOME/.config/memora}"
+TOKEN_LEN=48                                   # exact health-token length
 [ -f "$DEFAULT_CRED_SOURCE" ] || DEFAULT_CRED_SOURCE="$HOME/repos/agentic-box/.mcp.json"
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
@@ -72,13 +73,13 @@ load() {  # load instances/<name>.env into INSTANCE/PORT/STORAGE_URI/VOLUME
   # sharing one credential file would silently switch cloud backup ON for
   # stores that never had it. Reset it every load so one instance cannot
   # inherit the previous one's source during `status all`.
-  INSTANCE=""; PORT=""; STORAGE_URI=""; VOLUME=""; CONTAINER=""; IMAGE=""; CRED_SOURCE=""; MEMORY=""; CPUS=""; TOOL_PROFILE=""
+  INSTANCE=""; PORT=""; STORAGE_URI=""; VOLUME=""; CONTAINER=""; IMAGE=""; CRED_SOURCE=""; MEMORY=""; CPUS=""; TOOL_PROFILE=""; MEMORA_DATABASES=""; MEMORA_DEFAULT_DB=""
   # shellcheck disable=SC1090
   set -a; . "$f"; set +a
   VOLUME="${VOLUME/#\$HOME/$HOME}"
   [ -n "$INSTANCE" ] || die "$f: INSTANCE missing"
   [ -n "$PORT" ]     || die "$f: PORT missing"
-  [ -n "$STORAGE_URI" ] || [ -n "$VOLUME" ] || die "$f: needs STORAGE_URI or VOLUME"
+  [ -n "$STORAGE_URI" ] || [ -n "$VOLUME" ] || [ -n "$MEMORA_DATABASES" ] || die "$f: needs STORAGE_URI, VOLUME or MEMORA_DATABASES"
   # CONTAINER may be set by the config to adopt a container created elsewhere.
   CONTAINER="${CONTAINER:-memora-$INSTANCE}"
   # A config may pin its own image tag so rebuilding for one instance cannot
@@ -128,15 +129,32 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
   # body is unreachable and only an aggregate status is served (memora #996).
   local f="$SECRET_DIR/$INSTANCE.health-token"
   mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
-  # Validate on EVERY read, not only at creation: a pre-existing file with a
-  # one-character token, or one left world-readable by an earlier tool, was
-  # previously trusted purely because it was non-empty.
-  if [ -s "$f" ] && LC_ALL=C grep -Eq '^[A-Za-z0-9]{32,}$' "$f"; then
+
+  # WHOLE-FILE validation, on EVERY read rather than only at creation. A
+  # line-based check accepts a good first line followed by anything at all,
+  # and command substitution keeps the embedded newlines -- which would then
+  # be written straight into curl's config file. Require exactly TOKEN_LEN
+  # alphanumerics and nothing else, no trailing newline.
+  local valid=0
+  if [ -f "$f" ] && [ "$(wc -c <"$f")" -eq "$TOKEN_LEN" ]; then
+    if [ "$(LC_ALL=C tr -d 'A-Za-z0-9' <"$f" | wc -c | tr -d ' ')" -eq 0 ]; then
+      valid=1
+    fi
+  fi
+
+  if [ "$valid" -eq 1 ]; then
     chmod 600 "$f"
   else
-    [ -e "$f" ] && echo "replacing unusable health token at $f" >&2
-    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 > "$f"
-    chmod 600 "$f"
+    if [ -e "$f" ]; then echo "replacing unusable health token at $f" >&2; fi
+    # Temp file + rename: a reader must never see a half-written token, and a
+    # crash must not leave one behind. The subshell drops pipefail because
+    # `head -c` closing the pipe SIGPIPEs `tr`, which would otherwise abort
+    # the whole script under `set -euo pipefail`.
+    local tmp; tmp="$(mktemp "$SECRET_DIR/.token.XXXXXX")"
+    chmod 600 "$tmp"
+    ( set +o pipefail
+      LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$TOKEN_LEN" ) > "$tmp"
+    mv -f "$tmp" "$f"
   fi
   cat "$f"
 }
@@ -149,7 +167,11 @@ cmd_up() {
   args+=(-e "MEMORA_HEALTH_TOKEN=$(health_token)")
   args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
   args+=(-e "MEMORA_HEALTH_REFRESH_INTERVAL=${MEMORA_HEALTH_REFRESH_INTERVAL:-15}")
-  if [ -n "$STORAGE_URI" ]; then
+  # A multi-database instance carries a REGISTRY instead of one storage URI;
+  # it is what makes a single container serve every workspace by URL path.
+  if [ -n "${MEMORA_DATABASES:-}" ]; then
+    args+=(-e "MEMORA_DATABASES=$MEMORA_DATABASES" -e "MEMORA_DEFAULT_DB=${MEMORA_DEFAULT_DB:-}")
+  elif [ -n "$STORAGE_URI" ]; then
     # CLOUDFLARE_API_TOKEN comes through cred_args with everything else.
     args+=(-e "MEMORA_STORAGE_URI=$STORAGE_URI")
   else
@@ -275,10 +297,20 @@ cmd_config() {
   echo "resources     memory=$MEMORY cpus=$CPUS"
   echo "tool profile  $TOOL_PROFILE"
   echo "proxy port    $PORT  (http://127.0.0.1:$PORT/mcp)"
-  [ -n "$STORAGE_URI" ] && echo "storage       $STORAGE_URI" || echo "storage       sqlite $VOLUME"
+  if [ -n "$MEMORA_DATABASES" ]; then
+    echo "storage       registry: $(python3 -c "import json,sys;print(', '.join(sorted(json.loads(sys.argv[1]))))" "$MEMORA_DATABASES") (default=$MEMORA_DEFAULT_DB)"
+  elif [ -n "$STORAGE_URI" ]; then
+    echo "storage       $STORAGE_URI"
+  else
+    echo "storage       sqlite $VOLUME"
+  fi
   echo "credentials   $CRED_SOURCE (read at run time, never baked in)"
   echo "launchd label $LABEL"
 }
+
+# Sourceable: `source memora-instance.sh` exposes the functions without
+# running the dispatcher, which is what lets the token logic be tested.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 0 2>/dev/null || true; fi
 
 case "${1:-}" in
   build)  cmd_build "${2:-}" ;;

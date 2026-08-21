@@ -837,8 +837,9 @@ class TestReadinessRefreshesWithoutAnAuthorisedCaller:
         """
         health._snapshot = None
         health._refresh_owner = 0
-        health._refresh_seq = 0
-
+        # Do NOT reset _refresh_seq: production relies on owner tokens never
+        # repeating, and reusing an integer an abandoned pass still holds
+        # would let it clear this test's claim.
         with health._refresh_lock:
             health._refresh_seq += 1
             owner, generation = health._refresh_seq, health._generation
@@ -1051,3 +1052,82 @@ class TestStalenessBudgetIsValidatedAsAWhole:
 
     def test_the_shipped_defaults_satisfy_the_whole_budget(self):
         assert health.REFRESH_INTERVAL_S + health.REFRESH_DEADLINE_S < health.MAX_STALENESS_S
+
+
+class TestRetiredEvidenceCannotBeServed:
+    """codex P1 (round 2): _invalidate_locked fenced future publication but
+    left the retired generation's snapshot marked fresh. A replacing loop
+    would find it younger than the TTL, decide no refresh was needed, and
+    serve the dead app's verdicts -- so a database that broke as part of the
+    configuration change could keep answering 200 for a full TTL."""
+
+    class _RemoteReq:
+        headers = {}
+        client = type("C", (), {"host": "10.0.0.7"})()
+
+        def __init__(self, name):
+            self.path_params = {"name": name}
+
+    def test_a_replaced_refresher_cannot_serve_its_predecessors_verdict(
+            self, monkeypatch, tmp_path):
+        import asyncio
+        import threading
+        import time as _t
+
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_INTERVAL_S", 3600)  # no cycle interferes
+
+        app = FastMCP("retired-evidence")
+        health.register_health_routes(app)
+        route = next(r for r in app._custom_starlette_routes
+                     if r.path == "/health/db/{name}")
+
+        # Generation A published "alpha is fine", moments ago.
+        health._snapshot = {"status": "ok", "version": "x", "default_database": "alpha",
+                            "degraded": [], "databases": {"alpha": {"status": "ok"}}}
+        health._snapshot_at = _t.monotonic()
+
+        # alpha is in fact broken now -- the config changed underneath.
+        monkeypatch.setattr(health, "_probe_one",
+                            lambda name: {"status": "error", "error": "RuntimeError"})
+
+        # A live refresher on a foreign loop, so ensure_refresher REPLACES it.
+        made = threading.Event()
+        holder = {}
+
+        def loop_a():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            async def forever():
+                await asyncio.sleep(3600)
+
+            async def build():
+                holder["task"] = loop.create_task(forever())
+                made.set()
+                await asyncio.sleep(2)
+
+            loop.run_until_complete(build())
+            loop.close()
+
+        threading.Thread(target=loop_a, daemon=True).start()
+        assert made.wait(5)
+        health._refresher_task = holder["task"]
+
+        async def scenario():
+            resp = await route.endpoint(self._RemoteReq("alpha"))
+            return resp.status_code
+
+        try:
+            status = asyncio.run(scenario())
+        finally:
+            health.stop_refresher()
+
+        assert status == 503, (
+            "served the retired generation's alpha=ok after replacement"
+        )

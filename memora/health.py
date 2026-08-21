@@ -275,9 +275,11 @@ def _refresh_snapshot(owner: int, generation: int) -> None:
                 _logger.debug("discarding superseded readiness refresh %d", owner)
     finally:
         with _refresh_lock:
-            # Only the OWNER may free the slot. Clearing unconditionally let a
-            # stale pass release a newer pass's claim.
-            if _refresh_owner == owner:
+            # Only the OWNER of the CURRENT generation may free the slot.
+            # Checking the owner alone would rely entirely on tokens never
+            # repeating; including the generation makes the fence hold even
+            # if a token value is ever reused.
+            if _refresh_owner == owner and generation == _generation:
                 _refresh_owner = 0
 
 
@@ -300,8 +302,18 @@ async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]
             _refresh_owner = owner
 
     if start:
-        task = asyncio.get_running_loop().run_in_executor(
-            None, _refresh_snapshot, owner, generation)
+        try:
+            task = asyncio.get_running_loop().run_in_executor(
+                None, _refresh_snapshot, owner, generation)
+        except RuntimeError:
+            # The executor refused the job (loop/executor shutting down), so
+            # _refresh_snapshot will never run and can never release the claim
+            # in its finally. Without this the slot stays occupied forever and
+            # no refresh is ever scheduled again.
+            with _refresh_lock:
+                if _refresh_owner == owner and generation == _generation:
+                    _refresh_owner = 0
+            raise
         if snap is None:
             try:
                 await asyncio.wait_for(asyncio.shield(task), REFRESH_DEADLINE_S)
@@ -415,10 +427,18 @@ def _invalidate_locked() -> None:
     pool threads until they return; that is bounded by the pool and happens
     only on stop/replace, never per refresh.
     """
-    global _generation, _refresh_owner
+    global _generation, _refresh_owner, _snapshot, _snapshot_at
     _generation += 1
     _refresh_owner = 0
     _inflight.clear()
+    # Fencing future PUBLICATION is not enough: the retired generation's
+    # snapshot is still sitting there marked fresh. A new loop would find it
+    # younger than the TTL, decide it needs no refresh, and serve the retired
+    # app's verdicts -- so a database that broke as part of the very
+    # configuration change that caused this invalidation could keep answering
+    # 200 for a full TTL. The evidence dies with the generation that gathered it.
+    _snapshot = None
+    _snapshot_at = 0.0
 
 
 def stop_refresher() -> None:
