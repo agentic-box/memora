@@ -72,9 +72,18 @@ MAX_INIT_PER_MIN = _int_env("MEMORA_MAX_INIT_PER_MIN", "120", minimum=0)
 # every one of them alive with cheap rejected requests -- about two per second
 # for a thousand sessions -- and grow without limit at the creation rate. Only
 # a ceiling checked before allocation actually bounds it. 0 disables.
-MAX_SESSIONS = _int_env("MEMORA_MAX_SESSIONS", "512", minimum=0)
+MAX_SESSIONS = _int_env("MEMORA_MAX_SESSIONS", "128", minimum=0)
 
-_admissions: list[float] = []
+# Admissions are request-SCOPED tokens, not bare timestamps. Popping "the
+# newest" refunded whichever request happened to be last, which under
+# concurrency is not the one being refunded.
+_admissions: list[tuple[float, int]] = []
+_admission_seq = 0
+# Capacity reserved by requests that have passed the ceiling check but whose
+# session does not exist yet. Without it the check is a read followed by an
+# await, and N concurrent initializes all observe the same pre-burst count and
+# all allocate -- codex reproduced exactly that with cap=1 and two requests.
+_pending = 0
 
 
 def _now() -> float:
@@ -82,42 +91,57 @@ def _now() -> float:
     return time.monotonic()
 
 
-def _admit() -> bool:
-    """Sliding one-minute window over ADMITTED initializations.
+def _admit():
+    """Charge one slot in the sliding one-minute window; return its token.
+
+    Returns None when the window is full. The token identifies THIS request's
+    charge so it can be refunded specifically.
 
     Charged only once a request is fully eligible to reach the manager --
     never for one the router or path check is about to refuse. Charging
     earlier let 120 requests to an unknown path exhaust the window and block
     every legitimate workspace for 60s while creating zero sessions.
     """
+    global _admission_seq
     if MAX_INIT_PER_MIN <= 0:
-        return True
+        return _UNLIMITED
     now = _now()
     cutoff = now - 60.0
-    while _admissions and _admissions[0] < cutoff:
+    while _admissions and _admissions[0][0] < cutoff:
         _admissions.pop(0)
     if len(_admissions) >= MAX_INIT_PER_MIN:
-        return False
-    _admissions.append(now)
-    return True
+        return None
+    _admission_seq += 1
+    token = (now, _admission_seq)
+    _admissions.append(token)
+    return token
+
+
+_UNLIMITED = (0.0, -1)   # sentinel: nothing was charged, nothing to refund
 
 
 def _reset_admissions() -> None:
-    """Test seam: the window is process-global, so tests must clear it."""
+    """Test seam: the window and reservations are process-global."""
+    global _pending
     _admissions.clear()
+    _pending = 0
 
 
-def _refund() -> None:
-    """Give back a slot charged for a request that produced no session.
+def _refund(token) -> None:
+    """Give back the slot THIS request charged.
 
     Downstream can still refuse after the guard -- authentication being the
     important case -- and those refusals must not consume the budget that
-    authorised clients need. Charging optimistically and refunding on "no
-    session appeared" covers every such rejection without the guard needing to
-    know what they are.
+    authorised clients need. The token is removed by identity: refunding "the
+    most recent admission" gave back somebody else's slot whenever two
+    requests overlapped.
     """
-    if _admissions:
-        _admissions.pop()
+    if token is _UNLIMITED or token is None:
+        return
+    try:
+        _admissions.remove(token)
+    except ValueError:
+        pass  # already aged out of the window
 
 
 async def _respond(send: Callable, status: int, message: str) -> None:
@@ -292,27 +316,65 @@ def guard_sessions(inner: Any, *, session_count: Callable | None = None,
         if not _is_initialize(body):
             await _respond(send, 400, "expected an initialize request")
             return
-        # HARD CEILING before anything is allocated. This is the only check
-        # that actually bounds retained sessions; the rate below merely paces
-        # them.
-        if MAX_SESSIONS > 0 and session_count is not None and session_count() >= MAX_SESSIONS:
-            logger.warning("refusing initialize: %d sessions already open", session_count())
-            await _respond(send, 503, "session capacity reached")
-            return
+        # HARD CEILING, RESERVED ATOMICALLY. Everything from the read of
+        # session_count() to the increment of _pending runs with no await, so
+        # concurrent initializes cannot all observe the same pre-burst count.
+        # The SDK's own _session_creation_lock is taken far too late to help:
+        # every request has already passed this point by then.
+        global _pending
+        reserved = False
+        if MAX_SESSIONS > 0 and session_count is not None:
+            if session_count() + _pending >= MAX_SESSIONS:
+                logger.warning("refusing initialize: %d sessions open, %d pending",
+                               session_count(), _pending)
+                await _respond(send, 503, "session capacity reached")
+                return
+            _pending += 1
+            reserved = True
 
-        # Charged LAST: only a request that is fully eligible to reach the
-        # session manager consumes capacity.
-        if not _admit():
-            logger.warning("refusing initialize: more than %d per minute", MAX_INIT_PER_MIN)
-            await _respond(send, 429, "too many new sessions")
-            return
+        try:
+            # Charged after the ceiling: only a request that is fully eligible
+            # to reach the session manager consumes rate capacity.
+            token = _admit()
+            if token is None:
+                logger.warning("refusing initialize: more than %d per minute",
+                               MAX_INIT_PER_MIN)
+                await _respond(send, 429, "too many new sessions")
+                return
 
-        before = session_count() if session_count is not None else None
-        await inner(scope, replay, send)
-        if before is not None and session_count() <= before:
-            # Something downstream refused it -- authentication, most likely --
-            # so no session was created and the slot must go back.
-            _refund()
+            # Attribute the outcome to THIS request rather than to a global
+            # count delta: a delta cannot tell "my session" from "someone
+            # else's, created meanwhile". The SDK stamps mcp-session-id on the
+            # initialize response, so the response itself is the evidence.
+            established = False
+
+            async def watch(message):
+                nonlocal established, reserved
+                global _pending
+                if message["type"] == "http.response.start":
+                    status = message.get("status", 0)
+                    headers = message.get("headers", ()) or ()
+                    has_id = any(k.lower() == _SESSION_HEADER for k, _ in headers)
+                    established = 200 <= status < 300 and has_id
+                    if established and reserved:
+                        # Release the RESERVATION as soon as the session is
+                        # real. inner() does not return until the initialize
+                        # SSE stream closes, which can be the whole life of
+                        # the session -- holding the reservation that long
+                        # would count the same session twice and shrink
+                        # capacity for everyone else.
+                        _pending -= 1
+                        reserved = False
+                await send(message)
+
+            await inner(scope, replay, watch)
+            if not established:
+                # Refused downstream -- authentication, most likely -- so no
+                # session exists and the slot goes back.
+                _refund(token)
+        finally:
+            if reserved:
+                _pending -= 1
 
     return app
 
@@ -330,8 +392,17 @@ def session_wiring(mcp: Any) -> dict:
 
     manager = mcp.session_manager
     settings = getattr(mcp.settings, "transport_security", None)
+    def live_sessions() -> int:
+        # Count only LIVE transports. On DELETE the SDK calls terminate() and
+        # its cleanup deletes the map entry only when the transport is NOT
+        # terminated, so a cleanly closed session stays in the map forever --
+        # counting len() would let ordinary clients drive the service to a
+        # permanent 503. Idle reaping is different: that path pops first.
+        return sum(1 for t in manager._server_instances.values()
+                   if not getattr(t, "is_terminated", False))
+
     return {
-        "session_count": lambda: len(manager._server_instances),
+        "session_count": live_sessions,
         "security": TransportSecurityMiddleware(settings),
     }
 

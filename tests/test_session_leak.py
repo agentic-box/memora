@@ -222,7 +222,11 @@ class TestAdmissionBound:
 
         async def inner(scope, receive, send):
             reached.append(1)
-            await send({"type": "http.response.start", "status": 200, "headers": []})
+            # Must carry mcp-session-id: the guard now attributes the outcome
+            # from the response, and a 200 without it means "no session was
+            # created", which is correctly refunded.
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"mcp-session-id", b"stub")]})
             await send({"type": "http.response.body", "body": b""})
 
         monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 5)
@@ -241,16 +245,18 @@ class TestAdmissionBound:
     def test_the_bound_can_be_disabled(self, monkeypatch):
         monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 0)
         session_guard._reset_admissions()
-        assert all(session_guard._admit() for _ in range(500))
+        assert all(session_guard._admit() is not None for _ in range(500))
 
     def test_the_window_slides_rather_than_latching(self, monkeypatch):
         """A bound that never releases would be an outage after one burst."""
         monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 3)
         session_guard._reset_admissions()
-        assert [session_guard._admit() for _ in range(4)] == [True, True, True, False]
+        # _admit returns a request-scoped TOKEN now, or None when full
+        assert [session_guard._admit() is not None for _ in range(4)] == [True, True, True, False]
         # age the recorded admissions past the window instead of sleeping 60s
-        session_guard._admissions[:] = [t - 61 for t in session_guard._admissions]
-        assert session_guard._admit() is True, "the window latched shut"
+        # admissions are (timestamp, sequence) tokens now
+        session_guard._admissions[:] = [(t - 61, n) for t, n in session_guard._admissions]
+        assert session_guard._admit() is not None, "the window latched shut"
 
 
 class TestHeaderPrevalidation:
@@ -603,17 +609,13 @@ class TestHardSessionCeiling:
         assert _post(port, "/mcp", INITIALIZE) == 503
         assert _sessions(mcp) == 3, "keepalives bought new session capacity"
 
-    def test_capacity_returns_when_a_session_goes_away(self, capped):
-        """A ceiling that never releases would be an outage after one burst."""
-        mcp, port = capped
-        for _ in range(3):
-            assert _post(port, "/mcp", INITIALIZE) == 200
-        assert _post(port, "/mcp", INITIALIZE) == 503
-
-        victim = next(iter(mcp.session_manager._server_instances))
-        mcp.session_manager._server_instances.pop(victim)
-
-        assert _post(port, "/mcp", INITIALIZE) == 200, "capacity never came back"
+    # test_capacity_returns_when_a_session_goes_away was REMOVED, not fixed.
+    # It popped mcp.session_manager._server_instances by hand, which codex
+    # correctly called out as hiding the real behaviour: an actual DELETE
+    # terminates the transport and the SDK then leaves the entry in the map,
+    # so the hand-popped version passed while ordinary clients could still
+    # wedge the server at 503. TestDeleteReturnsCapacityForReal covers this
+    # with a real DELETE against a real manager.
 
     def test_a_zero_ceiling_disables_the_cap(self, capped, monkeypatch):
         mcp, port = capped
@@ -690,3 +692,202 @@ class TestAdmissionIsRefundedWhenNoSessionResults:
         # is gone after two and everything later is 429 instead of 401.
         codes = [asyncio.run(drive()) for _ in range(10)]
         assert codes == [401] * 10, f"the budget was consumed by refusals: {codes}"
+
+
+class TestTheCeilingHoldsUnderConcurrency:
+    """codex round 5 P0, reproduced by them with cap=1 and two requests: the
+    ceiling read session_count() and then AWAITED before anything was
+    reserved, so N simultaneous initializes all saw the same pre-burst count
+    and all allocated. A serial test cannot catch this."""
+
+    def test_a_concurrent_burst_cannot_exceed_the_ceiling(self, monkeypatch, tmp_path):
+        import asyncio
+
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 1)
+        monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 0)
+        session_guard._reset_admissions()
+
+        created = {"n": 0}
+        start = None
+
+        async def slow_inner(scope, receive, send):
+            # Allocation is not instantaneous in the SDK either; the await is
+            # exactly the window the unreserved check left open.
+            await asyncio.sleep(0.05)
+            created["n"] += 1
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"mcp-session-id", b"x")]})
+            await send({"type": "http.response.body", "body": b""})
+
+        app = session_guard.guard_sessions(slow_inner,
+                                           session_count=lambda: created["n"])
+        body = json.dumps(INITIALIZE).encode()
+
+        async def one():
+            sent = []
+            done = {"v": False}
+
+            async def receive():
+                if not done["v"]:
+                    done["v"] = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(msg):
+                sent.append(msg)
+
+            await start.wait()
+            scope = {"type": "http", "method": "POST", "path": "/mcp",
+                     "headers": [(b"content-type", b"application/json"),
+                                 (b"accept", b"application/json, text/event-stream")]}
+            await app(scope, receive, send)
+            return next(m["status"] for m in sent if m["type"] == "http.response.start")
+
+        async def burst():
+            nonlocal start
+            start = asyncio.Event()
+            tasks = [asyncio.create_task(one()) for _ in range(8)]
+            await asyncio.sleep(0.05)
+            start.set()                      # release them together
+            return await asyncio.gather(*tasks)
+
+        codes = asyncio.run(burst())
+        assert codes.count(200) == 1, f"the ceiling was exceeded by a burst: {codes}"
+        assert created["n"] == 1, f"{created['n']} sessions created against a cap of 1"
+        assert session_guard._pending == 0, "a reservation leaked"
+
+
+class TestDeleteReturnsCapacityForReal:
+    """codex round 5 P1: the earlier capacity test popped the private map by
+    hand, which hid the actual behaviour. On DELETE the SDK terminates the
+    transport but the manager only deletes the map entry when it is NOT
+    terminated -- so a cleanly closed session was counted forever and ordinary
+    clients could drive the service to a permanent 503."""
+
+    @pytest.fixture
+    def capped(self, monkeypatch, tmp_path):
+        import socket
+        import threading
+        import time as _t
+
+        import uvicorn
+        from mcp.server.fastmcp import FastMCP
+
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        session_guard._reset_admissions()
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 1)
+
+        mcp = FastMCP("delete-probe")
+        app = session_guard.guard_sessions(mcp.streamable_http_app(),
+                                           **session_guard.session_wiring(mcp))
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        srv = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
+        threading.Thread(target=srv.run, daemon=True).start()
+        for _ in range(80):
+            if getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+        yield mcp, port
+        srv.should_exit = True
+        for _ in range(50):
+            if not getattr(srv, "started", False):
+                break
+            _t.sleep(0.1)
+
+    def test_an_explicit_DELETE_frees_a_slot(self, capped):
+        import time as _t
+
+        mcp, port = capped
+        assert _post(port, "/mcp", INITIALIZE) == 200
+        sid = next(iter(mcp.session_manager._server_instances))
+        assert _post(port, "/mcp", INITIALIZE) == 503, "the ceiling did not engage"
+
+        assert _request(port, "/mcp", method="DELETE",
+                        headers={"mcp-session-id": sid}) in (200, 204)
+
+        for _ in range(40):
+            if _post(port, "/mcp", INITIALIZE) == 200:
+                return
+            _t.sleep(0.1)
+        pytest.fail("DELETE never returned capacity; clients can wedge the server at 503")
+
+
+class TestRefundIsAttributedToTheRightRequest:
+    """codex round 5 P1: refunding by count delta credited whoever happened to
+    finish, and popping 'the newest admission' refunded somebody else's slot.
+    Under concurrency a refused request could keep its charge while a
+    successful one gave its own back."""
+
+    def test_concurrent_success_and_refusal_each_settle_correctly(self, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(session_guard, "MAX_SESSIONS", 0)
+        monkeypatch.setattr(session_guard, "MAX_INIT_PER_MIN", 50)
+        session_guard._reset_admissions()
+
+        async def mixed_inner(scope, receive, send):
+            # odd requests succeed with a session, even ones are refused
+            n = scope["headers"][-1][1]
+            if n == b"ok":
+                await asyncio.sleep(0.02)
+                await send({"type": "http.response.start", "status": 200,
+                            "headers": [(b"mcp-session-id", b"s")]})
+            else:
+                await asyncio.sleep(0.01)
+                await send({"type": "http.response.start", "status": 401, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        charged = {"ok": [], "no": []}
+        real_admit = session_guard._admit
+        current = {"kind": None}
+
+        def recording_admit():
+            token = real_admit()
+            if token is not None:
+                charged[current["kind"]].append(token)
+            return token
+
+        monkeypatch.setattr(session_guard, "_admit", recording_admit)
+
+        app = session_guard.guard_sessions(mixed_inner)
+        body = json.dumps(INITIALIZE).encode()
+
+        async def one(kind):
+            done = {"v": False}
+
+            async def receive():
+                if not done["v"]:
+                    done["v"] = True
+                    return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.disconnect"}
+
+            async def send(msg):
+                pass
+
+            scope = {"type": "http", "method": "POST", "path": "/mcp",
+                     "headers": [(b"content-type", b"application/json"),
+                                 (b"accept", b"application/json, text/event-stream"),
+                                 (b"x-kind", kind)]}
+            current["kind"] = "ok" if kind == b"ok" else "no"
+            await app(scope, receive, send)
+
+        async def run():
+            kinds = [b"ok" if i % 2 else b"no" for i in range(20)]
+            await asyncio.gather(*(one(k) for k in kinds))
+
+        asyncio.run(run())
+        # COUNTING IS NOT ENOUGH: refunding "the newest admission" also leaves
+        # exactly 10 entries, so a count assertion passes with the attribution
+        # bug fully present -- it did, under mutation. The surviving tokens
+        # must be the ones the SUCCESSFUL requests charged.
+        assert len(session_guard._admissions) == 10, (
+            f"charges settled wrong: {len(session_guard._admissions)} held, expected 10"
+        )
+        assert set(session_guard._admissions) == set(charged["ok"]), (
+            "the wrong requests' slots survived: refunds were not attributable"
+        )
+        assert not (set(session_guard._admissions) & set(charged["no"])), (
+            "a refused request kept its charge"
+        )
