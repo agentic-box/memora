@@ -12,6 +12,22 @@ from memora import health, storage
 from memora.storage import CURRENT_DB
 
 
+@pytest.fixture(autouse=True)
+def _reset_health_state():
+    """codex P1: module-global snapshot leaked BETWEEN tests and servers.
+
+    Without this, the per-database 503 test could inherit the preceding
+    degraded-beta snapshot and pass without probing its own server at all.
+    """
+    health._snapshot = None
+    health._snapshot_at = 0.0
+    health._refreshing = False
+    yield
+    health._snapshot = None
+    health._snapshot_at = 0.0
+    health._refreshing = False
+
+
 class TestLivenessNeverTouchesADatabase:
     """Collapsing liveness into readiness makes a supervisor restart a healthy
     process because one remote store is slow — and a restart takes memory from
@@ -335,3 +351,206 @@ class TestProductionRegistration:
         monkeypatch.delenv("MEMORA_DATABASES", raising=False)
         server.main(["--transport", "stdio"])
         assert registered == [], "stdio has no HTTP surface to register on"
+
+
+class TestAsyncPropertiesActuallyHold:
+    """codex P1: none of the earlier tests exercised TTL, single-flight,
+    timeout, event-loop responsiveness or max staleness — the properties the
+    module's docstring claims."""
+
+    def test_one_hung_store_does_not_hide_a_healthy_one(self, monkeypatch, tmp_path):
+        """The core claim. Sequential probing made a hung alpha hide beta."""
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
+            "alpha": str(tmp_path / "a.db"), "beta": str(tmp_path / "b.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 0.5)
+
+        real = storage.connect
+
+        def selective(*a, **k):
+            if CURRENT_DB.get() == "alpha":
+                _t.sleep(5)          # hangs well past the deadline
+            return real(*a, **k)
+
+        monkeypatch.setattr(storage, "connect", selective)
+        payload = health.readiness_payload()
+
+        assert payload["databases"]["beta"]["status"] == "ok", (
+            f"a hung alpha hid beta: {payload['databases']}"
+        )
+        assert payload["databases"]["alpha"]["status"] == "unknown"
+        assert payload["databases"]["alpha"]["reason"] == "probe_timeout"
+
+    def test_simultaneous_callers_trigger_one_refresh(self, monkeypatch, tmp_path):
+        import asyncio
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        builds = []
+        monkeypatch.setattr(health, "_build_snapshot",
+                            lambda: builds.append(1) or {"status": "ok", "databases": {},
+                                                         "degraded": [], "default_database": "a"})
+
+        async def main():
+            await asyncio.gather(*[health.readiness_payload_async() for _ in range(5)])
+
+        asyncio.run(main())
+        assert len(builds) == 1, f"single-flight broken: {len(builds)} refreshes"
+
+    def test_unauthorised_caller_never_triggers_a_refresh(self, monkeypatch, tmp_path):
+        """Single-flight caps concurrency; it does not stop an anonymous
+        caller forcing one N-database fanout per TTL forever."""
+        import asyncio
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        builds = []
+        monkeypatch.setattr(health, "_build_snapshot", lambda: builds.append(1) or {})
+
+        asyncio.run(health.readiness_payload_async(may_refresh=False))
+        assert builds == [], "an unauthorised caller triggered a probe fanout"
+
+    def test_a_stale_snapshot_is_never_reported_ready(self, monkeypatch):
+        import asyncio
+        import time as _t
+
+        health._snapshot = {"status": "ok", "databases": {"a": {"status": "ok"}},
+                            "degraded": [], "default_database": "a"}
+        health._snapshot_at = _t.monotonic() - (health.MAX_STALENESS_S + 10)
+        payload = asyncio.run(health.readiness_payload_async(may_refresh=False))
+        assert payload["too_stale"] is True
+        assert payload["status"] == "unknown", (
+            "a cached OK past max staleness was still reported ready"
+        )
+
+    def test_probing_does_not_block_the_event_loop(self, monkeypatch, tmp_path):
+        """A sleeping probe must not stop other coroutines running."""
+        import asyncio
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+        storage._registry_cache = None
+        storage._registry_source = None
+        monkeypatch.setattr(health, "REFRESH_DEADLINE_S", 2.0)
+        monkeypatch.setattr(health, "_build_snapshot",
+                            lambda: _t.sleep(0.6) or {"status": "ok", "databases": {},
+                                                      "degraded": [], "default_database": "a"})
+
+        ticks = []
+
+        async def heartbeat():
+            for _ in range(5):
+                ticks.append(1)
+                await asyncio.sleep(0.05)
+
+        async def main():
+            await asyncio.gather(health.readiness_payload_async(), heartbeat())
+
+        asyncio.run(main())
+        assert len(ticks) == 5, f"the event loop stalled during probing: {ticks}"
+
+
+class TestConfigValidation:
+    @pytest.mark.parametrize("value", ["0", "-5", "notanumber", "1e9", ""])
+    def test_bad_ttl_fails_closed(self, monkeypatch, value):
+        """A zero or negative TTL makes every request trigger a refresh —
+        the unbounded fanout this design removes.
+
+        Tests the validator directly rather than reloading the module:
+        importlib.reload leaves `health` half-initialised when the raise fires,
+        which broke every LATER test in the file. A test must not damage the
+        module it is checking.
+        """
+        monkeypatch.setenv("MEMORA_HEALTH_TTL", value)
+        if value == "":
+            # empty falls back to the default and must be valid
+            assert health._positive_seconds("MEMORA_HEALTH_TTL", "10", cap=3600) == 10
+            return
+        with pytest.raises(health.HealthConfigError):
+            health._positive_seconds("MEMORA_HEALTH_TTL", "10", cap=3600)
+
+    def test_malformed_bearer_is_refused_not_a_500(self, monkeypatch):
+        monkeypatch.setenv("MEMORA_HEALTH_TOKEN", "s3cret")
+
+        class _Req:
+            headers = {"authorization": "Bearer ÿþ"}
+            client = type("C", (), {"host": "10.0.0.7"})()
+
+        assert health._is_authorised(_Req()) is False
+
+
+class TestPerDatabaseRouteHonoursStaleness:
+    """The payload-level staleness test did NOT red when the ROUTE's staleness
+    check was removed — it tested the payload, not the decision that uses it.
+    Third instance of that pattern in this phase, so it gets its own test."""
+
+    def _route(self, name):
+        from mcp.server.fastmcp import FastMCP
+
+        app = FastMCP("stale-probe")
+        health.register_health_routes(app)
+        return next(r for r in app._custom_starlette_routes
+                    if r.path == "/health/db/{name}")
+
+    class _Req:
+        def __init__(self, name):
+            self.headers = {}
+            self.path_params = {"name": name}
+            self.client = type("C", (), {"host": "127.0.0.1"})()
+
+    def test_a_stale_healthy_entry_returns_503_not_200(self, monkeypatch, tmp_path):
+        import asyncio
+        import time as _t
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+
+        health._snapshot = {"status": "ok", "default_database": "alpha", "degraded": [],
+                            "databases": {"alpha": {"status": "ok"}}}
+        health._snapshot_at = _t.monotonic() - (health.MAX_STALENESS_S + 10)
+        # may_refresh False so the stale snapshot is what the route sees
+        monkeypatch.setattr(health, "readiness_payload_async",
+                            health.readiness_payload_async)
+
+        route = self._route("alpha")
+        with monkeypatch.context() as m:
+            m.setattr(health, "_is_authorised", lambda r: False)
+            resp = asyncio.run(route.endpoint(self._Req("alpha")))
+        assert resp.status_code == 503, (
+            "a formerly healthy store stayed 200 forever behind a hung refresh"
+        )
+
+    def test_a_configured_but_unproven_name_is_503_not_404(self, monkeypatch, tmp_path):
+        """404 must mean NOT CONFIGURED. Conflating it with 'not yet probed'
+        tells an operator the database does not exist."""
+        import asyncio
+
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"alpha": str(tmp_path / "a.db")}))
+        monkeypatch.setenv("MEMORA_DEFAULT_DB", "alpha")
+        storage._registry_cache = None
+        storage._registry_source = None
+        health._snapshot = {"status": "unknown", "databases": {}, "degraded": [],
+                            "default_database": "alpha"}
+        health._snapshot_at = 0.0
+
+        route = self._route("alpha")
+        with monkeypatch.context() as m:
+            m.setattr(health, "_is_authorised", lambda r: False)
+            known = asyncio.run(route.endpoint(self._Req("alpha")))
+            missing = asyncio.run(route.endpoint(self._Req("nosuch")))
+        assert known.status_code == 503
+        assert missing.status_code == 404

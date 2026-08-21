@@ -51,11 +51,29 @@ from .storage import (
     default_database_name,
 )
 
+class HealthConfigError(RuntimeError):
+    """Health tuning is unusable. Raised at import; never silently defaulted."""
+
+
+def _positive_seconds(env: str, default: str, *, cap: float) -> float:
+    raw = os.getenv(env, default).strip() or default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise HealthConfigError(f"{env}={raw!r} is not a number") from exc
+    if not (value > 0) or value != value or value in (float("inf"),) or value > cap:
+        # Zero or negative TTL would make every request trigger a refresh,
+        # turning the endpoint back into the unbounded fanout it was.
+        raise HealthConfigError(f"{env}={raw!r} must be > 0 and <= {cap}")
+    return value
+
+
 # How long a readiness snapshot may be served before a refresh is triggered.
-SNAPSHOT_TTL_S = float(os.getenv("MEMORA_HEALTH_TTL", "10"))
-# Overall bound on one refresh pass. Cannot cancel blocked I/O; it bounds how
-# long a CALLER waits, while single-flight bounds how much work exists.
-REFRESH_DEADLINE_S = float(os.getenv("MEMORA_HEALTH_TIMEOUT", "5"))
+SNAPSHOT_TTL_S = _positive_seconds("MEMORA_HEALTH_TTL", "10", cap=3600)
+# Bound on one refresh pass and on each individual store probe.
+REFRESH_DEADLINE_S = _positive_seconds("MEMORA_HEALTH_TIMEOUT", "5", cap=300)
+# Beyond this age a cached per-database result may no longer be reported READY.
+MAX_STALENESS_S = _positive_seconds("MEMORA_HEALTH_MAX_STALE", "60", cap=3600)
 
 _PROCESS_START = time.monotonic()
 
@@ -106,6 +124,40 @@ def _probe_one(name: Optional[str]) -> Dict[str, Any]:
             CURRENT_DB.reset(token)
 
 
+def _probe_all(names) -> Dict[str, Dict[str, Any]]:
+    """Probe every store CONCURRENTLY with a per-store deadline.
+
+    Sequential probing meant a hung alpha hid beta entirely -- the exact
+    property this endpoint claims. Each store gets its own future and its own
+    deadline, and a store that does not answer in time is published as
+    unknown/timeout while the finished ones stay visible.
+
+    A timeout cannot cancel blocked I/O, so the executor is bounded and the
+    caller never waits on the stuck future again; it is left to finish and be
+    discarded rather than resubmitted indefinitely.
+    """
+    from concurrent.futures import ThreadPoolExecutor, wait
+
+    out: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(names)))) as pool:
+        futures = {pool.submit(_probe_one, n): (n or "(default)") for n in names}
+        done, not_done = wait(futures, timeout=REFRESH_DEADLINE_S)
+        for fut in done:
+            label = futures[fut]
+            try:
+                out[label] = fut.result()
+            except Exception as exc:  # pragma: no cover - _probe_one catches
+                out[label] = {"status": "error", "error": type(exc).__name__}
+        for fut in not_done:
+            out[futures[fut]] = {
+                "status": "unknown",
+                "reason": "probe_timeout",
+                "latency_ms": round(REFRESH_DEADLINE_S * 1000, 1),
+            }
+            fut.cancel()
+    return out
+
+
 def _build_snapshot() -> Dict[str, Any]:
     try:
         registry = database_registry()
@@ -114,7 +166,7 @@ def _build_snapshot() -> Dict[str, Any]:
         return {"status": "error", "message": str(exc), "databases": {}, "default_database": None}
 
     names = sorted(registry) if registry else [None]
-    result = {(n or "(default)"): _probe_one(n) for n in names}
+    result = _probe_all(names)
     degraded = [n for n, r in result.items() if r["status"] != "ok"]
     return {
         "status": "degraded" if degraded else "ok",
@@ -136,33 +188,42 @@ def _refresh_snapshot() -> None:
             _refreshing = False
 
 
-async def readiness_payload_async() -> Dict[str, Any]:
-    """Cached, single-flight readiness. Never blocks the event loop."""
+async def readiness_payload_async(*, may_refresh: bool = True) -> Dict[str, Any]:
+    """Cached, single-flight readiness. Never blocks the event loop.
+
+    `may_refresh=False` for unauthorised callers: single-flight caps
+    CONCURRENCY but an anonymous caller could still force one N-database
+    refresh per TTL forever. An unauthorised request now reads whatever
+    snapshot exists and never schedules work.
+    """
     global _refreshing
     with _refresh_lock:
         snap, age = _snapshot, time.monotonic() - _snapshot_at
         need = snap is None or age > SNAPSHOT_TTL_S
-        start = need and not _refreshing
+        start = need and not _refreshing and may_refresh
         if start:
             _refreshing = True
 
     if start:
         task = asyncio.get_running_loop().run_in_executor(None, _refresh_snapshot)
         if snap is None:
-            # No snapshot at all: a caller must wait, but only up to the
-            # deadline. Past it they are told so rather than hanging.
             try:
                 await asyncio.wait_for(asyncio.shield(task), REFRESH_DEADLINE_S)
             except asyncio.TimeoutError:
-                return {"status": "unknown", "reason": "probe_timeout", "databases": {}}
+                pass  # fall through and report what exists, if anything
 
     with _refresh_lock:
         snap, age = _snapshot, time.monotonic() - _snapshot_at
     if snap is None:
-        return {"status": "unknown", "reason": "probing", "databases": {}}
+        return {"status": "unknown", "reason": "probing", "databases": {},
+                "default_database": None, "degraded": []}
     out = dict(snap)
     out["age_seconds"] = round(age, 1)
     out["stale"] = age > SNAPSHOT_TTL_S
+    out["too_stale"] = age > MAX_STALENESS_S
+    if out["too_stale"]:
+        # Beyond max staleness the cached verdicts are not evidence any more.
+        out["status"] = "unknown"
     return out
 
 
@@ -175,10 +236,17 @@ def _is_authorised(request: Any) -> bool:
     """Detail is privileged: a shared secret, or a loopback peer."""
     token = os.getenv("MEMORA_HEALTH_TOKEN", "")
     if token:
-        header = request.headers.get("authorization", "")
+        header = request.headers.get("authorization", "") or ""
         prefix = "Bearer "
-        if header.startswith(prefix) and hmac.compare_digest(header[len(prefix):], token):
-            return True
+        if header.startswith(prefix):
+            presented = header[len(prefix):]
+            try:
+                # compare_digest RAISES on non-ASCII str operands; a malformed
+                # header must be a refusal, not a 500.
+                if hmac.compare_digest(presented.encode("utf-8"), token.encode("utf-8")):
+                    return True
+            except (TypeError, UnicodeError):
+                return False
     client = getattr(request, "client", None)
     host = getattr(client, "host", None)
     if not host:
@@ -212,10 +280,11 @@ def register_health_routes(mcp: Any) -> None:
 
     @mcp.custom_route("/health/db", methods=["GET"])
     async def _health_db(request):
-        payload = await readiness_payload_async()
+        authorised = _is_authorised(request)
+        payload = await readiness_payload_async(may_refresh=authorised)
         if payload.get("status") == "degraded":
             logger.warning("readiness degraded: %s", payload.get("degraded"))
-        if not _is_authorised(request):
+        if not authorised:
             return JSONResponse(_redact(payload))
         # ALWAYS 200. This is an alert surface: a 503 here would make a load
         # balancer withdraw the whole process because ONE store is degraded,
@@ -225,12 +294,32 @@ def register_health_routes(mcp: Any) -> None:
     @mcp.custom_route("/health/db/{name}", methods=["GET"])
     async def _health_db_one(request):
         name = request.path_params["name"]
-        payload = await readiness_payload_async()
+        authorised = _is_authorised(request)
+
+        # 404 is reserved for a name that is NOT CONFIGURED. A configured name
+        # with no fresh result is "known but unproven" -- 503, not 404.
+        try:
+            registry = database_registry()
+        except DatabaseRegistryError:
+            registry = {}
+        known = name in registry or (not registry and name == "(default)")
+
+        payload = await readiness_payload_async(may_refresh=authorised)
         entry = payload.get("databases", {}).get(name)
+
         if entry is None:
-            return JSONResponse({"status": "unknown"}, status_code=404)
-        ok = entry.get("status") == "ok"
-        # Per-database readiness MAY 503: withdrawing on this affects only the
-        # workspaces bound to this database.
-        body = {"status": entry.get("status")} if not _is_authorised(request) else entry
+            if not known:
+                return JSONResponse({"status": "unknown"}, status_code=404)
+            body = {"status": "unknown", "reason": payload.get("reason", "unproven")}
+            return JSONResponse(body, status_code=503)
+
+        # A cached OK past max staleness is no longer evidence: a hung refresh
+        # would otherwise keep a dead store reporting 200 forever.
+        ok = entry.get("status") == "ok" and not payload.get("too_stale")
+        if authorised:
+            body = dict(entry)
+            body["stale"] = bool(payload.get("stale"))
+            body["age_seconds"] = payload.get("age_seconds")
+        else:
+            body = {"status": entry.get("status") if ok else "unknown"}
         return JSONResponse(body, status_code=200 if ok else 503)
