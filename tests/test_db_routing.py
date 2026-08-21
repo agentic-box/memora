@@ -253,14 +253,22 @@ class TestProductionWiring:
         assert calls["uvicorn_app"] is not None, "routed app was never served"
         assert calls["mcp_run"] is False, "fell through to mcp.run; routing is inert"
 
-    def test_unconfigured_http_stays_on_mcp_run(self, monkeypatch):
+    def test_unconfigured_http_is_ALSO_served_by_us_so_the_guard_applies(self, monkeypatch):
+        """Changed deliberately for #999. This previously asserted that an
+        unconfigured deployment stays on mcp.run() -- which was true, and was
+        the bug: mcp.run() mounts the app with no place to put the
+        pre-session guard, so a single-database server stayed trivially
+        exhaustible by unauthenticated requests while the registry
+        deployment was protected. Both paths are now served by uvicorn behind
+        the guard; only the ROUTER is conditional on a registry.
+        """
         server, calls = self._stub(monkeypatch)
         monkeypatch.delenv("MEMORA_DATABASES", raising=False)
         # MEMORA_TRANSPORT is read at MODULE IMPORT into DEFAULT_TRANSPORT, so
         # setting it here would not reach args.transport. Pass it explicitly.
         server.main(["--transport", "streamable-http"])
-        assert calls["mcp_run"] is True
-        assert calls["uvicorn_app"] is None
+        assert calls["mcp_run"] is False, "unconfigured http bypassed the guard"
+        assert calls["uvicorn_app"] is not None
 
     def test_configured_stdio_stays_on_mcp_run(self, monkeypatch, tmp_path):
         server, calls = self._stub(monkeypatch)

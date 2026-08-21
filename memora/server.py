@@ -3381,17 +3381,38 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             register_health_routes(mcp)
 
-        if args.transport == "streamable-http" and os.getenv("MEMORA_DATABASES", "").strip():
-            # Multi-database mode: serve FastMCP's streamable-http app behind
-            # the /mcp/<db> router (memora #965 phase 2). mcp.run() would mount
-            # the app directly and there would be no place to bind CURRENT_DB.
+        if args.transport == "streamable-http":
+            # Serve streamable-http ourselves rather than via mcp.run(), for
+            # BOTH single-database and registry deployments. Two reasons:
+            # the /mcp/<db> router needs a place to bind CURRENT_DB (#965
+            # phase 2), and the pre-session guard (#999) must protect every
+            # streamable-http deployment -- an earlier fix wrapped only the
+            # routed app, leaving a plain single-store server just as
+            # exhaustible by unauthenticated requests.
             import uvicorn
 
             from .db_routing import describe_routes, routed_streamable_http_app
+            from .session_guard import guard_sessions
 
-            print(f"Serving {describe_routes()}", file=sys.stderr)
+            if os.getenv("MEMORA_DATABASES", "").strip():
+                print(f"Serving {describe_routes()}", file=sys.stderr)
+                served = routed_streamable_http_app(mcp)
+            else:
+                served = mcp.streamable_http_app()
+
+            # Bound abandoned-but-VALID sessions. Body prevalidation cannot
+            # help there: a client that handshakes correctly and vanishes
+            # leaves a session behind forever. session_manager is a public
+            # FastMCP surface and session_idle_timeout a supported knob, so
+            # this uses the pinned SDK's own mechanism rather than reaching
+            # past it. 0 disables.
+            idle = float(os.getenv("MEMORA_SESSION_IDLE_TIMEOUT", "1800"))
+            if idle > 0:
+                mcp.session_manager.session_idle_timeout = idle
+                print(f"Session idle timeout: {idle:.0f}s", file=sys.stderr)
+
             uvicorn.run(
-                routed_streamable_http_app(mcp),
+                guard_sessions(served),
                 host=args.host,
                 port=args.port,
                 # FastMCP's configured level, not a hardcoded one: mcp.run()
