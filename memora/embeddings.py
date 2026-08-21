@@ -839,7 +839,13 @@ def _store_cache_key(conn: sqlite3.Connection) -> str:
     # fallback below for unit/admin callers.
     try:
         from . import storage
-        backend = storage.STORAGE_BACKEND
+        # current_backend(), NOT the module attribute: under a bound session
+        # (memora #965) two databases would otherwise key from the SAME legacy
+        # backend, so equal epochs could reuse another database's cached
+        # integrity result. current_backend() still falls back to
+        # STORAGE_BACKEND when nothing is bound, so monkeypatching it in tests
+        # keeps working.
+        backend = storage.current_backend()
         path = getattr(backend, "db_path", None) or getattr(backend, "cache_path", None)
         if path is not None:
             return f"backend:{type(backend).__name__}:{path}"

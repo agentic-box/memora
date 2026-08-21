@@ -24,6 +24,7 @@ from .hierarchy import (
     suggest_hierarchy_from_similar,
 )
 from .storage import (
+    DatabaseRegistryError,
     _redact_secrets,
     absorb_memory,
     add_link,
@@ -3323,7 +3324,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             conn = connect()
             conn.close()
             print("Database ready.", file=sys.stderr)
+        except DatabaseRegistryError as e:
+            # CONFIGURATION is fatal, unlike a transient connect failure. A
+            # malformed or ambiguous MEMORA_DATABASES must not leave a server
+            # running whose storage tools fail on every call -- and it must not
+            # reach start_graph_server or mcp.run first. Same rule, and same
+            # reason, as an unknown MEMORA_TOOL_PROFILE.
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
         except Exception as e:
+            # A transient backend failure keeps the legacy warn-and-continue
+            # behaviour: the server is still useful once the backend recovers.
             logger.warning("Database pre-warm failed: %s", e)
             print(f"Warning: Database pre-warm failed: {e}", file=sys.stderr)
 

@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import contextvars
+import threading
 import json
 import logging
 import math
@@ -75,6 +77,171 @@ else:
         DB_PATH = Path.home() / ".local" / "share" / "memora" / "memories.db"
     from .backends import LocalSQLiteBackend
     STORAGE_BACKEND = LocalSQLiteBackend(DB_PATH)
+
+
+# --- named database registry (memora #965 phase 1) --------------------------
+# A memora process has always been bound to ONE database because the line above
+# resolves a backend at MODULE IMPORT. This adds a NAMED REGISTRY and a
+# per-context override so one process can hold several. Phase 1 wires the
+# plumbing ONLY -- nothing selects a database yet, and with MEMORA_DATABASES
+# unset the behaviour is byte-for-byte what it was.
+#
+# MEMORA_DATABASES='{"memora":"d1://acct/id","ob1":"d1://acct/id2","scratch":"/data/s.db"}'
+# MEMORA_DEFAULT_DB=memora
+#
+# Backend-agnostic by construction: parse_backend_uri dispatches on the URI
+# scheme, so a registry may mix local paths, d1:// and s3:// freely.
+
+class DatabaseRegistryError(RuntimeError):
+    """Registry configuration is unusable. Raised at startup, never swallowed."""
+
+
+_registry_cache: Optional[Dict[str, Any]] = None
+_registry_source: Optional[str] = None
+# connect() now runs on worker threads (#968), so two threads can miss the
+# cache for the same name and each construct a backend. That is not merely
+# wasted work: duplicate D1 backends split the shared latest-bookmark state, so
+# a write through the discarded instance need not advance the one later calls
+# use. Invalidation, lookup, construction and insertion are one critical
+# section.
+_registry_lock = threading.Lock()
+
+# The database bound to the current context. None means "no explicit binding":
+# with a registry CONFIGURED that resolves to the registry's default, and with
+# no registry it falls back to the module-level STORAGE_BACKEND -- which is what
+# keeps every existing caller (and every test that monkeypatches
+# STORAGE_BACKEND) working unchanged.
+CURRENT_DB: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "memora_current_db", default=None
+)
+
+
+def database_registry() -> Dict[str, str]:
+    """Parse MEMORA_DATABASES into {name: uri}. Empty when unset.
+
+    Fails CLOSED on malformed configuration rather than falling back to a
+    single database: a typo that silently routes every workspace into one
+    store is the worst outcome this feature can have.
+    """
+    raw = os.getenv("MEMORA_DATABASES", "").strip()
+    if not raw:
+        return {}
+    def _no_duplicate_names(pairs):
+        # {"x":"/a","x":"/b"} parses last-wins by default, which silently picks
+        # ONE store for an ambiguous mapping. Ambiguity must fail closed.
+        seen: set = set()
+        for key, _ in pairs:
+            if key in seen:
+                raise DatabaseRegistryError(
+                    f"MEMORA_DATABASES defines database {key!r} more than once"
+                )
+            seen.add(key)
+        return dict(pairs)
+
+    try:
+        parsed = json.loads(raw, object_pairs_hook=_no_duplicate_names)
+    except json.JSONDecodeError as exc:
+        raise DatabaseRegistryError(f"MEMORA_DATABASES is not valid JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not parsed:
+        raise DatabaseRegistryError("MEMORA_DATABASES must be a non-empty JSON object of name -> uri")
+    out: Dict[str, str] = {}
+    for name, uri in parsed.items():
+        if not isinstance(name, str) or not name:
+            raise DatabaseRegistryError(f"MEMORA_DATABASES has a non-string database name: {name!r}")
+        if not isinstance(uri, str) or not uri.strip():
+            raise DatabaseRegistryError(f"MEMORA_DATABASES['{name}'] must be a non-empty URI string")
+        out[name] = uri.strip()
+    return out
+
+
+def default_database_name() -> Optional[str]:
+    """MEMORA_DEFAULT_DB, validated against the registry. None when no registry."""
+    registry = database_registry()
+    if not registry:
+        return None
+    name = os.getenv("MEMORA_DEFAULT_DB", "").strip()
+    if not name:
+        if len(registry) == 1:
+            return next(iter(registry))
+        raise DatabaseRegistryError(
+            "MEMORA_DEFAULT_DB must be set when MEMORA_DATABASES defines more than one database; "
+            f"known: {sorted(registry)}"
+        )
+    if name not in registry:
+        raise DatabaseRegistryError(
+            f"MEMORA_DEFAULT_DB={name!r} is not in MEMORA_DATABASES; known: {sorted(registry)}"
+        )
+    return name
+
+
+def backend_for(name: str):
+    """Resolve a registered database NAME to a backend, cached per name.
+
+    An unknown name raises. It must NEVER fall through to the default: a
+    request for a database this server does not serve is an error, not an
+    invitation to use someone else's store.
+    """
+    global _registry_cache, _registry_source
+    raw = os.getenv("MEMORA_DATABASES", "").strip()
+    with _registry_lock:
+        if _registry_cache is None or _registry_source != raw:
+            _registry_cache = {}
+            _registry_source = raw
+        cached = _registry_cache.get(name)
+        if cached is not None:
+            return cached
+        registry = database_registry()
+        if name not in registry:
+            raise DatabaseRegistryError(
+                f"unknown database {name!r}; known: {sorted(registry)}"
+            )
+        try:
+            backend = parse_backend_uri(registry[name])
+        except ValueError as exc:
+            # parse_backend_uri raises ValueError for CONFIGURATION problems --
+            # invalid d1:// syntax, a missing CLOUDFLARE_API_TOKEN, a malformed
+            # s3:// URI. Left as ValueError those reach main()'s generic prewarm
+            # handler, which warns and starts the server anyway, so an unusable
+            # registry entry still leaves a running server whose storage tools
+            # fail on every call. Translate at the registry boundary, naming the
+            # database, rather than making every prewarm ValueError fatal --
+            # that would misclassify operational failures as configuration ones.
+            raise DatabaseRegistryError(
+                f"database {name!r} is misconfigured: {exc}"
+            ) from exc
+        _registry_cache[name] = backend
+        return backend
+
+
+def current_backend():
+    """The backend this call should use.
+
+    Order matters and is the compatibility contract:
+      1. a context-bound database wins;
+      2. else, if MEMORA_DATABASES is CONFIGURED, its validated default -- this
+         is what makes a malformed or ambiguous registry fail on the connect
+         path instead of silently opening the legacy database;
+      3. else the module-level STORAGE_BACKEND.
+    Reading the module attribute in (3) rather than closing over its
+    import-time value is what keeps every test that monkeypatches
+    storage.STORAGE_BACKEND working, and what makes this a no-op when no
+    registry is configured.
+    """
+    name = CURRENT_DB.get()
+    if name is not None:
+        return backend_for(name)
+    # No binding. If a registry is CONFIGURED, resolve its default -- which
+    # validates it. Without this, malformed or ambiguous MEMORA_DATABASES never
+    # reached database_registry() on the connect path at all, so a broken
+    # configuration silently opened the LEGACY database instead of failing.
+    # The documented fail-closed contract has to hold where connections are
+    # actually made, not only where a caller happens to call a helper.
+    if os.getenv("MEMORA_DATABASES", "").strip():
+        default_name = default_database_name()
+        if default_name is not None:
+            return backend_for(default_name)
+    return STORAGE_BACKEND
+
 
 # Embedding backend configuration
 EMBEDDING_MODEL = os.getenv("MEMORA_EMBEDDING_MODEL", "openai")  # openai, sentence-transformers, tfidf
@@ -474,19 +641,19 @@ def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
     list_absorb_inflight / health / memory_verify_integrity.
     """
     from .schema import connect as _connect
-    return _connect(STORAGE_BACKEND, check_same_thread=check_same_thread)
+    return _connect(current_backend(), check_same_thread=check_same_thread)
 
 
 def sync_to_cloud() -> None:
     """Sync database to cloud storage if using a cloud backend."""
     from .schema import sync_to_cloud as _sync
-    _sync(STORAGE_BACKEND)
+    _sync(current_backend())
 
 
 def get_backend_info() -> dict:
     """Get information about the current storage backend."""
     from .schema import get_backend_info as _info
-    return _info(STORAGE_BACKEND)
+    return _info(current_backend())
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
