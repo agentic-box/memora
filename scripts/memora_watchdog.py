@@ -32,7 +32,22 @@ Environment (see launchd/WATCHDOG_RUNBOOK.md):
   MEMORA_WATCHDOG_LOCK         lock file path
   MEMORA_WATCHDOG_INTERVAL     seconds between probes (default 10)
   MEMORA_WATCHDOG_THRESHOLD    consecutive failures before restart (default 3)
-  MEMORA_WATCHDOG_TIMEOUT      per-probe timeout seconds (default 5)
+  MEMORA_WATCHDOG_TIMEOUT      per-probe timeout seconds (default 20)
+
+  WHY 20 AND NOT 5. /health answers in ~4ms on an idle host and does no
+  database work, so a probe that takes SECONDS is not a slow service -- it is
+  a container that did not get scheduled. On 2026-08-22 sustained compilation
+  on the host (12,500 build-cache writes in one hour, 3.9 GB of swap in use)
+  pushed probes past a 5s timeout 18 times in an hour; three landed
+  consecutively and triggered a restart of a perfectly healthy server. The
+  restart then wedged the container runtime and turned host contention into a
+  45-minute outage.
+
+  A restart cannot fix host contention -- the process was fine -- so the
+  timeout must be generous enough that only a genuinely unresponsive server
+  trips it. 20s still detects a dead server inside threshold x interval
+  (~30s) plus one timeout, and the cost of being slow to notice is far lower
+  than the cost of restarting something that was never broken.
   MEMORA_WATCHDOG_GRACE        seconds after TERM before KILL (default 15)
   MEMORA_WATCHDOG_STARTUP      seconds to wait for health after start (default 60)
   MEMORA_WATCHDOG_BACKOFF      first backoff seconds (default 30, doubling)
@@ -149,7 +164,7 @@ class Watchdog:
         url: str,
         *,
         threshold: int = 3,
-        timeout: float = 5.0,
+        timeout: float = 20.0,
         grace: float = 15.0,
         startup: float = 60.0,
         backoff: float = 30.0,
@@ -390,7 +405,7 @@ def main(argv=None) -> int:
     dog = Watchdog(
         container, url,
         threshold=_int_env("MEMORA_WATCHDOG_THRESHOLD", 3),
-        timeout=_num_env("MEMORA_WATCHDOG_TIMEOUT", 5),
+        timeout=_num_env("MEMORA_WATCHDOG_TIMEOUT", 20),
         grace=_num_env("MEMORA_WATCHDOG_GRACE", 15),
         startup=_num_env("MEMORA_WATCHDOG_STARTUP", 60),
         backoff=_num_env("MEMORA_WATCHDOG_BACKOFF", 30),

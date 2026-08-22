@@ -19,7 +19,7 @@ misconfigured away.
 |---|---|---|
 | `MEMORA_WATCHDOG_INTERVAL` | 10s | seconds between probes |
 | `MEMORA_WATCHDOG_THRESHOLD` | 3 | consecutive failures before acting (~30s) |
-| `MEMORA_WATCHDOG_TIMEOUT` | 5s | per-probe timeout |
+| `MEMORA_WATCHDOG_TIMEOUT` | 20s | per-probe timeout. Raised from 5s after host compilation load tripped it 18x/hour and restarted a healthy server (2026-08-22); a restart cannot fix host contention. |
 | `MEMORA_WATCHDOG_GRACE` | 15s | after TERM before KILL |
 | `MEMORA_WATCHDOG_STARTUP` | 60s | must become healthy after start, or the restart FAILED |
 | `MEMORA_WATCHDOG_BACKOFF` | 30s | first backoff, doubling |

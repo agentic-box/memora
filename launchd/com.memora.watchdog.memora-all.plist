@@ -20,7 +20,7 @@
         <key>MEMORA_WATCHDOG_LOCK</key><string>REPLACE_HOME/.local/var/run/memora-watchdog-memora-all.lock</string>
         <key>MEMORA_WATCHDOG_INTERVAL</key><string>10</string>
         <key>MEMORA_WATCHDOG_THRESHOLD</key><string>3</string>
-        <key>MEMORA_WATCHDOG_TIMEOUT</key><string>5</string>
+        <key>MEMORA_WATCHDOG_TIMEOUT</key><string>20</string>
         <key>MEMORA_WATCHDOG_GRACE</key><string>15</string>
         <key>MEMORA_WATCHDOG_STARTUP</key><string>60</string>
         <key>MEMORA_WATCHDOG_BACKOFF</key><string>30</string>
