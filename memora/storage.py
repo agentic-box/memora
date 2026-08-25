@@ -2478,6 +2478,233 @@ def _search_by_vector_ids_only(
     ]
 
 
+# ---------------------------------------------------------------------------
+# Skinny corpus snapshot (memora absorb scan-once).
+#
+# absorb_memory used to run a full corpus scan once PER FACT and again per
+# created memory (via the write-time crossref pass), so a 4-fact absorb doing
+# real work re-downloaded the whole corpus ~8 times over remote D1 -- the
+# proximate cause of the read timeouts this change fixes. The snapshot loads
+# the corpus ONCE, scores every fact against it exhaustively (exact cosine --
+# no prefilter, no recall loss), reuses it for the crossref pass, and appends
+# newly created vectors so later scans in the same call still see them.
+# It is SKINNY: only the columns scoring and tie-break need (id, embedding,
+# created_at, metadata type, encoding source), never content for all rows.
+# ---------------------------------------------------------------------------
+
+_CORPUS_REPAIR_BATCH = 256
+
+
+class _CorpusEntry:
+    __slots__ = ("id", "vector", "created_at", "metadata_type", "encoding_source")
+
+    def __init__(self, id, vector, created_at, metadata_type, encoding_source):
+        self.id = id
+        self.vector = vector
+        self.created_at = created_at
+        self.metadata_type = metadata_type
+        self.encoding_source = encoding_source
+
+
+class _CorpusSnapshot:
+    """One skinny in-memory corpus snapshot reused for a whole absorb call.
+
+    Scoring stays exhaustive and exact (never narrows the candidate set), so
+    for the corpus represented by the snapshot it carries ZERO dedup-recall
+    risk versus the old per-scan full download -- it only stops re-reading D1.
+    ``search`` mirrors the sort/ordering of ``_search_by_vector_ids_only``
+    (score, then created_at, descending).
+    """
+
+    __slots__ = ("_by_id",)
+
+    def __init__(self):
+        self._by_id: Dict[int, _CorpusEntry] = {}
+
+    def __len__(self) -> int:
+        return len(self._by_id)
+
+    def append(self, id, vector, created_at, metadata_type, encoding_source: str = "python") -> None:
+        self._by_id[id] = _CorpusEntry(id, vector, created_at, metadata_type, encoding_source)
+
+    def metadata_type(self, id: int) -> Optional[str]:
+        entry = self._by_id.get(id)
+        return entry.metadata_type if entry is not None else None
+
+    def discard(self, id: int) -> None:
+        """Drop a memory from the snapshot (e.g. a created memory that a
+        write-boundary tombstone then deleted). Keeps the snapshot in sync with
+        the live DB for later scans in the same call."""
+        self._by_id.pop(id, None)
+
+    def search(self, vector, *, top_k: int = 5, min_score: Optional[float] = None, exclude_ids=()) -> List[Tuple[int, float]]:
+        exclude = set(exclude_ids or ())
+        results: List[Tuple[float, str, int]] = []
+        for entry in self._by_id.values():
+            if entry.id in exclude:
+                continue
+            if entry.vector is _CERTIFIED_EMPTY_EMBEDDING:
+                continue
+            score = _cosine_similarity(vector, entry.vector)
+            if min_score is not None and score < min_score:
+                continue
+            results.append((score, entry.created_at or "", entry.id))
+        # Identical sort to _search_by_vector_ids_only: score desc, then
+        # created_at desc for ties (newest first).
+        results.sort(key=lambda t: (t[0], t[1]), reverse=True)
+        return [(entry_id, score) for score, _, entry_id in results[:top_k]]
+
+
+def _metadata_type_from_metadata(metadata_json: Optional[str]) -> Optional[str]:
+    if not metadata_json:
+        return None
+    try:
+        meta = json.loads(metadata_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(meta, dict):
+        return None
+    return meta.get("type")
+
+
+def _metadata_dict_from_json(metadata_json: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not metadata_json:
+        return None
+    try:
+        meta = json.loads(metadata_json)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return meta if isinstance(meta, dict) else None
+
+
+def _load_corpus_snapshot(conn: sqlite3.Connection, *, page_size: int = _VECTOR_SCAN_PAGE_SIZE) -> _CorpusSnapshot:
+    """Load the corpus ONCE into a skinny snapshot, repairing missing embeddings.
+
+    The main pass pulls only scoring columns (no content/metadata/tags for the
+    common, fully-embedded case). Legacy rows with a missing embedding are
+    collected and repaired in a separate bounded pass (compute + upsert once,
+    per absorb call) so every subsequent steady-state scan does not re-backfill
+    them -- the amplifier that made the per-scan download even more expensive.
+    """
+    snapshot = _CorpusSnapshot()
+    repair: List[Tuple[int, str, Optional[str]]] = []  # (id, created_at, metadata_json)
+    last_id = 0
+    while True:
+        rows = conn.execute(
+            """
+            SELECT m.id, m.created_at, m.metadata,
+                   e.embedding AS embedding,
+                   e.representation AS embedding_representation,
+                   e.encoding_source AS embedding_encoding_source
+            FROM memories m
+            LEFT JOIN memories_embeddings e ON e.memory_id = m.id
+            WHERE m.id > ?
+            ORDER BY m.id
+            LIMIT ?
+            """,
+            (last_id, page_size),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            raw_embedding = None
+            try:
+                raw_embedding = row["embedding"]
+            except (IndexError, KeyError):
+                pass
+            vector = None
+            if raw_embedding:
+                vector = _json_to_embedding(raw_embedding)
+            elif row["embedding_representation"] == "empty" and row["embedding_encoding_source"] == "python":
+                vector = _CERTIFIED_EMPTY_EMBEDDING
+            meta_type = _metadata_type_from_metadata(row["metadata"])
+            if vector is None:
+                repair.append((row["id"], row["created_at"], row["metadata"]))
+            else:
+                snapshot.append(
+                    row["id"], vector, row["created_at"], meta_type,
+                    row["embedding_encoding_source"],
+                )
+            last_id = row["id"]
+        if len(rows) < page_size:
+            break
+
+    if repair:
+        _repair_corpus_embeddings(conn, repair, snapshot)
+    return snapshot
+
+
+def _repair_corpus_embeddings(
+    conn: sqlite3.Connection,
+    repair: List[Tuple[int, str, Optional[str]]],
+    snapshot: _CorpusSnapshot,
+) -> None:
+    """Compute embeddings for rows that were missing one, once per absorb.
+
+    Pulls content/tags ONLY for the missing rows (bounded IN batches), so the
+    steady-state skinny pass never carries all source text. Each repaired row
+    is upserted and appended to the snapshot so it is scored like the old
+    inline backfill would have, but without repeating the work per scan.
+    """
+    ids = [row_id for row_id, _, _ in repair]
+    meta_by_id = {row_id: meta for row_id, _, meta in repair}
+    created_by_id = {row_id: created for row_id, created, _ in repair}
+    for start in range(0, len(ids), _CORPUS_REPAIR_BATCH):
+        batch = ids[start:start + _CORPUS_REPAIR_BATCH]
+        placeholders = ",".join("?" for _ in batch)
+        rows = conn.execute(
+            f"SELECT id, content, metadata, tags FROM memories WHERE id IN ({placeholders})",
+            batch,
+        ).fetchall()
+        for row in rows:
+            meta = _metadata_dict_from_json(row["metadata"])
+            tags_json = row["tags"]
+            tags = json.loads(tags_json) if tags_json else []
+            # FAIL CLOSED: a repair embedding failure must propagate, not be
+            # swallowed. The old lazy-backfill path let a strict/provider
+            # failure re-raise into absorb's per-fact handler so the fact was
+            # NOT written. If we silently dropped this legacy row from the
+            # snapshot, absorb would search a corpus missing that memory and
+            # could create its duplicate -- the exact "zero recall risk (for
+            # the snapshot's corpus)" claim this change exists to keep. So we never score against a
+            # knowingly incomplete corpus.
+            vector = _compute_embedding(row["content"], meta, tags)
+            # Upsert ALWAYS, even for a genuinely empty result, so it becomes
+            # a certified-empty marker (representation='empty',
+            # encoding_source='python') that the loader recognises -- otherwise
+            # every absorb would re-fetch and re-compute this row forever.
+            _upsert_embedding(conn, row["id"], vector)
+            if not vector:
+                continue
+            snapshot.append(
+                row["id"], vector, created_by_id.get(row["id"]),
+                _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
+            )
+
+
+def _hydrate_memories_by_ids(conn: sqlite3.Connection, ids) -> Dict[int, sqlite3.Row]:
+    """Fetch full memory rows for a bounded set of ids in ONE IN query."""
+    if not ids:
+        return {}
+    unique = list(dict.fromkeys(ids))
+    placeholders = ",".join("?" for _ in unique)
+    rows = conn.execute(f"SELECT * FROM memories WHERE id IN ({placeholders})", unique).fetchall()
+    return {row["id"]: row for row in rows}
+
+
+def _search_snapshot_full(conn: sqlite3.Connection, corpus: _CorpusSnapshot, vector, *, top_k: int = 5, min_score: Optional[float] = None):
+    """Exhaustive snapshot search returning hydrated full memories, matching the
+    ``_search_by_vector`` (no-filter) shape absorb relies on: [{score, memory}].
+    Top-k candidate ids are hydrated in ONE bounded IN query."""
+    ids_scores = corpus.search(vector, top_k=top_k, min_score=min_score)
+    rows = _hydrate_memories_by_ids(conn, [entry_id for entry_id, _ in ids_scores])
+    return [
+        {"score": score, "memory": _serialise_row(rows[entry_id])}
+        for entry_id, score in ids_scores
+        if entry_id in rows
+    ]
+
+
 _CROSSREF_CAS_RETRIES = 8
 
 
@@ -2674,6 +2901,7 @@ def _update_crossrefs_for_memory(
     vector: Optional[Dict[str, float]] = None,
     top_k: int = 5,
     min_score: Optional[float] = None,
+    corpus: Optional[_CorpusSnapshot] = None,
 ) -> List[Dict[str, Any]]:
     if vector is None:
         embeddings = _get_embeddings_for_ids(conn, [memory_id])
@@ -2688,6 +2916,22 @@ def _update_crossrefs_for_memory(
                 record.get("tags", []),
             )
             _upsert_embedding(conn, memory_id, vector)
+
+    if corpus is not None:
+        # Snapshot path (absorb): score exhaustively against the in-memory
+        # corpus -- no fresh D1 scan -- and drop document memories in-process
+        # using the snapshot's metadata type, avoiding the per-result
+        # _get_metadata_type fan-out.
+        ids_scores = corpus.search(
+            vector, top_k=top_k, min_score=min_score, exclude_ids=[memory_id],
+        )
+        related: List[Dict[str, Any]] = []
+        for entry_id, score in ids_scores:
+            if corpus.metadata_type(entry_id) in _DOCUMENT_TYPES:
+                continue
+            related.append({"id": entry_id, "score": score, "edge_type": "related_to"})
+        _store_crossrefs(conn, memory_id, related)
+        return related
 
     results = _search_by_vector_ids_only(
         conn,
@@ -3976,6 +4220,7 @@ def add_memory(
     owned_ids: Optional[List[int]] = None,
     absorb_nonce: Optional[str] = None,
     absorb_operation_key: Optional[str] = None,
+    corpus: Optional[_CorpusSnapshot] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
 
@@ -3986,6 +4231,8 @@ def add_memory(
     absorb_nonce: stamped into metadata; compensating deletes must match it.
     absorb_operation_key: client-chosen per-row key used to recover an INSERT
         that D1 committed before its HTTP response was lost.
+    corpus: optional absorb corpus snapshot. When provided the write-time
+        crossref pass scores against it instead of re-scanning D1.
     """
     content = _validate_content(content)
 
@@ -4071,7 +4318,7 @@ def add_memory(
 
         related: List[Dict[str, Any]] = []
         if not _should_skip_crossrefs(prepared_metadata):
-            related = _update_crossrefs_for_memory(conn, memory_id, vector=vector)
+            related = _update_crossrefs_for_memory(conn, memory_id, vector=vector, corpus=corpus)
 
         _log_action(conn, memory_id, "create", f"Created memory #{memory_id}")
         if commit:
@@ -4463,6 +4710,27 @@ def absorb_memory(
     if not facts:
         return {"decisions": [], "created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
+    # Scan-once: load the corpus into a SKINNY snapshot a single time and score
+    # every fact (and every write-time crossref pass) against it, instead of
+    # re-downloading the whole corpus per fact and per created memory. This is
+    # the O(facts + creates) FULL-CORPUS-READS -> O(1) fix (there are still
+    # O(facts) bounded hydration IN queries, tombstone/hash checks and writes,
+    # so it is not O(1) work).
+    # Scoring stays exhaustive and exact -- no prefilter, so no dedup-recall
+    # risk for the corpus represented by the snapshot (see bounded-concurrency
+    # note below).
+    #
+    # BOUNDED POINT-IN-TIME DEDUP: the snapshot is a point-in-time view at the
+    # start of this call, plus our own phase-3 creates appended as they land.
+    # It does NOT observe writes committed by OTHER agents after load. The old
+    # per-fact scans could see a concurrent insert between facts; the snapshot
+    # cannot. So dedup is guaranteed against the corpus as of load time, not
+    # against the live DB at the final write. This is a deliberate, documented
+    # trade for the O(1) full-corpus-reads property; a concurrent writer that commits a
+    # duplicate after load is not caught in this call (a later absorb or the
+    # periodic exact rebuild will see it).
+    corpus = _load_corpus_snapshot(conn)
+
     decisions: List[Dict[str, Any]] = []
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
 
@@ -4503,8 +4771,8 @@ def absorb_memory(
                 counts["skipped"] += 1
                 continue
 
-            matches = _search_by_vector(
-                conn, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
+            matches = _search_snapshot_full(
+                conn, corpus, vector, top_k=5, min_score=_ABSORB_RELATED_THRESHOLD,
             )
         except Exception as e:
             # N6: strict mode must fail cleanly (named provider error), not as
@@ -4775,6 +5043,16 @@ def absorb_memory(
                 owned_ids=owned_ids,
                 absorb_nonce=absorb_nonce,
                 absorb_operation_key=str(uuid.uuid4()),
+                corpus=corpus,
+            )
+            # Append the created memory to the in-memory corpus so a LATER
+            # create's crossref scan (and any later scan in this call) sees it,
+            # matching the old behavior where each crossref pass re-read the
+            # live DB that already contained prior creates.
+            created_meta_type = (record.get("metadata") or {}).get("type")
+            corpus.append(
+                record["id"], job["vector"], record.get("created_at"),
+                created_meta_type, "python",
             )
             # Abort hook sits on the write boundary, before heartbeat, so a
             # SIGKILL still simulates process death after the INSERT even if
@@ -4805,6 +5083,7 @@ def absorb_memory(
                             )
                         if record["id"] in owned_ids:
                             owned_ids.remove(record["id"])
+                        corpus.discard(record["id"])
                         counts["superseded"] = max(0, counts["superseded"] - 1)
                         counts["tombstoned"] += 1
                         counts["skipped"] += 1
@@ -4859,6 +5138,7 @@ def absorb_memory(
                             )
                         if record["id"] in owned_ids:
                             owned_ids.remove(record["id"])
+                        corpus.discard(record["id"])
                         counts["superseded"] = max(0, counts["superseded"] - 1)
                         counts["tombstoned"] += 1
                         counts["skipped"] += 1

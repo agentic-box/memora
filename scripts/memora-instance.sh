@@ -182,6 +182,20 @@ cmd_up() {
   args+=(-e "MEMORA_HEALTH_TOKEN=$(health_token)")
   args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
   args+=(-e "MEMORA_HEALTH_REFRESH_INTERVAL=${MEMORA_HEALTH_REFRESH_INTERVAL:-15}")
+  # Vector-scan page size. The default of 1000 means a store under 1000 rows
+  # returns its ENTIRE corpus -- every embedding blob, plus each row's content
+  # and tags -- in ONE D1 response, so pagination never engages where it is
+  # most needed. At 902 memories that single response is ~5.4 MB of vectors
+  # before content, and it races the 30s ceiling that applies to each request
+  # (urllib timeout AND Cloudflare's own per-request limit). absorb then times
+  # out mid-write and its compensating delete erases the row it had inserted,
+  # reporting "nothing written". 100 keeps each response an order of magnitude
+  # smaller for ~0.5-2s of extra round-trip per scan.
+  #
+  # This is a TOURNIQUET, not the fix: it converts failure into slowness and
+  # leaves the O(facts x corpus) transfer untouched. The fix is one skinny
+  # corpus snapshot per absorb call, reused across facts and crossrefs.
+  args+=(-e "MEMORA_VECTOR_SCAN_PAGE_SIZE=${MEMORA_VECTOR_SCAN_PAGE_SIZE:-100}")
   # A multi-database instance carries a REGISTRY instead of one storage URI;
   # it is what makes a single container serve every workspace by URL path.
   if [ -n "${MEMORA_DATABASES:-}" ]; then

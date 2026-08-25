@@ -95,7 +95,7 @@ def test_absorb_timeout_falls_back_instead_of_raising(local_db, monkeypatch):
         existing = storage.add_memory(conn, content="Deployment uses version one")
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": existing}],
         )
         result = storage.absorb_memory(conn, ["Deployment uses version three"])
@@ -356,7 +356,7 @@ def test_absorb_update_supersedes_current_leaf(
         matched = original if matched_version == "stale" else current
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *args, **kwargs: [{"score": 0.5, "memory": matched}],
         )
         monkeypatch.setattr(
@@ -400,7 +400,7 @@ def test_absorb_update_collapses_fork_to_one_leaf(local_db, monkeypatch):
         orig, left, right = _seed_fork(conn)
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
         )
         monkeypatch.setattr(
@@ -448,7 +448,7 @@ def test_absorb_contradict_does_not_collapse_fork(local_db, monkeypatch):
         orig, left, right = _seed_fork(conn)
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
         )
         monkeypatch.setattr(
@@ -489,7 +489,7 @@ def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch):
         monkeypatch.setattr(storage, "add_memory", racing_add)
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *args, **kwargs: [{"score": 0.5, "memory": left}],
         )
         monkeypatch.setattr(
@@ -607,7 +607,7 @@ def test_absorb_new_content_after_tombstone_creates_root(local_db, monkeypatch):
         storage.delete_memory(conn, leaf["id"])
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": storage.get_memory(conn, orig["id"])}],
         )
         monkeypatch.setattr(
@@ -640,7 +640,7 @@ def test_absorb_write_boundary_tombstone_wins(local_db, monkeypatch):
         monkeypatch.setattr(storage, "add_memory", racing_add)
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": target}],
         )
         monkeypatch.setattr(
@@ -920,7 +920,7 @@ def test_absorb_postlink_recheck_compensates_after_delete_markers(fake_d1_backen
         storage.add_link(conn, leaf["id"], ancestor["id"], edge_type="supersedes")
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": leaf}],
         )
         monkeypatch.setattr(
@@ -994,7 +994,7 @@ def test_losing_absorb_reports_winner_current_id(fake_d1_backend, monkeypatch):
 
     monkeypatch.setattr(
         storage,
-        "_search_by_vector",
+        "_search_snapshot_full",
         lambda *a, **k: [{"score": 0.5, "memory": {"id": lid, "content": "Concurrent absorb leaf extra words", "metadata": None, "tags": []}}],
     )
     monkeypatch.setattr(
@@ -1072,7 +1072,7 @@ def test_absorb_second_link_failure_compensates(fake_d1_backend, monkeypatch):
         monkeypatch.setattr(storage, "add_link", flaky_add_link)
         monkeypatch.setattr(
             storage,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": leaves[0]}],
         )
         monkeypatch.setattr(

@@ -181,7 +181,7 @@ def test_uniform_current_after_fork_collapse(local_db, monkeypatch):
         st.add_link(conn, right["id"], orig["id"], edge_type="supersedes")
         monkeypatch.setattr(
             st,
-            "_search_by_vector",
+            "_search_snapshot_full",
             lambda *a, **k: [{"score": 0.5, "memory": left}],
         )
         monkeypatch.setattr(

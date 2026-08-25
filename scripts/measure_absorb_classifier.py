@@ -58,7 +58,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
     original_backend = storage.STORAGE_BACKEND
     original_model = storage.EMBEDDING_MODEL
     original_compute = storage._compute_embedding
-    original_search = storage._search_by_vector
+    original_search = storage._search_snapshot_full
     original_classifier = storage._classify_fact_against_matches
     storage.STORAGE_BACKEND = LocalSQLiteBackend(db_path)
     storage.EMBEDDING_MODEL = "tfidf"
@@ -67,7 +67,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
     try:
         with storage.connect() as conn:
             existing = storage.add_memory(conn, content=case["memory"])
-            storage._search_by_vector = lambda *args, **kwargs: [{
+            storage._search_snapshot_full = lambda *args, **kwargs: [{
                 "score": 0.5,
                 "memory": existing,
             }]
@@ -128,7 +128,7 @@ def _predict_case(case: Dict[str, Any], mode: str, db_path: Path) -> Dict[str, A
         storage.STORAGE_BACKEND = original_backend
         storage.EMBEDDING_MODEL = original_model
         storage._compute_embedding = original_compute
-        storage._search_by_vector = original_search
+        storage._search_snapshot_full = original_search
         storage._classify_fact_against_matches = original_classifier
 
 

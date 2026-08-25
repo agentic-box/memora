@@ -177,7 +177,7 @@ def test_successful_absorb_clears_inflight(tmp_path, monkeypatch, kind):
     db_path = tmp_path / ("ok-d1.db" if kind == "fake_d1" else "ok.db")
     _fresh_backend(db_path, kind, monkeypatch)
     monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
-    monkeypatch.setattr(storage, "_search_by_vector", lambda *a, **k: [])
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
     with storage.connect() as conn:
         result = storage.absorb_memory(conn, ["Successful absorb fact extra words"])
         assert result.get("created", 0) >= 1
