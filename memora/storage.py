@@ -470,7 +470,9 @@ def _recover_absorb_owned_ids(conn: sqlite3.Connection, absorb_nonce: Optional[s
 # for reporting. Fail-safe: an orphan is preferable to deleting live work.
 ABSORB_INFLIGHT_LEASE_SECONDS = 120
 
-# Test hook: fires after each absorb-owned add_memory (and its inflight touch).
+# Test hook: fires after the owned insert is appended to this call's corpus
+# fork and before the inflight heartbeat. Tests that must observe the
+# post-append state (then fail the write) hook here.
 _after_absorb_owned_insert = None
 
 
@@ -2516,13 +2518,23 @@ class _CorpusSnapshot:
     (score, then created_at, descending).
     """
 
-    __slots__ = ("_by_id",)
+    __slots__ = ("_by_id", "_cache_key")
 
     def __init__(self):
         self._by_id: Dict[int, _CorpusEntry] = {}
+        self._cache_key: Optional[str] = None
 
     def __len__(self) -> int:
         return len(self._by_id)
+
+    def fork(self) -> "_CorpusSnapshot":
+        """Return a PRIVATE copy-on-write snapshot. The cache's base is shared
+        and immutable; absorb (and any caller) must work on a fork so its
+        append/discard never leak into the shared base or another call."""
+        new = _CorpusSnapshot()
+        new._by_id = dict(self._by_id)  # shallow copy; entries are immutable
+        new._cache_key = self._cache_key
+        return new
 
     def append(self, id, vector, created_at, metadata_type, encoding_source: str = "python") -> None:
         self._by_id[id] = _CorpusEntry(id, vector, created_at, metadata_type, encoding_source)
@@ -2680,6 +2692,189 @@ def _repair_corpus_embeddings(
                 row["id"], vector, created_by_id.get(row["id"]),
                 _metadata_type_from_metadata(meta_by_id.get(row["id"])), "python",
             )
+
+
+# ---------------------------------------------------------------------------
+# Process-local exact vector cache (memora absorb step 3).
+#
+# _load_corpus_snapshot pulls the corpus from D1 once per call; with several
+# stores in one long-lived container that is a full corpus download per absorb
+# forever. The cache below keeps the loaded snapshot process-locally so the
+# per-call read becomes a cheap single-row epoch check instead of a full vector
+# pull.
+#
+# KEY: store identity (local, no D1) + embedding model stamp, so a re-embed
+# under a different model never serves vectors computed under the old one.
+# INVALIDATION: the schema already maintains a DB-owned MONOTONIC
+# `embedding_change_epoch` (memories_meta), advanced by triggers on INSERT /
+# UPDATE / DELETE of BOTH memories and memories_embeddings -- including
+# external SQL (schema.py _ensure_integrity_epoch_triggers). The hot path
+# compares that ONE row (model stamp AND epoch in a single SELECT). Because
+# it is monotonic, an insert-then-compensate-delete that restores the DB
+# content still advances the epoch, so a cache that observed the transient
+# rows is never wrongly reused -- a content hash cannot say that.
+# ISOLATION: absorb never mutates the cached base. get_corpus_snapshot returns a
+# COPY-ON-WRITE FORK per call, so a failing/concurrent absorb's append/discard
+# can never pollute the shared base (compensated, never-committed rows are never
+# visible to another call).
+# PUBLICATION: a snapshot is cached ONLY after an exact load under a STABLE
+# epoch (epoch before == epoch after), so the cache never claims to represent
+# an epoch it did not observe. absorb never publishes its fork -- a post-write
+# snapshot cannot be proven to represent the DB without an exact re-read, so
+# after a write the entry is invalidated (using the key already resolved on
+# the fork) and the next exact load repopulates.
+# FAIL CLOSED ON THE CACHE: a missing or malformed epoch is not a valid
+# stamp. Schema init is cached per backend, so an external DELETE of that
+# memories_meta row leaves the triggers updating zero rows; treating the
+# absence as epoch 0 would cache forever under a dead stamp. Exact-load and
+# DO NOT cache. An epoch mismatch (including an external writer) also
+# exact-loads. Scoring stays exhaustive and exact -- sourcing the same
+# vectors from memory instead of D1 changes nothing about dedup recall.
+# POINT-IN-TIME: every call revalidates the epoch. The window begins at
+# THAT call's stamp read; the cached base may be old in memory but is
+# proven unchanged at call start. The cache does not stretch the window
+# across calls -- a later call that sees a matching epoch is a new window
+# that happens to reuse the bytes.
+# RETRY EXHAUSTION: if the epoch will not stay still for _CORPUS_LOAD_RETRIES
+# loads, we return the last snapshot uncached. That snapshot is a bounded
+# point-in-time view of whatever the last SELECT returned; it is NOT proven
+# to match the live epoch (a concurrent writer landed during the load).
+# Caching it would certify a snapshot under an epoch it did not observe.
+# Raising would turn a write storm into absorb failure -- worse than the
+# already-documented PIT miss of a concurrent duplicate. The next call
+# retries; under sustained writes every absorb scans and never caches.
+# ---------------------------------------------------------------------------
+
+_corpus_cache: Dict[str, "_CorpusCacheEntry"] = {}
+_corpus_cache_lock = threading.Lock()
+_EPOCH_KEY = "embedding_change_epoch"
+_CORPUS_LOAD_RETRIES = 3
+
+
+class _CorpusCacheEntry:
+    __slots__ = ("snapshot", "epoch")
+
+    def __init__(self, snapshot: _CorpusSnapshot, epoch: int):
+        self.snapshot = snapshot
+        self.epoch = epoch
+
+
+def _corpus_meta(conn: sqlite3.Connection) -> Tuple[Optional[str], Optional[int]]:
+    """Read (model_stamp, epoch) from memories_meta in ONE SELECT.
+
+    Store identity is local; this is the only D1 statement a warm hit needs.
+    ``epoch`` is the freshness proof: missing or non-integer means we cannot
+    prove the cache is current -- callers must exact-load and MUST NOT cache.
+    An unavailable stamp is never coerced to 0.
+
+    The model stamp may be absent (stores that have not yet recorded one).
+    That is not a freshness failure; it becomes the empty key component.
+    """
+    rows = conn.execute(
+        "SELECT key, value FROM memories_meta WHERE key IN (?, ?)",
+        ("embedding_model", _EPOCH_KEY),
+    ).fetchall()
+    model: Optional[str] = None
+    epoch_raw: Optional[str] = None
+    for r in rows:
+        if r["key"] == "embedding_model":
+            model = r["value"]
+        elif r["key"] == _EPOCH_KEY:
+            epoch_raw = r["value"]
+    if epoch_raw is None:
+        return model, None
+    try:
+        # bool is a subclass of int; refuse it. Non-numeric strings must
+        # not coerce to 0 (int('abc') raises; that is the point).
+        if isinstance(epoch_raw, bool):
+            return model, None
+        epoch = int(epoch_raw)
+    except (TypeError, ValueError):
+        return model, None
+    return model, epoch
+
+
+def _corpus_cache_key_for(store: str, model: Optional[str]) -> str:
+    """Cache key from local store identity plus the model stamp."""
+    return f"{store}|{model or ''}"
+
+
+def _corpus_base(conn: sqlite3.Connection) -> _CorpusSnapshot:
+    """Return the immutable shared base snapshot for this store, loading and
+    caching it under a STABLE epoch. Callers must fork() before mutating.
+
+    Fail closed on the cache: if the freshness proof (epoch) is missing or
+    malformed, exact-load and DO NOT cache. An unavailable proof must never
+    be treated as a valid stable epoch, or a deleted epoch row would let a
+    stale cache be reused forever (the triggers update zero rows).
+    """
+    from .embeddings import _store_cache_key
+    store = _store_cache_key(conn)
+    model, epoch = _corpus_meta(conn)
+    if epoch is None:
+        loaded = _load_corpus_snapshot(conn)
+        loaded._cache_key = None
+        return loaded
+    key = _corpus_cache_key_for(store, model)
+    entry = _corpus_cache.get(key)
+    if entry is not None and entry.epoch == epoch:
+        return entry.snapshot
+    # Cold load: only cache if the epoch is stable across the read, so we never
+    # publish a snapshot under an epoch it did not observe.
+    with _corpus_cache_lock:
+        entry = _corpus_cache.get(key)
+        if entry is not None and entry.epoch == epoch:
+            return entry.snapshot
+        loaded: Optional[_CorpusSnapshot] = None
+        for _ in range(_CORPUS_LOAD_RETRIES):
+            _model, before = _corpus_meta(conn)
+            if before is None:
+                loaded = _load_corpus_snapshot(conn)
+                loaded._cache_key = None
+                return loaded
+            loaded = _load_corpus_snapshot(conn)
+            _model2, after = _corpus_meta(conn)
+            if after is None:
+                loaded._cache_key = None
+                return loaded
+            if before == after:
+                loaded._cache_key = key
+                _corpus_cache[key] = _CorpusCacheEntry(loaded, after)
+                return loaded
+        # See RETRY EXHAUSTION in the module comment: last load, uncached.
+        loaded._cache_key = None
+        return loaded
+
+
+def get_corpus_snapshot(conn: sqlite3.Connection) -> _CorpusSnapshot:
+    """Return a PRIVATE, copy-on-write fork of the exact corpus snapshot.
+
+    Reuses the process-local cache when this call's epoch stamp matches the
+    cached entry; else falls back to an exact D1 scan. Fail closed on the
+    cache when the stamp is unavailable. The returned fork is safe to
+    append/discard without affecting the shared base or any other call.
+    """
+    return _corpus_base(conn).fork()
+
+
+def invalidate_corpus_cache(
+    conn: sqlite3.Connection, *, key: Optional[str] = None,
+) -> None:
+    """Drop the cached base for this store. Called after absorb writes (success
+    or failure): the snapshot would no longer represent the DB, and republishing
+    it would risk certifying an incomplete view (HIGH 3). The next exact load
+    repopulates.
+
+    Prefer the key already resolved on the snapshot (warm path paid for it).
+    When omitted, one memories_meta SELECT derives it -- never a second
+    get_stored_embedding_model round-trip.
+    """
+    if not key:
+        from .embeddings import _store_cache_key
+        model, _epoch = _corpus_meta(conn)
+        key = _corpus_cache_key_for(_store_cache_key(conn), model)
+    with _corpus_cache_lock:
+        _corpus_cache.pop(key, None)
 
 
 def _hydrate_memories_by_ids(conn: sqlite3.Connection, ids) -> Dict[int, sqlite3.Row]:
@@ -4720,16 +4915,18 @@ def absorb_memory(
     # risk for the corpus represented by the snapshot (see bounded-concurrency
     # note below).
     #
-    # BOUNDED POINT-IN-TIME DEDUP: the snapshot is a point-in-time view at the
-    # start of this call, plus our own phase-3 creates appended as they land.
-    # It does NOT observe writes committed by OTHER agents after load. The old
-    # per-fact scans could see a concurrent insert between facts; the snapshot
-    # cannot. So dedup is guaranteed against the corpus as of load time, not
-    # against the live DB at the final write. This is a deliberate, documented
-    # trade for the O(1) full-corpus-reads property; a concurrent writer that commits a
-    # duplicate after load is not caught in this call (a later absorb or the
-    # periodic exact rebuild will see it).
-    corpus = _load_corpus_snapshot(conn)
+    # PROCESS-LOCAL CACHE (step 3): get_corpus_snapshot reuses a cached base
+    # when THIS call's epoch stamp matches the cached entry, so D1 is not
+    # re-read. Fail closed on the cache: a missing/malformed stamp or any
+    # mismatch (including an external writer) exact-loads and does not
+    # publish. POINT-IN-TIME: every call revalidates the epoch; the window
+    # begins at that stamp read. The cached bytes may be old, but they are
+    # proven unchanged at call start -- the cache does not stretch one
+    # window across calls. The snapshot plus this call's own phase-3 creates
+    # still cannot observe writes committed by other agents after the stamp
+    # read. A concurrent duplicate committed after that read is not caught
+    # here (a later absorb sees it because its stamp check fails).
+    corpus = get_corpus_snapshot(conn)
 
     decisions: List[Dict[str, Any]] = []
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}
@@ -5245,6 +5442,15 @@ def absorb_memory(
         # window cannot be reaped as a partial write.
         _complete_absorb_inflight(conn, absorb_nonce)
         conn.commit()
+        # Invalidate the cached base: absorb wrote rows (or compensated/deleted
+        # them), so the cached snapshot no longer represents the DB. The next
+        # call does an exact load that sees the final committed state. We never
+        # publish this call's fork -- a post-write snapshot cannot be proven to
+        # represent the DB without an exact re-read, and republishing it could
+        # certify an incomplete view. (This also covers the failure path below,
+        # where compensation restores rows: the DB epoch is monotonic, so the
+        # cache entry would not match anyway, but invalidating is explicit.)
+        invalidate_corpus_cache(conn, key=corpus._cache_key)
     except Exception as write_exc:
         # A D1 INSERT can commit remotely while its response is lost before
         # lastrowid reaches add_memory. Recover every row owned by this call.
@@ -5298,6 +5504,10 @@ def absorb_memory(
                     absorb_nonce,
                 )
             conn.commit()
+            # Absorb mutated the DB (writes then compensation deletes); the
+            # cached base no longer represents it. Invalidate so the next call
+            # reloads (the monotonic epoch would reject it anyway).
+            invalidate_corpus_cache(conn, key=corpus._cache_key)
             return {
                 "decisions": decisions,
                 **counts,
@@ -5315,6 +5525,7 @@ def absorb_memory(
             }
         # All owned rows cleaned — re-raise original for strict callers
         _clear_absorb_inflight(conn, absorb_nonce)
+        invalidate_corpus_cache(conn, key=corpus._cache_key)
         raise
 
     return {"decisions": decisions, **counts}

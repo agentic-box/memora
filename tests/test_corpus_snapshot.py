@@ -164,7 +164,7 @@ def test_absorb_appends_created_memories_to_snapshot(local_db, monkeypatch):
             storage.add_memory(conn, content=content, commit=True)
 
         appended = {}
-        original = storage._load_corpus_snapshot
+        original = storage.get_corpus_snapshot
 
         def spy(conn, **kwargs):
             corpus = original(conn, **kwargs)
@@ -172,7 +172,7 @@ def test_absorb_appends_created_memories_to_snapshot(local_db, monkeypatch):
             appended["initial_len"] = len(corpus)
             return corpus
 
-        monkeypatch.setattr(storage, "_load_corpus_snapshot", spy)
+        monkeypatch.setattr(storage, "get_corpus_snapshot", spy)
         result = storage.absorb_memory(conn, ["zeta upstream deploy", "eta upstream deploy"])
 
         created = result.get("created", 0)
