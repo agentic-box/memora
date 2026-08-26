@@ -22,13 +22,14 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 </p>
 
 <p align="center">
-<b><a href="#features">Features</a></b> · <b><a href="#preview">Preview</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#container-deployment">Containers</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
+<b><a href="#features">Features</a></b> · <b><a href="#preview">Preview</a></b> · <b><a href="#install">Install</a></b> · <b><a href="#usage">Usage</a></b> · <b><a href="#configuration">Config</a></b> · <b><a href="#multi-database-routing">Multi-DB</a></b> · <b><a href="#container-deployment">Containers</a></b> · <b><a href="#live-graph-server">Live Graph</a></b> · <b><a href="#cloud-graph">Cloud Graph</a></b> · <b><a href="#chat-with-memories">Chat</a></b> · <b><a href="#semantic-search--embeddings">Semantic Search</a></b> · <b><a href="#document-storage">Documents</a></b> · <b><a href="#llm-deduplication">LLM Dedup</a></b> · <b><a href="#memory-linking">Linking</a></b> · <b><a href="#neovim-integration">Neovim</a></b>
 </p>
 
 ## Features
 
 **Core Storage**
 - 💾 **Persistent Storage** - SQLite with optional cloud sync (S3, R2, D1)
+- 🗄️ **Multi-database routing** - One process serves many stores; a workspace reaches its own at `/mcp/<name>` (see [Multi-database routing](#multi-database-routing))
 - 📂 **Hierarchical Organization** - Section/subsection structure with auto-hierarchy assignment
 - 📦 **Export/Import** - Backup and restore with merge strategies
 
@@ -188,17 +189,31 @@ Add to `~/.codex/config.toml`:
 | Variable               | Description                                                                 |
 |------------------------|-----------------------------------------------------------------------------|
 | `MEMORA_DB_PATH`       | Local SQLite database path (default: `~/.local/share/memora/memories.db`)  |
-| `MEMORA_STORAGE_URI`   | Storage URI: `d1://<account>/<db-id>` (D1) or `s3://bucket/memories.db` (S3/R2) |
-| `CLOUDFLARE_API_TOKEN` | API token for D1 database access (required for `d1://` URI)                |
-| `MEMORA_CLOUD_ENCRYPT` | Encrypt database before uploading to cloud (`true`/`false`)                |
-| `MEMORA_CLOUD_COMPRESS`| Compress database before uploading to cloud (`true`/`false`)               |
-| `MEMORA_CACHE_DIR`     | Local cache directory for cloud-synced database                            |
+| `MEMORA_STORAGE_URI`   | Storage URI: `d1://<account>/<db-id>` (D1) or `s3://bucket/memories.db` (S3/R2). Used when `MEMORA_DATABASES` is unset. |
+| `MEMORA_DATABASES`     | JSON object `{name: uri}` mapping each store this process serves. Names are one URL path segment (`/mcp/<name>`): letters, digits, `-`, `_`, `.` only. Duplicate keys, empty values, unsafe names, or non-objects refuse to start rather than silently picking a store. Unset = single-store (legacy). See [Multi-database routing](#multi-database-routing). |
+| `MEMORA_DEFAULT_DB`    | Registry name a bare `/mcp` uses. Required when the registry has more than one database; with exactly one name, that name is the default. A value not in the registry refuses to start. |
+| `CLOUDFLARE_API_TOKEN` | API token for D1 (`d1://` URI). `CF_API_TOKEN` is accepted as an alias. |
+| `MEMORA_CLOUD_ENCRYPT` | Encrypt the local file before uploading to S3/R2. Unset/`false` = off; `1`/`true`/`yes` = on. |
+| `MEMORA_CLOUD_COMPRESS`| Compress the local file before uploading to S3/R2. Unset/`false` = off; `1`/`true`/`yes` = on. |
+| `MEMORA_CACHE_DIR`     | Local cache directory for an S3/R2-synced database. Unset: the backend picks a cache path. |
 | `MEMORA_ALLOW_ANY_TAG` | Allow any tag without validation against allowlist (`1` to enable)         |
 | `MEMORA_TAG_FILE`      | Path to a JSON file containing an array of allowed tags, e.g. `["plan", "memora/issues"]` |
 | `MEMORA_TAGS`          | Comma-separated list of allowed tags                                       |
+| `MEMORA_HOST`          | Bind address for HTTP transports (default `127.0.0.1`). Overridable with `--host`. |
+| `MEMORA_PORT`          | Bind port for HTTP transports (default `8000`). Overridable with `--port`. |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
+| `MEMORA_TRANSPORT`     | `stdio` (default), `sse`, or `streamable-http`. An unknown **env** value falls back to `stdio`; `--transport` still rejects unknown values. Multi-database routing and the session guard run only on `streamable-http`. |
 | `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 43), `leader` (19), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
-| `MEMORA_STALE_DAYS`    | Days before an open TODO/issue counts as stale in `memory_insights` (default: `14`) |
+| `MEMORA_MAX_SESSIONS`  | Hard ceiling on concurrent MCP sessions (default `128`). `0` disables. A creation rate plus an idle timeout is not a bound — a client that keeps session ids alive can grow without limit at the creation rate. Invalid values refuse to start. Streamable-HTTP only. |
+| `MEMORA_MAX_INIT_PER_MIN` | New sessions admitted per minute (default `120`). `0` disables. Invalid values refuse to start. Streamable-HTTP only. |
+| `MEMORA_MAX_INIT_BODY_BYTES` | Maximum initialize request body accepted/buffered (default `65536`, minimum `1024`). Larger requests receive `413`. Invalid values refuse to start. Streamable-HTTP only. |
+| `MEMORA_SESSION_IDLE_TIMEOUT` | Seconds before an abandoned valid session is reaped (default `1800`). `0` disables. Invalid values refuse to start. Streamable-HTTP only. |
+| `MEMORA_HEALTH_TOKEN`  | Bearer token for detailed `/health/db` bodies (names, counts, error text). Unset: only a loopback peer sees detail; everyone else gets aggregate status. FastMCP `custom_route()` is unauthenticated even when MCP auth is configured. HTTP transports only (`memora.health` is imported for SSE/streamable-http, not stdio). |
+| `MEMORA_HEALTH_TTL`    | Seconds a readiness snapshot may be served before a refresh is due (default `10`, cap `3600`). Must be `> 0`. Invalid values refuse to start. HTTP transports only — a malformed value does not abort stdio. |
+| `MEMORA_HEALTH_TIMEOUT`| Bound on one refresh pass and on each store probe (default `15`, cap `300`). Must be `> 0`. HTTP transports only. |
+| `MEMORA_HEALTH_REFRESH_INTERVAL` | How often the server refreshes readiness on its own (default `15`, cap `3600`). `0` = poll-only. Without this, a proxy deployment has no loopback caller and the alert surface stays `unknown` while every database is fine. When periodic refresh is enabled, `interval + timeout` must be `< MEMORA_HEALTH_MAX_STALE`. HTTP transports only. |
+| `MEMORA_HEALTH_MAX_STALE` | Age after which a cached per-database result may no longer be reported ready (default `60`, cap `3600`). Must be `>= MEMORA_HEALTH_TTL`. HTTP transports only. |
+| `MEMORA_STALE_DAYS`    | Two consumers, two defaults, same name: `memory_insights` treats an open TODO/issue as stale after **14** days; the graph UI greys closed items after **30** days. Set the variable to override both. |
 | `MEMORA_EMBEDDING_MODEL` | Embedding backend: `openai` (default), `sentence-transformers`, or `tfidf` |
 | `SENTENCE_TRANSFORMERS_MODEL` | Model for sentence-transformers (default: `all-MiniLM-L6-v2`)        |
 | `MEMORA_EMBEDDING_API_KEY` | Embedding provider API key (atomic with base URL — see below)           |
@@ -207,9 +222,16 @@ Add to `~/.codex/config.toml`:
 | `OPENAI_API_KEY`       | **LLM only** (dedup/chat) when `MEMORA_EMBEDDING_*` is set. Embeddings fall back to this key only if **both** `MEMORA_EMBEDDING_API_KEY` and `MEMORA_EMBEDDING_BASE_URL` are unset |
 | `OPENAI_BASE_URL`      | **LLM** base URL (OpenRouter, Azure, etc.). Same atomic fallback rule as the key — not an embeddings URL when you use a split config |
 | `OPENAI_EMBEDDING_MODEL` | Model id for the openai embedding backend. Must exist on the **embedding** host (default `text-embedding-3-small` is OpenAI-only; Cloudflare needs e.g. `@cf/baai/bge-m3`) |
-| `MEMORA_LLM_ENABLED`   | Enable LLM-powered deduplication comparison (`true`/`false`, default: `true`) |
-| `MEMORA_LLM_MODEL`     | Model for deduplication comparison (default: `gpt-4o-mini`)                |
-| `CHAT_MODEL`           | Model for the chat panel (default: `deepseek/deepseek-chat`, falls back to `MEMORA_LLM_MODEL`) |
+| `MEMORA_LLM_ENABLED`   | Enable LLM-powered deduplication comparison (`true`/`1`/`yes`; default: `true`) |
+| `MEMORA_LLM_MODEL`     | Model for deduplication comparison and, if unset, for query rewrite and local chat (default: `gpt-4o-mini`) |
+| `MEMORA_LLM_TIMEOUT`   | Seconds the OpenAI client waits (default `60`, floored at `1`). A non-numeric value falls back to `60`. |
+| `MEMORA_REWRITE_MODEL` | Model for RAG query rewriting in the graph chat panel. Unset/empty uses `MEMORA_LLM_MODEL`. |
+| `MEMORA_VECTOR_SCAN_PAGE_SIZE` | Rows per page when loading embeddings from D1 (default `1000`; non-numeric or `<1` falls back to `1000`; hard ceiling `10000`). At the default, a store under 1000 rows returns the **entire corpus plus every embedding in one D1 response**, which raced Cloudflare's 30s per-request ceiling and made `memory_absorb` fail outright. **Use `100` on D1** (the instance script already injects that). Paging is a mitigation, not the fix: absorb reads the corpus once per call and reuses a process-local cache keyed on the DB's monotonic `embedding_change_epoch`. |
+| `CHAT_MODEL`           | Model for the local graph chat panel. Unset/empty falls back to `MEMORA_LLM_MODEL`. (The `deepseek/deepseek-chat` default is Cloudflare Pages `wrangler.toml`, not this process.) |
+| `MEMORA_CLOUD_GRAPH_ENABLED` | `true`/`1`/`yes` to notify the hosted graph of writes (default off). |
+| `MEMORA_CLOUD_GRAPH_WORKER_URL` | Worker base URL for those broadcasts (`POST <url>/broadcast`). Unset: broadcasts are skipped. |
+| `MEMORA_CLOUD_GRAPH_DEBOUNCE` | Seconds to batch rapid writes before broadcasting (default `1.0`). |
+| `MEMORA_CLOUD_GRAPH_SYNC_SCRIPT` | Path captured at startup (default: `memora-graph/scripts/sync.sh` if that file exists). The current write path does **not** execute this script — D1 is the source of truth and only the worker broadcast runs. |
 | `AWS_PROFILE`          | AWS credentials profile from `~/.aws/credentials` (useful for R2)          |
 | `AWS_ENDPOINT_URL`     | S3-compatible endpoint for R2/MinIO                                        |
 | `R2_PUBLIC_DOMAIN`     | Public domain for R2 image URLs                                            |
@@ -236,7 +258,7 @@ All 43 MCP tools register unconditionally, so every agent session is injected wi
 - `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 43 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
 
 ```bash
-# Leader deployment — exposes 18 tools
+# Leader deployment — exposes 19 tools
 MEMORA_TOOL_PROFILE=leader memora-server
 
 # Agent worker — exposes 12 tools
@@ -252,12 +274,96 @@ memora-server
 
 </details>
 
+<details id="multi-database-routing">
+<summary><big><big><strong>Multi-database routing</strong></big></big></summary>
+
+One memora process can serve every workspace. `MEMORA_DATABASES` is a JSON
+registry of `{name: storage URI}`; a client reaches its store at `/mcp/<name>`.
+The selector is the URL already in `.mcp.json`, not a tool argument — an optional
+`db` on every tool is 43 chances to forget one, and every miss would write into
+someone else's store.
+
+**Unset `MEMORA_DATABASES` is the old shape:** one backend from `MEMORA_STORAGE_URI`
+/ `MEMORA_DB_PATH`, one `/mcp`. Existing stdio deployments do not change.
+
+**Routing (streamable-http only):**
+
+| URL | Resolves to |
+|-----|-------------|
+| `/mcp/<name>` | That registry entry. Unknown names return `404 {"error":"unknown database"}` — the body does not list the other names. |
+| `/mcp` | `MEMORA_DEFAULT_DB`. Required when the registry has more than one database; a single-name registry uses that name. |
+
+The binding is **sticky per MCP session**, not per request. A session opened on
+`/mcp/alpha` and reused against `/mcp/beta` still resolves to `alpha`. A client
+cannot half-switch databases mid-conversation.
+
+Malformed configuration **refuses to start** (it does not fall through to the
+legacy database): bad JSON, a non-object, duplicate keys, an empty URI, a name
+that is not one URL path segment, or `MEMORA_DEFAULT_DB` missing/unknown when
+more than one database is listed.
+
+**Worked pair — run this, connect to this.** A streamable-HTTP listener, not
+an MCP `command` entry (that would spawn a stdio child that never speaks MCP
+on stdio). Credentials live on the server process.
+
+```bash
+MEMORA_DATABASES='{"memora":"d1://<account-id>/<memora-db-id>","ob1":"d1://<account-id>/<ob1-db-id>"}' \
+MEMORA_DEFAULT_DB=memora \
+CLOUDFLARE_API_TOKEN='<token>' \
+MEMORA_VECTOR_SCAN_PAGE_SIZE=100 \
+memora-server --transport streamable-http --host 127.0.0.1 --port 8000 --no-graph
+```
+
+```json
+{
+  "mcpServers": {
+    "memora": {
+      "type": "http",
+      "url": "http://127.0.0.1:8000/mcp/ob1"
+    }
+  }
+}
+```
+
+**Container / proxy variant** (this host's usual launcher, not the command
+above): `scripts/memora-instance.sh up <name>` starts the same HTTP server
+inside a container and puts `scripts/memora_proxy.py` on `127.0.0.1:<PORT>`
+(8910 for the `memora` instance). The workspace URL is then
+`http://127.0.0.1:8910/mcp/ob1`. See [Container Deployment](#container-deployment).
+
+A registry may mix `d1://`, `s3://`, and local paths; `parse_backend_uri`
+dispatches on the scheme.
+
+**`memory_stats` reports the bound database.** It returns `database` (the name
+this session actually resolved) and `database_source` (`path`,
+`registry_default`, or `unconfigured`). A valid-but-wrong name in `.mcp.json`
+is otherwise undetectable: every tool works, reads succeed, and writes land
+silently in another project's store. Call `memory_stats` and check `database`
+against the workspace you meant.
+
+Health of a multi-database process: `GET /health` is liveness (no database I/O
+— the only signal a supervisor may restart on). `GET /health/db` is an alert
+surface (always HTTP 200; `status` is `ok`, `degraded`, `unknown` — no
+snapshot yet, a refresh timed out, or evidence older than max staleness — or
+`error` if the registry itself is unusable). `GET /health/db/{name}` is the
+workspace-specific probe (200 or 503). Withdrawing the whole process because
+one store is degraded takes the healthy ones down with it.
+
+</details>
+
 <details id="container-deployment">
 <summary><big><big><strong>Container Deployment</strong></big></big></summary>
 
-A `memora` process binds **one** database for its lifetime (`storage.py` resolves the
-backend at import from `MEMORA_STORAGE_URI`). So one store = one container = one port.
-Running several stores means running several containers, not one server that routes.
+With `MEMORA_DATABASES` unset, a process still binds **one** database for its
+lifetime (`MEMORA_STORAGE_URI` / `MEMORA_DB_PATH`). That is the original
+one-store-one-container-one-port shape.
+
+With `MEMORA_DATABASES` set, **one container serves every workspace** and
+clients select a store by URL path (`/mcp/<name>`). See
+[Multi-database routing](#multi-database-routing). `scripts/memora-instance.sh`
+wants one of `STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES` per instance file
+(`load()` requires at least one). If more than one is set, `cmd_up` uses
+`MEMORA_DATABASES`, then `STORAGE_URI`, then `VOLUME`.
 
 `Dockerfile` builds a credential-free image; `scripts/memora-instance.sh` deploys one
 instance from `instances/<name>.env`:
@@ -269,10 +375,12 @@ instance from `instances/<name>.env`:
 ./scripts/memora-instance.sh status                # every instance at a glance
 ```
 
-Then point the workspace at it — the whole client config, with no secrets in it:
+Then point the workspace at it — the whole client config, with no secrets in it.
+A registry instance needs the store in the path (`/mcp/<name>`); bare `/mcp` is
+the registry default:
 
 ```json
-{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp"}}}
+{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp/ob1"}}}
 ```
 
 **Credentials never enter the image or the config.** They are read at run time from a
@@ -590,7 +698,7 @@ memory_insights(period="1m", include_llm_analysis=False)
 
 Returns:
 - **Activity summary** — memories created in the period, grouped by type and tag
-- **Open items** — open TODOs and issues with stale detection (configurable via `MEMORA_STALE_DAYS`, default 14)
+- **Open items** — open TODOs and issues with stale detection (configurable via `MEMORA_STALE_DAYS`; `memory_insights` default 14, graph UI default 30 — same variable, two consumers)
 - **Consolidation candidates** — similar memory pairs that could be merged
 - **LLM analysis** — themes, focus areas, knowledge gaps, and a summary (requires `OPENAI_API_KEY`)
 
