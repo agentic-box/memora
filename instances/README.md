@@ -45,7 +45,8 @@ HTTP entry — the env block has nowhere to live.
 
 ## Deploy one
 
-Default runtime is Apple's `container` CLI. `scripts/memora-instance.sh`
+Default runtime is Apple's `container` CLI (Apple silicon, **macOS 26** —
+Apple does not support older macOS versions). `scripts/memora-instance.sh`
 invokes it as `$MEMORA_CONTAINER_BIN` (default `container`) for every
 container operation the script performs (`build`, `up`, `status`, `logs`,
 `down`). The generated proxy process hardcodes `container list`.

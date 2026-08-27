@@ -7,15 +7,15 @@
 # is how one container serves every workspace. Adding a store is a new file in
 # instances/ -- or a new entry in an existing registry -- not a fork of this script.
 #
-#   ./memora-instance.sh build   [name]        # build the shared image, or one instance's tag
-#   ./memora-instance.sh up      <name>        # run the container
-#   ./memora-instance.sh proxy   <name>        # generate + print the plist install commands
-#   ./memora-instance.sh status  [name|all]
-#   ./memora-instance.sh down    <name>
-#   ./memora-instance.sh logs    <name>
-#   ./memora-instance.sh config  <name>        # show resolved config (secrets redacted)
+#   ./memora-instance.sh build   NAME          # build NAME's IMAGE tag (omit NAME => memora-pilot)
+#   ./memora-instance.sh up      NAME          # run NAME's IMAGE
+#   ./memora-instance.sh proxy   NAME          # generate + print the plist install commands
+#   ./memora-instance.sh status  [NAME|all]
+#   ./memora-instance.sh down    NAME
+#   ./memora-instance.sh logs    NAME
+#   ./memora-instance.sh config  NAME          # show resolved config (secrets redacted)
 #
-# instances/<name>.env fields:
+# instances/NAME.env fields:
 #   INSTANCE      short name (container becomes memora-<INSTANCE>)
 #   PORT          host port the proxy listens on (127.0.0.1:<PORT>)
 #   STORAGE_URI   d1://account/database   (single-store instance)

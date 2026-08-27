@@ -109,45 +109,38 @@ Default runtime is Apple's [`container`](https://github.com/apple/container) CLI
    cd memora
    ```
 
-4. Copy the instance template and edit `INSTANCE`, `PORT`, and a backend (`STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES`):
+4. Copy the instance template. It ships with `INSTANCE=myinstance` so the later `build`/`up`/`proxy` lines match without renaming. Edit `PORT` and a backend (`STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES`):
 
    ```bash
    cp instances/example.env instances/myinstance.env
    ```
 
-5. Create the credential file `cred_args()` requires — a `.mcp.json` whose `mcpServers.memora.env` holds `CLOUDFLARE_API_TOKEN` (D1 access), the embedding/LLM keys, and the rest. The script looks for `~/.config/memora/credentials.mcp.json` **if that file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Set `CRED_SOURCE` in the instance file to pick a path. `up` dies if the file is missing.
+5. Create the credential file and install the proxy the LaunchAgent will run. `cred_args()` requires a `.mcp.json` whose `mcpServers.memora.env` holds `CLOUDFLARE_API_TOKEN` (D1 access) and the embedding/LLM keys — `up` dies if that file is missing. The script looks for `~/.config/memora/credentials.mcp.json` **if that file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Set `CRED_SOURCE` in the instance file to pick a path. Separately, `proxy` renders a plist whose executable is `$MEMORA_PROXY_BIN` (default `~/.local/libexec/memora/memora_proxy.py`) and whose logs live in `$MEMORA_LOG_DIR` (default `~/.local/var/log`) — nothing creates either on a fresh clone.
 
    ```bash
-   mkdir -p ~/.config/memora
+   mkdir -p ~/.config/memora ~/.local/libexec/memora ~/.local/var/log
+   cp scripts/memora_proxy.py ~/.local/libexec/memora/
    # real values; any key is fine, an absent file is not
-   # default umask is permissive -- chmod 600 so other local accounts cannot read it
+   # the default umask is permissive -- chmod 600 keeps other local accounts out
    cat > ~/.config/memora/credentials.mcp.json <<'JSON'
-   {"mcpServers": {"memora": {"env": {"CLOUDFLARE_API_TOKEN": "REPLACE",
-   "OPENAI_API_KEY": "REPLACE"}}}}
+   {"mcpServers":{"memora":{"env":{"CLOUDFLARE_API_TOKEN":"REPLACE","OPENAI_API_KEY":"REPLACE"}}}}
    JSON
    chmod 600 ~/.config/memora/credentials.mcp.json
    ```
 
-   This is the minimal correct config: both the LLM and embeddings use the
+   That JSON is the minimal correct config: both the LLM and embeddings use the
    default OpenAI host with a real OpenAI key. Do **not** add
    `OPENAI_BASE_URL` pointing at OpenRouter without the embedding pair from
    [Embeddings](#semantic-search--embeddings) — OpenRouter has no embeddings
    endpoint, every embed call 404s, and memora silently falls back to TF-IDF
    keyword bags while looking healthy.
 
-6. Install the proxy the LaunchAgent will run. `memora-instance.sh proxy` renders a plist whose executable is `$MEMORA_PROXY_BIN` (default `~/.local/libexec/memora/memora_proxy.py`) and whose logs live in `$MEMORA_LOG_DIR` (default `~/.local/var/log`) — nothing creates either on a fresh clone. Copy the script and create the log dir before rendering:
-
-   ```bash
-   mkdir -p ~/.local/libexec/memora ~/.local/var/log
-   cp scripts/memora_proxy.py ~/.local/libexec/memora/
-   ```
-
 Then:
 
 ```bash
-./scripts/memora-instance.sh build myinstance   # build myinstance's image tag (instances/myinstance.env)
-./scripts/memora-instance.sh up      myinstance # run the container
-./scripts/memora-instance.sh proxy   myinstance # stable 127.0.0.1:<PORT>
+./scripts/memora-instance.sh build myinstance   # tags IMAGE from myinstance.env (memora-pilot if IMAGE is unset)
+./scripts/memora-instance.sh up      myinstance # runs that same IMAGE
+./scripts/memora-instance.sh proxy   myinstance # render the LaunchAgent; run the printed launchctl
 ```
 
 `up` does **not** publish a host port. The listener the workspace connects to is the proxy. `proxy` only *renders* a macOS LaunchAgent and prints the `launchctl` commands — it does not load the service. Run those printed commands.
@@ -403,7 +396,7 @@ memora-server --transport streamable-http --host 127.0.0.1 --port 8000 --no-grap
 ```
 
 **Container / proxy variant** (this host's usual launcher, not the command
-above): `scripts/memora-instance.sh up <name>` starts the same HTTP server
+above): `scripts/memora-instance.sh up myinstance` starts the same HTTP server
 inside a container and puts `scripts/memora_proxy.py` on `127.0.0.1:<PORT>`
 (8910 for the `memora` instance). The workspace URL is then
 `http://127.0.0.1:8910/mcp/ob1`. See [Container Deployment](#container-deployment).
@@ -443,7 +436,7 @@ wants one of `STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES` per instance file
 `MEMORA_DATABASES`, then `STORAGE_URI`, then `VOLUME`.
 
 `Dockerfile` builds a credential-free image; `scripts/memora-instance.sh` deploys one
-instance from `instances/<name>.env`. The script's runtime CLI is
+instance from `instances/myinstance.env` (or another named file). The script's runtime CLI is
 `$MEMORA_CONTAINER_BIN` (default `container` — Apple's CLI). Every container
 operation the script performs honours that override (`build`, `up`, `status`,
 `logs`, `down`). The generated `memora_proxy.py` process hardcodes
