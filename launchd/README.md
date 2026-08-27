@@ -1,10 +1,11 @@
 # Supervised memora proxies
 
-Each memora container gets a LaunchAgent running `scripts/memora_proxy.py`,
-which holds a stable `127.0.0.1:<PORT>` in front of the container. Apple's
-`container` runtime reassigns a container's IP on **every start**, and an MCP
-client reads its config once at startup — so without the proxy a restart does
-not produce an error, it produces a permanent silent hang.
+Each memora container gets a LaunchAgent running the proxy (`$MEMORA_PROXY_BIN`,
+default `~/.local/libexec/memora/memora_proxy.py`), which holds a stable
+`127.0.0.1:<PORT>` in front of the container. Apple's `container` runtime
+reassigns a container's IP on **every start**, and an MCP client reads its
+config once at startup — so without the proxy a restart does not produce an
+error, it produces a permanent silent hang.
 
 ## Install one
 
@@ -14,8 +15,15 @@ machine-specific) and prints the exact `launchctl` commands. It deliberately
 does **not** load the service for you; loading a supervised background job is
 the operator's decision.
 
+The rendered plist points at `$MEMORA_PROXY_BIN` and writes to `$MEMORA_LOG_DIR`
+— neither directory exists on a fresh clone, so install the proxy and create
+the log dir first (see [Install · Container](../README.md#container-http-service) in the
+top-level README):
+
 ```sh
-./scripts/memora-instance.sh proxy ob1     # render + print the install commands
+mkdir -p ~/.local/libexec/memora ~/.local/var/log     # the proxy + its logs live here
+cp scripts/memora_proxy.py ~/.local/libexec/memora/   # the generated plist's $MEMORA_PROXY_BIN
+./scripts/memora-instance.sh proxy ob1                # render + print the install commands
 ```
 
 Then run what it prints. It ends with an `lsof` check so you see the listener

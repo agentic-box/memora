@@ -69,6 +69,10 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 
 ## Install
 
+Two paths. **pip** is a local stdio child the client spawns. A **container** is a detached HTTP service you start with `up`; with `MEMORA_DATABASES` it serves multiple stores from one process. The LaunchAgent supervises the **proxy**, not the container — after a host restart the listener can come back while its upstream is still stopped. If you are running memora as a service, the container path *is* the install.
+
+### pip (local / stdio)
+
 ```bash
 pip install memora-mcp
 ```
@@ -82,6 +86,79 @@ pip install "memora-mcp[local]"
 # Latest development version straight from git
 pip install "git+https://github.com/agentic-box/memora.git"
 ```
+
+Then spawn it from `.mcp.json` with `"command": "memora-server"` (see [Configuration](#configuration)).
+
+### Container (HTTP service)
+
+Default runtime is Apple's [`container`](https://github.com/apple/container) CLI. Every container operation `scripts/memora-instance.sh` performs (`build`, `up`, `status`, `logs`, `down`) uses `$MEMORA_CONTAINER_BIN` (default `container`). The generated proxy process does not; it hardcodes `container list`.
+
+**Before the first `build`:**
+
+1. Install Apple's `container` CLI (signed pkg from its GitHub releases). It needs a Mac with Apple silicon **running macOS 26** — Apple does not support older macOS versions for `container`.
+2. Start the runtime — Apple's documented first command, which also installs a kernel if none is configured:
+
+   ```bash
+   container system start
+   ```
+
+3. Clone this repo and `cd` into it:
+
+   ```bash
+   git clone https://github.com/agentic-box/memora.git
+   cd memora
+   ```
+
+4. Copy the instance template and edit `INSTANCE`, `PORT`, and a backend (`STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES`):
+
+   ```bash
+   cp instances/example.env instances/myinstance.env
+   ```
+
+5. Create the credential file `cred_args()` requires — a `.mcp.json` whose `mcpServers.memora.env` holds `CLOUDFLARE_API_TOKEN` (D1 access), the embedding/LLM keys, and the rest. The script looks for `~/.config/memora/credentials.mcp.json` **if that file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Set `CRED_SOURCE` in the instance file to pick a path. `up` dies if the file is missing.
+
+   ```bash
+   mkdir -p ~/.config/memora
+   # real values; any key is fine, an absent file is not
+   # default umask is permissive -- chmod 600 so other local accounts cannot read it
+   cat > ~/.config/memora/credentials.mcp.json <<'JSON'
+   {"mcpServers": {"memora": {"env": {"CLOUDFLARE_API_TOKEN": "REPLACE",
+   "OPENAI_API_KEY": "REPLACE"}}}}
+   JSON
+   chmod 600 ~/.config/memora/credentials.mcp.json
+   ```
+
+   This is the minimal correct config: both the LLM and embeddings use the
+   default OpenAI host with a real OpenAI key. Do **not** add
+   `OPENAI_BASE_URL` pointing at OpenRouter without the embedding pair from
+   [Embeddings](#semantic-search--embeddings) — OpenRouter has no embeddings
+   endpoint, every embed call 404s, and memora silently falls back to TF-IDF
+   keyword bags while looking healthy.
+
+6. Install the proxy the LaunchAgent will run. `memora-instance.sh proxy` renders a plist whose executable is `$MEMORA_PROXY_BIN` (default `~/.local/libexec/memora/memora_proxy.py`) and whose logs live in `$MEMORA_LOG_DIR` (default `~/.local/var/log`) — nothing creates either on a fresh clone. Copy the script and create the log dir before rendering:
+
+   ```bash
+   mkdir -p ~/.local/libexec/memora ~/.local/var/log
+   cp scripts/memora_proxy.py ~/.local/libexec/memora/
+   ```
+
+Then:
+
+```bash
+./scripts/memora-instance.sh build myinstance   # build myinstance's image tag (instances/myinstance.env)
+./scripts/memora-instance.sh up      myinstance # run the container
+./scripts/memora-instance.sh proxy   myinstance # stable 127.0.0.1:<PORT>
+```
+
+`up` does **not** publish a host port. The listener the workspace connects to is the proxy. `proxy` only *renders* a macOS LaunchAgent and prints the `launchctl` commands — it does not load the service. Run those printed commands.
+
+The printed workspace URL is always `http://127.0.0.1:<PORT>/mcp` (the registry default). For a non-default store, append `/<name>` yourself — a bare `/mcp` on a registry silently binds `MEMORA_DEFAULT_DB`:
+
+```json
+{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:<PORT>/mcp/<store>"}}}
+```
+
+Proxy rationale, credentials, instance files, and `MEMORA_CONTAINER_BIN`: [Container Deployment](#container-deployment).
 
 <details id="usage">
 <summary><big><big><strong>Usage</strong></big></big></summary>
@@ -366,7 +443,12 @@ wants one of `STORAGE_URI`, `VOLUME`, or `MEMORA_DATABASES` per instance file
 `MEMORA_DATABASES`, then `STORAGE_URI`, then `VOLUME`.
 
 `Dockerfile` builds a credential-free image; `scripts/memora-instance.sh` deploys one
-instance from `instances/<name>.env`:
+instance from `instances/<name>.env`. The script's runtime CLI is
+`$MEMORA_CONTAINER_BIN` (default `container` — Apple's CLI). Every container
+operation the script performs honours that override (`build`, `up`, `status`,
+`logs`, `down`). The generated `memora_proxy.py` process hardcodes
+`container list`, which is also why the proxy exists: that runtime reassigns
+the container's IP on every start.
 
 ```bash
 ./scripts/memora-instance.sh build   myinstance   # build the image
@@ -383,14 +465,18 @@ the registry default:
 {"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp/ob1"}}}
 ```
 
-**Credentials never enter the image or the config.** They are read at run time from a
-`.mcp.json` outside the repo (`CRED_SOURCE`, per instance) and injected with `-e`. Pass
-through *every* variable the direct configuration defined, not a hand-picked few: a
-container started with only the embedding keys silently loses `memory_absorb`'s LLM
-consolidation instead of failing loudly.
+**Credentials never enter the image, the instance file, or the workspace's HTTP
+config.** They are read at run time from a separate credential config
+(`$CRED_SOURCE` — itself a `.mcp.json` holding only the `mcpServers.memora.env`
+block) and injected with `-e`. If the instance file does not set
+`CRED_SOURCE`, the script uses `~/.config/memora/credentials.mcp.json` **when that
+file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Pass through *every*
+variable that file defines, not a hand-picked few: a container started with only
+the embedding keys silently loses `memory_absorb`'s LLM consolidation instead of
+failing loudly.
 
-**Why the proxy exists — read this before deciding you do not need it.** Apple's
-`container` runtime reassigns a container's IP on *every start*, not just on recreate.
+**Why the proxy exists — read this before deciding you do not need it.** The
+default runtime (Apple's `container`) reassigns a container's IP on *every start*, not just on recreate.
 An MCP client reads its config once at startup, so a moved address does not produce an
 error: it produces a permanent silent hang. `scripts/memora_proxy.py` holds a stable
 `127.0.0.1:<PORT>` in front of the moving address and re-resolves per connection.
@@ -406,6 +492,13 @@ Two failure modes it distinguishes, which cost an outage to learn:
 Set `MEMORA_TOOL_PROFILE` per instance (see **Tool Profiles**). Note the profile is
 per *container* while roles are per *agent*: if one container serves a workspace's
 leader and its workers, it needs the leader superset.
+
+Deploy-time script variable (not a memora-server env var — it never reaches
+the process inside the container):
+
+| Variable | Meaning |
+|----------|---------|
+| `MEMORA_CONTAINER_BIN` | CLI every `memora-instance.sh` container operation uses (`build`, `up`, `status`, `logs`, `down`; default `container`). The generated `memora_proxy.py` process does not honour this; it hardcodes `container list`. |
 
 `instances/README.md` covers the config fields and `launchd/README.md` the supervised
 proxy. `REVERT.md` documents restoring a workspace to the direct stdio server.

@@ -22,8 +22,8 @@
 #   VOLUME        host dir mounted at /data (single-store, local sqlite)
 #   MEMORA_DATABASES   {"name":"uri",...} registry; serves /mcp/<name> per session
 #   MEMORA_DEFAULT_DB  which registry entry a bare /mcp resolves to
-#                 Exactly one of STORAGE_URI, VOLUME or MEMORA_DATABASES is required.
-#                 Routing is INSTANCE-owned: a credential file may not supply it.
+#                 At least one of STORAGE_URI, VOLUME, MEMORA_DATABASES.
+#                 If several, up uses DATABASES, then STORAGE_URI, then VOLUME.
 #   CONTAINER     optional: adopt an existing container name instead of memora-<INSTANCE>
 #   IMAGE         optional: pin this instance to its own image tag
 #   CRED_SOURCE   optional: this instance's own credential file (see below)
@@ -31,7 +31,10 @@
 #   TOOL_PROFILE  optional: full|leader|agent (default leader — see note below)
 #
 # CREDENTIALS are never in these files, never in the image, never in git. They
-# are read at run time from $CRED_SOURCE (a workspace .mcp.json, untracked).
+# are read at run time from $CRED_SOURCE (CRED_SOURCE in the instance file, else
+# ~/.config/memora/credentials.mcp.json if that file exists, else a
+# host-specific fallback). A workspace .mcp.json pointed at the container is
+# a bare {type,url} and is not the credential source.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
