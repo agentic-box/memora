@@ -12,6 +12,49 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.4.0
+
+Multi-database release. One memora process now serves every workspace from its
+own store, with per-database health, images and identity.
+
+### Multi-database routing
+- `MEMORA_DATABASES` registers named stores (`{name: uri}`); a workspace reaches its own at `/mcp/<name>`. Unset keeps single-store behaviour.
+- Names are one URL path segment, matched on component boundaries; an unknown store gets a generic 404 that does not disclose the registry.
+- A malformed registry, a duplicate name, an empty URI or an unusable backend is fatal at startup rather than silently serving the wrong store.
+- `memory_identity` reports which database the session is bound to (#997).
+
+### Health and readiness
+- `GET /health` is liveness with no database I/O — the only signal a supervisor may restart on. `GET /health/db` is per-database readiness, `GET /health/db/{name}` a single store.
+- Probes run off the event loop, bounded and concurrent; a timed-out probe is truly abandoned rather than left to land later.
+- Readiness refreshes on its own schedule (`MEMORA_HEALTH_REFRESH_INTERVAL`), so a proxy deployment with no loopback caller no longer reports `unknown` while every database is fine.
+- Detailed bodies are token-gated (`MEMORA_HEALTH_TOKEN`); an unauthenticated caller sees aggregate status only, because FastMCP custom routes are unauthenticated even when MCP auth is configured.
+- A staleness budget bounds how old a cached result may be before it stops counting as ready.
+- A watchdog supervises the shared container (#987).
+
+### Session and transport hardening (#999)
+- A hard ceiling on live sessions, counted atomically, with admission refunded when a request is rejected — a rejected request no longer costs a session.
+- Routing mirrors the SDK's own acceptance rules and the transport's security settings, closing a POST bypass that reached deployments unguarded.
+- Terminated transports are purged rather than ignored; idle sessions are reaped.
+
+### Images
+- Object keys are namespaced per database, so two stores cannot collide in one bucket (#965 phase 3).
+- Images are keyed by `(name, uri)` rather than name alone — the same name at a new URI is a new image, not a stale hit.
+
+### Absorb
+- The corpus is cached across calls, keyed on a monotonic database epoch, and loaded once per call instead of once per fact. Absorb of many facts no longer re-reads the store for each one.
+
+### Tool profiles (#981)
+- `MEMORA_TOOL_PROFILE` exposes `full` (43 tools), `leader` (19) or `agent` (12). An unknown value refuses to start rather than guessing.
+- Gating is attested through the public handler path and fails closed if the profile cannot be verified.
+
+### Deployment
+- Every runtime call routes through `CONTAINER_BIN`, not just `run` (#996).
+- Routing is instance-owned; a credential file can no longer supply it.
+
+### Docs
+- Four version-stamped release-notes files consolidated into this CHANGELOG, which has a stable name README and issues can link to without rotting (#1000).
+- README rewritten around the container path, which is what a running memora actually is.
+
 ## 0.3.3
 
 Search accuracy and hardening release.
