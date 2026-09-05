@@ -76,10 +76,13 @@ CONNECT_TIMEOUT = _env_float("MEMORA_PROXY_CONNECT_TIMEOUT", 2.0)
 RESOLVE_TIMEOUT = _env_float("MEMORA_PROXY_RESOLVE_TIMEOUT", 2.0)
 CACHE_TTL = _env_float("MEMORA_PROXY_CACHE_TTL", 2.0)
 
-if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
-    NAME = sys.argv[1]
-if len(sys.argv) > 2:
-    LISTEN_PORT = int(sys.argv[2])
+# Guarded on __main__ so importing this module (tests) does not parse the
+# importer's own argv -- pytest's argv[1] is a test path, not a container name.
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-"):
+        NAME = sys.argv[1]
+    if len(sys.argv) > 2:
+        LISTEN_PORT = int(sys.argv[2])
 
 # good_at = when we last SAW a real address. Distinct from `at` (last lookup
 # attempt) because the stale-grace window must measure the age of the ADDRESS,
@@ -174,8 +177,92 @@ def _serve_stale(reason: str) -> Optional[str]:
     return None
 
 
-def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
-    """Current container IP.
+# ---------------------------------------------------------------------------
+# Single-flight resolve (memora #1011). clmux's probe scheduler dispatches
+# several workspaces at once and their completions stay phase-aligned, so a
+# CACHE_TTL expiry arrives as a BURST of concurrent callers -- observed in
+# production as clmux logging nine DOWN transitions at reason=no-status-line,
+# duration_ms=801-802, all against this proxy's stale-cache path: six
+# `container list` processes launched together, none able to warm the cache
+# for the other five before each independently decided it needed a refresh.
+# Every caller that needs a fresh lookup now shares exactly one in-flight
+# subprocess call: the first to ask becomes the leader and runs it, everyone
+# else waits on the same Event and reads the result the leader wrote to
+# `_cache` rather than launching a redundant `container list` of its own.
+# ---------------------------------------------------------------------------
+_resolve_group_lock = threading.Lock()
+_resolve_event: Optional[threading.Event] = None
+
+
+def _claim_or_join() -> tuple[bool, threading.Event]:
+    """Atomically become leader of the current resolve group, or get the
+    Event to wait on if someone already is.
+
+    The check-and-create happens under ONE lock acquisition so two
+    concurrent callers can never both become leader -- that race is exactly
+    the herd this exists to remove.
+    """
+    global _resolve_event
+    with _resolve_group_lock:
+        event = _resolve_event
+        if event is None:
+            event = _resolve_event = threading.Event()
+            return True, event
+        return False, event
+
+
+def _release_leader(event: threading.Event) -> None:
+    global _resolve_event
+    with _resolve_group_lock:
+        _resolve_event = None
+    event.set()
+
+
+def _resolve_singleflight() -> Optional[str]:
+    """Run one real resolve on behalf of every concurrent caller needing one.
+
+    A follower reads `_cache` after waking rather than being handed the
+    leader's return value directly: by the time it wakes, a THIRD caller may
+    already be leading a NEWER group, and the cache is always at least as
+    fresh as the group this follower joined.
+    """
+    is_leader, event = _claim_or_join()
+    if not is_leader:
+        event.wait()
+        with _cache_lock:
+            return _cache["ip"]
+    try:
+        return _do_resolve()
+    finally:
+        _release_leader(event)
+
+
+def _kick_background_refresh() -> None:
+    """Start exactly one background resolve if none is already in flight.
+
+    Fire-and-forget, and joins the SAME single-flight group as a foreground
+    caller: if one is already resolving -- another kick, or a caller that
+    found no usable stale IP -- this is a no-op rather than a second process.
+    """
+    is_leader, event = _claim_or_join()
+    if not is_leader:
+        return
+
+    def _run() -> None:
+        try:
+            _do_resolve()
+        finally:
+            _release_leader(event)
+
+    threading.Thread(target=_run, name="proxy-bg-resolve", daemon=True).start()
+
+
+def _do_resolve() -> Optional[str]:
+    """Actually run `container list` and update the cache.
+
+    Never called by more than one thread at a time for the same group --
+    see _resolve_singleflight / _kick_background_refresh, which serialize
+    entry via _claim_or_join.
 
     Two failure modes that MUST be handled differently (memora #982):
 
@@ -188,16 +275,7 @@ def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
     pressure made `container list` exceed the timeout, all four proxies
     concluded "container gone", and MCP went dark across every workspace while
     the containers sat there answering on their unchanged addresses.
-
-    Serving a stale IP is safe because a genuinely moved address is caught one
-    connection later: handle() poisons the cache on CONNECT failure and forces
-    a fresh lookup. STALE_GRACE bounds it, so a permanently broken lookup does
-    eventually surface instead of pinning a wrong address forever.
     """
-    now = time.time()
-    with _cache_lock:
-        if ttl > 0 and now - _cache["at"] < ttl:
-            return _cache["ip"]
     try:
         proc = subprocess.run(
             ["container", "list"],
@@ -245,6 +323,45 @@ def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
     if found is None:
         warn_limited("list-miss", "container %r not in `container list`" % NAME)
     return found
+
+
+def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
+    """Current container IP.
+
+    STALE-WHILE-REVALIDATE (memora #1011): when ttl>0 (the normal,
+    cache-respecting path -- NOT the forced-fresh retry below) and a
+    known-good IP exists within STALE_GRACE, an expired cache entry is
+    returned IMMEDIATELY and a background refresh is kicked, rather than
+    putting `container list` -- a subprocess exec plus an IPC round trip to
+    the container runtime -- in this caller's critical path. A cold cache
+    (no known-good IP at all) still blocks on a real resolve: there is
+    nothing safe to serve in the meantime.
+
+    ttl=0.0 (handle()'s forced-fresh retry after a failed connect) never
+    takes the stale path: the caller already tried the cached address and it
+    did not work, so it must wait for a REAL answer rather than another one
+    that might be exactly as wrong. It still benefits from single-flight: if
+    a resolve is already running -- foreground, or a kicked background one --
+    it joins that one instead of starting its own.
+
+    Serving a stale IP is safe because a genuinely moved address is caught one
+    connection later: handle() poisons the cache on CONNECT failure and forces
+    a fresh lookup (ttl=0.0, above). STALE_GRACE bounds it, so a permanently
+    broken lookup does eventually surface instead of pinning a wrong address
+    forever.
+    """
+    now = time.time()
+    with _cache_lock:
+        if ttl > 0 and now - _cache["at"] < ttl:
+            return _cache["ip"]
+        stale_ip = _cache.get("ip")
+        stale_good_at = _cache.get("good_at") or 0.0
+
+    if ttl > 0 and stale_ip is not None and (now - stale_good_at) <= STALE_GRACE:
+        _kick_background_refresh()
+        return stale_ip
+
+    return _resolve_singleflight()
 
 
 def poison_cache() -> None:
