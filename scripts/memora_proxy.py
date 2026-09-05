@@ -187,54 +187,82 @@ def _serve_stale(reason: str) -> Optional[str]:
 # for the other five before each independently decided it needed a refresh.
 # Every caller that needs a fresh lookup now shares exactly one in-flight
 # subprocess call: the first to ask becomes the leader and runs it, everyone
-# else waits on the same Event and reads the result the leader wrote to
-# `_cache` rather than launching a redundant `container list` of its own.
+# else waits on the same _ResolveGroup and reads ITS result.
+#
+# A follower reads the GROUP's result, never the global `_cache` (codex
+# review, blocker 1). The cache is NOT monotonic once stale-serving is
+# routine: a stale caller's failed connect() poisons it, and an authoritative
+# list-miss clears it too, either of which can land between the leader
+# publishing a fresh IP and a follower waking up -- re-reading `_cache` could
+# then hand a follower None for a flight that actually succeeded. Each group
+# fixes its result (and exception, if the resolve crashed) once, before
+# signalling, so a follower's answer can never be clobbered by an unrelated
+# cache mutation that merely happened to land first.
 # ---------------------------------------------------------------------------
+class _ResolveGroup:
+    __slots__ = ("event", "result", "exc")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.result: Optional[str] = None
+        self.exc: Optional[BaseException] = None
+
+
 _resolve_group_lock = threading.Lock()
-_resolve_event: Optional[threading.Event] = None
+_resolve_group: Optional[_ResolveGroup] = None
 
 
-def _claim_or_join() -> tuple[bool, threading.Event]:
+def _claim_or_join() -> tuple[bool, _ResolveGroup]:
     """Atomically become leader of the current resolve group, or get the
-    Event to wait on if someone already is.
+    group to wait on if someone already is.
 
     The check-and-create happens under ONE lock acquisition so two
     concurrent callers can never both become leader -- that race is exactly
     the herd this exists to remove.
     """
-    global _resolve_event
+    global _resolve_group
     with _resolve_group_lock:
-        event = _resolve_event
-        if event is None:
-            event = _resolve_event = threading.Event()
-            return True, event
-        return False, event
+        group = _resolve_group
+        if group is None:
+            group = _resolve_group = _ResolveGroup()
+            return True, group
+        return False, group
 
 
-def _release_leader(event: threading.Event) -> None:
-    global _resolve_event
+def _release_leader(group: _ResolveGroup) -> None:
+    """Retire this group and wake every follower waiting on it.
+
+    Guarded on identity: only the thread that created a group ever releases
+    it, but checking `is` before clearing means a stray double-release can
+    never clobber a NEWER group that has already formed in its place.
+    """
+    global _resolve_group
     with _resolve_group_lock:
-        _resolve_event = None
-    event.set()
+        if _resolve_group is group:
+            _resolve_group = None
+    group.event.set()
 
 
 def _resolve_singleflight() -> Optional[str]:
     """Run one real resolve on behalf of every concurrent caller needing one.
 
-    A follower reads `_cache` after waking rather than being handed the
-    leader's return value directly: by the time it wakes, a THIRD caller may
-    already be leading a NEWER group, and the cache is always at least as
-    fresh as the group this follower joined.
+    Followers return THIS group's result, or re-raise its exception -- see
+    the module comment above for why re-reading `_cache` is unsafe.
     """
-    is_leader, event = _claim_or_join()
+    is_leader, group = _claim_or_join()
     if not is_leader:
-        event.wait()
-        with _cache_lock:
-            return _cache["ip"]
+        group.event.wait()
+        if group.exc is not None:
+            raise group.exc
+        return group.result
     try:
-        return _do_resolve()
+        group.result = _do_resolve()
+    except BaseException as exc:
+        group.exc = exc
+        raise
     finally:
-        _release_leader(event)
+        _release_leader(group)
+    return group.result
 
 
 def _kick_background_refresh() -> None:
@@ -244,17 +272,36 @@ def _kick_background_refresh() -> None:
     caller: if one is already resolving -- another kick, or a caller that
     found no usable stale IP -- this is a no-op rather than a second process.
     """
-    is_leader, event = _claim_or_join()
+    is_leader, group = _claim_or_join()
     if not is_leader:
         return
 
     def _run() -> None:
         try:
-            _do_resolve()
+            group.result = _do_resolve()
+        except BaseException as exc:
+            group.exc = exc
+            warn_limited(
+                "bg-resolve-crash",
+                "background resolve failed: %s: %s" % (type(exc).__name__, exc),
+            )
         finally:
-            _release_leader(event)
+            _release_leader(group)
 
-    threading.Thread(target=_run, name="proxy-bg-resolve", daemon=True).start()
+    try:
+        threading.Thread(target=_run, name="proxy-bg-resolve", daemon=True).start()
+    except Exception as exc:
+        # memora #1011 blocker 3: Thread.start() can itself fail -- e.g. a
+        # thread-count limit under the exact memory pressure this whole fix
+        # exists to survive. Without this, the claim above stays installed
+        # forever: stale calls keep serving until STALE_GRACE expires, and
+        # after that a cold-cache or ttl=0 caller waits on an Event nobody
+        # will ever set. Release immediately so the next caller can lead.
+        warn_limited(
+            "bg-resolve-start-failed",
+            "starting background resolve thread failed: %s: %s" % (type(exc).__name__, exc),
+        )
+        _release_leader(group)
 
 
 def _do_resolve() -> Optional[str]:
@@ -364,9 +411,20 @@ def resolve(ttl: float = CACHE_TTL) -> Optional[str]:
     return _resolve_singleflight()
 
 
-def poison_cache() -> None:
+def poison_cache(expected_ip: str) -> None:
+    """Clear the cache -- but only if it still holds `expected_ip`.
+
+    memora #1011 blocker 2: routine stale-serving means a background refresh
+    can land a NEWER address while an older caller's connect() is still
+    failing on the one it was handed earlier. An unconditional clear would
+    delete that newer answer for a failure that has nothing to do with it,
+    forcing every other caller into a redundant forced-fresh resolve and a
+    spurious fail-fast in the meantime. Compare-and-clear only fires when
+    nothing has updated the cache since this caller read it.
+    """
     with _cache_lock:
-        _cache.update(ip=None, at=0.0)
+        if _cache.get("ip") == expected_ip:
+            _cache.update(ip=None, at=0.0)
 
 
 def splice(left: socket.socket, right: socket.socket) -> None:
@@ -431,7 +489,7 @@ def handle(client: socket.socket, peer: str) -> None:
                     "connect-%s" % ip,
                     "upstream connect %s:%d failed: %s" % (ip, TARGET_PORT, exc),
                 )
-                poison_cache()
+                poison_cache(ip)
                 upstream = None
         if upstream is None:
             return

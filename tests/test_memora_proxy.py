@@ -16,6 +16,21 @@ Plus a regression test for the property that makes serving stale safe at
 all: the forced-fresh retry after a failed connect (ttl=0.0) must never take
 the stale path, or a proxy could hand out the very address that just failed
 to connect, indefinitely.
+
+CODEX REVIEW ROUND 2 found three races in the single-flight/SWR design
+itself, once stale-serving became the routine (not exceptional) case:
+
+1. A follower re-reading the global `_cache` after waking can observe an
+   UNRELATED mutation (a stale caller's poisoned connect, or an
+   authoritative list-miss) instead of the outcome of the flight it
+   actually joined -- the cache is not monotonic.
+2. `poison_cache()` was unconditional, so a stale caller's late connect
+   failure could delete a background refresh's NEWER answer.
+3. `_kick_background_refresh()` claimed the flight before `Thread.start()`;
+   a start() failure left the claim installed forever -- deadlock for every
+   later caller with nothing safe to serve.
+
+Tests for all three are below, alongside the originals.
 """
 from __future__ import annotations
 
@@ -39,20 +54,20 @@ _spec.loader.exec_module(proxy)
 def _reset_proxy_state():
     """Module-level singleton state -- reset between tests, not just at import.
 
-    A leftover in-flight `_resolve_event` from a prior test's background
+    A leftover in-flight `_resolve_group` from a prior test's background
     thread would make the next test's leader claim silently become a
     follower, waiting on a group that has nothing to do with it.
     """
     proxy.NAME = "test-container"
     proxy.STALE_GRACE = 300.0
     proxy._cache.update(ip=None, at=0.0, good_at=0.0)
-    proxy._resolve_event = None
+    proxy._resolve_group = None
     proxy._warn_at.clear()
     yield
     # Let any straggler background thread finish before the next test reuses
-    # the module-level lock/event.
+    # the module-level lock/group.
     deadline = time.monotonic() + 2.0
-    while proxy._resolve_event is not None and time.monotonic() < deadline:
+    while proxy._resolve_group is not None and time.monotonic() < deadline:
         time.sleep(0.01)
 
 
@@ -151,7 +166,7 @@ def test_stale_path_kicks_at_most_one_background_refresh(monkeypatch):
     assert results == ["10.0.0.5"] * 5
     block.set()
     deadline = time.monotonic() + 2.0
-    while proxy._resolve_event is not None and time.monotonic() < deadline:
+    while proxy._resolve_group is not None and time.monotonic() < deadline:
         time.sleep(0.01)
     assert fake.calls == 1, "one background refresh should serve every caller in the burst, got %d" % fake.calls
 
@@ -183,4 +198,104 @@ def test_cold_cache_blocks_on_a_real_resolve(monkeypatch):
     ip = proxy.resolve(ttl=2.0)
 
     assert ip == "10.0.0.200"
+    assert fake.calls == 1
+
+
+def test_follower_returns_group_result_despite_racing_cache_mutation(monkeypatch):
+    """Blocker 1 (codex round 2): a follower must return the outcome of the
+    FLIGHT it joined, not whatever `_cache` holds when it wakes.
+
+    Deliberately single-threaded and deterministic: it drives _claim_or_join
+    / _do_resolve / _release_leader by hand instead of racing real threads,
+    because the bug this guards against IS a race -- the whole point is that
+    the follower's answer must not depend on how the scheduler interleaves
+    with an unrelated cache mutation.
+    """
+    fake = _FakeRun(ip="10.0.0.77")
+    monkeypatch.setattr(proxy.subprocess, "run", fake)
+
+    # The "leader" claims the group and actually resolves.
+    is_leader, group = proxy._claim_or_join()
+    assert is_leader
+    group.result = proxy._do_resolve()
+    assert group.result == "10.0.0.77"
+    assert proxy._cache["ip"] == "10.0.0.77"
+
+    # A "follower" joins the SAME group before it is released -- exactly
+    # what _resolve_singleflight() does while a resolve is still in flight.
+    is_follower_leader, follower_group = proxy._claim_or_join()
+    assert not is_follower_leader
+    assert follower_group is group
+
+    # codex's race: something clears the cache AFTER the leader resolved
+    # successfully but BEFORE the follower's wait() returns and it reads a
+    # result -- an unrelated stale caller's failed connect, or an
+    # authoritative list-miss, landing in between.
+    proxy._cache.update(ip=None, at=0.0, good_at=0.0)
+
+    proxy._release_leader(group)  # what the real leader does when _do_resolve() returns
+    follower_group.event.wait(timeout=2)
+    result = follower_group.result if follower_group.exc is None else None
+
+    assert result == "10.0.0.77", (
+        "follower must read the GROUP's result, not the raced cache (got %r)" % result
+    )
+
+
+def test_stale_connect_failure_cannot_poison_a_newer_refresh(monkeypatch):
+    """Blocker 2 (codex round 2): a background refresh can land a NEWER IP
+    while an older caller's connect() is still failing on the STALE address
+    it was handed earlier. poison_cache must be a compare-and-clear keyed on
+    the address that actually failed, or it deletes the newer answer.
+    """
+    now = time.time()
+    proxy._cache.update(ip="10.0.0.5", at=now - 100.0, good_at=now - 1.0)
+
+    # A background refresh lands Y after this caller already read stale X.
+    proxy._cache.update(ip="10.0.0.99", at=time.time(), good_at=time.time())
+
+    # The (late) connect failure is against the STALE address X, not the
+    # current Y -- handle() calls poison_cache(ip) with the IP IT tried.
+    proxy.poison_cache("10.0.0.5")
+
+    assert proxy._cache["ip"] == "10.0.0.99", (
+        "poison_cache cleared a newer refresh it had nothing to do with"
+    )
+
+
+def test_poison_cache_still_clears_when_the_failed_ip_is_current():
+    """Control for the above: compare-and-clear must not become a no-op --
+    it still clears when the cache genuinely holds the address that failed.
+    """
+    proxy._cache.update(ip="10.0.0.5", at=time.time(), good_at=time.time())
+    proxy.poison_cache("10.0.0.5")
+    assert proxy._cache["ip"] is None
+
+
+def test_background_thread_start_failure_releases_the_group(monkeypatch):
+    """Blocker 3 (codex round 2): if Thread.start() raises, the claimed
+    group must be released immediately. Otherwise stale calls keep serving
+    until STALE_GRACE expires, and every caller after that -- a cold cache,
+    or a forced-fresh ttl=0 retry -- waits forever on an Event nobody will
+    ever set.
+    """
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected: thread limit reached")
+
+    monkeypatch.setattr(proxy.threading, "Thread", _boom)
+
+    proxy._kick_background_refresh()
+
+    assert proxy._resolve_group is None, "a failed Thread.start() must release its claim"
+
+    # And the NEXT caller must be able to lead a fresh group -- not join a
+    # phantom one that will never finish.
+    monkeypatch.undo()  # restore threading.Thread before the real resolve needs it
+    fake = _FakeRun(ip="10.0.0.42")
+    monkeypatch.setattr(proxy.subprocess, "run", fake)
+
+    ip = proxy.resolve(ttl=0.0)
+
+    assert ip == "10.0.0.42"
     assert fake.calls == 1
