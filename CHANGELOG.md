@@ -14,6 +14,15 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L1b: retired D1 writers made inert, D1 write guard
+- Per `docs/local-primary-implementation.md` §0 P6 and §6 F2/F3, memora is the only code allowed to write Cloudflare D1. This slice issues no D1 statement.
+- `memora-graph/scripts/sync-to-d1.py`: every remote run (`--remote`, with or without `--replace`) exits 1 before importing memora, reading a store or starting wrangler; argument abbreviations are rejected. Local-D1 development runs are unchanged, and the wrangler command is always `--local`.
+- `memora-graph/scripts/sync.sh`: `--remote` exits 1 before it reads `.mcp.json`, runs python or calls the worker broadcast. The remote-only broadcast step is removed.
+- `memora-graph/scripts/link-r2-images.py`: retired. It wrote `memories.metadata` through the D1 REST API; it now exits 1 for every invocation, `--dry-run` included, without importing boto3 or requests.
+- `memora-graph/scripts/setup-cloudflare.sh`: the remote D1 migration step exits 1 with a pointer. The Pages deploy step runs the guard first and exits 1 on any finding.
+- `memora-graph/package.json`: `deploy` runs the guard first (`--scope all`); `d1:migrate` exits 1 (`d1:migrate-local` is unchanged); `sync-remote` exits 1 through `sync.sh`.
+- New `scripts/d1_write_guard.py`, with scopes `tools` (retired scripts, remote wrangler D1 execute or migrations, `requests` calls to the D1 REST API, Pages deploys not preceded by the guard) and `handlers` (write SQL in the memora-graph Pages functions and worker). The only allow-listed file is `memora/backends.py`. `graph-ui.yml` runs the tools scope as a blocking step. It runs the handlers scope as a reporting step (`continue-on-error`) that fails by design until slice L7 makes the viewer read-only; L7 makes it blocking. The tools scope also runs on every push through the test suite. Scripted Pages deploys run `--scope all`, so they refuse until L7. A direct `wrangler pages deploy` is forbidden by operator rule.
+
 ### Issue #47 backfill apply
 - `scripts/apply_backfill_47.py --preview <approved.json> [--db NAME] [--expect-count N] [--dry-run] [--allow-skips] [--report out.json]` applies ONLY the rows of an approved preview with `approved: true` and `status: "proposed"`.
 - Before any store connection it validates the file: a non-empty approval block (`approved_by`, `at`, `rule`), unique memory ids, the approved+proposed count (`--expect-count`), full fingerprints on every considered row (`content_sha256` over the full content, `metadata_sha256` over the full canonical stored metadata), and each `proposal.retag_typed` recomputed from the stored tags and target.

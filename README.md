@@ -643,8 +643,9 @@ When using Cloudflare D1 as your database, the graph visualization is hosted on 
 2. **Deploy Pages:**
    ```bash
    cd memora-graph
-   npx wrangler pages deploy ./public --project-name=memora-graph
+   npm run deploy
    ```
+   `npm run deploy` runs `scripts/d1_write_guard.py --scope all` first and refuses on any finding. Do not run `wrangler pages deploy` directly: it bypasses the guard (`docs/local-primary-implementation.md` §0 P6).
 
 3. **Configure bindings** in Cloudflare Dashboard:
    - Pages → memora-graph → Settings → Bindings

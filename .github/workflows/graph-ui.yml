@@ -18,14 +18,38 @@ on:
       - "memora-graph/**"
       - "memora/graph/**"          # index.html lives here; public/ symlinks to it
       - ".github/workflows/graph-ui.yml"
+      - "scripts/d1_write_guard.py"
   pull_request:
     paths:
       - "memora-graph/**"
       - "memora/graph/**"
       - ".github/workflows/graph-ui.yml"
+      - "scripts/d1_write_guard.py"
   workflow_dispatch:
 
 jobs:
+  # D1 write guard (docs/local-primary-implementation.md §0 P6, §6 F2). D1 is the
+  # only complete copy of every store; nothing but memora itself may write it.
+  # The same tools-scope check also runs on EVERY push through pytest
+  # (tests/test_l1b_inert_d1_writers.py::test_repo_tools_scope_clean, in
+  # clean-install.yml), since this workflow's path filter covers memora-graph only.
+  d1-write-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: "Guard: retired tools and deploy/migration commands (blocking)"
+        run: python3 scripts/d1_write_guard.py --scope tools
+      - name: "Guard: viewer write handlers (reports; blocking from slice L7)"
+        # FAILS BY DESIGN until slice L7 makes the viewer read-only (plan §6 F1,
+        # §8 L7). The plan assigns the handler half of F2 to L7, which removes
+        # this continue-on-error. Scripted Pages deploys already run --scope all
+        # and refuse on these findings.
+        continue-on-error: true
+        run: python3 scripts/d1_write_guard.py --scope handlers
+
   graph-ui:
     runs-on: ubuntu-latest
     defaults:

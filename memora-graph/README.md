@@ -69,9 +69,7 @@ Update `wrangler.toml` with the database ID from the output.
 
 ### 4. Run migrations
 
-```bash
-npx wrangler d1 execute memora-graph --remote --file=migrations/0001_init.sql
-```
+Retired: memora-all on nuc8 is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). Remote D1 migrations are disabled; `npm run d1:migrate` exits 1. `npm run d1:migrate-local` still works for local development.
 
 ### 5. Deploy WebSocket Worker
 
@@ -109,11 +107,11 @@ In Cloudflare Dashboard:
 npm run deploy
 ```
 
+`npm run deploy` runs `scripts/d1_write_guard.py --scope all` first and refuses on any finding. Until the viewer is read-only (slice L7) the guard fails, so the deploy refuses. A direct `wrangler pages deploy` bypasses the guard and is forbidden by operator rule until then (plan §0 P6).
+
 ### 10. Initial sync
 
-```bash
-npm run sync-remote
-```
+Retired: memora-all on nuc8 is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). `npm run sync-remote` (`sync.sh --remote`) exits 1; `npm run sync` still syncs to a local D1.
 
 ## Enable Auto-Sync
 
@@ -134,9 +132,11 @@ Now any memory create/update/delete will automatically sync to the cloud graph a
 | Script | Description |
 |--------|-------------|
 | `npm run setup` | Full automated setup |
-| `npm run deploy` | Deploy Pages site |
+| `npm run deploy` | Deploy Pages site (runs the D1 write guard first; refuses on findings) |
 | `npm run deploy:worker` | Deploy WebSocket worker |
-| `npm run sync-remote` | Manual sync R2 → D1 |
+| `npm run sync` | Sync to a local D1 (development) |
+| `npm run sync-remote` | Retired: exits 1 |
+| `npm run d1:migrate` | Retired: exits 1 (use `d1:migrate-local`) |
 | `npm run dev` | Local development server |
 
 ## Environment Variables
@@ -164,8 +164,9 @@ memora-graph/
 │   └── index.html             # Graph SPA
 ├── scripts/
 │   ├── setup-cloudflare.sh    # Automated setup script
-│   ├── sync.sh                # Sync wrapper with env loading
-│   └── sync-to-d1.py          # Export R2 data → D1
+│   ├── sync.sh                # Sync wrapper with env loading (local D1 only)
+│   ├── sync-to-d1.py          # Export to a local D1 (remote runs exit 1)
+│   └── link-r2-images.py      # Retired: exits 1
 ├── worker/
 │   └── src/
 │       └── index.ts           # Durable Object for WebSocket

@@ -6,10 +6,10 @@
   "scripts": {
     "setup": "./scripts/setup-cloudflare.sh",
     "dev": "wrangler pages dev ./public --local --persist-to=.wrangler/state/v3",
-    "deploy": "wrangler pages deploy ./public --project-name=memora-graph",
+    "deploy": "python3 ../scripts/d1_write_guard.py --scope all && wrangler pages deploy ./public --project-name=memora-graph",
     "deploy:worker": "cd worker && wrangler deploy",
     "d1:create": "wrangler d1 create memora-graph",
-    "d1:migrate": "wrangler d1 migrations apply memora-graph",
+    "d1:migrate": "node -e \"console.error('d1:migrate is retired: remote D1 migrations are disabled (docs/local-primary-implementation.md §0 P6, §6 F3). Use d1:migrate-local.');process.exit(1)\"",
     "d1:migrate-local": "wrangler d1 migrations apply memora-graph --local",
     "sync": "./scripts/sync.sh",
     "sync-remote": "./scripts/sync.sh --remote"

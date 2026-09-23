@@ -121,10 +121,11 @@ setup_d1_database() {
         print_success "D1 database 'memora-graph' already exists"
     fi
 
-    # Run migrations
-    print_warning "Running D1 migrations..."
-    npx wrangler d1 execute memora-graph --remote --file="$PROJECT_DIR/migrations/0001_init.sql" 2>/dev/null || true
-    print_success "Migrations applied"
+    # Remote D1 migrations are RETIRED: memora-all on nuc8 is the only D1
+    # writer (docs/local-primary-implementation.md §0 P6, §6 F3). The setup
+    # stops here rather than write D1.
+    print_error "Remote D1 migrations are retired: memora-all on nuc8 is the only D1 writer. See docs/local-primary-implementation.md §0 P6 and §6 F3."
+    exit 1
 }
 
 # Deploy Durable Object Worker
@@ -194,8 +195,10 @@ deploy_pages() {
         print_success "Updated frontend WebSocket URL"
     fi
 
-    # Deploy
-    PAGES_OUTPUT=$(npx wrangler pages deploy public --project-name=memora-graph 2>&1)
+    # Deploy. The D1 write guard runs first and refuses on any finding
+    # (docs/local-primary-implementation.md §0 P6): until the viewer is
+    # read-only (slice L7) it fails, so this cannot republish write handlers.
+    python3 "$PROJECT_DIR/../scripts/d1_write_guard.py" --scope all || { print_error "D1 write guard failed; refusing to deploy Pages."; exit 1; }; PAGES_OUTPUT=$(npx wrangler pages deploy public --project-name=memora-graph 2>&1)
     echo "$PAGES_OUTPUT"
 
     # Extract pages URL

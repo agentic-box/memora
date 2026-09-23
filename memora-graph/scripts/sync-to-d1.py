@@ -6,8 +6,12 @@ This script exports memories and crossrefs from the local memora database
 and syncs them to D1 for the web graph visualization.
 
 Usage:
-    python scripts/sync-to-d1.py           # Local D1 (development)
-    python scripts/sync-to-d1.py --remote  # Remote D1 (production)
+    python scripts/sync-to-d1.py           # Local D1 (development) only
+
+RETIRED for remote D1: memora-all on nuc8 is the only D1 writer
+(docs/local-primary-implementation.md §0 P6, §6 F3). Any remote run
+(`--remote`, with or without `--replace`) exits 1 before it imports memora,
+reads a store or starts wrangler. Local-D1 development runs still work.
 """
 
 import argparse
@@ -22,6 +26,49 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 MEMORA_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MEMORA_ROOT))
+
+RETIRED_REMOTE = (
+    "sync-to-d1.py: remote D1 sync is retired. memora-all on nuc8 is the only D1 "
+    "writer; see docs/local-primary-implementation.md §0 P6 and §6 F3."
+)
+
+
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Sync memora data to a LOCAL Cloudflare D1 (development only)",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--remote",
+        action="store_true",
+        help="Retired: refuses and exits 1 (see the module docstring).",
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default=None,
+        help="Source backend URI (e.g., s3://memora/memories.db). Default: auto-detect from environment.",
+    )
+    parser.add_argument(
+        "--database",
+        type=str,
+        default="memora-graph",
+        help="Target local D1 database name. Default: memora-graph.",
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Delete all local D1 data before inserting. Default: upsert (INSERT OR REPLACE).",
+    )
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    # Refuse before importing memora or touching anything else.
+    _ARGS = _parse_args()
+    if _ARGS.remote:
+        print(RETIRED_REMOTE, file=sys.stderr)
+        sys.exit(1)
 
 try:
     from memora import TAG_WHITELIST
@@ -66,8 +113,8 @@ def escape_sql_string(s: str) -> str:
     return f"'{escaped}'"
 
 
-def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "memora-graph", replace: bool = False):
-    """Export memora data to D1."""
+def export_to_d1(source_uri: str = None, database: str = "memora-graph", replace: bool = False):
+    """Export memora data to a LOCAL D1 (development)."""
     print("Connecting to source database...")
     backend = get_source_backend(source_uri)
     print(f"Using backend: {backend.get_info().get('backend_type', 'unknown')}")
@@ -257,12 +304,8 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
         print(f"SQL file: {sql_file}")
 
         # Apply to D1 using wrangler
-        print(f"\nApplying to D1 ({'remote' if remote else 'local'})...")
-        cmd = ["npx", "wrangler", "d1", "execute", database, f"--file={sql_file}"]
-        if remote:
-            cmd.append("--remote")
-        else:
-            cmd.append("--local")
+        print("\nApplying to local D1...")
+        cmd = ["npx", "wrangler", "d1", "execute", database, f"--file={sql_file}", "--local"]
 
         # Run from the memora-graph directory
         result = subprocess.run(
@@ -293,34 +336,11 @@ def export_to_d1(remote: bool = False, source_uri: str = None, database: str = "
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Sync memora data to Cloudflare D1"
-    )
-    parser.add_argument(
-        "--remote",
-        action="store_true",
-        help="Sync to remote D1 (production). Default is local D1.",
-    )
-    parser.add_argument(
-        "--source",
-        type=str,
-        default=None,
-        help="Source backend URI (e.g., s3://memora/memories.db). Default: auto-detect from environment.",
-    )
-    parser.add_argument(
-        "--database",
-        type=str,
-        default="memora-graph",
-        help="Target D1 database name. Default: memora-graph.",
-    )
-    parser.add_argument(
-        "--replace",
-        action="store_true",
-        help="Delete all D1 data before inserting. Default: upsert (INSERT OR REPLACE).",
-    )
-    args = parser.parse_args()
-
-    export_to_d1(remote=args.remote, source_uri=args.source, database=args.database, replace=args.replace)
+    args = _parse_args()
+    if args.remote:
+        print(RETIRED_REMOTE, file=sys.stderr)
+        sys.exit(1)
+    export_to_d1(source_uri=args.source, database=args.database, replace=args.replace)
 
 
 if __name__ == "__main__":
