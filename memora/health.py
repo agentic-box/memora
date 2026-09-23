@@ -501,6 +501,25 @@ def _redact(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _gate_fields(name: str) -> Dict[str, Any]:
+    """Write-gate freeze state and D1 journal status for one store (plan §1).
+    Live; never raises; never calls D1."""
+    if name == "(default)":
+        return {}
+    from .admin import gate_health
+
+    return gate_health(name) or {}
+
+
+def _with_gate_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    dbs = payload.get("databases")
+    if not isinstance(dbs, dict):
+        return payload
+    out = dict(payload)
+    out["databases"] = {n: {**e, **_gate_fields(n)} if isinstance(e, dict) else e for n, e in dbs.items()}
+    return out
+
+
 def register_health_routes(mcp: Any) -> None:
     """Attach /health, /health/db and /health/db/{name} to FastMCP's HTTP app."""
     import logging
@@ -525,6 +544,7 @@ def register_health_routes(mcp: Any) -> None:
             logger.warning("readiness degraded: %s", payload.get("degraded"))
         if not authorised:
             return JSONResponse(_redact(payload))
+        payload = _with_gate_fields(payload)
         # ALWAYS 200. This is an alert surface: a 503 here would make a load
         # balancer withdraw the whole process because ONE store is degraded,
         # taking the healthy databases down with it.
@@ -572,6 +592,9 @@ def register_health_routes(mcp: Any) -> None:
             body = dict(entry)
             body["stale"] = bool(payload.get("stale"))
             body["age_seconds"] = payload.get("age_seconds")
+            # Live, not from the cached snapshot: migration scripts re-read
+            # this at every step boundary (plan §1 freeze barrier).
+            body.update(_gate_fields(name))
         else:
             body = {"status": entry.get("status") if ok else "unknown"}
         return JSONResponse(body, status_code=200 if ok else 503)

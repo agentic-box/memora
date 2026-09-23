@@ -3546,6 +3546,17 @@ def main(argv: Optional[list[str]] = None) -> None:
             logger.warning("Database pre-warm failed: %s", e)
             print(f"Warning: Database pre-warm failed: {e}", file=sys.stderr)
 
+        # Write gates, persisted freezes and D1 intent journals (plan §1)
+        # before anything can write: the import sweep below writes.
+        try:
+            from .write_gate import initialize_registry_gates
+
+            for _name, _st in initialize_registry_gates().items():
+                if _st.get("state") != "open" or _st.get("open_intents"):
+                    logger.warning("store %s write gate at startup: %s", _name, _st)
+        except Exception as e:
+            logger.error("write gate initialisation failed: %s", e)
+
         # Complete or remove rows an interrupted import left marked.
         threading.Thread(target=_startup_import_sweep, name="memora-import-sweep", daemon=True).start()
 
@@ -3582,6 +3593,13 @@ def main(argv: Optional[list[str]] = None) -> None:
             from .health import register_health_routes
 
             register_health_routes(mcp)
+
+            # /admin/freeze, /admin/intents, /admin/reconcile (plan §1). The
+            # handlers refuse every request until the admin auth layer
+            # (L2a) installs require_admin via memora.admin.set_admin_auth.
+            from .admin import register_admin_routes
+
+            register_admin_routes(mcp)
 
             # /api/v1: the plain JSON API for clmuxd (memora/api_v1.py).
             # Custom routes, outside the MCP session lifecycle. Fails closed:

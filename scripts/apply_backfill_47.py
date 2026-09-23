@@ -116,6 +116,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 import uuid
 from pathlib import Path
@@ -506,7 +507,7 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
     results: List[Dict[str, Any]] = report["rows"]
     considered: List[Dict[str, Any]] = []
     storage = None
-    token = conn = lease = None
+    token = conn = lease = primary_fd = None
     transactional = False
     current = {"row": None, "stage": "setup"}
     try:
@@ -524,6 +525,18 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
         report["summary"]["considered"] = len(considered)
         token = storage.CURRENT_DB.set(db) if db else None
         known = list(storage.configured_projects(db) if db else storage.configured_projects())
+        if not dry_run:
+            # A live local primary is written only by memora-all, which holds
+            # its primary lock (docs/local-primary-implementation.md §1 M10):
+            # take the lock or refuse.
+            from memora.backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock
+
+            backend = storage.backend_for(db) if db else storage.STORAGE_BACKEND
+            if isinstance(backend, LocalSQLiteBackend) and backend.live_primary:
+                try:
+                    primary_fd = acquire_primary_lock(backend.db_path)
+                except StoreLockedError as exc:
+                    raise Refused(f"refused: {exc}; apply through memora-all's API or stop it first")
         conn = storage.connect_without_schema() if dry_run else storage.connect()
         d1 = isinstance(conn, D1Connection)
         transactional = not dry_run and not d1
@@ -604,6 +617,8 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
                 storage.CURRENT_DB.reset(token)
             except Exception:
                 pass
+        if primary_fd is not None:
+            os.close(primary_fd)
     return _finalize(report)
 
 

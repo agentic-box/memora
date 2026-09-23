@@ -739,3 +739,27 @@ def test_an_interrupt_during_a_write_is_recorded_and_re_raised(d1, tmp_path, mon
     assert data["summary"]["error"] == "interrupted: KeyboardInterrupt"
     with storage.connect() as conn:
         assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0  # released in finally
+
+
+# --- a live local primary is memora-all's alone (docs/local-primary-implementation.md §1 M10) ---
+
+def test_a_live_primary_whose_lock_is_held_is_refused(sqlite_store, tmp_path, monkeypatch):
+    import os
+
+    from memora import backends
+
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+        before = {k: _state(conn, v) for k, v in ids.items()}
+    storage.STORAGE_BACKEND.store_name = "primary"
+    monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"primary": "d1://acct/db"}))
+    held = backends.acquire_primary_lock(storage.STORAGE_BACKEND.db_path)  # memora-all's hold
+    try:
+        with pytest.raises(SystemExit, match="primary-lock is held"):
+            apply.main(["--preview", str(_file(tmp_path, preview))])
+        with storage.connect() as conn:
+            assert {k: _state(conn, v) for k, v in ids.items()} == before
+    finally:
+        os.close(held)
+    rc, rows = _run(tmp_path, preview)  # no other holder: the script takes the lock itself
+    assert rc == 0 and {r["outcome"] for r in rows.values()} == {"applied"}

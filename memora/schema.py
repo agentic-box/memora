@@ -134,6 +134,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_tombstones_table(conn)
     _ensure_absorb_inflight_table(conn)
     _ensure_import_lease_table(conn)
+    _ensure_sync_outbox(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -413,6 +414,164 @@ def _ensure_import_lease_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.commit()
+
+
+# ---------------------------------------------------------------- local primary
+# docs/local-primary-implementation.md §1. The outbox and its triggers exist
+# only on a LOCAL store that install_sync() enabled (the seed script, L5);
+# they are never created on D1, and ensure_schema only maintains them.
+
+SYNC_TRIGGER_VERSION = 1
+
+# table -> primary-key columns, in pk order
+SYNC_TABLES = {
+    "memories": ("id",),
+    "memories_embeddings": ("memory_id",),
+    "memories_crossrefs": ("memory_id",),
+    "tombstones": ("content_hash", "memory_id"),
+    "tombstone_components": ("memory_id",),
+    "memories_actions": ("id",),
+    "memories_meta": ("key",),
+}
+# memories_meta keys that are never replicated: D1's own epoch (the
+# foreign-writer check depends on it), the process-local rebuild lease, and
+# the integrity stamp bound to the local epoch.
+SYNC_META_EXCLUDED = ("embedding_change_epoch", "embedding_rebuild_lease", "embedding_integrity")
+
+_SYNC_OUTBOX_DDL = """
+CREATE TABLE IF NOT EXISTS sync_outbox (
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  tbl TEXT NOT NULL,
+  op  TEXT NOT NULL CHECK (op IN ('U','D')),
+  pk  TEXT NOT NULL,
+  created_at REAL NOT NULL DEFAULT (julianday('now'))
+)
+"""
+_SYNC_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS sync_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  replica_uri TEXT NOT NULL,
+  last_acked_seq INTEGER NOT NULL,
+  log_cursor_seq INTEGER NOT NULL DEFAULT 0,
+  compare_consumed_seq INTEGER NOT NULL DEFAULT 0,
+  d1_epoch_expected INTEGER,
+  trigger_version INTEGER NOT NULL,
+  inflight_id TEXT, inflight_lo INTEGER, inflight_hi INTEGER,
+  inflight_epoch_before INTEGER, inflight_at TEXT,
+  halted_reason TEXT, halted_at TEXT
+)
+"""
+_SHADOW_STATE_DDL = """
+CREATE TABLE IF NOT EXISTS shadow_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  dirty INTEGER NOT NULL DEFAULT 0, dirty_reason TEXT, dirty_at TEXT,
+  clean_shutdown INTEGER NOT NULL DEFAULT 0,
+  clean_nights INTEGER NOT NULL DEFAULT 0, last_clean_night TEXT
+)
+"""
+
+
+def sync_trigger_ddl() -> list:
+    """The 28 CREATE TRIGGER statements (7 tables x insert/update/delete,
+    plus one update_pk trigger per table)."""
+    out = []
+    excluded = ", ".join(f"'{k}'" for k in SYNC_META_EXCLUDED)
+    for table, pk in SYNC_TABLES.items():
+        for action, ref, op in (("insert", "NEW", "U"), ("update", "NEW", "U"), ("delete", "OLD", "D")):
+            when = f"WHEN {ref}.key NOT IN ({excluded}) " if table == "memories_meta" else ""
+            cols = ", ".join(f"{ref}.{c}" for c in pk)
+            out.append(
+                f"CREATE TRIGGER trg_sync_{table}_{action} AFTER {action.upper()} ON {table} {when}"
+                f"BEGIN INSERT INTO sync_outbox(tbl, op, pk) VALUES ('{table}', '{op}', json_array({cols})); END"
+            )
+        changed = " OR ".join(f"OLD.{c} IS NOT NEW.{c}" for c in pk)
+        if table == "memories_meta":
+            changed = f"({changed}) AND OLD.key NOT IN ({excluded})"
+        cols = ", ".join(f"OLD.{c}" for c in pk)
+        out.append(
+            f"CREATE TRIGGER trg_sync_{table}_update_pk AFTER UPDATE ON {table} WHEN {changed} "
+            f"BEGIN INSERT INTO sync_outbox(tbl, op, pk) VALUES ('{table}', 'D', json_array({cols})); END"
+        )
+    return out
+
+
+def _sync_trigger_names(conn: sqlite3.Connection) -> list:
+    return [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_sync_%'"
+    ).fetchall()]
+
+
+def _install_sync_triggers_locked(conn: sqlite3.Connection) -> None:
+    """Drop every trg_sync_* trigger and recreate the current set. The caller
+    holds a BEGIN IMMEDIATE transaction."""
+    for name in _sync_trigger_names(conn):
+        conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
+    for ddl in sync_trigger_ddl():
+        conn.execute(ddl)
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
+    ).fetchone() is not None
+
+
+def _ensure_sync_outbox(conn: sqlite3.Connection) -> None:
+    """Maintain -- never enable -- replication (plan §1): nothing on D1,
+    nothing on a store without a sync_state row; upgrade the triggers in one
+    BEGIN IMMEDIATE when their version is older than SYNC_TRIGGER_VERSION."""
+    if isinstance(conn, D1Connection):
+        return
+    if not _has_table(conn, "sync_state"):
+        return
+    row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
+    if row is None or int(row[0]) >= SYNC_TRIGGER_VERSION:
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
+        if row is not None and int(row[0]) < SYNC_TRIGGER_VERSION:
+            _install_sync_triggers_locked(conn)
+            conn.execute("UPDATE sync_state SET trigger_version = ? WHERE id = 1", (SYNC_TRIGGER_VERSION,))
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def install_sync(conn: sqlite3.Connection, replica_uri: str, d1_epoch) -> None:
+    """Enable replication on a LOCAL store (only the seed script calls this):
+    the outbox, the state row and the triggers, in one BEGIN IMMEDIATE.
+    last_acked_seq starts at 0 with an empty outbox."""
+    if isinstance(conn, D1Connection):
+        raise ValueError("install_sync is for local stores; D1 never carries sync objects")
+    if _has_table(conn, "sync_state"):
+        raise ValueError("sync is already installed on this store")
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(_SYNC_OUTBOX_DDL)
+        conn.execute(_SYNC_STATE_DDL)
+        conn.execute(
+            "INSERT INTO sync_state (id, replica_uri, last_acked_seq, d1_epoch_expected, trigger_version) "
+            "VALUES (1, ?, 0, ?, ?)",
+            (replica_uri, d1_epoch, SYNC_TRIGGER_VERSION),
+        )
+        _install_sync_triggers_locked(conn)
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def install_shadow_state(conn: sqlite3.Connection) -> None:
+    """The shadow file's own state row (plan §2.9; used by L3b)."""
+    if isinstance(conn, D1Connection):
+        raise ValueError("shadow_state belongs to a local shadow file")
+    conn.execute(_SHADOW_STATE_DDL)
+    conn.execute("INSERT OR IGNORE INTO shadow_state (id) VALUES (1)")
     conn.commit()
 
 

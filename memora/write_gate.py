@@ -242,6 +242,38 @@ def remove_freeze(name: str) -> None:
     _fsync_dir(path.parent)
 
 
+_PRIMARY_LOCK_FDS: List[int] = []
+
+
+def initialize_registry_gates() -> Dict[str, Dict[str, Any]]:
+    """Server startup (plan §1): create every registry store's gate (applying
+    the persisted freeze file and MEMORA_READONLY_DBS), open and replay each
+    d1:// store's intent journal, and take the primary lock of every live
+    local primary. Returns a per-store summary; problems are reported, and a
+    store whose journal cannot be used refuses its own connections."""
+    import logging
+
+    from .storage import backend_for, database_registry
+
+    log = logging.getLogger(__name__)
+    summary: Dict[str, Dict[str, Any]] = {}
+    for name in database_registry():
+        try:
+            backend = backend_for(name)
+            if not hasattr(backend, "write_gate"):
+                continue
+            gate = backend.write_gate()
+            summary[name] = gate.status()
+            if getattr(backend, "live_primary", False):
+                from .backends import acquire_primary_lock
+
+                _PRIMARY_LOCK_FDS.append(acquire_primary_lock(backend.db_path))
+        except Exception as exc:
+            log.error("write gate for %s: %s", name, exc)
+            summary[name] = {"state": "unknown", "error": f"{type(exc).__name__}: {exc}"}
+    return summary
+
+
 def _reset_for_tests() -> None:
     with _GATES_GUARD:
         _GATES.clear()

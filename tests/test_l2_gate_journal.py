@@ -627,3 +627,36 @@ def test_select_only_connection_rejects_everything_but_select(monkeypatch):
     assert len(posted) == 1
     for name in ("executemany", "executescript", "commit", "execute_batch"):
         assert not hasattr(conn, name)
+
+
+def test_cursor_is_gated(tmp_path):
+    """Plan §9 item (c): the raw cursor is not a bypass, and an admitted
+    transaction's cursor shares the connection's token."""
+    backend = _local(tmp_path)
+    conn = backend.connect()
+    cur = conn.cursor()
+    assert isinstance(cur, backends._GatedCursor)
+    cur.execute("INSERT INTO memories (content) VALUES ('a')")  # takes the token
+    gate = backend.write_gate()
+    t = threading.Thread(target=lambda: gate.freeze(timeout_s=5))
+    t.start()
+    time.sleep(0.1)
+    conn.cursor().executemany("INSERT INTO memories (content) VALUES (?)", [("b",), ("c",)])  # same txn
+    conn.commit()
+    t.join(5)
+    assert gate.state == "frozen"
+    with pytest.raises(StoreReadOnlyError):
+        conn.cursor().execute("DELETE FROM memories")
+    conn.close()
+
+
+def test_setup_statements_are_not_gated(tmp_path, monkeypatch):
+    """Plan §9 item (b): connect() arms the gate only after its own setup on
+    the raw connection (today one read; L4 adds WAL/busy_timeout there)."""
+    backend = _local(tmp_path)
+    entered = []
+    real_enter = write_gate._WriteGate.enter
+    monkeypatch.setattr(write_gate._WriteGate, "enter", lambda self, desc: entered.append(desc) or real_enter(self, desc))
+    conn = backend.connect()
+    assert entered == [] and conn._memora_gate is backend.write_gate()
+    conn.close()
