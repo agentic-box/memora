@@ -18,6 +18,8 @@ this file only parses arguments and builds the dependencies.
   thaw    <db>              lift the freeze -- the only command that does
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
+  check-endpoint            F4a: authenticated round trip to memora-all through a
+                            SCRATCH local store, before a client is repointed (L8)
 
 No command lifts the freeze by itself: a recheck and the step that relies
 on it (seed, sequence-highwater) run under one freeze, lifted by `thaw`
@@ -70,6 +72,12 @@ def _parser() -> argparse.ArgumentParser:
         fz.add_argument("--memora-url", default="http://127.0.0.1:8000")
         fz.add_argument("--admin-token-file", required=True)
         fz.add_argument("--health-token-file", required=True)
+    ce = sub.add_parser("check-endpoint", help="F4a: prove the memora-all endpoint before repointing a client")
+    ce.add_argument("--memora-url", required=True, help="memora-all's base URL, e.g. http://nuc8:8920")
+    ce.add_argument("--health-token-file", required=True, help="0600 file with MEMORA_HEALTH_TOKEN")
+    ce.add_argument("--admin-token-file", required=True, help="0600 file with MEMORA_ADMIN_TOKEN")
+    ce.add_argument("--store", default="scratch", help="a LOCAL SQLite store in the registry (default: scratch)")
+    ce.add_argument("--no-write", action="store_true", help="skip the create/get/delete of a throwaway memory")
     common(sub.add_parser("export", help="P1 verified export with receipt"))
     rc = sub.add_parser("recheck", help="P1 freeze-recheck of a receipt")
     common(rc)
@@ -203,6 +211,18 @@ def _restore(args, deps) -> dict:
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.cmd == "check-endpoint":
+            from memora.endpoint_check import EndpointCheckFailed, check_endpoint
+
+            health = lp.load_credential_file(args.health_token_file)
+            admin = lp.load_credential_file(args.admin_token_file)
+            try:
+                report = check_endpoint(args.memora_url, health, admin, args.store, write=not args.no_write)
+            except EndpointCheckFailed as exc:
+                print(json.dumps({"ok": False, "refused": str(exc), "step": exc.step}))
+                return 2
+            print(json.dumps(report))
+            return 0
         if args.cmd in ("freeze", "thaw"):
             client = _freeze_client(args)
             client.freeze() if args.cmd == "freeze" else client.thaw()

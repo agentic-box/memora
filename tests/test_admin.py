@@ -63,7 +63,7 @@ class TestAdminAuth:
         _, client = _app()
         r = _get(client, ADMIN)
         assert r.status_code == 200
-        assert r.json()["stores"]["local"] == {"needs_data_volume": True,
+        assert r.json()["stores"]["local"] == {"kind": "sqlite", "needs_data_volume": True,
                                                "refused": "/data is not a mount point"}
 
     @pytest.mark.parametrize("presented", [None, "", "wrong" * 10, HEALTH, ADMIN + "x", ADMIN[:-1]])

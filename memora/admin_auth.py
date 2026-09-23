@@ -85,8 +85,20 @@ def check_admin(request: Any) -> Optional[Result]:
     return None if ok else (401, {"error": "unauthorized"})
 
 
+def _store_kind(uri: str) -> str:
+    """The backend a registry URI selects (parse_backend_uri's dispatch)."""
+    if uri.startswith("d1://"):
+        return "d1"
+    if uri.startswith("s3://"):
+        return "s3"
+    return "sqlite"
+
+
 def data_volume_status() -> Result:
-    """GET /admin/data-volume: what the startup /data check decided per store."""
+    """GET /admin/data-volume: what the startup /data check decided per store,
+    and each store's kind -- "d1", "s3" or "sqlite" (a local file) -- which
+    `local_primary.py check-endpoint` requires before it writes a scratch
+    store (slice L8)."""
     from . import storage
     from .data_volume import MARKER_ENV, data_dir, uri_needs_data_volume
 
@@ -101,6 +113,7 @@ def data_volume_status() -> Result:
         "volume": os.getenv(MARKER_ENV) or None,
         "stores": {
             (name or "(default)"): {
+                "kind": _store_kind(uri),
                 "needs_data_volume": uri_needs_data_volume(uri),
                 "refused": refusals.get(name),
             }

@@ -14,6 +14,14 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L8: config audit, endpoint check, repoint tool, credential inventory
+- Per `docs/local-primary-implementation.md` §6 F4a–F6 and §6.1. This slice issues no D1 statement: it reads configuration files and talks only to memora-all's HTTP endpoint.
+- `scripts/audit_configs.py` (logic in `memora/config_audit.py`, standard library only): finds every memora client configuration that can reach D1 directly -- a `d1://` URI, `MEMORA_STORAGE_URI` or a `MEMORA_DATABASES` entry on `d1://`, or `CLOUDFLARE_API_TOKEN` / `CF_API_TOKEN` with a value or a reference -- in `*.mcp.json`, `.claude.json`, `*.env`, `instances/*.env`, launchd plists, shell rc files, `~/.codex/*` and `~/.config/memora/*` under `$HOME` or the given roots (caches, `node_modules`, `.git` and most of `~/Library` skipped). Findings name the file, line, kind, a masked value (first four characters and the length; token values are never printed) and whether the file is memora-all's own (`instances/all.env`; on nuc8, `~/.config/memora/credentials.mcp.json` and `all.*`; `--memora-all PATH`), which is reported but does not fail. `--host H` (repeatable) audits other hosts by piping the module to `ssh -o BatchMode=yes H python3 -`. Exit 1 while any other direct-D1 client remains, or when a file cannot be read or a host cannot be audited; 0 when clean. Repoint backups (`*.bak-repoint-*`) are found too, since they hold the old token.
+- `scripts/local_primary.py check-endpoint --memora-url --health-token-file --admin-token-file [--store scratch] [--no-write]` (`memora/endpoint_check.py`), for F4a. It checks, and stops at the first failure: liveness; that the admin token is enforced (no token and the health token are refused); that `/admin/data-volume` lists the store as `kind: "sqlite"` and not refused (a `d1`/`s3` store, an unknown store, or a memora-all without kinds is refused before anything is written); authenticated `/health/db/<store>`; then over MCP `/mcp/<store>`: `memory_stats` bound to the store, and `memory_create` → `memory_get` → `memory_delete` → `memory_get` (not found) of one tagged throwaway memory. Token files must be 0600 and owned by the user.
+- `/admin/data-volume` also reports each store's `kind` (`sqlite`, `d1`, `s3`).
+- `scripts/repoint_mcp_config.py FILE --url http://nuc8:8920/mcp/<store>`: in a JSON MCP config (`credentials*.mcp.json`, a workspace or Codex `.mcp.json`, `~/.claude.json`), replaces each server entry that reaches D1 directly with `{"type": "http", "url": …}` and keeps everything else as it was. Dry run by default, with secrets masked; `--apply` writes a 0600 backup `FILE.bak-repoint-<UTC timestamp>`, then replaces the file atomically with its own mode. With `--check-health-token-file` and `--check-admin-token-file` it runs check-endpoint against the server through the scratch store (`--check-store`) first, and refuses to apply if that fails.
+- New `docs/local-primary-credentials.md`: which process holds which token in each phase (`MEMORA_D1_EDIT_TOKEN`, `MEMORA_D1_REPLICATOR_TOKEN`, `MEMORA_D1_READ_TOKEN`, operator, Pages, health and admin tokens); the Cloudflare minting steps (account-scoped D1 Edit / D1 Read, no Pages permission, IP filtering, verification); the rotation order (mint → scratch check → repoint → audit → move memora-all to (a) → revoke the old token and delete the backups); and the 14 days (a) is kept after the last cutover.
+
 ### Local-primary L5 (piece c): restore, conflicts/approve, reconcile, resume
 - Per `docs/local-primary-implementation.md` §4, §1 "Reconciliation", §2.6, §0 P3/P7.
 - **`restore <db> --receipt R --out P`** (default): a full re-seed. The target's primary lock is held, and the old store and its sidecars are moved into `<name>.pre-restore-<ts>/`, never deleted. It then seeds (with a recheck); the old store is put back if the seed fails.
@@ -25,6 +33,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   - The apply needs memora-all stopped (`--service-stopped`, refused before any send otherwise). It holds the store's primary lock from before the first D1 send through the rebuild. Groups are compared by enumerating their current D1 rows (every child table by memory id), so a row added after prepare aborts the group. `--dry-run` is the whole no-write plan, delete-guard result included; `--rehearse` does not apply to `--from-r2`.
 - **`reconcile <db> [--accept ID --receipt R --operator O --decision applied|not-applied --evidence-sha256 X]`**: shows the open intents, or POSTs L2's accept body after checking the receipt's D1 identity and that the evidence is unchanged.
 - **`resume <db> --store P [--accept-d1-epoch N | --allow-deletes A]`**: clears a replicator halt while holding the store's primary lock (memora-all stopped). An accepted epoch must equal D1's current one.
+
 
 ### Local-primary L5 (piece b): seed, sequence high-water, snapshot, volume alert
 - Per `docs/local-primary-implementation.md` §4 and §9 k/v.
@@ -39,6 +48,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - `freeze`/`thaw`; a failed step's output names `local_primary.py thaw <db>` (the freeze is kept on purpose).
 - `LocalSQLiteBackend` creates a live primary's parent directory before taking its primary lock (§9 k).
 
+
 ### Local-primary L7: read-only viewer, blocking D1 write guard
 - Per `docs/local-primary-implementation.md` §6 F1/F2 and §9 (f)/(g). This slice issues no D1 statement; it removes the viewer's D1 writes. The Pages deploy is a separate user step.
 - `memora-graph/functions/api/memories/[id].ts`: `PATCH`, `PUT`, `POST` and `DELETE` answer `405` (`{"error": "read_only"}`, `Allow: GET, HEAD`) before any D1 call. `GET` is unchanged.
@@ -48,6 +58,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - `scripts/d1_write_guard.py` (§9 (f)): H1 also matches an interpolated table (`UPDATE ${…} SET`); new H2 flags a string literal or template fragment headed by an uppercase write verb (write SQL built by concatenation); T2/T4 read logical lines (backslash continuations joined); new T6 flags a wrangler D1 `execute`/`migrations apply` whose arguments come from a shell variable without a literal `--local`; T5 now needs an executed guard run with `--scope all` chained directly before the deploy (`&&`, or `|| { …; exit 1; };`), so the guard's name in a comment, an `echo` or a string no longer satisfies it. `--scope all` is clean on the tree.
 - `graph-ui.yml`: the handlers step is blocking (no `continue-on-error`), a blocking `--scope all` step is added, and the read-only tests replace the tag-write tests.
 - `memora-graph/README.md` (§9 (g)): `npm run setup` is labelled partial (it stops after creating the D1 database), and a "Read-only viewer" section documents the above.
+
 
 ### Local-primary L2a: named /data volume, startup mount check, admin token, memory gate
 - Per `docs/local-primary-implementation.md` §8 L2a and §9 (a)/(b). This slice issues no D1 statement.
