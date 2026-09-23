@@ -40,8 +40,11 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
     immediately before seed and before any repoint (cutover, rollback,
     restore). It:
     1. freezes the source store (§1 freeze file);
-    2. re-reads D1's epoch and per-table `COUNT(*)`;
-    3. compares them with the receipt.
+    2. re-reads D1's epoch, per-table `COUNT(*)` and the FULL per-table
+       content hashes, computed the same way as in the receipt;
+    3. compares all of them with the receipt. The epoch covers only
+       `memories` and `memories_embeddings`, and counts miss same-count
+       edits, so the hashes are the deciding check.
     If anything differs, it takes a fresh export and receipt while still
     frozen, and the step continues with that receipt. The freeze stays in
     place until the step completes.
@@ -375,53 +378,120 @@ never fails a write.
 per store in shadow. The registry keeps the store on `d1://`, so every read
 and every primary write still go to D1.
 
-- **The only hook.** `D1Backend.connect()` returns a
-  `ShadowingD1Connection(D1Connection)` for a shadowed store. It overrides
-  `execute` (backends.py:1459), `executemany` (1478) and `executescript`
-  (1493). Every write storage.py makes to D1 goes through these three
-  methods, so no storage.py call site changes.
-  - Each override calls `super()` first and returns its result or exception
-    unchanged.
-  - Only after D1 reports success does it enqueue
-    `(sql, params, d1_last_row_id, d1_rows_written)`, and only for a
-    statement whose target table (the first `INSERT INTO` / `UPDATE` /
-    `DELETE FROM` / `REPLACE INTO` name) is one of the 7 in §1.
-  - DDL, SELECTs and other tables are not mirrored. A statement it cannot
-    parse is counted in `shadow_unparsed`.
-- **`ShadowApplier(name, shadow: LocalSQLiteBackend, reader: D1ReadOnly)`**
-  is one thread with a FIFO queue, off the request path, so it adds no D1
-  latency. For each item, in one local `store_write`:
-  1. Run the same SQL and params on the shadow. The local outbox triggers
-     fire and record the touched keys.
-  2. Add D1's `last_row_id` as a key for an INSERT into `memories` or
-     `memories_actions`.
-  3. For every touched key, read the row from D1 by pk, and make the local
-     row identical: upsert it, or delete it locally. This removes drift from
-     `datetime('now')` and autoincrement ids.
-  4. Compare local and D1 row counts, and count mismatches.
-- **Failure.** On an exception, it logs, counts `shadow_failures`, and marks
-  the shadow dirty. It never retries into the D1 path and never touches the
-  D1 result.
-  - A dirty shadow is re-seeded from a fresh export, and the 7-night clock
-    restarts.
-  - `D1ReadOnly` wraps a schema-free D1 connection and rejects any
-    non-SELECT with the P2 checker, so the shadow cannot write D1.
-- **Nightly check, shadow mode.** No barrier is needed: D1 is the source.
-  - **(a) Shadow vs D1.** A full-table compare of all §5.2 tables, after the
-    queue has drained. A diffed key is re-read from D1 once; a persistent
-    diff is a shadow-apply bug.
-  - **(b) Builder.** Replay the log up to `log_cursor_seq` into a scratch
-    copy of the shadow's seed export, then compare it with a `.backup`
-    snapshot of the shadow at the same seq. A diff is a statement-builder
-    bug.
-  - Both checks are found before any replicator write reaches D1. A clean
-    night means (a) and (b) both show zero diffs and `shadow_failures`,
-    `shadow_unparsed` and row-count mismatches are all 0.
-- **Metrics.** `/health/db/<name>` gets a `shadow` block:
-  - `queue_depth`, `shadow_failures`, `shadow_unparsed`, `dirty`;
-  - `last_clean_night`, `clean_nights`.
-- **Removal.** L13 deletes `ShadowingD1Connection`, `ShadowApplier` and
-  `MEMORA_SHADOW_LOCAL` after the last cutover.
+**The only hook.** `D1Backend.connect()` returns a
+`ShadowingD1Connection(D1Connection)` for a shadowed store. It overrides
+`execute` (backends.py:1459), `executemany` (1478) and `executescript`
+(1493). Every write storage.py makes to D1 goes through these three
+methods, so no storage.py call site changes.
+- The app-visible result or exception is exactly what the unwrapped
+  connection returns: same object, same exception.
+- Per-element hooking (P1-2). `executemany` and `executescript` send one D1
+  request per element. The wrapper re-implements the loop by calling
+  `super().execute` once per element, and enqueues each element as soon as
+  that element succeeds. The result is still the same object, and
+  `rowcount` and `lastrowid` are aggregated as the parent does.
+- A statement is mirrored only if its target table (the first
+  `INSERT INTO` / `UPDATE` / `DELETE FROM` / `REPLACE INTO` name) is one of
+  the 7 in §1. DDL, SELECTs and other tables are not mirrored.
+- Each item carries
+  `(sql, params, d1_last_row_id, d1_rows_written, served_by_primary)`.
+
+**`ShadowApplier(name, shadow: LocalSQLiteBackend, reader: D1SelectOnlyConnection)`**
+is one thread with a FIFO queue, off the request path. For each item, in
+one local `store_write`:
+1. Run the same SQL and params on the shadow. The local outbox triggers fire
+   and record the touched keys.
+2. Add D1's `last_row_id` as a key for an INSERT into `memories` or
+   `memories_actions`.
+3. Copy back: read each key from D1 by pk, and make the local row identical
+   by upserting or deleting it locally.
+
+**Read consistency (P1-4).** D1's Sessions API (bookmarks) "is only
+available via the D1 Worker Binding and not yet available via the REST
+API", and read replication is opt-in
+(https://developers.cloudflare.com/d1/best-practices/read-replication/).
+The existing `cf-d1-session-token` handling in `D1Connection` therefore
+gives no guarantee over REST. The plan does not rely on it:
+- **Required:** read replication stays disabled on every store's D1
+  database. L3b checks `read_replication.mode` through the REST API, and
+  the applier refuses to start if it is not `disabled`.
+- **Per response:** the reader asserts `meta.served_by_primary == true` on
+  every copy-back response. A replica-served answer is retried, up to 5
+  times, 200 ms apart.
+- **Written values:** for statement shapes the parser recognises (the
+  INSERT column list, and `UPDATE … SET col = ?`), the copy-back row must
+  show the written parameter values in those columns. Expression columns
+  such as `datetime('now')` are exempt. A mismatch is retried with the same
+  bounds.
+
+**`D1SelectOnlyConnection` (P0-1).** This is a separate class. It is not
+`D1Connection` and not the P2 checker.
+- Its `execute` accepts exactly one statement that is `SELECT …` or
+  `WITH … SELECT …`: no `;` outside string literals, and none of
+  `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `UPSERT`, `PRAGMA`, `CREATE`,
+  `DROP`, `ALTER`, `ATTACH`, `VACUUM` or `RETURNING` as tokens. It rejects
+  everything else, including the per-key UPSERT and DELETE that P2 allows.
+- It has no `executemany`, `executescript`, `commit` or `execute_batch`.
+- It is opened schema-free.
+- Credential: Cloudflare offers a "D1 Read" API-token permission ("Grants
+  read access to D1",
+  https://developers.cloudflare.com/fundamentals/api/reference/permissions/).
+  It is account-scoped, not per-database. The shadow reader and the
+  compare, export and recheck tools use a separate D1 Read token
+  (`MEMORA_D1_READ_TOKEN`); this is **required**.
+  - L3b verifies, on a throwaway database, that the D1 Read token can run a
+    SELECT through `/query` and is refused an INSERT.
+  - If D1 Read cannot run `/query` SELECTs, the plan records that the
+    SELECT-only guard is the only boundary.
+
+**Dirty rule (every failure point).** Any of the following sets
+`shadow_state.dirty = 1` with a reason. The D1 result and the D1 path are
+never touched, and nothing retries into D1. A dirty shadow is re-seeded from
+a fresh export, and the 7-night clock restarts.
+
+| # | failure point | rule |
+|---|---|---|
+| 1 | a single mutating D1 request raises, or times out with an unknown outcome | dirty |
+| 2 | `executemany` / `executescript`: an element raises after earlier elements succeeded (those were already enqueued) | dirty |
+| 3 | enqueue fails, or the applier is not running when an item arrives | dirty |
+| 4 | local replay raises | dirty; roll back this item's local transaction |
+| 5 | a copy-back read fails, stays replica-served, or shows a written-value mismatch after the retries | dirty |
+| 6 | local rows affected ≠ D1 `rows_written` | dirty |
+| 7 | a mutating statement on a §1 table cannot be parsed for a target table | dirty |
+| 8 | the applier thread dies (its run loop catches `BaseException`) | dirty; health shows `applier_alive=false` |
+| 9 | process exit or restart with a non-empty queue: the queue is in memory | dirty via the marker below |
+| 10 | a D1 write not made through the wrapper (a foreign writer) | cannot be seen per write; the nightly shadow-vs-D1 compare finds it, and the writer freeze (§6) prevents it |
+
+The marker for row 9 is `shadow_state.clean_shutdown`:
+- It is set to 0 when the applier starts.
+- It is set to 1 only after a graceful stop has drained the queue.
+- A start that finds 0 marks the shadow dirty.
+
+```sql
+CREATE TABLE shadow_state (   -- in the shadow file only
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  dirty INTEGER NOT NULL DEFAULT 0, dirty_reason TEXT, dirty_at TEXT,
+  clean_shutdown INTEGER NOT NULL DEFAULT 0,
+  clean_nights INTEGER NOT NULL DEFAULT 0, last_clean_night TEXT
+);
+```
+
+**Nightly check (shadow mode).** No barrier is needed: D1 is the source.
+- **(a) Shadow vs D1.** A full-table compare of all §5.2 tables, after the
+  queue drains. A diffed key is re-read once; a persistent diff is a
+  shadow-apply bug.
+- **(b) Builder.** The log key set must equal the outbox key set up to
+  `log_cursor_seq`. Then the log is replayed into a scratch copy of the
+  shadow's seed export and compared with a `.backup` of the shadow at the
+  same seq. A diff is a statement-builder bug.
+- A clean night means (a) and (b) show zero diffs and `dirty = 0`. Either
+  failure resets `clean_nights`.
+
+**Metrics.** `/health/db/<name>` gets a `shadow` block with `queue_depth`,
+`applier_alive`, `dirty`, `dirty_reason` and `clean_nights`.
+
+**Removal.** L13 deletes `ShadowingD1Connection`, `ShadowApplier`,
+`D1SelectOnlyConnection`'s shadow use and `MEMORA_SHADOW_LOCAL`.
 
 ## 3. Absorb on a transactional backend (L4)
 
@@ -541,8 +611,13 @@ Other rules:
      - `snapshot` sends per-key UPSERTs to D1, or a per-key DELETE when the
        snapshot lacks the key. These are built by `_build_statements` and
        pass `_check_statement` and P3.
-  5. Nothing is written to D1 for a group without a selection.
-  6. `--dry-run` prints the exact statements.
+  5. Apply runs under the freeze. Before writing each `snapshot` group, it
+     re-reads the group's D1 rows (the memories row and all child rows, or
+     the meta key) and hashes them. If the hash differs from the D1
+     preimage hash recorded in the conflicts file, that group is aborted
+     and reported; the other groups continue.
+  6. Nothing is written to D1 for a group without a selection.
+  7. `--dry-run` prints the exact statements.
 - **Sequence high-water, D1 side** (H7): run before rollback and before
   restore, with a receipt and a passing recheck.
   - It is one statement per table:
@@ -622,10 +697,13 @@ lines.
    stops.
 6. Validate D1 read-only: `verify_embedding_integrity(conn, stamp=False)`
    against the `d1://` backend. It writes nothing.
-   - D1's `embedding_integrity` stamp is now stale (an older epoch). It is
-     restamped after the repoint by the normal primary path (an explicit
-     admin `verify_embedding_integrity` through memora-all), not by
-     rollback.
+   - D1's `embedding_integrity` stamp is now stale (an older epoch).
+     Rollback does not restamp it. The restamp is a separate, explicitly
+     operator-run admin step (write path 4, §8): `local_primary.py
+     restamp <db> --receipt R`. It runs after the rollback compare and after
+     the repoint, requires its own fresh export and receipt, and calls
+     `verify_embedding_integrity(conn, stamp=True)`. That writes one
+     `memories_meta` row, `embedding_integrity`. It is never automatic.
 7. Run `recheck` against step 3's receipt.
 8. Repoint `MEMORA_DATABASES` to `d1://` and remove the store from
    `MEMORA_REPLICAS`.
@@ -706,19 +784,30 @@ if it is in the dev deps.
 - **`test_connect_replicator_single_caller`**.
 
 **Shadow-local** (L3b):
-- the wrapper returns D1's result and exception unchanged when the shadow
-  raises;
-- mirror after success only;
-- DDL and non-replicated tables are not mirrored;
-- copy-back makes local rows equal to D1's, including `datetime('now')`
-  columns and ids;
-- a dirty shadow is marked, and D1 is untouched;
-- `D1ReadOnly` rejects INSERT/UPDATE/DELETE/DDL (mutation: remove the
-  check);
-- property run: random writes through the app's D1 path, and the shadow
-  equals FakeD1 after the drain;
-- the nightly check finds an injected shadow bug and an injected builder
-  bug.
+- **app-visible identity**: for every wrapped method, the result or
+  exception equals the unwrapped connection's (same `rowcount`,
+  `lastrowid`, exception type and message);
+- **`test_executemany_partial_then_fail_marks_dirty`** and
+  **`test_executescript_partial_then_fail_marks_dirty`**: completed elements
+  are enqueued, dirty is set, and the original exception propagates;
+- **`test_unknown_outcome_timeout_marks_dirty`**;
+- **`test_select_only_reader_rejects_p2_legal`**: a per-key UPSERT, a
+  per-key DELETE, PRAGMA, DDL, a multi-statement body and `RETURNING` are all
+  rejected; the missing `executemany`/`executescript` raise
+  `AttributeError`. Mutation: loosen the checker to the P2 set, and the
+  test must fail;
+- **`test_stale_replica_read`**: FakeD1 answers the first two copy-back reads
+  with `served_by_primary=false` and old values, then the fresh row.
+  Converges within bounds. Always stale means dirty;
+- **`test_applier_refuses_with_read_replication`**;
+- one test per dirty-rule row 1–9, each asserting dirty is set and FakeD1
+  shows no extra write;
+- **`test_restart_with_nonempty_queue_marks_dirty`**: a subprocess is killed
+  with items queued;
+- copy-back equality, including `datetime('now')` columns and ids;
+- a property run: random writes through the app path, and the shadow equals
+  FakeD1 after the drain;
+- the nightly check finds an injected apply bug and an injected builder bug.
 
 **Schema and read policy** (L2):
 - D1 store has no sync objects;
@@ -752,10 +841,13 @@ if it is in the dev deps.
 - R2 restore (P0-2): every difference becomes a conflict group; D1 receives
   nothing without a selection; a group missing from `--approve` refuses the
   whole apply; `d1` selections never write D1; a wrong conflicts sha refuses;
-  P3 applies;
+  P3 applies; a changed D1 preimage aborts only that group (P1-3);
 - receipt (P1-4): refused when the R2 read-back hash differs; refused when
   the epoch changes during the export; `recheck` detects a count or epoch
-  change and forces a fresh export;
+  change and forces a fresh export; **`test_recheck_same_count_crossref_edit`**:
+  a same-count edit to crossrefs, actions, tombstones or meta is caught by
+  the hash (P1-3);
+- **`test_restamp_requires_receipt_and_operator`** (P2-5);
 - **`test_rollback_validate_writes_nothing`**: FakeD1 records only SELECTs
   during step 6 (P2-7);
 - receipt refusal (P1).
@@ -779,10 +871,10 @@ with flags off.
 | L2a | launcher and volume (C1); see below | only adds a mount | none | none | 0 |
 | L2 | §1, M10, freeze, `connect_replicator` | no `sync_state` | none | none. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
 | L3 | §2: log and write modes, P2/P3, H2/H3, metrics, F7 | `MEMORA_REPLICATION` unset | write mode: epoch SELECT (preflight and postcheck), pk SELECT read-back. Log mode: none | write mode only: per-key UPSERT on 6 tables; embeddings DELETE+INSERT by pk; per-key DELETE (P2, P3). Log mode: none | 0 |
-| L3b | §2.9 shadow-local | `MEMORA_SHADOW_LOCAL` unset | pk SELECT copy-back, through `D1ReadOnly`; compare full-table SELECTs | **none new**: the wrapper only forwards the app's existing writes, unchanged | 0 |
+| L3b | §2.9 shadow-local | `MEMORA_SHADOW_LOCAL` unset | pk SELECT copy-back through `D1SelectOnlyConnection` with the D1 Read token; `read_replication` config GET; compare full-table SELECTs | **none new**: the wrapper only forwards the app's existing writes, unchanged | 0 |
 | L4 | §3 | local stores only | none new | none new (D1 absorb path unchanged) | 0 |
 | L5 | §4 export, seed, recheck, restore, snapshot, sequence step | run by hand | `wrangler d1 export --remote`; per-table `COUNT(*)` and full-table SELECTs (hashes); epoch SELECT; `SELECT … FROM sqlite_sequence`; conflict reads | R2 restore: only per-key UPSERT/DELETE selected in `--approve` (P3). Sequence step: `UPDATE sqlite_sequence SET seq=? WHERE name=? AND seq<?` (≤ 2 statements, operator-run, receipt and recheck). Nothing else | 0 at merge |
-| L6 | §5 compare and rollback | run by hand | full-table SELECTs of the 7 tables; epoch; `verify_embedding_integrity(stamp=False)` reads | rollback: only L5's sequence UPDATE | 0 |
+| L6 | §5 compare, rollback, `restamp` | run by hand | full-table SELECTs of the 7 tables; epoch; `verify_embedding_integrity(stamp=False)` reads | rollback: only L5's sequence UPDATE. `restamp` (a separate operator step): one `memories_meta` `embedding_integrity` write | 0 |
 | L7 | F1, F2 for handlers; viewer deploy | viewer deploy | viewer GET handlers (unchanged) | none (removes writers) | 0 |
 | L8 | F4a–F6, `audit-configs` | ops | none | none | 0 |
 | L9 | first store (`re` or `bestation`, the less critical), see below | per store | L3b, L5, L3 write-mode reads | the app's existing writes during shadow; after cutover, L3 write mode | whole store |
@@ -820,14 +912,18 @@ writes). Every D1 write the plan introduces is one of:
 1. replicator write mode: per-key, outbox-driven, P2/P3-guarded;
 2. R2 restore: only operator-selected per-key rows, P2/P3-guarded;
 3. the sequence UPDATE: operator-run, with receipt and recheck, halts on
-   rejection.
+   rejection;
+4. the post-rollback `restamp`: operator-run, with its own receipt, after
+   the rollback compare and the repoint. It writes one `memories_meta`
+   row. Never automatic.
 
 Checked and found to write nothing to D1:
 - export, recheck, seed, default restore, compare and snapshot;
 - rollback: validation uses `stamp=False`;
 - `resume`;
 - H3 reconciliation: SELECTs, then a resend through (1);
-- the shadow applier: `D1ReadOnly`;
+- the shadow applier: `D1SelectOnlyConnection`, SELECT only, with the D1
+  Read token;
 - the ShadowingD1Connection wrapper: it forwards the app's existing writes
   unchanged and adds none;
 - health and watchdog;
@@ -838,7 +934,6 @@ Checked and found to write nothing to D1:
 Pre-existing D1 writes the plan leaves as they are:
 - memora-all's own writes and `ensure_schema` DDL on stores still served
   from `d1://` (including the shadow period, and after a rollback);
-- the post-rollback integrity restamp, which is that normal primary path.
 
 **L2a, launcher and volume (C1):**
 - `memora-instance.sh` `cmd_up`, in the `MEMORA_DATABASES` branch (line
