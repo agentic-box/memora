@@ -435,6 +435,11 @@ def _emit_event(
             pass
 
 
+class ConcurrentUpdateError(RuntimeError):
+    """update_memory(expected_row=...) matched no row: the memory changed (or
+    was retired) after the caller checked it. Nothing was written."""
+
+
 class MemoryWriteError(Exception):
     """Raised when add_memory fails after allocating a row id (partial insert)."""
 
@@ -8338,6 +8343,8 @@ def update_memory(
     metadata: Optional[Dict[str, Any]] = None,
     tags: Optional[List[str]] = None,
     replace_metadata: bool = False,
+    expected_row: Optional[Mapping[str, Any]] = None,
+    force_reindex: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Update an existing memory. Only provided fields are updated.
 
@@ -8345,6 +8352,16 @@ def update_memory(
     the existing metadata and keys set to None are deleted. Pass
     replace_metadata=True only for callers that intentionally want to replace
     the complete metadata object.
+
+    expected_row (internal, e.g. the #47 backfill apply): a precondition ON
+    THE UPDATE STATEMENT ITSELF -- the row's stored content, metadata, tags,
+    updated_at and crossrefs `related` must still be exactly these values,
+    and the memory must not be tombstoned. If the guarded UPDATE matches no
+    row, ConcurrentUpdateError is raised BEFORE any index write, so a
+    concurrent absorb/update between the caller's check and this write is
+    never overwritten (on D1 too, where there is no transaction).
+    force_reindex (internal): refresh the FTS entry and the embedding even
+    when nothing changed (repairing a write that stopped part-way).
     """
     # First check if memory exists
     existing = get_memory(conn, memory_id)
@@ -8395,7 +8412,7 @@ def update_memory(
     content_changed = content is not None and new_content != existing["content"]
     tags_changed = sorted(new_tags) != sorted(existing.get("tags", []))
     metadata_changed = metadata is not None and new_metadata != existing.get("metadata")
-    index_changed = content_changed or tags_changed or metadata_changed
+    index_changed = content_changed or tags_changed or metadata_changed or force_reindex
 
     # Serialize for storage
     metadata_json = json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
@@ -8411,10 +8428,25 @@ def update_memory(
 
     # Update the memory
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    cur = conn.execute(
-        "UPDATE memories SET content = ?, metadata = ?, tags = ?, updated_at = ? WHERE id = ?",
-        (new_content, metadata_json, tags_json, now, memory_id),
-    )
+    if expected_row is not None:
+        cur = conn.execute(
+            "UPDATE memories SET content = ?, metadata = ?, tags = ?, updated_at = ? "
+            "WHERE id = ? AND content = ? AND metadata IS ? AND tags IS ? AND updated_at IS ? "
+            "AND NOT EXISTS (SELECT 1 FROM tombstones WHERE memory_id = ?) "
+            "AND NOT EXISTS (SELECT 1 FROM tombstone_components WHERE memory_id = ?) "
+            "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ?",
+            (new_content, metadata_json, tags_json, now, memory_id,
+             expected_row["content"], expected_row["metadata"], expected_row["tags"],
+             expected_row["updated_at"], memory_id, memory_id, memory_id, expected_row["related"]),
+        )
+        if getattr(cur, "rowcount", None) == 0:
+            raise ConcurrentUpdateError(
+                f"memory {memory_id} changed, or was retired or superseded, after it was checked")
+    else:
+        cur = conn.execute(
+            "UPDATE memories SET content = ?, metadata = ?, tags = ?, updated_at = ? WHERE id = ?",
+            (new_content, metadata_json, tags_json, now, memory_id),
+        )
 
     # Verify the update affected a row (helps catch D1 issues)
     if hasattr(cur, 'rowcount') and cur.rowcount == 0:

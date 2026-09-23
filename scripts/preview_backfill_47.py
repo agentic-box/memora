@@ -59,6 +59,62 @@ UNSUPPORTED_STORE = ("the preview supports local SQLite and D1 stores only: {uri
                      "(an S3 cloud store's backend syncs a local cache; nothing was opened)")
 
 
+def metadata_sha256(raw_metadata: Optional[str]) -> str:
+    """Fingerprint of a memory's FULL stored metadata: sha256 of its JSON
+    re-serialised canonically (sorted keys, no whitespace); malformed JSON
+    hashes as its raw text, none as the empty string. Shared with the apply
+    step (scripts/apply_backfill_47.py), which recomputes it."""
+    import hashlib
+
+    text = raw_metadata or ""
+    if text:
+        try:
+            text = json.dumps(json.loads(text), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            pass
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) -> List[str]:
+    """Copy approved=true from an older approved preview onto THIS preview,
+    mechanically: only for a memory id that OLD approved with status
+    proposed AND that this preview also proposes with the identical target,
+    identical proposal.retag_typed and identical stored section. Every other
+    row stays unapproved (back to the user). Returns a per-row table."""
+    if not isinstance(old.get("approval"), dict):
+        raise SystemExit(f"{old_path}: no approval block to carry")
+    new_rows = {r["id"]: r for g in ("contradictions", "keyword_only") for r in preview.get(g, [])}
+    lines, carried, dropped = [], 0, 0
+    for group in ("contradictions", "keyword_only"):
+        for o in old.get(group) or []:
+            if not (o.get("approved") is True and o.get("status") == "proposed"):
+                continue
+            n = new_rows.get(o["id"])
+            op, np_ = o.get("proposal") or {}, (n or {}).get("proposal") or {}
+            if n is None:
+                reason = "not in the new preview"
+            elif n.get("status") != "proposed":
+                reason = f"new status {n.get('status')!r}"
+            elif np_.get("set_metadata_project") != op.get("set_metadata_project"):
+                reason = f"target {op.get('set_metadata_project')!r} -> {np_.get('set_metadata_project')!r}"
+            elif np_.get("retag_typed") != op.get("retag_typed"):
+                reason = "retag_typed differs"
+            elif (n.get("stored") or {}).get("section") != (o.get("stored") or {}).get("section"):
+                reason = "stored section differs"
+            else:
+                reason = None
+            if reason is None:
+                n["approved"] = True
+                carried += 1
+                lines.append(f"#{o['id']}\tcarried\t{op.get('set_metadata_project')}")
+            else:
+                dropped += 1
+                lines.append(f"#{o['id']}\tdropped\t{reason}")
+    preview["approval"] = dict(old["approval"], carried_from=old_path, carried=carried, dropped=dropped)
+    lines.append(f"carried {carried}, dropped {dropped} (dropped rows stay unapproved: back to the user)")
+    return lines
+
+
 def configured_uri(db_name: Optional[str]) -> Optional[str]:
     """The store URI the preview would open, from the environment TEXT only
     -- no backend is resolved or constructed (a cloud backend's constructor
@@ -251,9 +307,9 @@ def assess(memory_id: int, content: str, metadata: Dict[str, Any], tags: List[st
 
 
 def build_preview(conn, known: List[str]) -> Dict[str, Any]:
-    rows = conn.execute("SELECT id, content, metadata, tags FROM memories ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id, content, metadata, tags, updated_at FROM memories ORDER BY id").fetchall()
     out: Dict[str, List[Dict[str, Any]]] = {"contradictions": [], "keyword_only": []}
-    for memory_id, content, raw_meta, raw_tags in rows:
+    for memory_id, content, raw_meta, raw_tags, updated_at in rows:
         if storage._import_pending(raw_meta):
             continue
         try:
@@ -264,6 +320,8 @@ def build_preview(conn, known: List[str]) -> Dict[str, Any]:
         row = assess(int(memory_id), content or "", metadata if isinstance(metadata, dict) else {},
                      tags if isinstance(tags, list) else [], known)
         if row is not None:
+            row["stored"]["metadata_sha256"] = metadata_sha256(raw_meta)
+            row["stored"]["updated_at"] = updated_at
             out[row.pop("group")].append(row)
     summary = {
         "kind": "issue #47 backfill PREVIEW (read-only; nothing was written). Flip approved to true "
@@ -302,6 +360,8 @@ def main(argv=None) -> int:
     ap.add_argument("--db", help="registry store name (MEMORA_DATABASES)")
     ap.add_argument("--out", required=True, help="preview JSON file to write (the approval list)")
     ap.add_argument("--markdown", help="also write a markdown table here")
+    ap.add_argument("--carry-approval", metavar="OLD.json",
+                    help="carry approvals from an older approved preview (see carry_approval)")
     args = ap.parse_args(argv)
     _bootstrap(args.db)  # refuse or pin FIRST, then import memora
 
@@ -316,6 +376,10 @@ def main(argv=None) -> int:
     finally:
         if token is not None:
             storage.CURRENT_DB.reset(token)
+    if args.carry_approval:
+        old = json.loads(Path(args.carry_approval).read_text())
+        for line in carry_approval(preview, old, args.carry_approval):
+            print(line)
     Path(args.out).write_text(json.dumps(preview, indent=1, ensure_ascii=False) + "\n")
     if args.markdown:
         Path(args.markdown).write_text(to_markdown(preview) + "\n")

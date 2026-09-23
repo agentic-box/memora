@@ -202,7 +202,7 @@ def _combined_env_run(tmp_path, argv_code):
     home.mkdir()
     local = tmp_path / "l.db"
     conn = _sqlite3.connect(local)
-    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT)")
+    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT, updated_at TEXT)")
     conn.commit()
     conn.close()
     guard = tmp_path / "guard"
@@ -253,7 +253,7 @@ def test_the_script_ignores_an_s3_storage_uri_when_the_registry_selects_a_local_
     home.mkdir()
     local = tmp_path / "l.db"
     conn = _sqlite3.connect(local)
-    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT)")
+    conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT, metadata TEXT, tags TEXT, updated_at TEXT)")
     conn.commit()
     conn.close()
     guard = tmp_path / "guard"
@@ -278,3 +278,50 @@ def test_the_script_ignores_an_s3_storage_uri_when_the_registry_selects_a_local_
     assert proc.returncode == 0, proc.stderr
     assert out.exists() and not (home / ".cache").exists()
     assert "CloudSQLiteBackend constructed" not in proc.stderr + proc.stdout
+
+
+def test_carry_approval_copies_only_identical_proposals(store, tmp_path, capsys):
+    with storage.connect() as conn:
+        ids = _seed(conn)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    fresh = outdir / "fresh.json"
+    assert preview.main(["--out", str(fresh)]) == 0
+    old = json.loads(fresh.read_text())
+    rows = {r["id"]: r for g in ("contradictions", "keyword_only") for r in old[g]}
+    # OLD approved the two proposed rows; for the keyword row it recorded a
+    # different section, and it approved a row that is now needs-human.
+    rows[ids["legacy_issue"]]["approved"] = True
+    rows[ids["keyword"]]["approved"] = True
+    rows[ids["keyword"]]["stored"]["section"] = "memora"
+    rows[ids["typed_only"]].update(approved=True, status="proposed",
+                                   proposal={"set_metadata_project": "memora", "retag_typed": {}})
+    old["approval"] = {"approved_by": "user", "at": "2026-09-23", "rule": "proposed rows"}
+    old_path = outdir / "old.json"
+    old_path.write_text(json.dumps(old))
+    new = outdir / "new.json"
+    capsys.readouterr()
+    assert preview.main(["--out", str(new), "--carry-approval", str(old_path)]) == 0
+    table = capsys.readouterr().out
+    data = json.loads(new.read_text())
+    approved = {r["id"] for g in ("contradictions", "keyword_only") for r in data[g] if r["approved"]}
+    assert approved == {ids["legacy_issue"]}
+    assert f"#{ids['legacy_issue']}\tcarried" in table
+    assert f"#{ids['keyword']}\tdropped\tstored section differs" in table
+    assert f"#{ids['typed_only']}\tdropped\tnew status 'needs-human'" in table
+    assert data["approval"]["carried"] == 1 and data["approval"]["dropped"] == 2
+    assert data["approval"]["approved_by"] == "user" and data["approval"]["carried_from"] == str(old_path)
+    # The new preview carries the full fingerprints the apply step requires.
+    row = next(r for r in data["contradictions"] if r["id"] == ids["legacy_issue"])
+    assert row["stored"]["content_sha256"] and row["stored"]["metadata_sha256"]
+
+
+def test_carry_approval_refuses_an_old_file_without_approval(store, tmp_path):
+    with storage.connect() as conn:
+        _seed(conn)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    old = outdir / "old.json"
+    old.write_text(json.dumps({"contradictions": [], "keyword_only": []}))
+    with pytest.raises(SystemExit, match="no approval block"):
+        preview.main(["--out", str(outdir / "n.json"), "--carry-approval", str(old)])
