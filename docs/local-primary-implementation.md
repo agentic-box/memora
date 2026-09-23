@@ -295,13 +295,22 @@ Not replicated:
       - the whole compaction: snapshot, write, fsync, rename and directory
         fsync.
 
-      memora-all also holds `fcntl.flock(LOCK_EX)` on the journal for its
-      lifetime, and asserts that it is the only writer.
+      **Lock and fd lifecycle (round-11 P0).** A flock belongs to an inode,
+      not a path, so it is never taken on the journal file, which compaction
+      replaces.
+      - memora-all holds `fcntl.flock(LOCK_EX)` on a stable, never-renamed
+        lockfile, `/data/intent/<db>.lock`, for its lifetime. It asserts
+        that it is the only writer.
+      - Before every pre-send intent append, it runs `fstat` on the active
+        fd and `stat` on `/data/intent/<db>.jsonl`, and compares
+        `(st_dev, st_ino)`. On a mismatch the send is refused with
+        `IntentJournalError` and the gate goes `frozen-unsafe`. It never
+        writes to a mismatched fd.
       - Operator actions (`reconcile --accept`) do not write the file. They
         go through the admin endpoint (`POST /admin/reconcile/<db>/<id>`,
         which needs a receipt), so the process is the only journal writer.
-      - When memora-all is stopped, `local_primary.py` takes the same flock
-        before touching the file.
+      - When memora-all is stopped, `local_primary.py` takes the same
+        lockfile flock before touching the journal.
     - **Repair after any write error (round-10 P0).** After ANY failed append
       or fsync (intent or resolution), under the mutex and before any further
       D1 send for that store:
@@ -343,7 +352,10 @@ Not replicated:
       store still on `d1://` before its shadow week has neither table.
       Compaction runs under the journal mutex when the file exceeds 8 MB. No
       intent can be appended between the snapshot and the rename; a mutation
-      that arrives meanwhile waits on the mutex. It writes a new file holding
+      that arrives meanwhile waits on the mutex. Before the mutex is
+      released it does all of this: write the replacement, fsync it, rename
+      it over the path, fsync the directory, close the old fd, and reopen
+      the active fd from the path (round-11 P0). It writes a new file holding
       only the open intents and the id counter, fsync it, `rename` it
       atomically over the old one, and fsync the directory. Only resolved
       pairs are dropped.
@@ -1139,8 +1151,16 @@ if it is in the dev deps.
   paused before its rename while another thread attempts a mutation. The
   mutation waits, then appears in the replacement journal;
 - **`test_journal_single_writer_flock`**: a second opener, and
-  `local_primary.py` while memora-all runs, are refused; `--accept` goes
-  through the endpoint;
+  `local_primary.py` while memora-all runs, are refused through the lockfile;
+  `--accept` goes through the endpoint;
+- **`test_compaction_then_write_survives_restart`** (round-11 P0):
+  compaction, then immediately a live D1 write, then a kill and restart. That
+  write's intent is in the journal at the path, and it is open;
+- **`test_lock_after_compaction_refused`**: right after compaction, a second
+  process tries to lock the new journal path's lockfile and is refused;
+- **`test_stale_fd_refuses_send`**: an injected stale fd (an inode mismatch)
+  refuses the send; FakeD1 receives nothing, and the gate is
+  `frozen-unsafe`;
 - **`test_every_open_intent_needs_accept`** (round-10 P2): an INSERT whose
   row is present, a no-op UPDATE and a DELETE of an absent key all stay open
   until `reconcile --accept`;
