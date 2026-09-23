@@ -74,6 +74,11 @@ class _GateToken:
                 "age_seconds": round(time.monotonic() - self.started, 3)}
 
 
+# The only module allowed to take an exempt (drain-while-frozen) gate entry
+# (L3 review 7603, §9 item o).
+_EXEMPT_CALLERS = frozenset({"memora.replicator"})
+
+
 class _WriteGate:
     def __init__(self, key: str, name: Optional[str] = None):
         self.key = key
@@ -93,6 +98,12 @@ class _WriteGate:
         refused while frozen or draining -- ingress is frozen, the replicator
         must still drain -- but counted in flight, so freeze() waits for it
         and a frozen store with it in flight is not "frozen, 0 in flight"."""
+        if exempt:
+            import sys
+
+            caller = sys._getframe(1).f_globals.get("__name__")
+            if caller not in _EXEMPT_CALLERS:
+                raise PermissionError(f"write gate: exempt entries are for the replicator only, not {caller!r}")
         with self._cond:
             if exempt:
                 tok = _GateToken(desc, threading.get_ident())

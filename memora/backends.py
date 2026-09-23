@@ -558,6 +558,114 @@ if hasattr(sqlite3.Connection, "autocommit"):  # Python 3.12+
     _ThreadCheckedConnection.autocommit = property(_get_autocommit, _set_autocommit)
 
 
+class StoreWriteAborted(RuntimeError):
+    """A helper called rollback() inside store_write: the transaction is gone."""
+
+
+WRITER_BUSY_TIMEOUT_MS = 5000
+
+
+def writer_setup_pragmas(live_primary: bool) -> tuple:
+    """The ONLY statements connect() runs on a writer before arming its gate
+    (plan §9 item b). Both are idempotent and change no row."""
+    base = (f"PRAGMA busy_timeout = {WRITER_BUSY_TIMEOUT_MS}",)
+    return base + (("PRAGMA journal_mode = WAL",) if live_primary else ())
+
+
+_STORE_WRITE_LOCKS: Dict[str, threading.Lock] = {}
+_STORE_WRITE_LOCKS_GUARD = threading.Lock()
+_STORE_WRITE_TLS = threading.local()
+
+
+def _store_write_lock(db_path) -> threading.Lock:
+    key = os.path.realpath(str(db_path))
+    with _STORE_WRITE_LOCKS_GUARD:
+        lk = _STORE_WRITE_LOCKS.get(key)
+        if lk is None:
+            lk = _STORE_WRITE_LOCKS[key] = threading.Lock()
+        return lk
+
+
+def in_store_write() -> bool:
+    """True while this thread is inside store_write (the no-network rule:
+    nothing may call an LLM, an embedding service or R2 then)."""
+    return getattr(_STORE_WRITE_TLS, "depth", 0) > 0
+
+
+def after_store_write(callback) -> None:
+    """Run callback() after the current store_write COMMITS, outside its lock
+    (deferred image processing, plan §3). Dropped if it rolls back."""
+    stack = getattr(_STORE_WRITE_TLS, "after", None)
+    if not stack:
+        raise RuntimeError("after_store_write outside store_write")
+    stack[-1].append(callback)
+
+
+@contextlib.contextmanager
+def store_write(conn):
+    """One BEGIN IMMEDIATE transaction on a local writer (plan §3), under a
+    per-store process-wide lock (writer connections are thread-affine, so a
+    lock replaces "one shared connection"). Inner commits are deferred to
+    the end, an inner rollback aborts the whole transaction, and callbacks
+    registered with after_store_write run after the commit, outside the
+    lock. Re-entrant on the same connection (a nested call joins)."""
+    if not getattr(conn, "supports_transactions", False):
+        raise TypeError("store_write needs a transactional local writer connection")
+    if conn._memora_store_write_depth:
+        conn._memora_store_write_depth += 1
+        try:
+            yield conn
+        finally:
+            conn._memora_store_write_depth -= 1
+        return
+    lock = _store_write_lock(conn._memora_db_path)
+    lock.acquire()
+    callbacks: list = []
+    entered = committed = False
+    try:
+        if conn.in_transaction:
+            conn._memora_commit_now()  # earlier, independent writes of this caller
+        conn.execute("BEGIN IMMEDIATE")
+        conn._memora_store_write_depth = 1
+        _STORE_WRITE_TLS.depth = getattr(_STORE_WRITE_TLS, "depth", 0) + 1
+        stack = getattr(_STORE_WRITE_TLS, "after", None)
+        if stack is None:
+            stack = _STORE_WRITE_TLS.after = []
+        stack.append(callbacks)
+        entered = True
+        try:
+            yield conn
+        except BaseException:
+            conn._memora_store_write_depth = 0
+            try:
+                conn._memora_rollback_now()
+            except sqlite3.Error:
+                logger.exception("store_write: rollback failed")
+            raise
+        conn._memora_store_write_depth = 0
+        try:
+            conn._memora_commit_now()
+        except BaseException:
+            try:
+                conn._memora_rollback_now()
+            except sqlite3.Error:
+                logger.exception("store_write: rollback after a failed commit failed")
+            raise
+        committed = True
+    finally:
+        conn._memora_store_write_depth = 0
+        if entered:
+            _STORE_WRITE_TLS.after.pop()
+            _STORE_WRITE_TLS.depth -= 1
+        lock.release()
+    if committed:
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception:
+                logger.exception("after-commit callback failed")
+
+
 _COMMIT_EVENTS: Dict[str, threading.Event] = {}
 _COMMIT_EVENTS_GUARD = threading.Lock()
 
@@ -664,7 +772,19 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
             self._memora_token = None
             self._memora_gate.leave(tok)
 
+    # Inside store_write (depth > 0) every inner commit is DEFERRED to the
+    # store_write's own commit, and an inner rollback aborts the whole
+    # transaction: phase 3 of absorb, an import, a replicator ack are one
+    # transaction however their helpers are written (plan §3).
+    _memora_store_write_depth = 0
+
     def commit(self):
+        if self._memora_store_write_depth:
+            self._memora_check()
+            return None  # deferred to store_write
+        return self._memora_commit_now()
+
+    def _memora_commit_now(self):
         try:
             result = _ThreadCheckedConnection.commit(self)
         finally:
@@ -673,12 +793,23 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
         return result
 
     def rollback(self):
+        if self._memora_store_write_depth:
+            self._memora_check()
+            raise StoreWriteAborted("rollback() inside store_write: the whole transaction is rolled back")
+        return self._memora_rollback_now()
+
+    def _memora_rollback_now(self):
         try:
             return _ThreadCheckedConnection.rollback(self)
         finally:
             self._memora_gate_after()
 
     def __exit__(self, *exc):
+        if self._memora_store_write_depth:
+            # `with conn:` inside store_write: neither commit nor roll back
+            # here; an exception propagates to store_write, which rolls back.
+            self._memora_check()
+            return False
         try:
             result = _ThreadCheckedConnection.__exit__(self, *exc)
         finally:
@@ -862,8 +993,13 @@ class LocalSQLiteBackend(StorageBackend):
             conn._memora_db_path = self.db_path
             lock.open_writers += 1
         conn.row_factory = sqlite3.Row
-        # Armed last: setup statements on the raw connection (above, and any
-        # future PRAGMAs) are not gated (plan §9 item b).
+        # Setup PRAGMAs on the raw connection (plan §3, §9 item b): these and
+        # nothing else. busy_timeout on every writer; WAL only for a live
+        # primary (readers must not wait for a phase-3 transaction), so every
+        # other local store keeps its journal mode.
+        for pragma in writer_setup_pragmas(self.live_primary):
+            conn.execute(pragma).fetchall()
+        # Armed last: the setup above is not gated.
         if gated:
             conn._memora_gate = self.write_gate()
         return conn

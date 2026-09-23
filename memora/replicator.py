@@ -472,18 +472,13 @@ class StoreReplicator:
         return dict(row)
 
     def _local_txn(self, statements: Sequence[Tuple[str, tuple]]) -> None:
-        """One BEGIN IMMEDIATE on the replicator's anchor writer."""
-        conn = self._conn
-        if conn.in_transaction:
-            conn.commit()
-        conn.execute("BEGIN IMMEDIATE")
-        try:
+        """One store_write (BEGIN IMMEDIATE under the store's write lock,
+        plan §3) on the replicator's anchor writer."""
+        from .backends import store_write
+
+        with store_write(self._conn):
             for sql, params in statements:
-                conn.execute(sql, params)
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
+                self._conn.execute(sql, params)
 
     def _halt(self, reason: str) -> None:
         logger.error("replicator %s halted: %s", self.name, reason)
