@@ -203,7 +203,8 @@ Not replicated:
 - **Freeze: a quiescence barrier (P0-1, P0-2).**
   - **Admission gate.** `_WriteGate` in backends.py holds one gate per
     registry store name, process-wide: a lock, a condition, `state`
-    (`open`, `draining` or `frozen`) and an in-flight set. Each in-flight
+    (`open`, `draining`, `frozen` or `frozen-unsafe`), an in-flight set and
+    a persistent indeterminate set (below). Each in-flight
     entry records the statement class, the thread and the age.
     ```python
     def write_gate(name: str) -> _WriteGate
@@ -234,6 +235,10 @@ Not replicated:
     `executescript` classify every statement. The first mutating statement
     of a transaction calls `enter`, and the token is held until `commit`,
     `rollback` or `close`. `store_write` enters at `BEGIN IMMEDIATE`.
+    `cursor()` returns `_GatedCursor`, whose `execute`, `executemany` and
+    `executescript` go through the same classification and the same
+    transaction token. The raw sqlite3 cursor is therefore not a bypass
+    (round-8 P2c).
     - A connection opened before the freeze is refused on its next mutation
       unless it already holds a token.
     - A transaction admitted before the freeze may finish, and the freeze
@@ -261,11 +266,49 @@ Not replicated:
     - `/health/db/<name>` reports `freeze: {state, in_flight}`.
     - `local_primary.py` export, seed, recheck and repoint call the endpoint
       and re-read `/health/db/<name>` at every step boundary. They refuse
-      unless it reports `frozen` with 0 in flight. The barrier is held
+      unless it reports `frozen` with 0 in flight; `frozen-unsafe` is a
+      refusal. The barrier is held
       through recheck and repoint.
     - When memora-all is stopped (the rollback steps after the stop), the
       scripts instead require `docker inspect … State.Running=false`.
   - Reads continue while frozen.
+  - **Indeterminate writes (round-8 P0).** A mutating D1 request whose
+    outcome is unknown (a client timeout, or a connection reset after
+    sending) does NOT count as complete. Cloudflare may still commit it
+    later.
+    - The gate removes it from in-flight and adds it to a persistent
+      `indeterminate` set. The record holds the id, store, SQL, a sha256
+      digest of the params, the target table, the touched keys when they
+      can be derived, the intended post-state (the INSERT column values, or
+      the `SET` values) and `sent_at`.
+    - The set lives in `/data/indeterminate/<db>.jsonl`, appended and
+      fsynced before the exception is re-raised to the app. It is a file,
+      not `sync_state`/`shadow_state`, because a store still on `d1://`
+      before its shadow week has neither table. The replicator's H3
+      `inflight_*` marker counts as an indeterminate record too.
+    - While the set is non-empty, the gate's state is `frozen-unsafe`, not
+      `frozen`. The freeze still drains to 0 in flight, but every export,
+      seed, recheck and repoint script refuses on `frozen-unsafe`. The
+      admin endpoint and `/health/db/<name>` report `frozen-unsafe` and the
+      record ids.
+    - **Automatic reconciliation** (in memora-all, per record) waits until
+      at least 60 s have passed since `sent_at`. That is 2 × the 30 s client
+      timeout (`_D1_TIMEOUT_SECONDS`, backends.py:1540), which also bounds
+      Cloudflare's per-request limit. It then re-reads the touched keys
+      through `D1SelectOnlyConnection` with the read token and
+      `served_by_primary`. For an INSERT without an explicit id, it looks up
+      rows matching the inserted column values. The record is resolved when
+      the write is visibly applied (the post-state is present) or visibly
+      not applied (the pre-state is intact, or no matching row exists).
+    - **Still ambiguous** (keys cannot be derived, or a key was rewritten
+      since): the record stays. Only
+      `local_primary.py reconcile <db> --accept <id> --receipt R` (an
+      operator decision, with a fresh receipt) or aborting the migration
+      step clears it.
+    - A fresh re-seed never clears the set; the seed script refuses while
+      it is non-empty.
+
+
   - `connect_replicator()` is the replicator's only entry point, and a test
     asserts that no other module calls it (H6).
 
@@ -1005,6 +1048,21 @@ if it is in the dev deps.
   until it commits;
 - **`test_replicator_and_shadow_exempt_from_gate`**;
 - **`test_scripts_refuse_without_frozen_zero_inflight`**;
+- **`test_indeterminate_blocks_freeze_until_reconciled`** (round-8 P0):
+  FakeD1 holds a request's server-side commit while the client times out.
+  The freeze drains to 0 but reports `frozen-unsafe`, and export, seed,
+  recheck and repoint refuse. After the held commit lands and 60 s (a test
+  clock) have passed, reconcile resolves the record as applied and the state
+  becomes `frozen`. The same test without the commit resolves it as not
+  applied;
+- **`test_indeterminate_ambiguous_needs_operator`**: the key is rewritten
+  after the lost request, so the record stays until `reconcile --accept`;
+- **`test_indeterminate_survives_restart_and_reseed`**: the jsonl is
+  fsynced, it is reloaded at startup, and the seed refuses while it is
+  non-empty;
+- **`test_cursor_is_gated`** (P2c): a mutation through
+  `conn.cursor().execute(...)` on a frozen store is refused, and an admitted
+  transaction's cursor shares its token;
 - **`test_pragma_whitelist`** (P1-3): `optimize` and `wal_checkpoint` are
   refused under freeze and mark the shadow dirty; `table_info` and
   `database_list` are allowed under freeze and are reads;
@@ -1191,3 +1249,11 @@ Pre-existing D1 writes the plan leaves as they are:
 - L7 and L8 gate L9.
 - Each cutover can be reversed with §5.3 until the next store's slice
   starts.
+
+## 9. Open items (owned by a slice)
+
+| item | owner | resolution due |
+|---|---|---|
+| (a) `/admin/freeze` auth: an admin-only token (not the health token), or binding the admin routes to loopback only, reached through `docker exec` | L2a | before L2's freeze code ships |
+| (b) the setup PRAGMAs on the raw connection in `connect()`: document that `journal_mode=WAL` and `busy_timeout` are the only ones; both are idempotent and cannot change row data on a frozen primary. A test asserts the set | L2 | with L2 |
+| (c) the `.cursor()` bypass on `_LockedWriterConnection`: **designed now** (§1, `_GatedCursor`) and tested by `test_cursor_is_gated` | L2 | with L2 |
