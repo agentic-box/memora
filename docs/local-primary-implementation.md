@@ -40,7 +40,7 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
   - **Freeze-recheck (`local_primary.py recheck <db> --receipt R`)** runs
     immediately before seed and before any repoint (cutover, rollback,
     restore). It:
-    1. freezes the source store (§1 freeze file);
+    1. freezes the source store (the §1 barrier: `frozen`, 0 in flight);
     2. re-reads D1's epoch, per-table `COUNT(*)` and the FULL per-table
        content hashes, computed the same way as in the receipt;
     3. compares all of them with the receipt. The epoch covers only
@@ -200,19 +200,74 @@ Not replicated:
     `apply_backfill_47.py`), take that lock non-blocking and refuse if it is
     held. So no external writer runs while the service runs; maintenance goes
     through the API or a stopped service.
-- **Freeze.** A store is frozen when it is named in `MEMORA_READONLY_DBS` or
-  when the file `/data/freeze/<db>` exists. The file needs no restart.
-  A frozen store refuses writes and keeps serving reads, for every backend
-  kind, so a store still on `d1://` can be frozen before its cutover:
-  - **Local:** `connect()` sets `PRAGMA query_only = 1` on the writer
-    connection, so any write raises.
-  - **`d1://`:** `D1Backend.connect()` wraps the connection. Its
-    `_execute_api` raises `StoreReadOnlyError` for any statement that
-    `classify_statement` (§2.9) does not class as `read`.
-  - Reads continue in both cases. The check runs per statement, so a freeze
-    placed while a connection is open applies to its next statement. `connect_replicator()` bypasses it; it is the
-  replicator's only entry point, and a test asserts no other module calls it
-  (H6).
+- **Freeze: a quiescence barrier (P0-1, P0-2).**
+  - **Admission gate.** `_WriteGate` in backends.py holds one gate per
+    registry store name, process-wide: a lock, a condition, `state`
+    (`open`, `draining` or `frozen`) and an in-flight set. Each in-flight
+    entry records the statement class, the thread and the age.
+    ```python
+    def write_gate(name: str) -> _WriteGate
+    class _WriteGate:
+        def enter(self, desc: str) -> _GateToken   # raises StoreReadOnlyError unless state == "open"
+        def leave(self, token: _GateToken) -> None
+        def freeze(self, timeout_s: float = 30.0) -> None   # close admission atomically, wait for in-flight == 0
+        def thaw(self) -> None
+    ```
+    - `freeze` closes admission under the lock (`state = draining`), then
+      waits for the in-flight set to empty, and then sets `frozen`.
+    - On timeout, it reopens the gate, which aborts the freeze, and raises
+      `FreezeTimeout` listing the in-flight entries. The step that asked for
+      the freeze does not proceed.
+  - **`d1://` (P0-1).** The connection `backend_for(name)` hands out
+    overrides `_execute_api`. For every statement `classify_statement` does
+    not class as `read`, it calls `enter` before sending. It calls `leave`
+    after the response has been parsed, or after the exception has been
+    determined, including a timeout with an unknown outcome. So a request
+    admitted before the freeze always finishes before the freeze completes.
+    A request arriving after the freeze started is refused. Reads never
+    touch the gate.
+    On a shadowed store, `ShadowingD1Connection` (§2.9) subclasses this gated
+    connection. The order is: enter, D1 request, shadow enqueue, leave. So a
+    completed freeze also means every admitted write has been enqueued.
+    Draining the shadow queue is a separate step (§8 L9).
+  - **Local (P0-2).** `_LockedWriterConnection.execute`, `executemany` and
+    `executescript` classify every statement. The first mutating statement
+    of a transaction calls `enter`, and the token is held until `commit`,
+    `rollback` or `close`. `store_write` enters at `BEGIN IMMEDIATE`.
+    - A connection opened before the freeze is refused on its next mutation
+      unless it already holds a token.
+    - A transaction admitted before the freeze may finish, and the freeze
+      waits for it to commit or roll back.
+    - The earlier `PRAGMA query_only` mechanism is dropped; the gate is the
+      only mechanism.
+    - The backend's own setup PRAGMAs in `connect()` (`journal_mode=WAL` once
+      per file, and `busy_timeout`) run on the raw sqlite3 connection before
+      it is handed out, so they are not gated.
+  - **Exempt by construction.** `connect_replicator()` returns
+    `_ReplicatorConnection`, a separate class that never calls the gate. The
+    shadow applier's backend is built from `MEMORA_SHADOW_LOCAL`, not the
+    registry, so it has no gate. Both must keep running to drain.
+  - **Placing and holding a freeze.** The gate is in-process, so a freeze
+    is valid only while memora-all is the sole D1 writer (F1–F6 require
+    that).
+    - Placed through `POST /admin/freeze/<db>` (health-token auth). It calls
+      `freeze()` and then writes `/data/freeze/<db>`, the persisted intent.
+      It returns 200 `{"state":"frozen","in_flight":0}`, or 409 with the
+      in-flight list if it timed out.
+    - Lifted through `DELETE /admin/freeze/<db>`, which removes the file and
+      calls `thaw()`.
+    - At startup, a store with a freeze file, or named in
+      `MEMORA_READONLY_DBS`, starts `frozen`.
+    - `/health/db/<name>` reports `freeze: {state, in_flight}`.
+    - `local_primary.py` export, seed, recheck and repoint call the endpoint
+      and re-read `/health/db/<name>` at every step boundary. They refuse
+      unless it reports `frozen` with 0 in flight. The barrier is held
+      through recheck and repoint.
+    - When memora-all is stopped (the rollback steps after the stop), the
+      scripts instead require `docker inspect … State.Running=false`.
+  - Reads continue while frozen.
+  - `connect_replicator()` is the replicator's only entry point, and a test
+    asserts that no other module calls it (H6).
 
 ## 2. Replicator (`memora/replicator.py`, L3)
 
@@ -439,8 +494,17 @@ and every primary write still go to D1.
      comma-separated) to reach the main statement. CTE bodies are SELECT-only
      in SQLite.
   4. Classify the main statement:
-     - `SELECT`, `VALUES`, `EXPLAIN`, or `PRAGMA` without `=` or an argument
-       list → `read`: never mirrored, never dirty;
+     - `SELECT`, `VALUES`, `EXPLAIN` → `read`: never mirrored, never dirty;
+     - `PRAGMA` (P1-3): `read` only for the read-only forms in a
+       whitelist: `table_info(t)`, `table_xinfo(t)`, `index_list(t)`,
+       `index_info(i)`, `foreign_key_list(t)`, `database_list`,
+       `integrity_check`, `quick_check`, and the no-argument, no-`=` forms of
+       `journal_mode` and `user_version`. memora itself uses only
+       `table_info` and `database_list`; the rest are listed for the
+       tools. Every other PRAGMA (`optimize`, `wal_checkpoint`,
+       `incremental_vacuum`, `shrink_memory`, any `=` or setter form) is
+       `ddl`-like: gated as a mutation under freeze, never mirrored, and
+       dirty in the shadow;
      - `INSERT` / `REPLACE` (target after `INTO`), `UPDATE` (the next name,
        after an optional `OR <conflict>`), `DELETE FROM` → `mutation` with
        that target;
@@ -750,7 +814,7 @@ Local rows come from one consistent `.backup` snapshot `S`.
 
 Two modes:
 - **Barrier** (cutover, rollback, `resume`):
-  1. Freeze ingress (the §1 freeze file, no restart).
+  1. Freeze ingress (the §1 barrier, no restart).
   2. Drain to `lag_rows = 0`.
   3. Take `S`.
   4. Compare. Zero diffs are required.
@@ -781,7 +845,7 @@ lines.
 
 ### 5.3 Rollback (H6)
 
-1. Freeze ingress (the §1 freeze file). The replicator keeps draining
+1. Freeze ingress (the §1 barrier). The replicator keeps draining
    through `connect_replicator()`.
 2. Wait for `lag_rows = 0`, then stop the service.
 3. Take an export and receipt (P1) of the post-drain D1.
@@ -928,8 +992,22 @@ if it is in the dev deps.
   (mirrored, target resolved); `WITH … SELECT` (read);
   `INSERT OR IGNORE`; `UPDATE OR REPLACE`; `REPLACE INTO`; string literals
   containing `;` and keywords; two statements (unknown, so dirty);
-- **`test_freeze_d1_rejects_writes_keeps_reads`** and
-  **`test_freeze_local_query_only`**;
+- **`test_freeze_d1_rejects_writes_keeps_reads`**;
+- **`test_freeze_waits_for_admitted_d1_write`** (P0-1): a FakeD1 write is
+  paused after admission, and the freeze is placed. The freeze does not
+  report `frozen`, and export does not start, until the write completes. A
+  write arriving after the freeze started is refused;
+- **`test_freeze_timeout_aborts`**: a stuck in-flight write makes the freeze
+  time out, reopen the gate, and list the in-flight entry. The export is not
+  run;
+- **`test_freeze_prior_open_writer`** (P0-2): a local writer opened before the
+  freeze is refused on its next mutation. An open transaction is waited for
+  until it commits;
+- **`test_replicator_and_shadow_exempt_from_gate`**;
+- **`test_scripts_refuse_without_frozen_zero_inflight`**;
+- **`test_pragma_whitelist`** (P1-3): `optimize` and `wal_checkpoint` are
+  refused under freeze and mark the shadow dirty; `table_info` and
+  `database_list` are allowed under freeze and are reads;
 - **`test_export_frozen_rejects_concurrent_child_write`**: a same-count
   crossref write during the paged fallback fails with `StoreReadOnlyError`
   and is not captured; **`test_export_frozen_rejects_schema_change`**
@@ -1039,7 +1117,8 @@ with flags off.
    1. export and receipt;
    2. seed the shadow at `/data/shadow/<db>.db` from that same export;
    3. set `MEMORA_SHADOW_LOCAL` and `MEMORA_REPLICATION=log`, and restart
-      memora-all (the freeze file survives the restart);
+      memora-all (the freeze file survives the restart, and the gate starts
+      `frozen`);
    4. confirm `applier_alive` and `dirty = 0` on `/health/db/<name>`;
    5. lift the freeze.
    No D1 write can fall between the export and the start of mirroring.
