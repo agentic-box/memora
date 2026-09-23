@@ -642,6 +642,14 @@ def _clear_absorb_inflight(conn: sqlite3.Connection, absorb_nonce: str) -> None:
     conn.commit()
 
 
+def _has_transactions(conn) -> bool:
+    """True on a writable local connection that can hold absorb's phase 3 in
+    one transaction (docs/local-primary-implementation.md §3, M10). False on
+    D1, on CloudSQLite's plain connections and on read-only connections --
+    those keep the D1 machinery (inflight lease, compensation)."""
+    return bool(getattr(conn, "supports_transactions", False))
+
+
 def list_absorb_inflight(
     conn: sqlite3.Connection,
     *,
@@ -651,6 +659,9 @@ def list_absorb_inflight(
 
     Does not mutate. Owned ids are recovered from memory metadata, not the
     hint column, so a death between INSERT and heartbeat is still visible.
+    A transactional store never writes new inflight rows (plan §3), so it
+    reports empty -- unless rows left by an earlier version remain, which
+    are still reported rather than hidden.
     """
     now_s = _absorb_format_ts(now or _absorb_now())
     rows = conn.execute(
@@ -1082,12 +1093,18 @@ def _process_metadata_images(
 def _prepare_metadata(
     metadata: Optional[Dict[str, Any]],
     memory_id: Optional[int] = None,
+    *,
+    defer_images: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Prepare metadata for storage, processing images if present.
 
     Args:
         metadata: Raw metadata dict
         memory_id: ID of the memory (required for R2 image upload)
+        defer_images: inside a store_write (no network under the write
+            lock, plan §3): keep the image sources as given and mark
+            `images_pending`; _apply_deferred_images uploads them after the
+            commit.
 
     Returns:
         Prepared metadata dict
@@ -1099,8 +1116,62 @@ def _prepare_metadata(
     if _IMPORT_MARKER_KEY in metadata:
         # Reserved: a row carrying it is hidden from reads and swept.
         raise ValueError(f"metadata key {_IMPORT_MARKER_KEY!r} is reserved for memora imports")
+    if defer_images and isinstance(metadata.get("images"), list) and metadata.get("images"):
+        pending = dict(metadata)
+        pending["images_pending"] = True
+        return _build_metadata_dict(pending)
     processed = _process_metadata_images(dict(metadata), memory_id=memory_id)
     return _build_metadata_dict(processed)
+
+
+def _apply_deferred_images(conn: sqlite3.Connection, memory_id: int) -> bool:
+    """After a store_write committed a row with `images_pending`: upload its
+    images (network, OUTSIDE the write lock), then swap the metadata in its
+    own short store_write -- only if the row is unchanged meanwhile. On any
+    failure the flag stays, an ERROR is logged, and the startup sweep
+    retries. Returns True when the images were applied."""
+    from .backends import store_write
+
+    row = conn.execute("SELECT content, metadata, tags FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    if row is None:
+        return False
+    raw = row["metadata"]
+    try:
+        meta = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        return False
+    if not meta.get("images_pending"):
+        return False
+    try:
+        base = {k: v for k, v in meta.items() if k != "images_pending"}
+        processed = _process_metadata_images(base, memory_id=memory_id)
+        new_json = json.dumps(processed, ensure_ascii=False)
+        with store_write(conn):
+            cur = conn.execute("UPDATE memories SET metadata = ? WHERE id = ? AND metadata = ?",
+                               (new_json, memory_id, raw))
+            if cur.rowcount != 1:
+                logger.warning("deferred images of #%s not applied: the row changed meanwhile; "
+                               "it stays images_pending", memory_id)
+                return False
+            _fts_upsert(conn, memory_id, row["content"], new_json, row["tags"])
+        return True
+    except Exception as exc:
+        logger.error("deferred images of #%s failed (%s: %s); images_pending stays for the startup sweep",
+                     memory_id, type(exc).__name__, exc)
+        return False
+
+
+def sweep_pending_images(conn: sqlite3.Connection) -> int:
+    """Retry every row still marked images_pending (server startup)."""
+    if not _has_transactions(conn):
+        return 0
+    try:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM memories WHERE json_valid(metadata) "
+            "AND json_extract(metadata, '$.images_pending') = 1").fetchall()]
+    except sqlite3.Error:
+        return 0
+    return sum(1 for mid in ids if _apply_deferred_images(conn, mid))
 
 
 def _expand_image_urls(metadata: Dict[str, Any]) -> Dict[str, Any]:
@@ -5625,6 +5696,12 @@ def add_memory(
     if embedding is not None:
         vector = embedding
     else:
+        from .backends import in_store_write
+
+        if in_store_write():
+            # No network under the write lock (plan §3): a caller inside
+            # store_write precomputes every vector (absorb, import do).
+            raise RuntimeError("add_memory inside store_write needs a precomputed embedding")
         vector = _compute_embedding(content, prepared_for_embed, validated_tags)
     if not vector:
         raise ValueError("embedding is empty; refusing to create memory without a vector")
@@ -5647,7 +5724,12 @@ def add_memory(
             memory_id = cur.lastrowid
             if owned_ids is not None and memory_id is not None:
                 owned_ids.append(int(memory_id))
-            prepared_metadata = _prepare_metadata(meta_for_embed, memory_id=memory_id)
+            from .backends import after_store_write, in_store_write
+
+            deferring = in_store_write()
+            prepared_metadata = _prepare_metadata(meta_for_embed, memory_id=memory_id, defer_images=deferring)
+            if deferring and (prepared_metadata or {}).get("images_pending"):
+                after_store_write(lambda _c=conn, _m=memory_id: _apply_deferred_images(_c, _m))
             if absorb_nonce:
                 prepared_metadata = dict(prepared_metadata or {})
                 prepared_metadata["absorb_nonce"] = absorb_nonce
@@ -6455,6 +6537,16 @@ def _absorb_passing_leaves(gate: Optional[Dict[str, Any]], targets: List[int]) -
     return [t for t in targets if (checks.get(t) or {}).get("verdict") == "supersede"]
 
 
+class _NeedsRegate(Exception):
+    """Inside the phase-3 transaction a leaf needs a supersede check (an LLM
+    call): roll back, gate it outside, retry (plan §3)."""
+
+    def __init__(self, job: Dict[str, Any], leaves: List[int]):
+        super().__init__(f"leaves {leaves} need a supersede check")
+        self.job = job
+        self.leaves = leaves
+
+
 def _absorb_partition_targets(
     conn: sqlite3.Connection,
     corpus: _CorpusSnapshot,
@@ -6462,6 +6554,8 @@ def _absorb_partition_targets(
     targets: List[int],
     *,
     context: Optional[str],
+    offline: Optional[str] = None,
+    stamp_fingerprints: bool = False,
 ) -> Tuple[List[int], Dict[int, Dict[str, Any]]]:
     """Split the leaves a FRESH resolution returned into (passing, rejected).
 
@@ -6476,13 +6570,39 @@ def _absorb_partition_targets(
     Residual window: D1 has no transactions, so an edit that lands after
     this read and before the link is not seen. The window is one or two
     round trips; closing it needs the local-transaction design.
+
+    offline (phase 3 inside a transaction, plan §3): the verdicts must
+    already exist -- gated before BEGIN. "raise": a leaf that needs a check
+    raises _NeedsRegate (roll back, gate outside, retry); "reject": after the
+    retries, such a leaf is treated as rejected (a kept fork, logged).
     """
     gate = job.setdefault("check", {"checks": {}})
     checks = gate.setdefault("checks", {})
     infos = _absorb_leaf_infos(conn, corpus, job.get("search_vector"), targets, db_vectors=True)
+    settled: set = set()
+    if offline is not None:
+        needing = [t for t in targets if infos.get(t) is not None and (
+            checks.get(t) is None or infos[t]["fingerprint"] not in (
+                checks[t].get("fingerprint"), checks[t].get("tx_fingerprint")))]
+        if needing and offline == "raise":
+            raise _NeedsRegate(job, needing)
+        settled.update(needing)
+        for t in needing:  # offline == "reject": no check may run under the lock
+            absorb_count("tx_ungated_leaves")
+            logger.warning("absorb supersede: leaf #%s still unverified after the regate retries; "
+                           "kept (not superseded)", t)
+            checks[t] = {"leaf_id": t, "verdict": "related", "gate": "ungated_in_transaction", "score": 0.0,
+                         "old_text": "", "reason": "leaf changed or appeared during the transaction retries; "
+                                                   "not verified, so not superseded"}
     for t in targets:
+        if t in settled:
+            continue
         info = infos.get(t)
         prior = checks.get(t)
+        if (offline is not None and info is not None and prior is not None
+                and prior.get("fingerprint") != info["fingerprint"]
+                and prior.get("tx_fingerprint") == info["fingerprint"]):
+            continue  # gated before BEGIN on this exact leaf state
         if info is None:
             checks[t] = {"leaf_id": t, "verdict": "related", "gate": "missing", "score": 0.0,
                          "old_text": "", "reason": "leaf row not found at write boundary"}
@@ -6506,6 +6626,13 @@ def _absorb_partition_targets(
         checks[t] = _absorb_check_supersede_safe(
             job["content"], info, [], job.get("tags"), context, job.get("fact_type"),
         )
+        if stamp_fingerprints:
+            # Transactional pre-gate/regate (plan §3): record the leaf state
+            # this verdict was made on. Inside the transaction, a leaf still in
+            # that state reuses the verdict AS-IS -- exactly what a re-check
+            # at the write boundary would have returned -- without a new
+            # (network) check.
+            checks[t] = {**checks[t], "tx_fingerprint": info["fingerprint"]}
     passing = [t for t in targets if checks[t].get("verdict") == "supersede"]
     rejected = {t: checks[t] for t in targets if t not in passing}
     return passing, rejected
@@ -7189,6 +7316,79 @@ def _absorb_gate_updates(
     return gates
 
 
+# Phase 3 on a transactional backend (plan §3): how many times a leaf that
+# needs a supersede check inside the transaction is gated outside and the
+# transaction retried before such a leaf is treated as rejected.
+_ABSORB_TX_REGATES = 3
+
+
+def _absorb_pregate_job(conn: sqlite3.Connection, corpus: "_CorpusSnapshot", job: Dict[str, Any],
+                        *, context: Optional[str]) -> None:
+    """Before BEGIN: gate every leaf the write boundary can meet -- the
+    supersede target's fresh resolution and every live leaf of its component
+    (a pre-existing fork the fork heal may collapse) -- so the transaction
+    needs no LLM call. Verdicts land in job["check"]["checks"]."""
+    link = job.get("link")
+    if not link or link[0] != "supersedes":
+        return
+    target_id = link[1]
+    plan = _resolve_absorb_supersedes_target(conn, target_id)
+    if plan.get("tombstoned"):
+        return
+    leaves = set(plan.get("targets") or [])
+    live, _cycle = _component_live_leaves(conn, target_id)
+    leaves.update(live)
+    if leaves:
+        _absorb_partition_targets(conn, corpus, job, sorted(leaves), context=context, stamp_fingerprints=True)
+
+
+def _absorb_phase3_transactional(conn, corpus, phase3_jobs, run_phase3, decisions, counts, owned_ids,
+                                 appended_ids, *, context: Optional[str]) -> Dict[str, Any]:
+    """Absorb phase 3 as ONE store_write (BEGIN IMMEDIATE) with no network
+    call under the lock (plan §3). Supersede checks run first, outside; a
+    leaf that still needs a check inside rolls the transaction back, is gated
+    outside, and the transaction is retried (at most _ABSORB_TX_REGATES
+    times; after that such a leaf is kept, not superseded). Any other error
+    rolls everything back -- nothing is written, nothing needs compensating
+    -- and propagates, like the D1 path's fully cleaned failure."""
+    from .backends import store_write
+
+    base_decisions, base_counts = list(decisions), dict(counts)
+
+    def reset() -> None:
+        decisions[:] = base_decisions
+        counts.clear()
+        counts.update(base_counts)
+        owned_ids.clear()
+        for mid in appended_ids:
+            corpus.discard(mid)
+        appended_ids.clear()
+
+    with absorb_phase("supersede_pregate"):
+        for job in phase3_jobs:
+            _absorb_pregate_job(conn, corpus, job, context=context)
+    try:
+        for attempt in range(_ABSORB_TX_REGATES + 1):
+            offline = "raise" if attempt < _ABSORB_TX_REGATES else "reject"
+            try:
+                with store_write(conn):
+                    run_phase3(offline)
+                break
+            except _NeedsRegate as need:
+                reset()
+                absorb_count("tx_regates")
+                with absorb_phase("supersede_regate"):
+                    _absorb_partition_targets(conn, corpus, need.job, need.leaves, context=context,
+                                              stamp_fingerprints=True)
+    except BaseException:
+        absorb_count("tx_rollbacks")
+        reset()
+        invalidate_corpus_cache(conn, key=corpus._cache_key)
+        raise
+    invalidate_corpus_cache(conn, key=corpus._cache_key)
+    return {"decisions": decisions, **counts}
+
+
 def absorb_memory(
     conn: sqlite3.Connection,
     facts: List[str],
@@ -7309,11 +7509,17 @@ def _absorb_memory_impl(
     # writes, so it keeps its existing no-side-effects contract: no nonce, no
     # inflight row, no heartbeat touches.
     import uuid
+    # Transactional backend (a local writer, plan §3): phase 3 is ONE
+    # transaction, so the D1 machinery -- inflight lease and heartbeats,
+    # owned-id recovery, compensating deletes -- is not used. The nonce is
+    # still minted and stamped (provenance).
+    tx = _has_transactions(conn)
     absorb_nonce: Optional[str] = None
     if not dry_run:
         absorb_nonce = str(uuid.uuid4())
-        with absorb_phase("inflight"):
-            _begin_absorb_inflight(conn, absorb_nonce)
+        if not tx:
+            with absorb_phase("inflight"):
+                _begin_absorb_inflight(conn, absorb_nonce)
 
     # Phase 1: Classify each fact against existing memories, collect "to create" facts
     #
@@ -7349,7 +7555,7 @@ def _absorb_memory_impl(
     if classify_indices:
         with absorb_phase("classification"):
             classify_results = _absorb_run_classification(
-                conn, prepared, classify_indices, absorb_nonce,
+                conn, prepared, classify_indices, None if tx else absorb_nonce,
             )
         supersede_gates = _absorb_gate_updates(
             conn, corpus, prepared, classify_results, caller_tags=tags, context=context,
@@ -7571,7 +7777,9 @@ def _absorb_memory_impl(
     # absorb_inflight tracking (durable nonce, committed before any writes)
     # began at the top of this call, before phase 1 — not re-begun here.
     owned_ids: List[int] = []
-    try:
+    appended_ids: List[int] = []
+
+    def _run_phase3(offline: Optional[str]) -> None:
         for job in phase3_jobs:
             with absorb_phase("phase3_insert"):
                 record = add_memory(
@@ -7596,14 +7804,16 @@ def _absorb_memory_impl(
                 record["id"], job["vector"], record.get("created_at"),
                 created_meta_type, "python",
             )
+            appended_ids.append(record["id"])
             # Abort hook sits on the write boundary, before heartbeat, so a
             # SIGKILL still simulates process death after the INSERT even if
             # the tracking row was never begun.
             owned_hook = _after_absorb_owned_insert
             if owned_hook is not None:
                 owned_hook(record["id"], absorb_nonce)
-            with absorb_phase("inflight"):
-                _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
+            if not tx:
+                with absorb_phase("inflight"):
+                    _touch_absorb_inflight(conn, absorb_nonce, owned_ids)
             if job["link"] is not None:
                 edge_type, target_id, reason = job["link"]
                 if edge_type == "supersedes":
@@ -7659,7 +7869,7 @@ def _absorb_memory_impl(
                     # that check; leaves that appeared since are checked now.
                     with absorb_phase("supersede_verify"):
                         passing, rejected = _absorb_partition_targets(
-                            conn, corpus, job, targets, context=context,
+                            conn, corpus, job, targets, context=context, offline=offline,
                         )
                     for leaf_id, check in rejected.items():
                         _log_supersede_decision(
@@ -7714,6 +7924,14 @@ def _absorb_memory_impl(
                         # nothing about whether one new fact replaces the
                         # other. Only a check on exactly this pair allows it.
                         if loser == _new:
+                            if offline is not None:
+                                # Unreachable under the write lock: the new
+                                # row's id is the store's maximum, so it is
+                                # always the winner (plan §3, H8).
+                                raise RuntimeError(
+                                    f"absorb fork heal: #{winner} would supersede new #{_new} "
+                                    "inside the transaction (unreachable)"
+                                )
                             check = _absorb_check_sibling_pair(
                                 conn, corpus, winner, _new, context=context,
                             )
@@ -7729,7 +7947,9 @@ def _absorb_memory_impl(
                             return False
                         # Our new row superseding a leaf that appeared after
                         # our gate ran: gate that exact leaf now.
-                        ok, _rej = _absorb_partition_targets(conn, corpus, _job, [loser], context=context)
+                        ok, _rej = _absorb_partition_targets(
+                            conn, corpus, _job, [loser], context=context, offline=offline,
+                        )
                         return bool(ok)
 
                     prelink = _before_absorb_supersede_links
@@ -7749,6 +7969,8 @@ def _absorb_memory_impl(
                             kept = _heal_supersession_fork(
                                 conn, record["id"], keep=rejected, may_collapse=_may_collapse,
                             )
+                    except _NeedsRegate:
+                        raise
                     except Exception as link_err:
                         # ALL-OR-COMPENSATE: partial collapse is worse than the fork.
                         raise RuntimeError(
@@ -7921,6 +8143,15 @@ def _absorb_memory_impl(
                     "reason": "new knowledge",
                 })
                 counts["created"] += 1
+
+    if tx:
+        return _absorb_phase3_transactional(
+            conn, corpus, phase3_jobs, _run_phase3, decisions, counts, owned_ids, appended_ids,
+            context=context,
+        )
+
+    try:
+        _run_phase3(None)
         # Mark completed before dropping the tracking row so a death in this
         # window cannot be reaped as a partial write.
         with absorb_phase("inflight"):
@@ -8583,16 +8814,26 @@ def delete_memory(
 
     image_storage = get_image_storage_instance()
     if image_storage:
-        try:
-            deleted_images = image_storage.delete_memory_images(memory_id)
-            if deleted_images > 0:
-                logging.getLogger(__name__).info(
-                    f"Deleted {deleted_images} R2 images for memory {memory_id}"
+        def _delete_images(_mid=memory_id):
+            try:
+                deleted_images = image_storage.delete_memory_images(_mid)
+                if deleted_images > 0:
+                    logging.getLogger(__name__).info(
+                        f"Deleted {deleted_images} R2 images for memory {_mid}"
+                    )
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"Failed to delete R2 images for memory {_mid}: {e}"
                 )
-        except Exception as e:
-            logging.getLogger(__name__).warning(
-                f"Failed to delete R2 images for memory {memory_id}: {e}"
-            )
+
+        from .backends import after_store_write, in_store_write
+
+        if in_store_write():
+            # No network under the write lock (plan §3): delete the images
+            # only if the transaction commits.
+            after_store_write(_delete_images)
+        else:
+            _delete_images()
 
     _fts_delete(conn, memory_id)
     _delete_embedding(conn, memory_id)
@@ -10190,13 +10431,23 @@ def _import_write_transactional(conn, prepared_rows, strategy) -> Dict[str, Any]
     reported as success.
     """
     try:
-        if strategy == "replace":
-            _clear_store_for_replace(conn)
-        for row in prepared_rows:
-            _import_insert_row(conn, *row)
-        conn.commit()
+        if _has_transactions(conn):
+            from .backends import store_write
+
+            with store_write(conn):
+                if strategy == "replace":
+                    _clear_store_for_replace(conn)
+                for row in prepared_rows:
+                    _import_insert_row(conn, *row)
+        else:
+            if strategy == "replace":
+                _clear_store_for_replace(conn)
+            for row in prepared_rows:
+                _import_insert_row(conn, *row)
+            conn.commit()
     except Exception as exc:
-        conn.rollback()
+        if not _has_transactions(conn):
+            conn.rollback()
         return {
             "imported": 0,
             "replaced": False,

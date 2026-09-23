@@ -980,6 +980,11 @@ def _startup_import_sweep() -> None:
             conn = connect()
             try:
                 sweep_import_markers(conn)
+                # Rows whose deferred images were not applied after their
+                # transaction (plan §3): retry (local stores only).
+                from .storage import sweep_pending_images
+
+                sweep_pending_images(conn)
             finally:
                 conn.close()
         except Exception as exc:

@@ -14,6 +14,23 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L4: absorb in one local transaction
+- Per `docs/local-primary-implementation.md` §3. D1 SQL is unchanged, and the d1:// absorb path keeps its inflight lease, owned-id recovery and compensating deletes.
+- **`store_write(conn)`** (backends) runs one `BEGIN IMMEDIATE` under a per-store process-wide lock:
+  - inner `commit()` calls are deferred to its end, and an inner `rollback()` aborts the whole transaction (`StoreWriteAborted`);
+  - `with conn:` inside it neither commits nor rolls back;
+  - callbacks registered with `after_store_write` run after the commit, outside the lock;
+  - nested calls join the outer transaction;
+  - `in_store_write()` marks the no-network rule.
+  Absorb phase 3, the local import and the replicator's local transactions use it.
+- **Transactional absorb:** on a writable local connection (`supports_transactions`), phase 3 is one `store_write`. No inflight row, heartbeat or compensation is used, and a failure rolls everything back and propagates (nothing is ever half-written).
+  - Supersede checks run before BEGIN, for the target's fresh resolution and every live leaf of its component (pre-existing forks).
+  - Inside the transaction the gate runs offline: a leaf that still needs a check rolls the transaction back, is gated outside, and the transaction is retried, at most 3 times. After that the leaf is kept, not superseded (profile counters `tx_regates`, `tx_ungated_leaves`).
+  - The fork heal's sibling branch is unreachable under the lock and raises.
+- **Images and R2:** inside `store_write`, `add_memory` stores image sources as given with `images_pending`. They are uploaded after the commit, and the row is swapped with a compare-and-set; a failure keeps the flag, and `sweep_pending_images` (server startup) retries. R2 deletions happen after the commit only. `add_memory` refuses to compute an embedding under the lock.
+- **Writers:** `connect()` sets `PRAGMA busy_timeout = 5000` on every writer, and `journal_mode = WAL` on live primaries only.
+- `_WriteGate.enter(exempt=True)` is refused unless called from `memora.replicator`.
+
 ### Local-primary L3: the replicator (dark)
 - Per `docs/local-primary-implementation.md` §2 and §0 P2-P4. `memora/replicator.py`: one thread per replicated store reads `sync_outbox` in seq order, coalesces it per key, and builds statements from each key's CURRENT local row. A present row becomes an UPSERT of every column (`memories_embeddings`: a DELETE+INSERT pair, so D1's update trigger cannot null `representation`); an absent row becomes a DELETE by the full primary key. `memories_meta` exclusions are enforced by the triggers.
 - **P2 allow-list:** `_check_statement` accepts exactly those shapes, plus per-key read-back SELECTs and the epoch SELECT; anything else halts the store (`statement_rejected`). The replicator's D1 writer (`ReplicaD1Connection`) has only `execute_batch` and checks every statement before sending.

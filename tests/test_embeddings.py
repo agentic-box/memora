@@ -1378,6 +1378,19 @@ def test_p1_2_delete_false_reports_partial(monkeypatch, absorb_backend):
     monkeypatch.setattr(storage, "add_memory", add_then_fail)
     monkeypatch.setattr(storage, "delete_memory", lambda *a, **k: False)
 
+    from memora.backends import LocalSQLiteBackend
+
+    if isinstance(absorb_backend, LocalSQLiteBackend):
+        # Transactional backend (plan §3): no compensation exists to fail --
+        # the failure rolls the whole phase back and propagates.
+        with storage.connect() as conn:
+            with pytest.raises(RuntimeError, match="phase3 second job fail"):
+                storage.absorb_memory(conn, facts=[
+                    "first unique fact alpha delete false",
+                    "second unique fact beta delete false",
+                ])
+            assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        return
     with storage.connect() as conn:
         result = storage.absorb_memory(
             conn,

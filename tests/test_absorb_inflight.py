@@ -110,6 +110,17 @@ def test_process_death_orphan_detected(tmp_path, monkeypatch, kind):
 
     _fresh_backend(db_path, kind, monkeypatch)
     conn = storage.connect()
+    if kind == "sqlite":
+        # Transactional backend (docs/local-primary-implementation.md §3):
+        # phase 3 is one transaction and no inflight row is written, so a
+        # process death leaves NOTHING -- no tracking row, no absorb row.
+        try:
+            assert storage.list_absorb_inflight(conn) == {"live": [], "orphaned": []}
+            assert _nonce_rows(conn) == [], "a SIGKILL mid-transaction must leave no absorb row"
+            assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+        finally:
+            conn.close()
+        return
     try:
         report = storage.list_absorb_inflight(conn)
         assert report["live"] or report["orphaned"], (

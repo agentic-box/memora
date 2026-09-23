@@ -540,10 +540,12 @@ def test_absorb_sequential_classify_failure_still_propagates(local_db, monkeypat
             storage.absorb_memory(conn, ["A fact needs classify"], dry_run=True)
 
 
-def test_absorb_heartbeats_inflight_during_concurrent_classify(local_db, monkeypatch):
+def test_absorb_heartbeats_inflight_during_concurrent_classify(fake_d1_backend, monkeypatch):
     """Phase 1's concurrent classify calls must heartbeat absorb_inflight —
     otherwise a batch of several 12-17s LLM calls looks stale/abandoned for
-    minutes even though it's actively working."""
+    minutes even though it's actively working. D1 machinery: a
+    transactional (local) backend has no inflight row to heartbeat
+    (docs/local-primary-implementation.md §3), see the test below."""
     with storage.connect() as conn:
         mem_a = storage.add_memory(conn, content="topic A existing memory")
         mem_b = storage.add_memory(conn, content="topic B existing memory")
@@ -580,6 +582,23 @@ def test_absorb_heartbeats_inflight_during_concurrent_classify(local_db, monkeyp
     # Phase 3 still heartbeats with real ids as before.
     assert any(c for c in touch_calls if c)
     assert len(result["decisions"]) == 2
+
+
+def test_transactional_absorb_writes_no_inflight_row_and_never_heartbeats(local_db, monkeypatch):
+    """Plan §3: on a local (transactional) store phase 3 is one transaction;
+    the D1 inflight lease, heartbeats and completion are skipped."""
+    calls = []
+    for name in ("_begin_absorb_inflight", "_touch_absorb_inflight", "_complete_absorb_inflight",
+                 "_recover_absorb_owned_ids"):
+        monkeypatch.setattr(storage, name, lambda *a, _n=name, **k: calls.append(_n))
+    monkeypatch.setattr(storage, "_compute_embedding", lambda *a, **k: {"x": 1.0})
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
+    with storage.connect() as conn:
+        result = storage.absorb_memory(conn, ["one transactional fact with enough words"])
+        assert result["created"] == 1 and calls == []
+        assert conn.execute("SELECT COUNT(*) FROM absorb_inflight").fetchone()[0] == 0
+        meta = json.loads(conn.execute("SELECT metadata FROM memories").fetchone()[0])
+        assert meta.get("absorb_nonce")  # still minted and stamped (provenance)
 
 
 def test_resolve_follow_defaults_and_all_escape_hatch():
@@ -947,7 +966,11 @@ def test_absorb_contradict_does_not_collapse_fork(local_db, monkeypatch):
         assert left["id"] in active and right["id"] in active
 
 
-def test_absorb_write_boundary_reresolve_prevents_refork(local_db, monkeypatch, supersede_gate_open):
+def test_absorb_write_boundary_reresolve_prevents_refork(fake_d1_backend, monkeypatch, supersede_gate_open):
+    # A competitor writing INSIDE phase 3 is a D1-only race: on a local store
+    # phase 3 is one BEGIN IMMEDIATE under the store's write lock
+    # (docs/local-primary-implementation.md §3), so it cannot interleave.
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     with storage.connect() as conn:
         orig, left, right = _seed_fork(conn)
         real_add = storage.add_memory
