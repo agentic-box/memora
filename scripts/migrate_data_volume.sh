@@ -36,13 +36,25 @@ TO="${MIGRATE_TO:-/to}"
 MARKER=.memora-volume-source
 STAGING=.memora-staging
 
-manifest() {  # manifest DIR -- "sha256  ./path" per file, control entries excluded
-  (cd "$1" && find . \( -path "./$STAGING" -o -path './.memora-previous-*' \) -prune \
-      -o -type f ! -path "./$MARKER" ! -path "./$MARKER.tmp" -print \
-    | LC_ALL=C sort | while IFS= read -r f; do sha256sum "$f"; done)
-}
+# digest DIR -- sha256 over "sha256  ./path" of every file, sorted, control
+# entries excluded. Built from separate, checked steps: plain sh has no
+# pipefail, and a failed find or sha256sum inside a pipeline would silently
+# drop files from the digest (review 7637 P1-2).
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
 
-digest() { manifest "$1" | sha256sum | cut -d' ' -f1; }
+digest() {
+  (cd "$1" && find . \( -path "./$STAGING" -o -path './.memora-previous-*' \) -prune \
+      -o -type f ! -path "./$MARKER" ! -path "./$MARKER.tmp" -print) >"$WORK/list" \
+    || { echo "cannot list $1" >&2; exit 1; }
+  LC_ALL=C sort "$WORK/list" >"$WORK/sorted" || { echo "cannot sort the listing of $1" >&2; exit 1; }
+  : >"$WORK/sums"
+  while IFS= read -r f; do
+    (cd "$1" && sha256sum "$f") >>"$WORK/sums" || { echo "cannot hash $1/$f" >&2; exit 1; }
+  done <"$WORK/sorted"
+  sum="$(sha256sum <"$WORK/sums")" || { echo "cannot hash the manifest of $1" >&2; exit 1; }
+  echo "${sum%% *}"
+}
 
 cmd="${1:-}"
 case "$cmd" in

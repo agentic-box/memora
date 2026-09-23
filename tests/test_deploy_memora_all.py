@@ -51,6 +51,7 @@ def deploy(tmp_path):
     cfg = home / ".config" / "memora"
     cfg.mkdir(parents=True)
     (cfg / "all.health-token").write_text("h" * 48)
+    os.chmod(cfg / "all.health-token", 0o600)
 
     volroot = tmp_path / "volumes"
     old = volroot / ANON
@@ -180,6 +181,21 @@ def test_a_source_still_in_use_is_refused(deploy):
     assert not any(c[0] == "rename" for c in calls)
 
 
+def test_a_failed_in_use_check_is_refused(deploy):
+    """Review 7637 P1-2: a FAILED `docker ps` must refuse, not read as
+    "nothing uses the volume"."""
+    proc, calls, _ = deploy(runtime_env={"PS_RC": "1"})
+    assert proc.returncode != 0 and "cannot tell whether a container uses" in proc.stderr
+    assert not any(_is_copy(c) for c in calls)
+    assert not any(c[0] == "rename" for c in calls)
+
+
+def test_a_successful_empty_in_use_check_means_unused(deploy):
+    proc, calls, _ = deploy()
+    assert any(_is_copy(c) for c in calls)
+    _new_container_run(calls)
+
+
 def test_a_failed_copy_stops_before_rename_and_run(deploy):
     proc, calls, _ = deploy(runtime_env={"COPY_RC": "1"})
     assert proc.returncode != 0
@@ -232,6 +248,27 @@ class TestAdminTokenFile:
         (wrap / "sitecustomize.py").write_text("import os\nos.getuid = lambda: 424242\n")
         proc, calls, _ = deploy(admin_token="k" * 48, runtime_env={"PYTHONPATH": str(wrap)})
         assert proc.returncode != 0 and "owned by" in proc.stderr
+        assert not any(c[0] == "stop" for c in calls)
+
+    @pytest.mark.parametrize("mode", [0o644, 0o640])
+    def test_a_readable_health_token_is_refused(self, deploy, tmp_path, mode):
+        """Review 7636: the health token gets the same rule."""
+        f = tmp_path / "home" / ".config" / "memora" / "all.health-token"
+        os.chmod(f, mode)
+        proc, calls, _ = deploy()
+        assert proc.returncode != 0 and "all.health-token must be a regular file" in proc.stderr
+        assert not any(c[0] == "stop" for c in calls)
+        assert oct(os.stat(f).st_mode)[-3:] == oct(mode)[-3:]
+
+    def test_a_symlinked_health_token_is_refused(self, deploy, tmp_path):
+        f = tmp_path / "home" / ".config" / "memora" / "all.health-token"
+        target = tmp_path / "elsewhere-health"
+        target.write_text("h" * 48)
+        os.chmod(target, 0o600)
+        f.unlink()
+        f.symlink_to(target)
+        proc, calls, _ = deploy()
+        assert proc.returncode != 0 and "regular file" in proc.stderr
         assert not any(c[0] == "stop" for c in calls)
 
     def test_equal_to_the_health_token_refuses_before_stop(self, deploy):

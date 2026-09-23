@@ -8,8 +8,11 @@ Volumes are directories under $VOLROOT/<name>. A `run --rm` that carries the
 would land in the named volume. Nothing touches a real runtime.
 
 Environment knobs:
-  CURRENT_MOUNT   what the existing container mounts at /data (inspect);
-                  unset or empty = no such container
+  CURRENT_MOUNT   what the existing container mounts at /data (inspect)
+  EXISTING        container name `list --all` reports (unset = none)
+  INSPECT_OUT     raw text `inspect NAME` prints instead of the JSON
+  INSPECT_RC / LIST_RC / LIST_ALL_RC / PS_RC
+                  force `inspect` / `list` / `list --all` / `ps` to fail
   RUNNING_LIST    text `list` prints (e.g. "memora-t running")
   PS_RUNNING      volume name `ps -q --filter volume=` reports as in use
   RENAME_RC       exit status of `rename` (default 0)
@@ -34,9 +37,18 @@ def vol(name):
 
 
 verb = args[0] if args else ""
+listing_all = verb == "list" and "--all" in args
+for knob, name in (("INSPECT_RC", "inspect"), ("LIST_RC", "list"), ("LIST_ALL_RC", "list --all"), ("PS_RC", "ps")):
+    this = "list --all" if listing_all else verb
+    if this == name and os.environ.get(knob):
+        print(f"{name}: simulated failure", file=sys.stderr)
+        sys.exit(int(os.environ[knob]))
 if verb == "inspect":
     if "--format" in args:  # deploy: `docker inspect memora-all --format …`
         print(os.environ.get("CURRENT_MOUNT", ""))
+        sys.exit(0)
+    if os.environ.get("INSPECT_OUT") is not None:
+        print(os.environ["INSPECT_OUT"])
         sys.exit(0)
     cur = os.environ.get("CURRENT_MOUNT", "")
     if not cur:
@@ -56,6 +68,11 @@ if verb == "volume":
         print(name)
         sys.exit(0)
 if verb == "list":
+    if "--all" in args:
+        if os.environ.get("EXISTING"):
+            print("ID IMAGE STATE")
+            print(f"{os.environ['EXISTING']} memora stopped")
+        sys.exit(0)
     print(os.environ.get("RUNNING_LIST", ""))
     sys.exit(0)
 if verb == "ps":

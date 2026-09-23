@@ -127,3 +127,40 @@ def test_a_failed_verify_leaves_the_live_volume_untouched(tmp_path, old_volume):
     assert r.returncode == 1 and "verify failed" in r.stderr
     assert (dst / "live").read_text() == "live data"
     assert not (dst / MARKER).exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files")
+def test_an_unreadable_source_file_fails_closed(tmp_path, old_volume):
+    """Review 7637 P1-2: no pipeline may hide a failed hash; a file that
+    cannot be read stops the migration before the live volume changes."""
+    dst = tmp_path / "named"
+    dst.mkdir()
+    (dst / "live").write_text("live data")
+    secret = old_volume / "intent" / "unreadable.jsonl"
+    secret.write_text("x")
+    secret.chmod(0)
+    try:
+        r = _run(old_volume, dst)
+    finally:
+        secret.chmod(0o600)
+    assert r.returncode != 0
+    assert (dst / "live").read_text() == "live data" and not (dst / MARKER).exists()
+
+
+def test_a_failed_hash_stops_the_migration_even_when_the_copy_works(tmp_path, old_volume):
+    """The digest itself must fail closed: a sha256sum that fails on one file
+    (while cp can still copy it) must stop the run, not drop the file from
+    both digests and let them match."""
+    dst = tmp_path / "named"
+    dst.mkdir()
+    (dst / "live").write_text("live data")
+    (old_volume / "flaky.bin").write_text("x")
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    real = subprocess.run(["sh", "-c", "command -v sha256sum"], capture_output=True, text=True).stdout.strip()
+    (fake / "sha256sum").write_text(
+        f'#!/bin/sh\ncase "$*" in *flaky*) echo "sha256sum: read error" >&2; exit 1 ;; esac\nexec "{real}" "$@"\n')
+    (fake / "sha256sum").chmod(0o755)
+    r = _run(old_volume, dst, extra_env={"PATH": f"{fake}:{os.environ['PATH']}"})
+    assert r.returncode != 0 and "cannot hash" in r.stderr
+    assert (dst / "live").read_text() == "live data" and not (dst / MARKER).exists()

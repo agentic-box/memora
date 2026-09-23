@@ -160,16 +160,6 @@ admin_token() {  # per-instance secret for /admin/* (memora/admin.py)
   # Separate from the health token, which every prober holds: from L2 on the
   # admin routes place and lift write freezes. The server refuses to start if
   # the two are equal.
-  #
-  # An EXISTING admin-token file must be a regular file (not a symlink),
-  # owned by this user, mode 0600. Anything else is treated as possibly
-  # compromised: refuse and say how to re-mint, never chmod it into shape --
-  # a token that was world-readable must get a new value.
-  local f="$SECRET_DIR/$INSTANCE.admin-token"
-  if [ -e "$f" ] || [ -L "$f" ]; then
-    secret_file_is_private "$f" \
-      || die "$f must be a regular file owned by $(id -un) with mode 0600; it may have been exposed: rm '$f' and rerun to mint a new token"
-  fi
   secret_token admin
 }
 
@@ -187,6 +177,15 @@ secret_token() {  # secret_token KIND -- read or mint $SECRET_DIR/$INSTANCE.KIND
   local f="$SECRET_DIR/$INSTANCE.$kind-token"
   mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
 
+  # An EXISTING token file must be a regular file (not a symlink), owned by
+  # this user, mode 0600 (review 7626 P1-3, 7636). Anything else is treated
+  # as possibly exposed: refuse and say how to re-mint; never chmod it into
+  # shape, because a token that was readable by others needs a new value.
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    secret_file_is_private "$f" \
+      || die "$f must be a regular file owned by $(id -un) with mode 0600; it may have been exposed: rm '$f' and rerun to mint a new $kind token"
+  fi
+
   # WHOLE-FILE validation, on EVERY read rather than only at creation. A
   # line-based check accepts a good first line followed by anything at all,
   # and command substitution keeps the embedded newlines -- which would then
@@ -199,9 +198,7 @@ secret_token() {  # secret_token KIND -- read or mint $SECRET_DIR/$INSTANCE.KIND
     fi
   fi
 
-  if [ "$valid" -eq 1 ]; then
-    chmod 600 "$f"
-  else
+  if [ "$valid" -ne 1 ]; then
     if [ -e "$f" ]; then echo "replacing unusable $kind token at $f" >&2; fi
     # Temp file + rename: a reader must never see a half-written token, and a
     # crash must not leave one behind. The subshell drops pipefail because
@@ -239,26 +236,43 @@ ensure_volume() {  # ensure_volume NAME -- the named volume exists afterwards
     || die "could not create volume $1"
 }
 
-current_data_mount() {  # current_data_mount NAME -- the volume (or host dir) NAME mounts at /data
-  # Empty when there is no such container or no /data mount. Parses the
-  # runtime's inspect JSON loosely: docker's Mounts[] {Name|Source,
-  # Destination} and nested {source|name, destination|target} objects.
-  local out
-  out="$("$CONTAINER_BIN" inspect "$1" 2>/dev/null)" || return 0
-  printf '%s' "$out" | python3 -c '
+current_data_mount() {  # current_data_mount NAME -- what NAME mounts at /data
+  # Three cases, told apart explicitly (fail closed; review 7637 P1-1):
+  #  (a) no container NAME: prints nothing;
+  #  (b) NAME exists and inspect shows a /data mount: prints its volume name
+  #      (or host path);
+  #  (c) anything else -- the listing or inspect fails, the JSON does not
+  #      parse, or it shows no /data mount: dies, before anything is stopped.
+  #      The image declares VOLUME /data, so an existing container always
+  #      has one; not finding it means we cannot see it, not that it is not
+  #      there.
+  # Parses docker's Mounts[] {Name|Source, Destination} and nested
+  # {source|name, destination|target} objects.
+  local all
+  all="$("$CONTAINER_BIN" list --all 2>&1)" \
+    || die "cannot list containers ('$CONTAINER_BIN list --all' failed): $all"
+  if ! printf '%s\n' "$all" | awk -v n="$1" '$1==n{f=1} END{exit !f}'; then
+    return 0  # (a)
+  fi
+  local raw
+  raw="$(mktemp "${TMPDIR:-/tmp}/memora-inspect-$1.XXXXXX")"
+  "$CONTAINER_BIN" inspect "$1" >"$raw" 2>&1 \
+    || die "cannot inspect $1 (raw output: $raw); refusing to stop it without knowing its /data. Check '$CONTAINER_BIN inspect $1'"
+  local mount
+  mount="$(python3 -c '
 import json, sys
 try:
     doc = json.load(sys.stdin)
 except ValueError:
-    sys.exit(0)
+    sys.exit("inspect output is not JSON")
 found = []
 def walk(o):
     if isinstance(o, dict):
         dest = o.get("Destination") or o.get("destination") or o.get("target")
         if dest == "/data":
-            vol = (o.get("type") or {}).get("volume") if isinstance(o.get("type"), dict) else None
+            vol = o["type"].get("volume") if isinstance(o.get("type"), dict) else None
             name = o.get("Name") or o.get("name") or (vol or {}).get("name") or o.get("Source") or o.get("source")
-            if name:
+            if isinstance(name, str) and name:
                 found.append(name)
         for v in o.values():
             walk(v)
@@ -266,8 +280,13 @@ def walk(o):
         for v in o:
             walk(v)
 walk(doc)
-print(found[0] if found else "")
-'
+if len(set(found)) != 1:
+    sys.exit("no single /data mount in the inspect output (found %r)" % sorted(set(found)))
+print(found[0])
+' <"$raw")" \
+    || die "cannot tell what $1 mounts at /data (raw inspect: $raw); refusing to stop it. The image declares VOLUME /data, so it has one"
+  rm -f "$raw"
+  printf '%s\n' "$mount"
 }
 
 migrate_data() {  # migrate_data OLD NEW -- staged, verified copy while stopped
@@ -303,7 +322,10 @@ cmd_up() {
     # Carry the old /data (SQLite files, freeze files, intent journals) into
     # the named volume while nothing runs on it. The old container is kept
     # (renamed, stopped) with its volume, for rollback.
-    if "$CONTAINER_BIN" list 2>/dev/null | awk -v n="$CONTAINER" '$1==n{f=1} END{exit !f}'; then
+    local running
+    running="$("$CONTAINER_BIN" list 2>&1)" \
+      || die "cannot list running containers: $running; not copying $old_vol ($CONTAINER is stopped: $CONTAINER_BIN start $CONTAINER)"
+    if printf '%s\n' "$running" | awk -v n="$CONTAINER" '$1==n{f=1} END{exit !f}'; then
       die "$CONTAINER is still running; not copying $old_vol"
     fi
     echo "copying /data from $old_vol into $data_vol (staged, verified)"

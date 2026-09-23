@@ -156,7 +156,15 @@ print(f"MEMORA_LLM_MODEL: {before!r} -> 'openai/gpt-4o-mini' (backup kept alongs
 PY
 
 HEALTH_TOKEN_FILE=~/.config/memora/all.health-token
-[ -f "$HEALTH_TOKEN_FILE" ] || { echo "missing $HEALTH_TOKEN_FILE — refusing to mint a new one for a live container" >&2; exit 1; }
+{ [ -e "$HEALTH_TOKEN_FILE" ] || [ -L "$HEALTH_TOKEN_FILE" ]; } || { echo "missing $HEALTH_TOKEN_FILE — refusing to mint a new one for a live container" >&2; exit 1; }
+# Same rule as the admin token below: regular file, not a symlink, owned by
+# this user, mode 0600; otherwise refuse, never chmod (review 7636).
+python3 - "$HEALTH_TOKEN_FILE" <<'PY' || { echo "$HEALTH_TOKEN_FILE must be a regular file owned by $(id -un) with mode 0600; it may have been exposed: re-mint it (and restart memora-all with it)" >&2; exit 1; }
+import os, stat, sys
+st = os.lstat(sys.argv[1])
+ok = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o600
+sys.exit(0 if ok else 1)
+PY
 HEALTH_TOKEN=$(cat "$HEALTH_TOKEN_FILE")
 
 # Admin token: read, or mint once. Same shape as the health token (48
@@ -275,7 +283,11 @@ docker stop memora-all
 # writes) the next deploy recopies. Skipped entirely once memora-all itself
 # mounts memora-all-data.
 if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
-  if [ -n "$(docker ps -q --filter "volume=$OLD_VOLUME")" ]; then
+  # The status is captured on its own: a FAILED query must refuse, never read
+  # as "nothing uses it" (review 7637 P1-2).
+  IN_USE="$(docker ps -q --filter "volume=$OLD_VOLUME")" \
+    || { echo "cannot tell whether a container uses $OLD_VOLUME (docker ps failed) — refusing to copy it; memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
+  if [ -n "$IN_USE" ]; then
     echo "a running container still uses $OLD_VOLUME — refusing to copy it; memora-all is stopped, restart it with: docker start memora-all" >&2
     exit 1
   fi

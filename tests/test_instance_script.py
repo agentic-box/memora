@@ -63,21 +63,49 @@ class TestHealthToken:
         d.mkdir()
         f = d / "t.health-token"
         f.write_bytes(bad)
+        os.chmod(f, 0o600)  # private, just unusable content
         out, err = token(str(d))
         assert len(out) == 48 and out.isalnum(), f"kept an unusable token ({why})"
         assert out.encode() != bad
         if bad:
             assert "replacing unusable health token" in err
 
-    def test_a_world_readable_valid_token_is_kept_but_locked_down(self, tmp_path):
+    @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604])
+    def test_a_readable_token_is_refused_not_repaired(self, tmp_path, mode):
+        """Review 7636: the health token gets the admin token's rule -- a
+        token others could read may be exposed; refuse, never chmod."""
         d = tmp_path / "sec"
         d.mkdir()
         f = d / "t.health-token"
         f.write_text("b" * 48)
-        os.chmod(f, 0o644)
+        os.chmod(f, mode)
+        proc = subprocess.run(
+            ["bash", "-c", f'source "{SCRIPT}"; SECRET_DIR="{d}"; INSTANCE="t"; health_token'],
+            capture_output=True, text=True)
+        assert proc.returncode != 0 and "mode 0600" in proc.stderr and proc.stdout == ""
+        assert oct(os.stat(f).st_mode)[-3:] == oct(mode)[-3:], "the file must not be chmod-ed"
+        assert f.read_text() == "b" * 48
+
+    def test_a_symlinked_token_is_refused(self, tmp_path):
+        d = tmp_path / "sec"
+        d.mkdir()
+        target = tmp_path / "elsewhere"
+        target.write_text("b" * 48)
+        os.chmod(target, 0o600)
+        (d / "t.health-token").symlink_to(target)
+        proc = subprocess.run(
+            ["bash", "-c", f'source "{SCRIPT}"; SECRET_DIR="{d}"; INSTANCE="t"; health_token'],
+            capture_output=True, text=True)
+        assert proc.returncode != 0 and "regular file" in proc.stderr
+
+    def test_a_private_valid_token_is_kept(self, tmp_path):
+        d = tmp_path / "sec"
+        d.mkdir()
+        f = d / "t.health-token"
+        f.write_text("b" * 48)
+        os.chmod(f, 0o600)
         out, _ = token(str(d))
-        assert out == "b" * 48, "a valid token should survive, not be rotated"
-        assert oct(os.stat(f).st_mode)[-3:] == "600", "permissions were not repaired"
+        assert out == "b" * 48
 
 
 @pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
@@ -130,9 +158,9 @@ class TestRoutingIsInstanceOwned:
         calls = call_log.read_text().split()
         # "volume": the local registry entry gets the named /data volume
         # (inspect succeeds in the fake, so no create).
-        # inspect: the current /data mount (none here); volume: the named
-        # /data volume for the local entry (exists in the fake).
-        assert calls == ["inspect", "volume", "stop", "rm", "run"], f"runtime calls escaped the fake: {calls}"
+        # list: is there an existing container (none here; so no inspect);
+        # volume: the named /data volume for the local entry (exists).
+        assert calls == ["list", "volume", "stop", "rm", "run"], f"runtime calls escaped the fake: {calls}"
         return argv_out.read_text().splitlines(), proc.stdout, good
 
     def test_a_credential_file_cannot_override_the_instance_registry(self, tmp_path):
@@ -182,9 +210,12 @@ def _up(tmp_path, env_lines, cred_env=None, volume_exists=True, runtime_env=None
     for f in (argv_out, call_log):
         if f.exists():
             f.unlink()
+    runtime_env = dict(runtime_env or {})
+    if runtime_env.get("CURRENT_MOUNT") or runtime_env.get("INSPECT_OUT") is not None:
+        runtime_env.setdefault("EXISTING", "memora-t")
     env = dict(os.environ, MEMORA_INSTANCE_DIR=str(inst), MEMORA_CONTAINER_BIN=FAKE_RUNTIME,
                MEMORA_SECRET_DIR=str(tmp_path / "sec"), ARGV_OUT=str(argv_out),
-               CALL_LOG=str(call_log), VOLROOT=str(volroot), **(runtime_env or {}))
+               CALL_LOG=str(call_log), VOLROOT=str(volroot), **runtime_env)
     proc = subprocess.run([SCRIPT, "up", "t"], env=env, capture_output=True, text=True)
     raw = call_log.read_text() if call_log.exists() else ""
     calls = [r.split("\x1f")[:-1] for r in raw.split("\x1e") if r]
@@ -237,7 +268,7 @@ class TestDataVolume:
             volume_exists=False)
         assert proc.returncode == 0, proc.stderr
         verbs = [c[:2] if c[0] == "volume" else c[:1] for c in calls]
-        assert verbs == [["inspect"], ["volume", "inspect"], ["volume", "create"], ["stop"], ["rm"], ["run"]]
+        assert verbs == [["list"], ["volume", "inspect"], ["volume", "create"], ["stop"], ["rm"], ["run"]]
         assert calls[2] == ["volume", "create", "memora-t-data"]
 
     def test_single_d1_store_mounts_the_named_volume(self, tmp_path):
@@ -288,6 +319,7 @@ class TestAdminToken:
         sec.mkdir()
         (sec / "t.health-token").write_text("z" * 48)
         (sec / "t.admin-token").write_text("z" * 48)
+        os.chmod(sec / "t.health-token", 0o600)
         os.chmod(sec / "t.admin-token", 0o600)
         proc, calls, _ = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
         assert proc.returncode != 0
@@ -442,6 +474,63 @@ class TestUpgradeFromAnAnonymousVolume:
         assert proc.returncode == 0, proc.stderr
         assert "old volume" in proc.stdout and "rm" in [c[0] for c in calls]
         assert (old / "re.db").exists()
+
+
+@pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
+class TestFailClosedStatusChecks:
+    """Review 7637: a runtime query that gates a destructive step refuses when
+    it fails or its answer cannot be read -- before anything is stopped."""
+
+    REG = TestUpgradeFromAnAnonymousVolume.REG
+
+    def _refused_untouched(self, proc, calls, argv, needle):
+        assert proc.returncode != 0, proc.stdout
+        assert needle in proc.stderr, proc.stderr
+        verbs = [c[0] for c in calls]
+        assert "stop" not in verbs and "rm" not in verbs and "rename" not in verbs and argv == []
+
+    def test_a_failed_listing_is_refused(self, tmp_path):
+        proc, calls, argv = _up(tmp_path, self.REG, runtime_env={"LIST_ALL_RC": "1"})
+        self._refused_untouched(proc, calls, argv, "cannot list containers")
+
+    def test_a_failed_inspect_is_refused(self, tmp_path):
+        proc, calls, argv = _up(tmp_path, self.REG,
+                                runtime_env={"EXISTING": "memora-t", "INSPECT_RC": "1"})
+        self._refused_untouched(proc, calls, argv, "cannot inspect memora-t")
+        raw = proc.stderr.split("raw output: ")[1].split(")")[0]
+        assert "simulated failure" in open(raw).read(), "the raw inspect output is kept for the operator"
+
+    def test_malformed_inspect_json_is_refused(self, tmp_path):
+        proc, calls, argv = _up(tmp_path, self.REG, runtime_env={"INSPECT_OUT": "{not json"})
+        self._refused_untouched(proc, calls, argv, "cannot tell what memora-t mounts at /data")
+
+    def test_inspect_without_a_data_mount_is_refused(self, tmp_path):
+        import json as _json
+        out = _json.dumps([{"Name": "memora-t", "Mounts": [{"Name": "x", "Destination": "/elsewhere"}]}])
+        proc, calls, argv = _up(tmp_path, self.REG, runtime_env={"INSPECT_OUT": out})
+        self._refused_untouched(proc, calls, argv, "cannot tell what memora-t mounts at /data")
+
+    def test_no_container_proceeds(self, tmp_path):
+        proc, calls, argv = _up(tmp_path, self.REG)
+        assert proc.returncode == 0, proc.stderr
+        assert "inspect" not in [c[0] for c in calls] and argv
+
+    def test_a_failed_running_check_refuses_before_the_copy(self, tmp_path):
+        TestUpgradeFromAnAnonymousVolume._old_volume(TestUpgradeFromAnAnonymousVolume(), tmp_path)
+        proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
+                                runtime_env={"CURRENT_MOUNT": TestUpgradeFromAnAnonymousVolume.ANON,
+                                             "LIST_RC": "1"})
+        assert proc.returncode != 0 and "cannot list running containers" in proc.stderr
+        assert not any("migrate_data_volume" in c for c in calls) and argv == []
+        assert "rm" not in [c[0] for c in calls]
+
+    def test_an_empty_successful_running_list_means_not_running(self, tmp_path):
+        TestUpgradeFromAnAnonymousVolume._old_volume(TestUpgradeFromAnAnonymousVolume(), tmp_path)
+        proc, calls, _ = _up(tmp_path, self.REG, volume_exists=False,
+                             runtime_env={"CURRENT_MOUNT": TestUpgradeFromAnAnonymousVolume.ANON,
+                                          "RUNNING_LIST": ""})
+        assert proc.returncode == 0, proc.stderr
+        assert any("migrate_data_volume" in c for c in calls)
 
 
 @pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
