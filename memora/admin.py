@@ -190,6 +190,11 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
                 out["journal"]["unusable"] = broken  # this process serves the store read-only
         if getattr(backend, "refused_reason", None):
             out["refused"] = backend.refused_reason
+        from .replicator import replicator_for
+
+        rep = replicator_for(name)
+        if rep is not None:
+            out["replication"] = rep.status()
         return out
     except Exception as exc:
         return {"freeze": {"state": "unknown", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}}

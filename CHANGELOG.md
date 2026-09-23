@@ -14,6 +14,23 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L3: the replicator (dark)
+- Per `docs/local-primary-implementation.md` §2 and §0 P2-P4. `memora/replicator.py`: one thread per replicated store reads `sync_outbox` in seq order, coalesces it per key, and builds statements from each key's CURRENT local row. A present row becomes an UPSERT of every column (`memories_embeddings`: a DELETE+INSERT pair, so D1's update trigger cannot null `representation`); an absent row becomes a DELETE by the full primary key. `memories_meta` exclusions are enforced by the triggers.
+- **P2 allow-list:** `_check_statement` accepts exactly those shapes, plus per-key read-back SELECTs and the epoch SELECT; anything else halts the store (`statement_rejected`). The replicator's D1 writer (`ReplicaD1Connection`) has only `execute_batch` and checks every statement before sending.
+- **P3 deletion guard:** a batch whose net deletes on a table exceed 50 rows, or 1% of the table's rows (so any delete from a table under 100 rows), halts before anything is sent. `replicator.resume(conn, allow_deletes=<attempt>)` allows that one attempt.
+- **Log mode** (`MEMORA_REPLICATION=log`): JSONL under `$MEMORA_DATA_DIR/replica-log/<db>/`, fsynced (and the directory, for a new file) before `log_cursor_seq` advances. Nothing is sent or acked. `iter_log` deduplicates re-appended ranges and drops a torn final line.
+- **Write mode** (`MEMORA_REPLICATION=write`, token `MEMORA_D1_REPLICATOR_TOKEN`; reads use `MEMORA_D1_READ_TOKEN`; never `CLOUDFLARE_API_TOKEN`):
+  - A durable in-flight marker is written before anything is sent.
+  - The epoch preflight runs in its own request. A mismatch halts the store (`foreign_writer`), and only `resume(conn, accept_d1_epoch=…)` clears it.
+  - One REST batch is sent, with the epoch postcheck as its last statement; if D1 rejects the batch body (HTTP 400), statements go one per request.
+  - The ack happens only when every result succeeds. It is one local transaction that sets `last_acked_seq` and `d1_epoch_expected`, clears the marker, and prunes outbox rows at or below `min(acked, compare_consumed_seq)` that are older than 24 h. `/broadcast` follows the ack.
+  - After an unknown outcome, reconciliation reads the range's keys back: if all match, the batch is acked (`epoch_unverified_batches` += 1); otherwise it is resent whole, with the preflight relaxed to at least the marker's epoch.
+  - Halts persist across restarts.
+- **Scope:** replication is dark unless `MEMORA_REPLICATION` is `log` or `write` and `MEMORA_REPLICAS` names a local store whose `sync_state.replica_uri` matches. Stores in `MEMORA_SHADOW_LOCAL` are forced to log mode, and write mode refuses a shadow store.
+- **Metrics and wake-up:** `/health/db/<db>` (authorised) gains a `replication` block: mode, status, head, acked and log cursors, `lag_rows`, `oldest_unacked_age_s`, `last_ack_at`, `last_error`, `halted_reason`, `epoch_unverified_batches` and `d1_missing_vectors` (null until the compare, L6). A commit wakes the replicator (`commit_event`). The in-flight marker counts as an open intent of the store's write gate.
+- `sync_state` gains `allow_deletes_attempt`, `epoch_unverified_batches`, `last_ack_at` and `last_error`; existing tables are upgraded by `ensure_schema`.
+- `tests/test_l3b_live_d1.py` holds live checks against a throwaway D1 database, and is skipped unless `MEMORA_D1_TEST_*` is set.
+
 ### Local-primary L2: write gate, D1 intent journal, sync schema
 - Per `docs/local-primary-implementation.md` §1 and §2.9. This slice sends no new statement to D1; its only D1 reads are the reconciliation evidence SELECTs, through `D1SelectOnlyConnection` with `MEMORA_D1_READ_TOKEN`.
 - **Write gate (live on every store):** `_WriteGate` admits every mutating statement, on local writers (per transaction, through `_GatedCursor`, so `cursor()` is not a bypass) and on D1 connections (per request). `freeze()` closes admission, waits for in-flight writes, and reports `frozen`; on timeout it reopens and raises `FreezeTimeout` with the in-flight list. A freeze file `$MEMORA_DATA_DIR/freeze/<db>` or `MEMORA_READONLY_DBS` starts a store frozen. Reads always continue. `connect_replicator()` returns a gate-exempt writer; nothing calls it yet.

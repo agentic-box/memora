@@ -3590,6 +3590,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         except Exception as e:
             logger.error("write gate initialisation failed: %s", e)
 
+        # Replicators (plan §2.1): dark unless MEMORA_REPLICATION is log|write
+        # and MEMORA_REPLICAS / MEMORA_SHADOW_LOCAL name a store.
+        try:
+            from .replicator import start_replicators
+
+            for _name, _st in start_replicators().items():
+                if "error" in _st:
+                    logger.error("replicator %s: %s", _name, _st["error"])
+        except Exception as e:
+            logger.error("replicator startup failed: %s", e)
+
         # Complete or remove rows an interrupted import left marked.
         threading.Thread(target=_startup_import_sweep, name="memora-import-sweep", daemon=True).start()
 
