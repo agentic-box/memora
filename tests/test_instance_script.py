@@ -130,7 +130,9 @@ class TestRoutingIsInstanceOwned:
         calls = call_log.read_text().split()
         # "volume": the local registry entry gets the named /data volume
         # (inspect succeeds in the fake, so no create).
-        assert calls == ["stop", "rm", "volume", "run"], f"runtime calls escaped the fake: {calls}"
+        # inspect: the current /data mount (none here); volume: the named
+        # /data volume for the local entry (exists in the fake).
+        assert calls == ["inspect", "volume", "stop", "rm", "run"], f"runtime calls escaped the fake: {calls}"
         return argv_out.read_text().splitlines(), proc.stdout, good
 
     def test_a_credential_file_cannot_override_the_instance_registry(self, tmp_path):
@@ -156,10 +158,13 @@ class TestRoutingIsInstanceOwned:
         assert "sqlite" not in out, "a registry instance reported itself as sqlite"
 
 
-def _up(tmp_path, env_lines, cred_env=None, volume_exists=True):
-    """Run `memora-instance.sh up t` against a fake runtime that records
-    every call (one line per call, args tab-separated). Returns the calls and
-    the `run` argv."""
+FAKE_RUNTIME = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fake_container_runtime.py")
+
+
+def _up(tmp_path, env_lines, cred_env=None, volume_exists=True, runtime_env=None):
+    """Run `memora-instance.sh up t` against tests/fake_container_runtime.py,
+    which records every call and keeps volumes as directories under
+    tmp_path/volumes. Returns (proc, calls, run argv)."""
     import json as _json
 
     inst = tmp_path / "instances"
@@ -169,31 +174,20 @@ def _up(tmp_path, env_lines, cred_env=None, volume_exists=True):
         + f"CRED_SOURCE={tmp_path / 'cred.json'}\n")
     (tmp_path / "cred.json").write_text(_json.dumps(
         {"mcpServers": {"memora": {"env": cred_env or {"CLOUDFLARE_API_TOKEN": "tok"}}}}))
-    fake = tmp_path / "fakecontainer"
-    fake.write_text(
-        '#!/bin/bash\n'
-        '(IFS=$\'\\t\'; echo "$*") >> "$CALL_LOG"\n'
-        'if [ "$1" = run ]; then printf "%s\\n" "$@" > "$ARGV_OUT"; fi\n'
-        'if [ "$1 $2" = "volume inspect" ]; then [ -e "$VOL_STATE" ]; exit $?; fi\n'
-        'if [ "$1 $2" = "volume create" ]; then touch "$VOL_STATE"; fi\n'
-    )
-    fake.chmod(0o755)
-    vol_state = tmp_path / "volume-exists"
+    volroot = tmp_path / "volumes"
+    volroot.mkdir(exist_ok=True)
     if volume_exists:
-        vol_state.touch()
+        (volroot / "memora-t-data").mkdir(exist_ok=True)
     argv_out, call_log = tmp_path / "argv.txt", tmp_path / "calls.txt"
     for f in (argv_out, call_log):
         if f.exists():
             f.unlink()
-    proc = subprocess.run(
-        ["bash", "-c",
-         f'export MEMORA_INSTANCE_DIR="{inst}" MEMORA_CONTAINER_BIN="{fake}" '
-         f'MEMORA_SECRET_DIR="{tmp_path / "sec"}" ARGV_OUT="{argv_out}" '
-         f'CALL_LOG="{call_log}" VOL_STATE="{vol_state}"; '
-         f'"{SCRIPT}" up t'],
-        capture_output=True, text=True,
-    )
-    calls = [l.split("\t") for l in call_log.read_text().splitlines()] if call_log.exists() else []
+    env = dict(os.environ, MEMORA_INSTANCE_DIR=str(inst), MEMORA_CONTAINER_BIN=FAKE_RUNTIME,
+               MEMORA_SECRET_DIR=str(tmp_path / "sec"), ARGV_OUT=str(argv_out),
+               CALL_LOG=str(call_log), VOLROOT=str(volroot), **(runtime_env or {}))
+    proc = subprocess.run([SCRIPT, "up", "t"], env=env, capture_output=True, text=True)
+    raw = call_log.read_text() if call_log.exists() else ""
+    calls = [r.split("\x1f")[:-1] for r in raw.split("\x1e") if r]
     argv = argv_out.read_text().splitlines() if argv_out.exists() else []
     return proc, calls, argv
 
@@ -243,8 +237,8 @@ class TestDataVolume:
             volume_exists=False)
         assert proc.returncode == 0, proc.stderr
         verbs = [c[:2] if c[0] == "volume" else c[:1] for c in calls]
-        assert verbs == [["stop"], ["rm"], ["volume", "inspect"], ["volume", "create"], ["run"]]
-        assert calls[3] == ["volume", "create", "memora-t-data"]
+        assert verbs == [["inspect"], ["volume", "inspect"], ["volume", "create"], ["stop"], ["rm"], ["run"]]
+        assert calls[2] == ["volume", "create", "memora-t-data"]
 
     def test_single_d1_store_mounts_the_named_volume(self, tmp_path):
         proc, _, argv = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
@@ -294,10 +288,160 @@ class TestAdminToken:
         sec.mkdir()
         (sec / "t.health-token").write_text("z" * 48)
         (sec / "t.admin-token").write_text("z" * 48)
+        os.chmod(sec / "t.admin-token", 0o600)
         proc, calls, _ = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
         assert proc.returncode != 0
         assert "admin token equals health token" in proc.stderr
         assert "run" not in [c[0] for c in calls]
+
+
+@pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
+class TestAdminTokenFileMustBePrivate:
+    """Review 7626 P1-3: an existing admin-token file is used only when it is
+    a regular file, owned by this user, mode 0600. Anything else may have
+    been exposed: refused (never chmod-ed into shape), before any runtime
+    call, with the fix printed."""
+
+    def _sec(self, tmp_path):
+        sec = tmp_path / "sec"
+        sec.mkdir(exist_ok=True)
+        return sec
+
+    def test_0600_is_accepted(self, tmp_path):
+        f = self._sec(tmp_path) / "t.admin-token"
+        f.write_text("q" * 48)
+        os.chmod(f, 0o600)
+        proc, _, argv = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
+        assert proc.returncode == 0, proc.stderr
+        assert _envs(argv, "MEMORA_ADMIN_TOKEN") == ["q" * 48]
+
+    @pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o700])
+    def test_a_permissive_mode_is_refused_and_not_repaired(self, tmp_path, mode):
+        f = self._sec(tmp_path) / "t.admin-token"
+        f.write_text("q" * 48)
+        os.chmod(f, mode)
+        proc, calls, _ = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
+        assert proc.returncode != 0 and "mode 0600" in proc.stderr and "rm " in proc.stderr
+        assert calls == [], f"runtime touched before the refusal: {calls}"
+        assert oct(os.stat(f).st_mode)[-3:] == oct(mode)[-3:], "the file must not be chmod-ed into shape"
+
+    def test_a_symlink_is_refused(self, tmp_path):
+        target = tmp_path / "elsewhere"
+        target.write_text("q" * 48)
+        os.chmod(target, 0o600)
+        (self._sec(tmp_path) / "t.admin-token").symlink_to(target)
+        proc, calls, _ = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'])
+        assert proc.returncode != 0 and "regular file" in proc.stderr and calls == []
+
+    def test_a_file_owned_by_someone_else_is_refused(self, tmp_path, monkeypatch):
+        # Ownership cannot be changed without root: report a different uid
+        # to the checker instead (python3 on PATH is wrapped).
+        f = self._sec(tmp_path) / "t.admin-token"
+        f.write_text("q" * 48)
+        os.chmod(f, 0o600)
+        wrap = tmp_path / "pybin"
+        wrap.mkdir()
+        (wrap / "sitecustomize.py").write_text("import os\nos.getuid = lambda: 424242\n")
+        proc, calls, _ = _up(tmp_path, ['STORAGE_URI="d1://acct/db"'],
+                             runtime_env={"PYTHONPATH": str(wrap)})
+        assert proc.returncode != 0 and "owned by" in proc.stderr and calls == []
+
+
+@pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
+class TestUpgradeFromAnAnonymousVolume:
+    """Review 7626 P0-1: `up` on an instance whose container still mounts an
+    anonymous /data volume must carry that data into the named volume --
+    staged, verified, while stopped -- keep the old container for rollback,
+    and abort before run if the copy fails."""
+
+    REG = ["""MEMORA_DATABASES='{"re": "/data/re.db", "memora": "d1://acct/db"}'""", "MEMORA_DEFAULT_DB=re"]
+    ANON = "5e" * 32
+
+    def _old_volume(self, tmp_path):
+        import sqlite3
+        old = tmp_path / "volumes" / self.ANON
+        (old / "intent").mkdir(parents=True)
+        db = sqlite3.connect(old / "re.db")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)")
+        db.execute("INSERT INTO memories (content) VALUES ('must survive')")
+        db.commit()
+        keep = sqlite3.connect(old / "re.db")  # sidecars stay while copied
+        keep.execute("SELECT 1").fetchone()
+        (old / "intent" / "memora.jsonl").write_text('{"type":"intent","id":7,"sql":"INSERT INTO memories"}\n')
+        return old, (db, keep)
+
+    @staticmethod
+    def _files(root):
+        import hashlib
+        from pathlib import Path
+        return {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in sorted(Path(root).rglob("*")) if p.is_file()
+                and not p.name.startswith(".memora-volume-source")}
+
+    def test_upgrade_copies_everything_byte_identical_and_keeps_the_old_container(self, tmp_path):
+        old, conns = self._old_volume(tmp_path)
+        assert (old / "re.db-wal").exists() and (old / "re.db-shm").exists()
+        proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
+                                runtime_env={"CURRENT_MOUNT": self.ANON})
+        assert proc.returncode == 0, proc.stderr
+        new = tmp_path / "volumes" / "memora-t-data"
+        # Compared before closing: a close checkpoints the source's WAL.
+        assert self._files(new) == self._files(old)
+        for c in conns:
+            c.close()
+        assert {"re.db", "re.db-wal", "re.db-shm", "intent/memora.jsonl"} <= set(self._files(new))
+        assert f"source={self.ANON}" in (new / ".memora-volume-source").read_text()
+        verbs = [c[0] for c in calls]
+        stop, copy = verbs.index("stop"), next(i for i, c in enumerate(calls)
+                                              if c[0] == "run" and "migrate_data_volume" in c)
+        rename = verbs.index("rename")
+        assert stop < copy < rename < len(calls) - 1, "copy while stopped, keep the old one, then run"
+        assert calls[rename][1] == "memora-t" and calls[rename][2].startswith("memora-t-pre-data-volume-")
+        assert "rm" not in verbs, "the old container is kept for rollback"
+        assert _mounts(argv) == ["memora-t-data:/data"]
+
+    def test_a_second_up_is_a_no_op(self, tmp_path):
+        old, conns = self._old_volume(tmp_path)
+        _up(tmp_path, self.REG, volume_exists=False, runtime_env={"CURRENT_MOUNT": self.ANON})
+        for c in conns:
+            c.close()
+        new = tmp_path / "volumes" / "memora-t-data"
+        (new / "written-by-the-new-container").write_text("x")
+        before = self._files(new)
+        proc, calls, _ = _up(tmp_path, self.REG, runtime_env={"CURRENT_MOUNT": "memora-t-data"})
+        assert proc.returncode == 0, proc.stderr
+        assert not any("migrate_data_volume" in c for c in calls)
+        assert self._files(new) == before
+
+    def test_a_failed_copy_aborts_before_run_and_leaves_the_old_container(self, tmp_path):
+        old, conns = self._old_volume(tmp_path)
+        proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
+                                runtime_env={"CURRENT_MOUNT": self.ANON, "COPY_RC": "1"})
+        for c in conns:
+            c.close()
+        assert proc.returncode != 0
+        assert "container start memora-t" in proc.stderr.replace(FAKE_RUNTIME, "container")
+        verbs = [c[0] for c in calls]
+        assert "rm" not in verbs and "rename" not in verbs and argv == []
+        assert (old / "re.db").exists(), "the old volume is untouched"
+
+    def test_a_still_running_container_is_not_copied(self, tmp_path):
+        self._old_volume(tmp_path)
+        proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
+                                runtime_env={"CURRENT_MOUNT": self.ANON, "RUNNING_LIST": "memora-t running"})
+        assert proc.returncode != 0 and "still running" in proc.stderr
+        assert not any("migrate_data_volume" in c for c in calls) and argv == []
+
+    def test_without_rename_the_container_is_removed_and_the_volume_kept(self, tmp_path):
+        old, conns = self._old_volume(tmp_path)
+        proc, calls, _ = _up(tmp_path, self.REG, volume_exists=False,
+                             runtime_env={"CURRENT_MOUNT": self.ANON, "RENAME_RC": "1"})
+        for c in conns:
+            c.close()
+        assert proc.returncode == 0, proc.stderr
+        assert "old volume" in proc.stdout and "rm" in [c[0] for c in calls]
+        assert (old / "re.db").exists()
 
 
 @pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")

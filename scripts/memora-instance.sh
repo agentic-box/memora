@@ -160,7 +160,26 @@ admin_token() {  # per-instance secret for /admin/* (memora/admin.py)
   # Separate from the health token, which every prober holds: from L2 on the
   # admin routes place and lift write freezes. The server refuses to start if
   # the two are equal.
+  #
+  # An EXISTING admin-token file must be a regular file (not a symlink),
+  # owned by this user, mode 0600. Anything else is treated as possibly
+  # compromised: refuse and say how to re-mint, never chmod it into shape --
+  # a token that was world-readable must get a new value.
+  local f="$SECRET_DIR/$INSTANCE.admin-token"
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    secret_file_is_private "$f" \
+      || die "$f must be a regular file owned by $(id -un) with mode 0600; it may have been exposed: rm '$f' and rerun to mint a new token"
+  fi
   secret_token admin
+}
+
+secret_file_is_private() {  # secret_file_is_private PATH -- regular, not a symlink, ours, 0600
+  python3 - "$1" <<'PYEOF'
+import os, stat, sys
+st = os.lstat(sys.argv[1])
+ok = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o600
+sys.exit(0 if ok else 1)
+PYEOF
 }
 
 secret_token() {  # secret_token KIND -- read or mint $SECRET_DIR/$INSTANCE.KIND-token
@@ -220,17 +239,89 @@ ensure_volume() {  # ensure_volume NAME -- the named volume exists afterwards
     || die "could not create volume $1"
 }
 
+current_data_mount() {  # current_data_mount NAME -- the volume (or host dir) NAME mounts at /data
+  # Empty when there is no such container or no /data mount. Parses the
+  # runtime's inspect JSON loosely: docker's Mounts[] {Name|Source,
+  # Destination} and nested {source|name, destination|target} objects.
+  local out
+  out="$("$CONTAINER_BIN" inspect "$1" 2>/dev/null)" || return 0
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(0)
+found = []
+def walk(o):
+    if isinstance(o, dict):
+        dest = o.get("Destination") or o.get("destination") or o.get("target")
+        if dest == "/data":
+            vol = (o.get("type") or {}).get("volume") if isinstance(o.get("type"), dict) else None
+            name = o.get("Name") or o.get("name") or (vol or {}).get("name") or o.get("Source") or o.get("source")
+            if name:
+                found.append(name)
+        for v in o.values():
+            walk(v)
+    elif isinstance(o, list):
+        for v in o:
+            walk(v)
+walk(doc)
+print(found[0] if found else "")
+'
+}
+
+migrate_data() {  # migrate_data OLD NEW -- staged, verified copy while stopped
+  # scripts/migrate_data_volume.sh (shared with deploy-memora-all.sh): skips
+  # when NEW already holds a verified copy of OLD's current content.
+  "$CONTAINER_BIN" run --rm -v "$1:/from:ro" -v "$2:/to" "$IMAGE" \
+    sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" migrate_data_volume migrate "$1"
+}
+
 cmd_up() {
   load "$1"
+  # Everything that can refuse runs BEFORE the running container is touched:
+  # tokens, the registry, the named volume.
+  local htok atok
+  htok="$(health_token)"; atok="$(admin_token)"
+  [ "$htok" != "$atok" ] || die "admin token equals health token; delete $SECRET_DIR/$INSTANCE.admin-token and rerun"
+  local data_vol=""
+  if [ -n "${MEMORA_DATABASES:-}" ]; then
+    if registry_needs_data "$MEMORA_DATABASES"; then data_vol="memora-$INSTANCE-data"; fi
+  elif [ -n "$STORAGE_URI" ]; then
+    if uri_needs_data "$STORAGE_URI"; then data_vol="memora-$INSTANCE-data"; fi
+  fi
+  # What the running container keeps at /data now: an anonymous volume on
+  # an instance started before L2a (the image declares VOLUME /data).
+  local old_vol=""
+  old_vol="$(current_data_mount "$CONTAINER")"
+  [ -z "$data_vol" ] || ensure_volume "$data_vol"
   # Every runtime call goes through $CONTAINER_BIN, not just the final `run`.
   # Intercepting only `run` left stop/rm hitting the REAL runtime, so a test
   # could delete a genuine container that happened to share the instance name.
   "$CONTAINER_BIN" stop "$CONTAINER" >/dev/null 2>&1 || true
-  "$CONTAINER_BIN" rm   "$CONTAINER" >/dev/null 2>&1 || true
+  if [ -n "$data_vol" ] && [ -n "$old_vol" ] && [ "$old_vol" != "$data_vol" ]; then
+    # Carry the old /data (SQLite files, freeze files, intent journals) into
+    # the named volume while nothing runs on it. The old container is kept
+    # (renamed, stopped) with its volume, for rollback.
+    if "$CONTAINER_BIN" list 2>/dev/null | awk -v n="$CONTAINER" '$1==n{f=1} END{exit !f}'; then
+      die "$CONTAINER is still running; not copying $old_vol"
+    fi
+    echo "copying /data from $old_vol into $data_vol (staged, verified)"
+    migrate_data "$old_vol" "$data_vol" \
+      || die "copy $old_vol -> $data_vol failed; $CONTAINER is stopped, unchanged: $CONTAINER_BIN start $CONTAINER"
+    local kept="$CONTAINER-pre-data-volume-$(date +%s)"
+    if "$CONTAINER_BIN" rename "$CONTAINER" "$kept" >/dev/null 2>&1; then
+      echo "old container kept stopped as $kept (volume $old_vol); rollback: rm $CONTAINER, rename $kept back, start it"
+    else
+      # The runtime cannot rename: remove the container as up always did.
+      # Its volume is not removed by rm; the verified copy is in $data_vol.
+      "$CONTAINER_BIN" rm "$CONTAINER" >/dev/null 2>&1 || true
+      echo "old container removed (runtime has no rename); old volume $old_vol kept"
+    fi
+  else
+    "$CONTAINER_BIN" rm   "$CONTAINER" >/dev/null 2>&1 || true
+  fi
   local args=(run -d --name "$CONTAINER" --memory "$MEMORY" --cpus "$CPUS" -e "MEMORA_TOOL_PROFILE=$TOOL_PROFILE")
-  local htok atok
-  htok="$(health_token)"; atok="$(admin_token)"
-  [ "$htok" != "$atok" ] || die "admin token equals health token; delete $SECRET_DIR/$INSTANCE.admin-token and rerun"
   args+=(-e "MEMORA_HEALTH_TOKEN=$htok" -e "MEMORA_ADMIN_TOKEN=$atok")
   args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
   args+=(-e "MEMORA_HEALTH_REFRESH_INTERVAL=${MEMORA_HEALTH_REFRESH_INTERVAL:-15}")
@@ -256,21 +347,17 @@ cmd_up() {
   # that keeps state there gets the NAMED volume memora-<INSTANCE>-data, which
   # survives stop/rm/run, and MEMORA_DATA_VOLUME names it; the server refuses
   # such a store without both (memora/data_volume.py).
-  local data_vol=""
   if [ -n "${MEMORA_DATABASES:-}" ]; then
     args+=(-e "MEMORA_DATABASES=$MEMORA_DATABASES" -e "MEMORA_DEFAULT_DB=${MEMORA_DEFAULT_DB:-}")
-    if registry_needs_data "$MEMORA_DATABASES"; then data_vol="memora-$INSTANCE-data"; fi
   elif [ -n "$STORAGE_URI" ]; then
     # CLOUDFLARE_API_TOKEN comes through cred_args with everything else.
     args+=(-e "MEMORA_STORAGE_URI=$STORAGE_URI")
-    if uri_needs_data "$STORAGE_URI"; then data_vol="memora-$INSTANCE-data"; fi
   else
     # A host directory is a bind mount: a real mount, and it outlives the
     # container. Its path is the marker.
     mkdir -p "$VOLUME"; args+=(-v "$VOLUME:/data" -e "MEMORA_DATA_VOLUME=$VOLUME")
   fi
   if [ -n "$data_vol" ]; then
-    ensure_volume "$data_vol"
     args+=(-v "$data_vol:/data" -e "MEMORA_DATA_VOLUME=$data_vol")
   fi
   while IFS= read -r -d '' a; do args+=("$a"); done < <(cred_args)

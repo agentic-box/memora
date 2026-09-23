@@ -66,11 +66,13 @@
 # volume by id. The image declares VOLUME /data, so that id is normally an
 # ANONYMOUS (64-hex) volume, and the server now refuses to serve a store that
 # keeps state under /data from one (memora/data_volume.py). This deploy mounts
-# the NAMED volume memora-all-data instead and passes MEMORA_DATA_VOLUME. On
-# the first such deploy, after memora-all is stopped, it copies the old volume
-# into memora-all-data once (docker run --rm -v old:/from:ro -v new:/to) and
-# marks the copy complete; a rerun with an incomplete copy repeats it. It
-# refuses to mount a volume whose name is 64-hex. The old container (renamed,
+# the NAMED volume memora-all-data instead and passes MEMORA_DATA_VOLUME.
+# Whenever memora-all still mounts another volume, after memora-all is
+# stopped, it copies that volume into memora-all-data (scripts/migrate_data_volume.sh: staged, verified,
+# swapped in; the marker records the source volume and its content digest,
+# so a changed or different source is recopied). It refuses to mount a
+# volume whose name is 64-hex, and refuses to copy a source a running
+# container still uses. The old container (renamed,
 # stopped) keeps its old volume, so the rollback below is unchanged; writes
 # made to /data after the switch are not in the old volume.
 #
@@ -115,11 +117,16 @@ MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d=
 # base64 over the wire: the JSON has embedded quotes that ssh's remote
 # command re-join would otherwise mangle.
 MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
+# The /data migration program (shared with memora-instance.sh), sent from
+# THIS checkout: the nuc8 checkout is at $TAG and may predate it.
+MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 
-ssh nuc8 bash -s -- "$TAG" "$MEMORA_DATABASES_B64" <<'REMOTE'
+ssh nuc8 bash -s -- "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" <<'REMOTE'
 set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
+MIGRATE_SCRIPT="$(printf '%s' "$3" | base64 -d)"
+[ -n "$MIGRATE_SCRIPT" ] || { echo "empty /data migration program" >&2; exit 1; }
 TS=$(date +%s)
 # Keyed by registry store name (MEMORA_DATABASES); see the header for why.
 MEMORA_PROJECTS='{"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],"bestation":["bestation"],"re":["re"]}'
@@ -156,13 +163,22 @@ HEALTH_TOKEN=$(cat "$HEALTH_TOKEN_FILE")
 # alphanumerics, no newline); an unusable existing file is refused, not
 # replaced, because a script may already hold it.
 ADMIN_TOKEN_FILE=~/.config/memora/all.admin-token
-if [ ! -e "$ADMIN_TOKEN_FILE" ]; then
+if [ ! -e "$ADMIN_TOKEN_FILE" ] && [ ! -L "$ADMIN_TOKEN_FILE" ]; then
   tmp="$(mktemp ~/.config/memora/.admin-token.XXXXXX)"
   chmod 600 "$tmp"
   ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 ) > "$tmp"
   mv -f "$tmp" "$ADMIN_TOKEN_FILE"
   echo "minted $ADMIN_TOKEN_FILE"
 fi
+# An existing token file must be a regular file (not a symlink), owned by
+# this user, mode 0600. Otherwise it may have been exposed: refuse, never
+# chmod it into shape; removing it lets the next run mint a new value.
+python3 - "$ADMIN_TOKEN_FILE" <<'PY' || { echo "$ADMIN_TOKEN_FILE must be a regular file owned by $(id -un) with mode 0600; it may have been exposed: rm it and rerun to mint a new token" >&2; exit 1; }
+import os, stat, sys
+st = os.lstat(sys.argv[1])
+ok = stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o600
+sys.exit(0 if ok else 1)
+PY
 ADMIN_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
 [ "${#ADMIN_TOKEN}" -eq 48 ] && [ -z "$(printf '%s' "$ADMIN_TOKEN" | LC_ALL=C tr -d 'A-Za-z0-9')" ] \
   || { echo "$ADMIN_TOKEN_FILE is not 48 alphanumerics — fix or remove it" >&2; exit 1; }
@@ -250,18 +266,22 @@ PY
 
 docker stop memora-all
 
-# One-time copy of the old /data into the named volume, while memora-all is
-# stopped (nothing writes either side). Skipped once memora-all already
-# mounts memora-all-data, or when an earlier deploy completed the copy.
+# Copy the old /data into the named volume while memora-all is stopped
+# (scripts/migrate_data_volume.sh: staged into /to/.memora-staging, verified
+# by digest, then swapped in; live content is moved aside, never overlaid).
+# Its marker records the SOURCE volume and the source's content digest, so
+# the copy is skipped only when memora-all-data already holds this exact
+# source unchanged. After a rollback (memora-all back on OLD, accruing
+# writes) the next deploy recopies. Skipped entirely once memora-all itself
+# mounts memora-all-data.
 if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
-  if docker run --rm -v "$DATA_VOLUME:/to" memora:latest test -e /to/.memora-copied-from-previous-volume; then
-    echo "$DATA_VOLUME already holds a completed copy; not copying again"
-  else
-    docker run --rm -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" memora:latest \
-      sh -c 'cp -a /from/. /to/ && sync && touch /to/.memora-copied-from-previous-volume && sync' \
-      || { echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
-    echo "copied /data from $OLD_VOLUME into $DATA_VOLUME"
+  if [ -n "$(docker ps -q --filter "volume=$OLD_VOLUME")" ]; then
+    echo "a running container still uses $OLD_VOLUME — refusing to copy it; memora-all is stopped, restart it with: docker start memora-all" >&2
+    exit 1
   fi
+  docker run --rm -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" memora:latest \
+    sh -c "$MIGRATE_SCRIPT" migrate_data_volume migrate "$OLD_VOLUME" \
+    || { echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
 fi
 
 docker rename memora-all "memora-all-grok-$TS"
