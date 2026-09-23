@@ -158,7 +158,8 @@ def test_a_garbage_collected_connection_releases_its_side(tmp_path):
 # LocalSQLiteBackend.connect (exclusive side), a read through
 # connect_read_only (shared side).
 EXPECTED_SQLITE_CONNECT_SITES = {
-    ("backends.py", "LocalSQLiteBackend.connect"),            # writer: exclusive side
+    # writers (connect, and the gate-exempt connect_replicator): exclusive side
+    ("backends.py", "LocalSQLiteBackend._open_writer"),
     ("backends.py", "LocalSQLiteBackend.connect_read_only"),  # reader: shared side
     # S3 cloud stores: a local CACHE copy, synced from/to object storage.
     # Outside the local-store guarantee (their reads sync the cache file).

@@ -231,6 +231,10 @@ def backend_for(name: str):
             raise DatabaseRegistryError(
                 f"database {name!r} is misconfigured: {exc}"
             ) from exc
+        if hasattr(backend, "store_name"):
+            # The write gate, freeze file and intent journal are per NAME
+            # (docs/local-primary-implementation.md §1).
+            backend.store_name = name
         _registry_cache[name] = backend
         return backend
 

@@ -20,6 +20,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .intent_journal import IntentJournalError, journal_for
+from .sql_classify import READ, TXN, classify_statement, derive_effect, is_select_only
+from .write_gate import StoreReadOnlyError, _WriteGate, gate_for_key
+
 try:
     import filelock
 except ImportError:
@@ -554,6 +558,40 @@ if hasattr(sqlite3.Connection, "autocommit"):  # Python 3.12+
     _ThreadCheckedConnection.autocommit = property(_get_autocommit, _set_autocommit)
 
 
+class _GatedCursor(_ThreadCheckedCursor):
+    """Cursor of a local writer connection: every statement is classified,
+    and a mutating one enters the store's write gate (the freeze barrier,
+    plan §1) before it runs. The token is the CONNECTION's: it is taken by the
+    first mutation of a transaction and released when no transaction is open
+    any more (commit, rollback, close, or an autocommit statement finishing).
+    Connection.execute/executemany/executescript go through cursor(), so the
+    raw cursor is not a bypass (plan round-8 P2c)."""
+
+    def execute(self, sql, parameters=(), /):
+        conn = self.connection
+        conn._memora_gate_before(sql)
+        try:
+            return super().execute(sql, parameters)
+        finally:
+            conn._memora_gate_after()
+
+    def executemany(self, sql, parameters, /):
+        conn = self.connection
+        conn._memora_gate_before(sql)
+        try:
+            return super().executemany(sql, parameters)
+        finally:
+            conn._memora_gate_after()
+
+    def executescript(self, sql_script, /):
+        conn = self.connection
+        conn._memora_gate_before(sql_script)
+        try:
+            return super().executescript(sql_script)
+        finally:
+            conn._memora_gate_after()
+
+
 class _LockedWriterConnection(_ThreadCheckedConnection):
     """A local writer connection whose close (explicit or by the GC) takes
     the exclusive side of its store lock (see LocalSQLiteBackend.connect).
@@ -561,16 +599,77 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
     The bookkeeping (closed flag, open_writers) changes only AFTER the
     underlying close succeeded: a close that raises (e.g. from the wrong
     thread) leaves the connection open, counted, and still closable only
-    under the exclusive side; the exception propagates."""
+    under the exclusive side; the exception propagates.
+
+    Writes pass the store's write gate (see _GatedCursor)."""
+
+    supports_transactions = True  # plan §1 M10: absorb phase 3 may use one transaction
 
     _memora_lock: Optional[_StoreRWLock] = None
     _memora_closed = False
+    _memora_gate: Optional[_WriteGate] = None  # None until connect() arms it
+    _memora_token = None
+
+    def cursor(self, factory=None):
+        if factory is None:
+            factory = _GatedCursor
+        elif not issubclass(factory, _GatedCursor):
+            factory = type(f"_Gated{factory.__name__}", (_GatedCursor, factory), {})
+        return _ThreadCheckedConnection.cursor(self, factory)
+
+    def _memora_gate_before(self, sql) -> None:
+        gate = self._memora_gate
+        if gate is None or self._memora_token is not None:
+            return
+        c = classify_statement(sql if isinstance(sql, str) else str(sql))
+        if c.kind == READ or (c.kind == TXN and c.txn_end):
+            return
+        self._memora_token = gate.enter(c.main or c.kind)
+
+    def _memora_gate_after(self) -> None:
+        tok = self._memora_token
+        if tok is None:
+            return
+        try:
+            idle = not self.in_transaction
+        except sqlite3.ProgrammingError:  # closed
+            idle = True
+        if idle:
+            self._memora_token = None
+            self._memora_gate.leave(tok)
+
+    def commit(self):
+        try:
+            return _ThreadCheckedConnection.commit(self)
+        finally:
+            self._memora_gate_after()
+
+    def rollback(self):
+        try:
+            return _ThreadCheckedConnection.rollback(self)
+        finally:
+            self._memora_gate_after()
+
+    def __exit__(self, *exc):
+        try:
+            return _ThreadCheckedConnection.__exit__(self, *exc)
+        finally:
+            self._memora_gate_after()
+
+    def _memora_release_token(self) -> None:
+        tok, self._memora_token = self._memora_token, None
+        if tok is not None:
+            self._memora_gate.leave(tok)
 
     def close(self) -> None:
         self._memora_check()
         lock = self._memora_lock
         if lock is None or self._memora_closed:
-            return super().close()
+            try:
+                return super().close()
+            finally:
+                if self._memora_closed or lock is None:
+                    self._memora_release_token()
         with lock.exclusive():
             self._memora_close_locked()
 
@@ -581,6 +680,7 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
         _sqlite_close(self)  # raises -> nothing below runs
         self._memora_closed = True
         self._memora_lock.open_writers -= 1
+        self._memora_release_token()  # a closed connection's transaction is gone
 
     def __del__(self) -> None:
         lock = self._memora_lock
@@ -592,10 +692,21 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
             logger.exception("local store writer connection: close by the GC failed")
 
 
+class _ReplicatorConnection(_LockedWriterConnection):
+    """The replicator's writer (plan §1 H6): exempt from the write gate by
+    construction, so it can drain the outbox while ingress is frozen. Only
+    LocalSQLiteBackend.connect_replicator() creates it."""
+
+    def _memora_gate_before(self, sql) -> None:
+        return
+
+
 class _LockedReaderConnection(_ThreadCheckedConnection):
     """A read-only connection that holds the shared side of its store lock
     until the underlying close SUCCEEDS (explicitly or by the GC): a close
     that raises (e.g. from the wrong thread) keeps the read protected."""
+
+    supports_transactions = False
 
     _memora_release = None
 
@@ -638,6 +749,29 @@ class LocalSQLiteBackend(StorageBackend):
             db_path: Path to the SQLite database file
         """
         self.db_path = Path(db_path)
+        # The registry name (set by storage.backend_for); None when the
+        # backend was built directly.
+        self.store_name: Optional[str] = None
+
+    def write_gate(self) -> _WriteGate:
+        """This store's write gate (plan §1), shared by every backend object
+        for the same real file."""
+        return gate_for_key("sqlite:" + os.path.realpath(str(self.db_path)), self.store_name)
+
+    @property
+    def live_primary(self) -> bool:
+        """True when this store is named in MEMORA_REPLICAS (plan §1 M10):
+        a local primary replicated to D1. Dark until configured."""
+        if not self.store_name:
+            return False
+        raw = os.getenv("MEMORA_REPLICAS", "").strip()
+        if not raw:
+            return False
+        try:
+            replicas = json.loads(raw)
+        except ValueError:
+            return False
+        return isinstance(replicas, dict) and self.store_name in replicas
 
     def _ensure_parent_dir(self) -> None:
         """Ensure parent directory exists."""
@@ -654,11 +788,19 @@ class LocalSQLiteBackend(StorageBackend):
         until it is closed). The open also touches the database once, so a
         WAL database's -wal/-shm exist for as long as this connection is open.
         """
+        return self._open_writer(check_same_thread, _LockedWriterConnection, gated=True)
+
+    def connect_replicator(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        """The replicator's writer: exempt from the write gate and the freeze
+        (plan §1 H6). Nothing but memora/replicator.py may call this; a test
+        asserts it."""
+        return self._open_writer(check_same_thread, _ReplicatorConnection, gated=False)
+
+    def _open_writer(self, check_same_thread: bool, factory, *, gated: bool) -> sqlite3.Connection:
         self._ensure_parent_dir()
         lock = _store_lock(self.db_path)
         with lock.exclusive():
-            conn = sqlite3.connect(self.db_path, check_same_thread=False,
-                                   factory=_LockedWriterConnection)
+            conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=factory)
             conn._memora_owner = threading.get_ident()
             conn._memora_check_thread = check_same_thread
             try:
@@ -668,6 +810,10 @@ class LocalSQLiteBackend(StorageBackend):
             conn._memora_lock = lock
             lock.open_writers += 1
         conn.row_factory = sqlite3.Row
+        # Armed last: setup statements on the raw connection (above, and any
+        # future PRAGMAs) are not gated (plan §9 item b).
+        if gated:
+            conn._memora_gate = self.write_gate()
         return conn
 
     def connect_read_only(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
@@ -713,6 +859,10 @@ class LocalSQLiteBackend(StorageBackend):
             params = "mode=ro"
             if _sqlite_header_is_wal(path):
                 has_wal, has_shm = wal.exists(), shm.exists()
+                if lock.open_writers == 0 and not has_wal and not has_shm and self.live_primary:
+                    # A live primary is never read immutable (plan §1 M10):
+                    # the replicator's anchor writer keeps the sidecars.
+                    raise StoreLockedError("wal_sidecars_missing_live_primary")
                 if lock.open_writers == 0 and not has_wal and not has_shm:
                     params = "mode=ro&immutable=1"
                 elif has_wal != has_shm or not has_wal:
@@ -1337,6 +1487,12 @@ class D1Cursor:
         pass
 
 
+class D1DefiniteError(RuntimeError):
+    """D1 answered and the statement definitely did NOT apply: an HTTP 4xx, or
+    a response with success=false. Anything else that fails after a request
+    was sent (a timeout, a reset, a 5xx) has an UNKNOWN outcome."""
+
+
 class D1Connection:
     """A connection-like object that talks to Cloudflare D1 via HTTP API.
 
@@ -1374,7 +1530,48 @@ class D1Connection:
         # constructed directly without a backend (tests, ad-hoc tooling).
         self._backend: Optional["D1Backend"] = None
 
+    supports_transactions = False  # every statement autocommits (plan §1 M10)
+
+    def _gate_and_journal(self):
+        backend = self._backend
+        if backend is not None and hasattr(backend, "write_gate"):
+            return backend.write_gate(), backend.journal()
+        name = self.database_id
+        gate = gate_for_key(f"d1:{self.database_id}")
+        journal = journal_for(name)
+        gate.journal_status = journal.status
+        return gate, journal
+
     def _execute_api(self, sql: str, params: tuple = None) -> dict:
+        """One statement over the D1 HTTP API, behind the write gate and the
+        write-ahead intent journal (plan §1).
+
+        Reads go straight through. A mutating statement enters the store's
+        gate (refused while frozen), is journaled and fsynced BEFORE it is
+        sent (not sent if that fails), and is resolved after a KNOWN outcome.
+        An unknown outcome leaves the intent open; the gate token is released
+        once the outcome is determined either way."""
+        c = classify_statement(sql)
+        if c.kind == READ:
+            return self._send(sql, params)
+        gate, journal = self._gate_and_journal()
+        token = gate.enter(c.main or c.kind)
+        try:
+            target, keys, post_state = derive_effect(sql, params)
+            iid = journal.append_intent(sql, params, target=target or c.target,
+                                        keys=keys, post_state=post_state)
+            try:
+                result = self._send(sql, params)
+            except D1DefiniteError:
+                journal.resolve(iid, "failed")
+                raise
+            # Any other exception: unknown outcome, the intent stays open.
+            journal.resolve(iid, "ok")
+            return result
+        finally:
+            gate.leave(token)
+
+    def _send(self, sql: str, params: tuple = None) -> dict:
         """Execute SQL via D1 HTTP API with session affinity for read-your-writes."""
         import urllib.error
         import urllib.request
@@ -1409,7 +1606,8 @@ class D1Connection:
                 "/query", data, headers, retry_safe=_is_read_statement(sql),
             )
             if status >= 400:
-                raise RuntimeError(f"D1 API error ({status}): {raw.decode(errors='replace')}")
+                err = D1DefiniteError if status < 500 else RuntimeError
+                raise err(f"D1 API error ({status}): {raw.decode(errors='replace')}")
             result = json.loads(raw.decode())
             self._absorb_session_token(getheader("cf-d1-session-token"))
         else:
@@ -1427,12 +1625,13 @@ class D1Connection:
 
             except urllib.error.HTTPError as e:
                 error_body = e.read().decode() if e.fp else str(e)
-                raise RuntimeError(f"D1 API error ({e.code}): {error_body}")
+                err = D1DefiniteError if e.code < 500 else RuntimeError
+                raise err(f"D1 API error ({e.code}): {error_body}")
 
         if not result.get("success"):
             errors = result.get("errors", [])
             error_msg = errors[0].get("message") if errors else "Unknown error"
-            raise RuntimeError(f"D1 query failed: {error_msg}")
+            raise D1DefiniteError(f"D1 query failed: {error_msg}")
 
         return result
 
@@ -1684,6 +1883,10 @@ class D1Backend(StorageBackend):
         self._latest_bookmark: Optional[str] = None
         self._bookmark_lock = threading.Lock()
         self._transports = threading.local()
+        # The registry name (set by storage.backend_for); None when the
+        # backend was built directly -- the journal is then keyed by the
+        # database id.
+        self.store_name: Optional[str] = None
 
         logger.info(f"Initialized D1Backend: database={database_id}")
 
@@ -1713,8 +1916,28 @@ class D1Backend(StorageBackend):
             if self._latest_bookmark is None or bookmark > self._latest_bookmark:
                 self._latest_bookmark = bookmark
 
+    def write_gate(self) -> _WriteGate:
+        """This store's write gate (plan §1), with the journal's status."""
+        gate = gate_for_key(f"d1:{self.database_id}", self.store_name)
+        if gate.journal_status is None:
+            gate.journal_status = self.journal().status
+        return gate
+
+    def journal(self):
+        """This store's write-ahead intent journal (opened and replayed on
+        first use; see memora/intent_journal.py)."""
+        return journal_for(self.store_name or self.database_id)
+
     def connect(self, *, check_same_thread: bool = True) -> D1Connection:
-        """Return a D1 connection seeded with the backend's latest bookmark."""
+        """Return a D1 connection seeded with the backend's latest bookmark.
+
+        Refused when the store's intent journal cannot be used at all
+        (corrupt before its final line, held by another process, or not
+        openable): plan §1 "Startup replay"."""
+        journal = self.journal()
+        if journal.fatal:
+            raise IntentJournalError(journal.fatal)
+        self.write_gate()
         conn = D1Connection(self.account_id, self.database_id, self.api_token)
         conn._session_token = self.get_latest_bookmark()
         conn._backend = self
@@ -1735,6 +1958,77 @@ class D1Backend(StorageBackend):
             "account_id": self.account_id,
             "database_id": self.database_id,
         }
+
+
+class D1SelectOnlyConnection:
+    """A D1 reader that can run exactly one SELECT per call, and nothing else
+    (plan §2.9 P0-1). It is NOT a D1Connection and does not use the P2
+    statement checker: per-key UPSERTs and DELETEs, PRAGMA, EXPLAIN, VALUES,
+    DDL, RETURNING and multi-statement bodies are all refused. It has no
+    executemany, executescript, commit or execute_batch. Meant for the D1
+    Read token (MEMORA_D1_READ_TOKEN)."""
+
+    def __init__(self, account_id: str, database_id: str, api_token: str):
+        self.account_id = account_id
+        self.database_id = database_id
+        self._api_token = api_token
+        self.base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}"
+        self._transport_obj: Optional[_D1Transport] = None
+
+    @classmethod
+    def from_env(cls, account_id: str, database_id: str) -> "D1SelectOnlyConnection":
+        token = os.getenv("MEMORA_D1_READ_TOKEN", "").strip()
+        if not token:
+            raise RuntimeError("MEMORA_D1_READ_TOKEN is not set: no D1 read credential")
+        return cls(account_id, database_id, token)
+
+    def _post(self, body: bytes) -> tuple:
+        if self._transport_obj is None:
+            self._transport_obj = _D1Transport(self.base_url)
+        headers = {"Authorization": f"Bearer {self._api_token}", "Content-Type": "application/json"}
+        return self._transport_obj.post("/query", body, headers, retry_safe=True)
+
+    def execute(self, sql: str, params: tuple = None) -> tuple:
+        """(rows, meta) of one SELECT. Raises ValueError for anything else."""
+        if not isinstance(sql, str) or not is_select_only(sql):
+            raise ValueError("D1SelectOnlyConnection runs a single SELECT only")
+        body = {"sql": sql}
+        if params:
+            body["params"] = list(params)
+        status, _getheader, raw = self._post(json.dumps(body).encode("utf-8"))
+        if status >= 400:
+            raise RuntimeError(f"D1 API error ({status}): {raw.decode(errors='replace')}")
+        result = json.loads(raw.decode())
+        if not result.get("success"):
+            errors = result.get("errors", [])
+            raise RuntimeError(f"D1 query failed: {errors[0].get('message') if errors else 'Unknown error'}")
+        first = (result.get("result") or [{}])[0]
+        return first.get("results", []), first.get("meta", {})
+
+    def close(self) -> None:
+        if self._transport_obj is not None:
+            self._transport_obj.close()
+            self._transport_obj = None
+
+
+def primary_lock_path(db_path: Path) -> Path:
+    return Path(f"{db_path}.primary-lock")
+
+
+def acquire_primary_lock(db_path: Path) -> int:
+    """flock(LOCK_EX|LOCK_NB) on `<db>.primary-lock` (plan §1 M10). memora-all
+    holds it for its lifetime on every live primary; a script that writes
+    takes it too, and refuses when it is held. Returns the fd (keep it open);
+    raises StoreLockedError when another holder has it."""
+    import fcntl
+
+    fd = os.open(str(primary_lock_path(db_path)), os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise StoreLockedError(f"{primary_lock_path(db_path)} is held: memora-all is serving this store")
+    return fd
 
 
 def parse_backend_uri(uri: str) -> StorageBackend:

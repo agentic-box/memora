@@ -14,6 +14,23 @@ from memora.backends import D1Connection, LocalSQLiteBackend
 from memora.graph.server import start_graph_server
 
 
+@pytest.fixture(autouse=True)
+def _isolated_write_gate_state(tmp_path_factory, monkeypatch):
+    """Each test gets its own data dir for the write gate's freeze files and
+    the D1 intent journal (docs/local-primary-implementation.md §1), and
+    fresh in-process gate and journal registries. Nothing is ever written to
+    the real /data."""
+    from memora import intent_journal, write_gate
+
+    monkeypatch.setenv("MEMORA_DATA_DIR", str(tmp_path_factory.mktemp("memora-data")))
+    monkeypatch.delenv("MEMORA_READONLY_DBS", raising=False)
+    write_gate._reset_for_tests()
+    intent_journal._reset_for_tests()
+    yield
+    write_gate._reset_for_tests()
+    intent_journal._reset_for_tests()
+
+
 class FakeD1Connection(D1Connection):
     """Offline D1 behavioral double backed by SQLite.
 
