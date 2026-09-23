@@ -95,9 +95,15 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
 - **P5. Order.** Least critical first; `memora` last. Each store waits until
   the previous one has completed a clean week with writes enabled (§8).
 - **P6. Old tools inert before L2.** `sync-to-d1.py` (every remote run, not
-  only `--replace`), `link-r2-images.py` and `setup-cloudflare.sh` (remote
-  migration and Pages deploy) must exit 1 before slice L2 lands. The CI
-  guard (F2) holds them there.
+  only `--replace`), `link-r2-images.py`, and the remote migration in
+  `setup-cloudflare.sh` and `package.json` `d1:migrate` must exit 1 before
+  slice L2 lands.
+  - Pages deploys (`setup-cloudflare.sh`'s `wrangler pages deploy`, and
+    `package.json` `deploy`) are not disabled outright: L7 must deploy the
+    read-only viewer. Instead, they run the F2 guard first and refuse on any
+    finding. Until F1 lands, the guard fails, so no deploy can republish the
+    old write handlers.
+  - The CI guard (F2) holds all of this.
 - **P7. No automatic D1 writes by rollback or restore.** Rollback writes
   nothing to D1 except the operator-run sequence step (§4). Restore writes
   only the keys an operator selected one by one (§4). Every other difference
@@ -210,10 +216,16 @@ def _check_statement(sql: str) -> None                                          
 
 ### 2.1 Where it runs
 
-There is one daemon thread per store that is local, named in
-`MEMORA_REPLICAS` and has a `sync_state` row. It starts in `server.main`,
-next to `_startup_import_sweep` (server.py:3550), only when
-`MEMORA_REPLICATION` is `log` or `write`.
+There is one daemon thread per store that has a `sync_state` row and is
+either:
+- local and named in `MEMORA_REPLICAS` (after cutover, `log` or `write`
+  mode); or
+- named in `MEMORA_SHADOW_LOCAL` (shadow week). Its outbox is the shadow
+  file's, and the mode is forced to `log`: write mode refuses to start on a
+  shadow store.
+
+It starts in `server.main`, next to `_startup_import_sweep`
+(server.py:3550), only when `MEMORA_REPLICATION` is `log` or `write`.
 
 The replicator's D1 connection is schema-free: `D1Backend` is opened without
 `ensure_schema`, like `connect_without_schema`. The replicator therefore
@@ -378,23 +390,42 @@ never fails a write.
 per store in shadow. The registry keeps the store on `d1://`, so every read
 and every primary write still go to D1.
 
-**The only hook.** `D1Backend.connect()` returns a
-`ShadowingD1Connection(D1Connection)` for a shadowed store. It overrides
-`execute` (backends.py:1459), `executemany` (1478) and `executescript`
-(1493). Every write storage.py makes to D1 goes through these three
-methods, so no storage.py call site changes.
-- The app-visible result or exception is exactly what the unwrapped
-  connection returns: same object, same exception.
-- Per-element hooking (P1-2). `executemany` and `executescript` send one D1
-  request per element. The wrapper re-implements the loop by calling
-  `super().execute` once per element, and enqueues each element as soon as
-  that element succeeds. The result is still the same object, and
-  `rowcount` and `lastrowid` are aggregated as the parent does.
-- A statement is mirrored only if its target table (the first
-  `INSERT INTO` / `UPDATE` / `DELETE FROM` / `REPLACE INTO` name) is one of
-  the 7 in §1. DDL, SELECTs and other tables are not mirrored.
-- Each item carries
-  `(sql, params, d1_last_row_id, d1_rows_written, served_by_primary)`.
+**The only hook** (P1-2, P2-4). `D1Backend.connect()` returns a
+`ShadowingD1Connection(D1Connection)` for a shadowed store.
+- It overrides exactly one method: `_execute_api(sql, params)`
+  (backends.py:1377). `execute` (1459), `executemany` (1478) and
+  `executescript` (1493) each call it once per statement or element, and
+  they are NOT overridden.
+  - The result and exception shapes are therefore the parent's own code, by
+    construction. Nothing is re-implemented: not the
+    `meta.get("changes", 0)` aggregation, not `lastrowid` carry-over, not the
+    `rowcount=meta.get("changes", len(rows))` fallback in `execute`, and not
+    the `sql_script.split(";")` splitter in `executescript`.
+  - Every storage.py write to D1 passes through `_execute_api`, so no call
+    site changes.
+- The override calls `super()._execute_api(sql, params)`.
+  - On success, it returns the response dict untouched, and enqueues
+    `(sql, params, meta)` when the statement is to be mirrored (below).
+    `executemany` and `executescript` therefore enqueue each element as it
+    completes.
+  - On any exception it marks the shadow dirty and re-raises the same
+    exception object. That covers a failed element of a composite call and
+    a timeout with an unknown outcome.
+  - The new `execute_batch` (§2.4) is overridden to raise on a shadowed
+    connection; the app never calls it.
+- Which statements are mirrored:
+  - A statement is read-only per the existing `_is_read_statement(sql)`
+    (backends.py:1549): ignored.
+  - It starts with `CREATE`, `ALTER` or `DROP`: DDL, not mirrored. This is
+    classified by the leading keyword, so the `UPDATE` inside a
+    `CREATE TRIGGER` body is never taken as a target.
+  - It starts with `INSERT`, `REPLACE`, `UPDATE`, `DELETE` or `WITH`: the
+    target is the table after `INTO`, `UPDATE` or `DELETE FROM`. It is
+    mirrored if the target is one of the 7 in §1; other tables are ignored.
+  - Anything else, or a target that cannot be parsed: dirty (row 7).
+  - A schema change D1 receives during the shadow period (for example a new
+    column from `ensure_schema`) makes later copy-backs mismatch, so the
+    shadow goes dirty and is re-seeded.
 
 **`ShadowApplier(name, shadow: LocalSQLiteBackend, reader: D1SelectOnlyConnection)`**
 is one thread with a FIFO queue, off the request path. For each item, in
@@ -405,6 +436,10 @@ one local `store_write`:
    `memories_actions`.
 3. Copy back: read each key from D1 by pk, and make the local row identical
    by upserting or deleting it locally.
+4. Verify per key: re-read the local row for every touched key. It must equal
+   the D1 row just read, column for column. A key absent on D1 must be
+   absent locally. A mismatch means dirty (row 6). D1's `rows_written` is
+   not compared: it counts index and trigger writes.
 
 **Read consistency (P1-4).** D1's Sessions API (bookmarks) "is only
 available via the D1 Worker Binding and not yet available via the REST
@@ -456,7 +491,7 @@ a fresh export, and the 7-night clock restarts.
 | 3 | enqueue fails, or the applier is not running when an item arrives | dirty |
 | 4 | local replay raises | dirty; roll back this item's local transaction |
 | 5 | a copy-back read fails, stays replica-served, or shows a written-value mismatch after the retries | dirty |
-| 6 | local rows affected ≠ D1 `rows_written` | dirty |
+| 6 | after copy-back, a touched key's local row ≠ D1's row, or a key deleted on D1 is still present locally | dirty |
 | 7 | a mutating statement on a §1 table cannot be parsed for a target table | dirty |
 | 8 | the applier thread dies (its run loop catches `BaseException`) | dirty; health shows `applier_alive=false` |
 | 9 | process exit or restart with a non-empty queue: the queue is in memory | dirty via the marker below |
@@ -574,7 +609,22 @@ Other rules:
 
 ## 4. Export, seed, restore, snapshot (`scripts/local_primary.py`, L5)
 
-- **`export <db>`**: P1.
+- **`export <db>`**: P1. Credentials (P2-3):
+  - `wrangler d1 export --remote` runs as a subprocess with an environment
+    built from scratch: `PATH`, `HOME`, `CLOUDFLARE_ACCOUNT_ID`, and
+    `CLOUDFLARE_API_TOKEN` set to the value of `MEMORA_D1_READ_TOKEN`.
+    Nothing else is inherited, and `CLOUDFLARE_API_TOKEN` never appears in
+    the app's own environment for this purpose.
+  - L3b tests on a throwaway database whether a D1 Read token may export.
+    If export is denied, `export` fails closed and uses the fallback: a
+    paged `SELECT` of every table through `D1SelectOnlyConnection` with the
+    read token (already verified), written as SQL `INSERT`s plus the schema
+    from `sqlite_master`. The read token remains the only credential used
+    for export.
+  - `local_primary.py` makes every D1 call through `memora/backends.py`
+    classes (`D1SelectOnlyConnection` for reads, and `D1Connection` with the
+    operator credential for the write paths). So the F2 CI guard's
+    allow-list stays `memora/backends.py` only.
 - **`seed <db> --receipt R --out /data/<db>.db`**
   1. Load the receipt's export into a fresh file.
   2. Run `ensure_schema`.
@@ -733,17 +783,43 @@ Not writers: the GET-only functions (`actions`, `databases`, `duplicates`,
 
 | # | step | owner | done when | slice |
 |---|---|---|---|---|
-| F3 | `sync-to-d1.py`, `sync.sh`, `link-r2-images.py`, the remote branch of `setup-cloudflare.sh`, and the `package.json` `d1:migrate`/`deploy` scripts exit 1 with a pointer here (P6) | worker | each exits 1; a test runs each | L1b |
+| F3 | `sync-to-d1.py`, `sync.sh`, `link-r2-images.py`, `setup-cloudflare.sh`'s remote migration and `package.json` `d1:migrate` exit 1 with a pointer here. `package.json` `deploy` and `setup-cloudflare.sh`'s Pages deploy first run the F2 guard, and refuse on any finding (P6) | worker | each exits 1, or refuses on 3d03123; a test runs each | L1b |
 | F2 | CI guard in `graph-ui.yml`. It fails on write SQL inside `.prepare(`/`.batch(`/`.exec(` under `memora-graph/functions/`, on `DB_MEMORA\|DB_OB1\|DB_BESTATION\|DB_RE` used with write SQL, on Python `requests.post` to `/d1/database/…/query`, and on `wrangler d1 execute --remote` / `migrations apply` without `--local`. An allow-list covers only `memora/backends.py` | worker | it fails on 3d03123 and passes after F1 and F3 | L1b (tools), L7 (handlers) |
 | F1 | viewer read-only: `chat.ts` keeps search and answers but drops the 3 write tools and `computeAndStoreEmbedding`; `[id].ts` PATCH returns 405; the edit controls in `index.html` and `force-graph.html` are hidden or disabled; `test_tag_writes.mjs` is replaced by 405 and no-tool tests | worker, deploy by leader | the deployed viewer returns 405; no edit controls | L7 |
 | F4a | from the Mac, over nuc8's endpoint: authenticate, and create and delete one memory in a `scratch` local store in the registry. D1 is never touched | user | receipt noted | L8 |
 | F4 | repoint the Mac `~/.config/memora/credentials.mcp.json` to nuc8: no `d1://`, no `CLOUDFLARE_API_TOKEN` | user | `audit-configs` is clean | L8 |
 | F5 | the same for every `.mcp.json` / `credentials*.mcp.json` on ob1, bestation and re (REVERT.md lists 4) | user | audit output | L8 |
-| F6 | rotate the old Cloudflare token. One D1-edit token goes to the nuc8 replicator only; the viewer keeps its binding (read-only by F1/F2) | user | a stale client gets 401/403 | L8, after F4a–F5 |
+| F6 | mint the three credentials in §6.1, move memora-all to (a), then revoke the OLD token (the one in the Mac MCP and on other hosts). The viewer keeps its Pages binding (read-only by F1/F2). (a) is revoked only after the last cutover and its rollback window | user | a stale client gets 401/403; memora-all is healthy on (a) | L8, after F4a–F5 |
 | F7 | `cloud_sync.schedule_sync` stays, called after the ack | worker | — | L3 |
 
 F1 is swappable: if the viewer later needs edits, it becomes "route writes
 to nuc8", and nothing else changes.
+
+### 6.1 Credential inventory (P0-1)
+
+Every D1 token permission is account-scoped: "D1 Read" or "D1 Edit", with
+no per-database scope. Separation is therefore by holder and purpose, not by
+database.
+
+| credential | permission | held by | how it is delivered |
+|---|---|---|---|
+| (a) `MEMORA_D1_EDIT_TOKEN` | D1 Edit | memora-all, for every store still served from `d1://` (all stores until their cutover, including the shadow week) | as `CLOUDFLARE_API_TOKEN` in memora-all's env: the name `D1Backend` already reads (backends.py:1767), so there is no code change |
+| (b) `MEMORA_D1_REPLICATOR_TOKEN` | D1 Edit | memora-all's replicator, in write mode only | `MEMORA_D1_REPLICATOR_TOKEN`, read only by `replicator.py` |
+| (c) `MEMORA_D1_READ_TOKEN` | D1 Read | the shadow applier's reader, and `local_primary.py` export, recheck and compare | `MEMORA_D1_READ_TOKEN`; handed to wrangler only as the subprocess's `CLOUDFLARE_API_TOKEN` (§4) |
+| operator | D1 Edit: (b) used interactively | a person running `local_primary.py` restore apply, the sequence step or `restamp` | read from a 0600 file given by `--credential-file`, never from any service env. Each use also needs a receipt |
+
+Which process holds which token, by phase:
+
+| phase | memora-all | scripts on nuc8 | other hosts |
+|---|---|---|---|
+| before F6 (L1b–L8) | the OLD token | none | the OLD token (Mac MCP etc.) |
+| after F6, before any shadow | (a) | (c) for exports | nothing: repointed to nuc8 (F4, F5) |
+| store X in shadow week | (a) plus (c) (shadow reader) | (c) | nothing |
+| store X cut over, others not | (a) for the uncut stores; (b) for X's replicator; (c) while any store is in shadow | (c); operator (b) for restore, sequence or restamp | nothing |
+| after L12, rollback window open (14 days after L12's clean write week) | (a) still held, so rollback remains possible; (b); (c) for nightly compares | (c); operator | nothing |
+| window closed | (b); (c) | (c); operator | nothing. (a) is revoked; a later rollback needs a new edit token |
+
+
 
 ## 7. Tests (offline, local SQLite + FakeD1)
 
@@ -784,9 +860,22 @@ if it is in the dev deps.
 - **`test_connect_replicator_single_caller`**.
 
 **Shadow-local** (L3b):
-- **app-visible identity**: for every wrapped method, the result or
-  exception equals the unwrapped connection's (same `rowcount`,
-  `lastrowid`, exception type and message);
+- **app-visible identity**: for `execute`, `executemany` and
+  `executescript`, the result or exception equals the unwrapped
+  connection's (same `rowcount`, `lastrowid`, exception type and message).
+  Cases: absent `meta.changes` (the `len(rows)` fallback in `execute`, and 0
+  in the composites); an empty parameter list; an empty script; partial
+  failure; and identical `rowcount` on the CAS paths (`_cas_store_crossrefs`,
+  `UPDATE memories SET metadata = ? WHERE id = ? AND metadata = ?`) and the
+  lease paths (`_ImportLease`, `_rebuild_lease`);
+- **`test_only_execute_api_overridden`**: asserts `execute`, `executemany`
+  and `executescript` are the parent's functions;
+- **`test_indexed_and_trigger_writes_not_dirty`**: a write to an indexed
+  table (`tombstones`), and a memories write that fires the epoch triggers,
+  both stay clean;
+- **`test_copyback_mismatch_marks_dirty`**;
+- **`test_trigger_ddl_not_mirrored`**: a `CREATE TRIGGER … UPDATE memories_meta …`
+  is not mirrored;
 - **`test_executemany_partial_then_fail_marks_dirty`** and
   **`test_executescript_partial_then_fail_marks_dirty`**: completed elements
   are enqueued, dirty is set, and the original exception propagates;
@@ -876,7 +965,7 @@ with flags off.
 | L5 | §4 export, seed, recheck, restore, snapshot, sequence step | run by hand | `wrangler d1 export --remote`; per-table `COUNT(*)` and full-table SELECTs (hashes); epoch SELECT; `SELECT … FROM sqlite_sequence`; conflict reads | R2 restore: only per-key UPSERT/DELETE selected in `--approve` (P3). Sequence step: `UPDATE sqlite_sequence SET seq=? WHERE name=? AND seq<?` (≤ 2 statements, operator-run, receipt and recheck). Nothing else | 0 at merge |
 | L6 | §5 compare, rollback, `restamp` | run by hand | full-table SELECTs of the 7 tables; epoch; `verify_embedding_integrity(stamp=False)` reads | rollback: only L5's sequence UPDATE. `restamp` (a separate operator step): one `memories_meta` `embedding_integrity` write | 0 |
 | L7 | F1, F2 for handlers; viewer deploy | viewer deploy | viewer GET handlers (unchanged) | none (removes writers) | 0 |
-| L8 | F4a–F6, `audit-configs` | ops | none | none | 0 |
+| L8 | F4a–F6 including the §6.1 credentials, `audit-configs` | ops | none | none | 0 |
 | L9 | first store (`re` or `bestation`, the less critical), see below | per store | L3b, L5, L3 write-mode reads | the app's existing writes during shadow; after cutover, L3 write mode | whole store |
 | L10 | the other of `re`/`bestation`: same as L9, after L9 has had a clean week in write mode | per store | same | same | whole store |
 | L11 | `ob1`, same, after a clean week | per store | same | same | whole store |
