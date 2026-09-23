@@ -463,9 +463,19 @@ CREATE TABLE IF NOT EXISTS sync_state (
   trigger_version INTEGER NOT NULL,
   inflight_id TEXT, inflight_lo INTEGER, inflight_hi INTEGER,
   inflight_epoch_before INTEGER, inflight_at TEXT,
-  halted_reason TEXT, halted_at TEXT
+  halted_reason TEXT, halted_at TEXT,
+  allow_deletes_attempt TEXT, epoch_unverified_batches INTEGER NOT NULL DEFAULT 0,
+  last_ack_at TEXT, last_error TEXT
 )
 """
+# Columns added after L2's first sync_state (the replicator, L3); ensured on
+# existing tables by _ensure_sync_outbox.
+_SYNC_STATE_ADDED = (
+    ("allow_deletes_attempt", "TEXT"),
+    ("epoch_unverified_batches", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_ack_at", "TEXT"),
+    ("last_error", "TEXT"),
+)
 _SHADOW_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS shadow_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -529,6 +539,11 @@ def _ensure_sync_outbox(conn: sqlite3.Connection) -> None:
         return
     if not _has_table(conn, "sync_state"):
         return
+    have = {r[1] for r in conn.execute("PRAGMA table_info(sync_state)").fetchall()}
+    for col, decl in _SYNC_STATE_ADDED:
+        if col not in have:
+            conn.execute(f"ALTER TABLE sync_state ADD COLUMN {col} {decl}")
+    conn.commit()
     row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
     if row is None or int(row[0]) >= SYNC_TRIGGER_VERSION:
         return

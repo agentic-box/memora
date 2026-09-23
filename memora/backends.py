@@ -558,6 +558,32 @@ if hasattr(sqlite3.Connection, "autocommit"):  # Python 3.12+
     _ThreadCheckedConnection.autocommit = property(_get_autocommit, _set_autocommit)
 
 
+_COMMIT_EVENTS: Dict[str, threading.Event] = {}
+_COMMIT_EVENTS_GUARD = threading.Lock()
+
+
+def commit_event(db_path) -> threading.Event:
+    """The per-store event a commit sets (plan §2.2): the replicator waits
+    on it instead of polling. Keyed by the store's real path."""
+    key = os.path.realpath(str(db_path))
+    with _COMMIT_EVENTS_GUARD:
+        ev = _COMMIT_EVENTS.get(key)
+        if ev is None:
+            ev = _COMMIT_EVENTS[key] = threading.Event()
+        return ev
+
+
+def _notify_commit(conn) -> None:
+    lock_owner = getattr(conn, "_memora_db_path", None)
+    if lock_owner is None:
+        return
+    key = os.path.realpath(str(lock_owner))
+    with _COMMIT_EVENTS_GUARD:
+        ev = _COMMIT_EVENTS.get(key)
+    if ev is not None:
+        ev.set()
+
+
 class _GatedCursor(_ThreadCheckedCursor):
     """Cursor of a local writer connection: every statement is classified,
     and a mutating one enters the store's write gate (the freeze barrier,
@@ -640,9 +666,11 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
 
     def commit(self):
         try:
-            return _ThreadCheckedConnection.commit(self)
+            result = _ThreadCheckedConnection.commit(self)
         finally:
             self._memora_gate_after()
+        _notify_commit(self)
+        return result
 
     def rollback(self):
         try:
@@ -652,9 +680,12 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
 
     def __exit__(self, *exc):
         try:
-            return _ThreadCheckedConnection.__exit__(self, *exc)
+            result = _ThreadCheckedConnection.__exit__(self, *exc)
         finally:
             self._memora_gate_after()
+        if not exc or exc[0] is None:
+            _notify_commit(self)
+        return result
 
     def _memora_release_token(self) -> None:
         tok, self._memora_token = self._memora_token, None
@@ -828,6 +859,7 @@ class LocalSQLiteBackend(StorageBackend):
             except sqlite3.Error:
                 pass  # e.g. not a database yet; the caller's own statements report it
             conn._memora_lock = lock
+            conn._memora_db_path = self.db_path
             lock.open_writers += 1
         conn.row_factory = sqlite3.Row
         # Armed last: setup statements on the raw connection (above, and any

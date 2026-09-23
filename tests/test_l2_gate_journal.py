@@ -271,14 +271,10 @@ def test_replicator_connection_is_exempt(tmp_path):
     r.close()
 
 
-def test_connect_replicator_has_no_callers_outside_backends():
-    offenders = []
-    for path in (REPO / "memora").rglob("*.py"):
-        if path.name == "backends.py":
-            continue
-        if "connect_replicator(" in path.read_text():
-            offenders.append(str(path))
-    assert offenders == []  # L3's memora/replicator.py will be the only caller
+def test_connect_replicator_has_no_callers_outside_the_replicator():
+    callers = sorted(p.relative_to(REPO).as_posix() for p in (REPO / "memora").rglob("*.py")
+                     if p.name != "backends.py" and "connect_replicator(" in p.read_text())
+    assert callers == ["memora/replicator.py"]  # plan §1 H6: the replicator is its only caller
 
 
 def test_registry_store_starts_frozen_from_freeze_file_and_readonly_env(tmp_path, monkeypatch):
