@@ -78,31 +78,40 @@ def metadata_sha256(raw_metadata: Optional[str]) -> str:
 def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) -> List[str]:
     """Copy approved=true from an older approved preview onto THIS preview,
     mechanically: only for a memory id that OLD approved with status
-    proposed AND that this preview also proposes with the identical target,
-    identical proposal.retag_typed and identical stored section. Every other
-    row stays unapproved (back to the user). Returns a per-row table."""
+    proposed AND that this preview also proposes in the same group, with the
+    identical target, proposal.retag_typed, evidence and content preview, and
+    identical stored section, subsection, tags, type and metadata.project.
+    Any difference drops the row (the field is named); every other row stays
+    unapproved (back to the user). Returns a per-row table."""
     if not isinstance(old.get("approval"), dict):
         raise SystemExit(f"{old_path}: no approval block to carry")
-    new_rows = {r["id"]: r for g in ("contradictions", "keyword_only") for r in preview.get(g, [])}
+    new_rows = {r["id"]: (g, r) for g in ("contradictions", "keyword_only") for r in preview.get(g, [])}
     lines, carried, dropped = [], 0, 0
     for group in ("contradictions", "keyword_only"):
         for o in old.get(group) or []:
             if not (o.get("approved") is True and o.get("status") == "proposed"):
                 continue
-            n = new_rows.get(o["id"])
+            new_group, n = new_rows.get(o["id"], (None, None))
             op, np_ = o.get("proposal") or {}, (n or {}).get("proposal") or {}
+            ost, nst = o.get("stored") or {}, (n or {}).get("stored") or {}
             if n is None:
                 reason = "not in the new preview"
             elif n.get("status") != "proposed":
                 reason = f"new status {n.get('status')!r}"
+            elif new_group != group:
+                reason = f"group {group} -> {new_group}"
             elif np_.get("set_metadata_project") != op.get("set_metadata_project"):
                 reason = f"target {op.get('set_metadata_project')!r} -> {np_.get('set_metadata_project')!r}"
             elif np_.get("retag_typed") != op.get("retag_typed"):
                 reason = "retag_typed differs"
-            elif (n.get("stored") or {}).get("section") != (o.get("stored") or {}).get("section"):
-                reason = "stored section differs"
+            elif n.get("evidence") != o.get("evidence"):
+                reason = "evidence differs"
+            elif n.get("preview") != o.get("preview"):
+                reason = "content preview differs"
             else:
-                reason = None
+                reason = next((f"stored {key} differs" for key in
+                               ("section", "subsection", "tags", "type", "metadata_project")
+                               if nst.get(key) != ost.get(key)), None)
             if reason is None:
                 n["approved"] = True
                 carried += 1
@@ -320,6 +329,7 @@ def build_preview(conn, known: List[str]) -> Dict[str, Any]:
         row = assess(int(memory_id), content or "", metadata if isinstance(metadata, dict) else {},
                      tags if isinstance(tags, list) else [], known)
         if row is not None:
+            row["stored"]["metadata"] = metadata if isinstance(metadata, dict) else {}
             row["stored"]["metadata_sha256"] = metadata_sha256(raw_meta)
             row["stored"]["updated_at"] = updated_at
             out[row.pop("group")].append(row)

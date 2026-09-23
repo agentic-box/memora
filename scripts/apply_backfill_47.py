@@ -19,50 +19,59 @@ Usage:
    refuses that row ("refused").
 
 2. PER ROW, inside one protected section -- on local SQLite a BEGIN IMMEDIATE
-   transaction around the re-read, the checks and the write; on D1 the
-   store's import lease, fenced right before the re-read -- the memory is
-   re-read and classified:
+   transaction around the re-read, the checks, the write AND the read-back
+   verification; on D1 the store's import lease, fenced right before the
+   re-read -- the memory is re-read and classified, in this order:
      skipped-missing / skipped-pending (import marker) / skipped-retired
-     (tombstoned or superseded);
-     canonicalization-diff: the update would change more than
-       {metadata.project -> target, the memory's own typed tags re-prefixed
-       <target>/<kind>, hierarchy.path added when absent} -- e.g. legacy
-       tasks/done or hierarchy forms, or images (which the write path would
-       process) -- refused, never written;
-     already-applied: project, tags and metadata already at the target AND
-       the derived state current (FTS entry equal to the row, embedding
-       present and equal to a recomputation for the current row -- cosine
-       >= 0.9999 --, an "update" action row at or after updated_at);
-     repair: project/tags already applied but some derived state lags ->
-       update_memory is run again with force_reindex;
-     skipped-stale: the row no longer matches the preview (section,
-       subsection, tags, metadata.project, type, content_sha256,
-       metadata_sha256);
-     otherwise it is written.
+       (tombstoned, or superseded -- including by a forward-only supersedes
+       edge, which lives only in the superseding memory's crossrefs);
+     skipped-stale if the full content no longer hashes to the preview's
+       content_sha256 -- checked FIRST, whatever the project or tags;
+     canonicalization-diff: the update of the PREVIEW's stored metadata and
+       tags would change more than {metadata.project -> target, the memory's
+       own typed tags re-prefixed <target>/<kind>, hierarchy.path added when
+       absent} -- e.g. legacy tasks/done or hierarchy forms, or images (which
+       the write path would process) -- refused, never written;
+     the current row must then be EXACTLY the preview's state (full metadata
+       hash and tags -> it is written) or EXACTLY the expected post-write
+       state (-> already-applied when the derived state is current, else
+       repair: update_memory again with force_reindex); anything else is
+       skipped-stale. A row at the target that changed otherwise is never
+       reindexed.
+   Derived state (derived_lag): FTS entry equal to the row (SQLite); an
+   embedding row with encoding_source "python" and the representation and
+   dimension of a vector computed now for the row (the embeddings table
+   records no model identifier) that matches it (cosine >= 0.9999); the
+   newest action row by id an "update" at or after updated_at (timestamps
+   are second-resolution). This is biased toward "repair" and may
+   over-trigger -- float noise in a remote model's vectors, or any later
+   action -- at the cost of a harmless idempotent reindex.
    The write is ONE update_memory(conn, id, metadata={"project": target},
-   expected_row=<the row just read>): memora's own rules apply as on any
-   edit (project validation, typed-tag re-prefix, allowlist, embedding and
-   FTS refresh, action row), and expected_row makes the UPDATE statement
-   itself conditional on the row being unchanged, not tombstoned and not
-   superseded -- a concurrent absorb/update in between is never
-   overwritten ("raced"). After the write the FULL row is read back and
-   diffed against the snapshot: only metadata (== the expected), tags (==
-   the expected), updated_at, the embedding, the FTS entry, one action row
-   and at most one event row (only when the event-trigger tag is present)
-   may differ, else "failed". SECTION is never changed (every proposal's
-   target equals its section).
+   expected_row=<the row just read>, commit=False): memora's own rules apply
+   as on any edit (project validation, typed-tag re-prefix, allowlist,
+   embedding and FTS refresh, action row), and expected_row makes the UPDATE
+   statement itself conditional on the row being unchanged, not tombstoned
+   and not superseded (crossrefs value, and no supersedes edge to it in any
+   crossrefs row) -- a concurrent change in between is never overwritten
+   ("raced"). Then the FULL row is read back and diffed against the
+   snapshot: only metadata (== the expected), tags (== the expected),
+   updated_at, the embedding, the FTS entry, one action row and at most one
+   event row (only with the event-trigger tag) may differ, else "failed"; a
+   verification that raises is "verify-error". SECTION is never changed.
 
-3. FAIL-STOP: the first "failed" or "raced" row stops the run; the rest are
-   "not-attempted". On D1 each statement autocommits, so a stop can leave a
-   row part-written (row updated, FTS or embedding not); a re-run classifies
-   it as "repair", completes it and reports it "repaired". On SQLite the transaction rolls back.
-   A lost import lease also stops the run.
+3. FAIL-STOP: the first "failed", "raced" or "verify-error" row stops the
+   run; the rest are "not-attempted". On SQLite the transaction is rolled
+   back (nothing written). On D1 each statement has already committed, so a
+   stop can leave a row written-but-unverified or part-written (row
+   updated, FTS or embedding not); a re-run classifies it through the same
+   assessment (already-applied, or repair -> "repaired"), never re-applying
+   blindly. A lost import lease also stops the run.
 
 4. EXIT 0 only when every considered row is applied, repaired or
    already-applied; --allow-skips also accepts skipped-* (not failed, raced,
-   refused, canonicalization-diff or not-attempted). --dry-run performs
-   every check on a read-only connection (no schema setup, no lease), prints
-   the expected diff per row, and writes nothing.
+   verify-error, refused, canonicalization-diff or not-attempted).
+   --dry-run performs every check on a read-only connection (no schema
+   setup, no lease), prints the expected diff per row, and writes nothing.
 
 REPORTED OUTCOMES (the complete vocabulary):
   applied, repaired, already-applied      -- success
@@ -70,7 +79,7 @@ REPORTED OUTCOMES (the complete vocabulary):
   skipped-missing, skipped-pending,
   skipped-retired, skipped-stale          -- not written; accepted only with --allow-skips
   refused, canonicalization-diff          -- not written; never accepted
-  raced, failed                           -- the run stops here
+  raced, failed, verify-error             -- the run stops here
   not-attempted                           -- after a stop
 ("repair" in section 2 is the classification; its reported outcome is
 "repaired", or "would-repair" in a dry run.)
@@ -99,7 +108,7 @@ import preview_backfill_47 as preview  # noqa: E402  (importing it has no side e
 OK = {"applied", "repaired", "already-applied"}
 SKIPS = {"skipped-missing", "skipped-pending", "skipped-retired", "skipped-stale"}
 DRY_OK = {"would-apply", "would-repair", "already-applied"}
-STOPPERS = {"failed", "raced"}
+STOPPERS = {"failed", "raced", "verify-error"}
 COSINE_EQUAL = 0.9999
 
 
@@ -138,6 +147,11 @@ def validate_artifact(data: Any, storage, expect_count: Optional[int]) -> List[D
         for key in ("content_sha256", "metadata_sha256"):
             if not stored.get(key):
                 problems.append(f"#{mid}: the preview lacks stored.{key} (regenerate it; --carry-approval)")
+        if not isinstance(stored.get("metadata"), dict):
+            problems.append(f"#{mid}: the preview lacks stored.metadata (regenerate it; --carry-approval)")
+        elif stored.get("metadata_sha256") and preview.metadata_sha256(
+                json.dumps(stored["metadata"])) != stored["metadata_sha256"]:
+            problems.append(f"#{mid}: stored.metadata does not hash to stored.metadata_sha256")
         tags = list(stored.get("tags") or [])
         meta = {"type": stored.get("type")}
         recomputed = {t: storage.project_tag(target, storage._typed_tag_kind(t))
@@ -228,7 +242,23 @@ def _cosine(a: Dict[str, float], b: Dict[str, float]) -> float:
 
 
 def derived_lag(storage, snap) -> List[str]:
-    """What of the derived state does not match the row (empty: all current)."""
+    """What of the derived state does not match the row (empty: all current).
+
+    Biased toward "repair" on any doubt -- repair is an idempotent reindex:
+      - FTS (SQLite only; D1 has none): the entry must equal the row;
+      - embedding: the row must exist, encoding_source "python", and carry
+        the representation and dimension of a vector computed NOW for the
+        current row (the embeddings table records no model identifier; the
+        store's model is store-level metadata), and that vector must match
+        the stored one (cosine >= 0.9999);
+      - action: the newest action row for the memory (by id: the
+        timestamps are second-resolution and name no write) must be an
+        "update" at or after updated_at.
+    It may over-trigger (float noise in a remote model's vectors, or any
+    later action such as a link making "update" not the newest): the cost is
+    a harmless reindex."""
+    from memora.embeddings import _vector_representation
+
     lag: List[str] = []
     mem = snap["memory"]
     if snap["fts_enabled"]:
@@ -237,15 +267,21 @@ def derived_lag(storage, snap) -> List[str]:
             lag.append("fts")
     emb = snap["embedding"]
     meta, tags = _parsed(snap)
+    fresh = storage._compute_embedding(mem["content"], storage._present_metadata(meta) if meta else None, tags)
+    rep = _vector_representation(fresh or {})
+    want_repr, want_dim = ("dense", int(rep.split(":", 1)[1])) if rep.startswith("dense:") else (rep, None)
     if emb is None or not emb.get("embedding"):
         lag.append("embedding missing")
     else:
+        if emb.get("encoding_source") != "python" or emb.get("representation") != want_repr \
+                or emb.get("dimension") != want_dim:
+            lag.append(f"embedding provenance ({emb.get('representation')}/{emb.get('dimension')}/"
+                       f"{emb.get('encoding_source')}, want {want_repr}/{want_dim}/python)")
         stored = storage._json_to_embedding(emb["embedding"])
-        fresh = storage._compute_embedding(mem["content"], storage._present_metadata(meta) if meta else None, tags)
         if _cosine(stored or {}, fresh or {}) < COSINE_EQUAL:
             lag.append("embedding stale")
-    updated = mem.get("updated_at") or ""
-    if not any(action == "update" and (ts or "") >= updated for action, ts in snap["actions"]):
+    newest = snap["actions"][-1] if snap["actions"] else None
+    if newest is None or newest[0] != "update" or (newest[1] or "") < (mem.get("updated_at") or ""):
         lag.append("action row")
     return lag
 
@@ -268,32 +304,39 @@ def assess(storage, conn, row: Dict[str, Any], known: List[str]) -> Dict[str, An
         return dict(out, outcome="skipped-retired", detail="tombstoned")
     if mid in storage._superseded_ids_batch(conn, [mid]):
         return dict(out, outcome="skipped-retired", detail="superseded")
-    meta, tags = _parsed(snap)
-    new_meta, new_tags, violations = expected_after(storage, meta, tags, target)
+    sources = storage._superseding_edge_sources(conn, mid)
+    if sources:
+        return dict(out, outcome="skipped-retired", detail=f"superseded (supersedes edge from {sources})")
+    # 1. Content first: any change since the preview is stale, whatever the
+    #    project or tags look like.
+    content_hash = hashlib.sha256((snap["memory"]["content"] or "").encode("utf-8")).hexdigest()
+    if content_hash != stored.get("content_sha256"):
+        return dict(out, outcome="skipped-stale", detail="changed since the preview: content_sha256")
+    # 2. The expected post-write state, from the PREVIEW's own full metadata.
+    pre_meta, pre_tags = dict(stored["metadata"]), list(stored.get("tags") or [])
+    new_meta, new_tags, violations = expected_after(storage, pre_meta, pre_tags, target)
     if violations:
         return dict(out, outcome="canonicalization-diff", detail="; ".join(violations))
     out["expected"] = {"metadata": new_meta, "tags": new_tags}
-    out["diff"] = {k: [meta.get(k), new_meta.get(k)] for k in sorted(set(meta) | set(new_meta))
-                   if meta.get(k) != new_meta.get(k)}
-    if tags != new_tags:
-        out["diff"]["tags"] = [tags, new_tags]
-    if meta == new_meta and tags == new_tags:
+    out["diff"] = {k: [pre_meta.get(k), new_meta.get(k)] for k in sorted(set(pre_meta) | set(new_meta))
+                   if pre_meta.get(k) != new_meta.get(k)}
+    if pre_tags != new_tags:
+        out["diff"]["tags"] = [pre_tags, new_tags]
+    # 3. The current row must be EXACTLY the preview's state (-> write) or
+    #    EXACTLY the expected post-write state (-> already applied / repair).
+    meta, tags = _parsed(snap)
+    at_pre = (preview.metadata_sha256(snap["memory"].get("metadata")) == stored.get("metadata_sha256")
+              and tags == pre_tags)
+    at_post = meta == new_meta and tags == new_tags
+    if at_post and not at_pre:
         lag = derived_lag(storage, snap)
         if not lag:
             return dict(out, outcome="already-applied", detail="project, tags and derived state current")
         return dict(out, outcome="repair", detail="applied, but lagging: " + ", ".join(lag))
-    checks = {
-        "section": (meta.get("section"), stored.get("section")),
-        "subsection": (meta.get("subsection"), stored.get("subsection")),
-        "tags": (tags, list(stored.get("tags") or [])),
-        "metadata.project": (meta.get("project"), stored.get("metadata_project")),
-        "type": (meta.get("type"), stored.get("type")),
-        "content_sha256": (hashlib.sha256((snap["memory"]["content"] or "").encode("utf-8")).hexdigest(),
-                           stored.get("content_sha256")),
-        "metadata_sha256": (preview.metadata_sha256(snap["memory"].get("metadata")), stored.get("metadata_sha256")),
-    }
-    changed = [k for k, (now, then) in checks.items() if now != then]
-    if changed:
+    if not at_pre:
+        changed = [name for name, ok in (
+            ("metadata_sha256", preview.metadata_sha256(snap["memory"].get("metadata")) == stored.get("metadata_sha256")),
+            ("tags", tags == pre_tags)) if not ok]
         return dict(out, outcome="skipped-stale", detail="changed since the preview: " + ", ".join(changed))
     return dict(out, outcome="apply", detail="")
 
@@ -331,7 +374,12 @@ def verify_write(storage, conn, decision) -> Optional[str]:
     return "; ".join(problems) or None
 
 
-def write(storage, conn, decision) -> Dict[str, Any]:
+def write(storage, conn, decision, *, transactional: bool) -> Dict[str, Any]:
+    """The guarded update, then the full read-back verification. On local
+    SQLite both run inside the caller's BEGIN IMMEDIATE transaction, which is
+    committed only after a clean verification (else rolled back: nothing
+    written). On D1 every statement has already committed: a verification
+    that fails or errors reports the row as written but not verified."""
     snap, mid = decision["snapshot"], decision["id"]
     guard = {
         "content": snap["memory"]["content"], "metadata": snap["memory"].get("metadata"),
@@ -341,16 +389,29 @@ def write(storage, conn, decision) -> Dict[str, Any]:
     repairing = decision["outcome"] == "repair"
     try:
         storage.update_memory(conn, mid, metadata={"project": decision["target"]},
-                              expected_row=guard, force_reindex=repairing)
+                              expected_row=guard, force_reindex=repairing, commit=False)
     except storage.ConcurrentUpdateError as exc:
         _rollback(conn)
         return dict(decision, outcome="raced", detail=f"guarded UPDATE matched no row: {exc}")
     except Exception as exc:
         _rollback(conn)
         return dict(decision, outcome="failed", detail=f"write step failed: {type(exc).__name__}: {exc}")
-    problem = verify_write(storage, conn, decision)
+    try:
+        problem = verify_write(storage, conn, decision)
+    except Exception as exc:
+        if transactional:
+            _rollback(conn)
+            return dict(decision, outcome="verify-error",
+                        detail=f"verification raised {type(exc).__name__}: {exc}; rolled back (nothing written)")
+        return dict(decision, outcome="verify-error",
+                    detail=f"verification raised {type(exc).__name__}: {exc}; WRITTEN, not verified "
+                           "(a re-run reassesses the row)")
     if problem:
+        if transactional:
+            _rollback(conn)
+            return dict(decision, outcome="failed", detail=f"read-back: {problem}; rolled back")
         return dict(decision, outcome="failed", detail=f"read-back: {problem}")
+    conn.commit()
     if repairing:
         return dict(decision, outcome="repaired", detail=f"re-written and verified ({decision['detail']})")
     return dict(decision, outcome="applied", detail="written and verified")
@@ -397,7 +458,7 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
                     conn.execute("BEGIN IMMEDIATE")  # re-read, checks and write: one transaction
                 decision = assess(storage, conn, row, known)
                 if decision["outcome"] in ("apply", "repair") and not dry_run:
-                    result = write(storage, conn, decision)
+                    result = write(storage, conn, decision, transactional=not d1)
                 else:
                     if not dry_run and not d1:
                         _rollback(conn)  # nothing to write: end the transaction

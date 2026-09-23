@@ -325,3 +325,34 @@ def test_carry_approval_refuses_an_old_file_without_approval(store, tmp_path):
     old.write_text(json.dumps({"contradictions": [], "keyword_only": []}))
     with pytest.raises(SystemExit, match="no approval block"):
         preview.main(["--out", str(outdir / "n.json"), "--carry-approval", str(old)])
+
+
+@pytest.mark.parametrize("field", ["group", "evidence", "preview", "tags", "type", "subsection", "metadata_project"])
+def test_carry_approval_names_every_differing_field(store, tmp_path, capsys, field):
+    with storage.connect() as conn:
+        ids = _seed(conn)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    fresh = outdir / "fresh.json"
+    assert preview.main(["--out", str(fresh)]) == 0
+    old = json.loads(fresh.read_text())
+    row = next(r for r in old["contradictions"] if r["id"] == ids["legacy_issue"])
+    row["approved"] = True
+    if field == "group":
+        old["contradictions"].remove(row)
+        old["keyword_only"].append(row)
+        expected = "group keyword_only -> contradictions"
+    elif field == "evidence":
+        row["evidence"] = [{"source": "section", "project": "memora"}]
+        expected = "evidence differs"
+    elif field == "preview":
+        row["preview"] = "something else"
+        expected = "content preview differs"
+    else:
+        row["stored"][field] = "changed"
+        expected = f"stored {field} differs"
+    old["approval"] = {"approved_by": "user", "at": "2026-09-23", "rule": "r"}
+    (outdir / "old.json").write_text(json.dumps(old))
+    capsys.readouterr()
+    preview.main(["--out", str(outdir / "new.json"), "--carry-approval", str(outdir / "old.json")])
+    assert f"#{ids['legacy_issue']}\tdropped\t{expected}" in capsys.readouterr().out

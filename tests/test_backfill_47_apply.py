@@ -51,7 +51,8 @@ def _preview_row(mid, content, tags, metadata, target, *, approved=True, status=
     stored = {"section": metadata.get("section"), "subsection": metadata.get("subsection"),
               "tags": list(tags), "metadata_project": metadata.get("project"), "type": metadata.get("type"),
               "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-              "metadata_sha256": preview_mod.metadata_sha256(json.dumps(metadata))}
+              "metadata_sha256": preview_mod.metadata_sha256(json.dumps(metadata)),
+              "metadata": dict(metadata)}
     row = {"id": mid, "preview": content[:120], "stored": stored, "approved": approved, "status": status}
     if status == "proposed":
         retag = {t: storage.project_tag(target, storage._typed_tag_kind(t))
@@ -429,3 +430,126 @@ def test_the_post_write_read_back_catches_anything_outside_the_allowed_diff(stor
     first = rows[ids["contradiction"]]
     assert first["outcome"] == "failed" and "memories.importance changed" in first["detail"]
     assert rows[ids["keyword"]]["outcome"] == "not-attempted"
+
+
+# --- round 3 (review 7469) -----------------------------------------------------------
+
+def _raise_once(monkeypatch, target, name, exc):
+    real = getattr(target, name)
+    state = {"done": False}
+
+    def wrapped(*a, **k):
+        if not state["done"]:
+            state["done"] = True
+            raise exc
+        return real(*a, **k)
+
+    monkeypatch.setattr(target, name, wrapped)
+    return real
+
+
+def test_a_verification_error_on_d1_stops_and_the_rerun_reassesses(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+    real = _raise_once(monkeypatch, apply, "verify_write", RuntimeError("injected read-back failure"))
+    rc, rows = _run(tmp_path, preview)
+    monkeypatch.setattr(apply, "verify_write", real)
+    assert rc == 1
+    first = rows[ids["contradiction"]]
+    assert first["outcome"] == "verify-error" and "WRITTEN, not verified" in first["detail"]
+    assert rows[ids["keyword"]]["outcome"] == "not-attempted"
+    rc, rows = _run(tmp_path, preview, name="rerun.json")
+    assert rc == 0
+    assert rows[ids["contradiction"]]["outcome"] == "already-applied"  # reassessed, not re-applied blindly
+    assert rows[ids["keyword"]]["outcome"] == "applied"
+
+
+def test_a_verification_error_on_sqlite_rolls_the_row_back(sqlite_store, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+        before = _state(conn, ids["contradiction"])
+    real = _raise_once(monkeypatch, apply, "verify_write", RuntimeError("injected read-back failure"))
+    rc, rows = _run(tmp_path, preview)
+    monkeypatch.setattr(apply, "verify_write", real)
+    assert rc == 1 and rows[ids["contradiction"]]["outcome"] == "verify-error"
+    assert "rolled back" in rows[ids["contradiction"]]["detail"]
+    with storage.connect() as conn:
+        assert _state(conn, ids["contradiction"]) == before
+    rc, rows = _run(tmp_path, preview, name="rerun.json")
+    assert rc == 0 and rows[ids["contradiction"]]["outcome"] == "applied"
+
+
+@pytest.mark.parametrize("change", ["content", "other_metadata"])
+def test_a_row_at_the_target_that_changed_otherwise_is_stale_not_repaired(store, tmp_path, change):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+    assert _run(tmp_path, preview)[0] == 0  # applied: now at the target project and tags
+    with storage.connect() as conn:
+        if change == "content":  # past the old 120-char preview
+            conn.execute("UPDATE memories SET content = content || ' edited later' WHERE id = ?",
+                         (ids["contradiction"],))
+        else:
+            _c, meta, _t = _state(conn, ids["contradiction"])
+            conn.execute("UPDATE memories SET metadata = ? WHERE id = ?",
+                         (json.dumps(dict(meta, status="closed")), ids["contradiction"]))
+        conn.commit()
+        before = _state(conn, ids["contradiction"])
+    rc, rows = _run(tmp_path, preview, name="rerun.json")
+    assert rc == 1 and rows[ids["contradiction"]]["outcome"] == "skipped-stale"
+    with storage.connect() as conn:
+        assert _state(conn, ids["contradiction"]) == before  # never force-reindexed
+
+
+@pytest.mark.parametrize("lag", ["provenance", "action"])
+def test_doubtful_derived_state_is_repaired(store, tmp_path, lag):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+    assert _run(tmp_path, preview)[0] == 0
+    with storage.connect() as conn:
+        if lag == "provenance":
+            conn.execute("UPDATE memories_embeddings SET representation = 'dense', dimension = 3 "
+                         "WHERE memory_id = ?", (ids["keyword"],))
+        else:  # a later action: "update" is no longer the newest
+            conn.execute("INSERT INTO memories_actions (memory_id, action, summary) VALUES (?, 'link', 'x')",
+                         (ids["keyword"],))
+        conn.commit()
+    rc, rows = _run(tmp_path, preview, name="rerun.json")
+    assert rc == 0 and rows[ids["keyword"]]["outcome"] == "repaired"
+    assert ("embedding provenance" if lag == "provenance" else "action row") in rows[ids["keyword"]]["detail"]
+    rc, rows = _run(tmp_path, preview, name="third.json")
+    assert rc == 0 and rows[ids["keyword"]]["outcome"] == "already-applied"
+
+
+def test_a_forward_only_supersedes_edge_at_assessment_is_skipped(store, tmp_path):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+        newer = storage.add_memory(conn, content="a newer note", tags=[])
+        storage.add_link(conn, newer["id"], ids["keyword"], edge_type="supersedes", bidirectional=False)
+        conn.commit()
+    _rc, rows = _run(tmp_path, preview)
+    assert rows[ids["keyword"]]["outcome"] == "skipped-retired"
+    assert f"supersedes edge from [{newer['id']}]" in rows[ids["keyword"]]["detail"]
+
+
+def test_a_forward_only_supersedes_edge_between_check_and_write_is_raced(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+        newer = storage.add_memory(conn, content="a newer issue", tags=[])
+        conn.commit()
+    real = storage._compute_embedding
+    state = {"done": False}
+
+    def edge_then_embed(content, metadata, tags):
+        if not state["done"]:
+            state["done"] = True
+            with d1.connect() as other:
+                storage.add_link(other, newer["id"], ids["contradiction"], edge_type="supersedes",
+                                 bidirectional=False)
+        return real(content, metadata, tags)
+
+    monkeypatch.setattr(storage, "_compute_embedding", edge_then_embed)
+    rc, rows = _run(tmp_path, preview)
+    monkeypatch.setattr(storage, "_compute_embedding", real)
+    assert rc == 1 and rows[ids["contradiction"]]["outcome"] == "raced"
+    with storage.connect() as conn:
+        assert "project" not in _state(conn, ids["contradiction"])[1]

@@ -435,6 +435,27 @@ def _emit_event(
             pass
 
 
+# Any memory's crossrefs holding a "supersedes" edge to memory ? (one bound
+# parameter). json_each of malformed JSON would raise, hence the json_valid
+# fallback; the LIKE is only a cheap prefilter.
+_SUPERSEDES_EDGE_TO_SQL = (
+    "SELECT 1 FROM memories_crossrefs c, "
+    "json_each(CASE WHEN json_valid(c.related) THEN c.related ELSE '[]' END) j "
+    "WHERE c.related LIKE '%supersedes%' "
+    "AND json_extract(j.value, '$.edge_type') = 'supersedes' "
+    "AND CAST(json_extract(j.value, '$.id') AS INTEGER) = ?"
+)
+
+
+def _superseding_edge_sources(conn: sqlite3.Connection, memory_id: int) -> List[int]:
+    """Ids of memories whose crossrefs say they supersede memory_id, including
+    a forward-only edge (which _superseded_ids_batch, reading memory_id's own
+    crossrefs, cannot see)."""
+    rows = conn.execute(_SUPERSEDES_EDGE_TO_SQL.replace("SELECT 1 FROM", "SELECT c.memory_id FROM", 1),
+                        (memory_id,)).fetchall()
+    return sorted({int(_row_field(r, 0, "memory_id")) for r in rows})
+
+
 class ConcurrentUpdateError(RuntimeError):
     """update_memory(expected_row=...) matched no row: the memory changed (or
     was retired) after the caller checked it. Nothing was written."""
@@ -8345,6 +8366,7 @@ def update_memory(
     replace_metadata: bool = False,
     expected_row: Optional[Mapping[str, Any]] = None,
     force_reindex: bool = False,
+    commit: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Update an existing memory. Only provided fields are updated.
 
@@ -8362,6 +8384,8 @@ def update_memory(
     never overwritten (on D1 too, where there is no transaction).
     force_reindex (internal): refresh the FTS entry and the embedding even
     when nothing changed (repairing a write that stopped part-way).
+    commit=False (internal): leave the transaction open (local SQLite), so a
+    caller can verify the result and roll it back; no effect on D1.
     """
     # First check if memory exists
     existing = get_memory(conn, memory_id)
@@ -8434,10 +8458,14 @@ def update_memory(
             "WHERE id = ? AND content = ? AND metadata IS ? AND tags IS ? AND updated_at IS ? "
             "AND NOT EXISTS (SELECT 1 FROM tombstones WHERE memory_id = ?) "
             "AND NOT EXISTS (SELECT 1 FROM tombstone_components WHERE memory_id = ?) "
-            "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ?",
+            "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ? "
+            # A forward-only supersedes edge (add_link bidirectional=False)
+            # lives only in the SUPERSEDING memory's crossrefs row.
+            "AND NOT EXISTS (" + _SUPERSEDES_EDGE_TO_SQL + ")",
             (new_content, metadata_json, tags_json, now, memory_id,
              expected_row["content"], expected_row["metadata"], expected_row["tags"],
-             expected_row["updated_at"], memory_id, memory_id, memory_id, expected_row["related"]),
+             expected_row["updated_at"], memory_id, memory_id, memory_id, expected_row["related"],
+             memory_id),
         )
         if getattr(cur, "rowcount", None) == 0:
             raise ConcurrentUpdateError(
@@ -8465,8 +8493,9 @@ def update_memory(
         # Cross-refs remain valid enough until manual rebuild via memory_rebuild_crossrefs
 
     _log_action(conn, memory_id, "update", f"Updated memory #{memory_id}")
-    conn.commit()
-    _emit_event(conn, memory_id, new_tags)
+    if commit:
+        conn.commit()
+    _emit_event(conn, memory_id, new_tags, commit=commit)
 
     # Return the data we just wrote instead of reading back from DB
     # This avoids D1 read replica lag issues where reads immediately
