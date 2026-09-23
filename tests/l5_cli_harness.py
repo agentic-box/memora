@@ -22,10 +22,25 @@ def main() -> int:
     replica.reads = []
     backends.D1SelectOnlyConnection._post = lambda self, body: replica.reader_post(body)
 
-    def no_writes(self, *a, **k):
-        raise AssertionError("the L5 export/recheck path must never use a D1 writer")
+    mode = os.environ.get("L5_TEST_D1_WRITES", "")
 
-    backends.D1Connection._send = no_writes
+    def d1_send(self, sql, params=None):
+        # Only the operator writer may reach here, and only when a test asks:
+        # "apply" runs the statement on the FakeReplica file, "reject" fails
+        # like D1 would. Otherwise any D1 write is a test failure.
+        if mode == "apply":
+            db = replica._db()
+            try:
+                db.execute(sql, tuple(params or ()))
+                db.commit()
+            finally:
+                db.close()
+            return {"success": True, "meta": {"changes": 1}}
+        if mode == "reject":
+            raise backends.D1DefiniteError("D1 API error (400): not authorized")
+        raise AssertionError("this L5 path must never use a D1 writer")
+
+    backends.D1Connection._send = d1_send
     sys.argv[0] = str(REPO / "scripts" / "local_primary.py")
     import importlib.util
 

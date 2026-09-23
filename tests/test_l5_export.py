@@ -125,6 +125,38 @@ def test_credential_file_must_be_0600_regular_owned_and_non_empty(tmp_path):
         lp.load_credential_file(str(tmp_path / "missing"))
 
 
+@pytest.mark.parametrize("mode", [0o400, 0o700, 0o644, 0o660, 0o604])
+def test_credential_file_mode_must_be_exactly_0600(tmp_path, mode):
+    """7633 (L2a's rule): not merely "no group/other bits" -- exactly 0600,
+    and the file is not chmod-ed."""
+    f = tmp_path / "tok"
+    f.write_text("secret")
+    f.chmod(mode)
+    with pytest.raises(lp.L5Refused, match="must be mode 0600"):
+        lp.load_credential_file(str(f))
+    assert (f.stat().st_mode & 0o777) == mode
+
+
+def test_a_symlinked_credential_file_is_refused_even_to_a_0600_file(tmp_path):
+    real = tmp_path / "real.tok"
+    real.write_text("secret")
+    real.chmod(0o600)
+    link = tmp_path / "link.tok"
+    link.symlink_to(real)
+    with pytest.raises(lp.L5Refused, match="is a symlink"):
+        lp.load_credential_file(str(link))
+    assert lp.load_credential_file(str(real)) == "secret"
+
+
+def test_the_freeze_client_needs_its_own_health_token():
+    """7633: memora-all refuses equal admin/health tokens, so the client never
+    defaults the health token to the admin token."""
+    with pytest.raises(lp.L5Refused, match="needs the health token"):
+        lp.FreezeClient("http://127.0.0.1:9", "admin", DB, health_token="")
+    with pytest.raises(lp.L5Refused, match="must differ"):
+        lp.FreezeClient("http://127.0.0.1:9", "same", DB, health_token="same")
+
+
 def test_read_token_comes_from_the_file_or_the_read_token_variable_only(tmp_path, monkeypatch):
     monkeypatch.delenv("MEMORA_D1_READ_TOKEN", raising=False)
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "edit-token-must-not-be-used")
@@ -566,7 +598,7 @@ def test_freeze_client_places_checks_and_thaws_only_on_request(freeze_server):
 
 def test_freeze_client_leaves_an_operator_placed_freeze_in_place(freeze_server):
     srv = freeze_server(already_frozen=True)
-    c = lp.FreezeClient(srv.url, "t", DB)
+    c = lp.FreezeClient(srv.url, "t", DB, health_token="h")
     c.freeze()
     c.require("mid-step")
     assert ("POST", f"/admin/freeze/{DB}") not in srv.methods()
@@ -582,7 +614,7 @@ def test_freeze_client_leaves_an_operator_placed_freeze_in_place(freeze_server):
 ])
 def test_freeze_check_refuses_anything_but_frozen_with_nothing_in_flight(freeze_server, fr, match):
     srv = freeze_server(health=[fr])
-    c = lp.FreezeClient(srv.url, "t", DB)
+    c = lp.FreezeClient(srv.url, "t", DB, health_token="h")
     with pytest.raises(lp.L5Refused, match=match):
         c.freeze()
     assert srv.state == "frozen"  # left in place: only `thaw` lifts it
@@ -590,7 +622,7 @@ def test_freeze_check_refuses_anything_but_frozen_with_nothing_in_flight(freeze_
 
 def test_freeze_check_refuses_a_health_answer_without_freeze_fields(freeze_server):
     srv = freeze_server(db="other-db")  # /health/db/memora-main is 404 {"status": "unknown"}
-    c = lp.FreezeClient(srv.url, "t", DB)
+    c = lp.FreezeClient(srv.url, "t", DB, health_token="h")
     with pytest.raises(lp.L5Refused, match="shows no freeze state"):
         c.check("before anything")
 
@@ -598,12 +630,12 @@ def test_freeze_check_refuses_a_health_answer_without_freeze_fields(freeze_serve
 def test_a_refused_freeze_request_is_a_refusal(freeze_server):
     srv = freeze_server(post_status=409)
     with pytest.raises(lp.L5Refused, match=r"refused \(409\)"):
-        lp.FreezeClient(srv.url, "t", DB).freeze()
+        lp.FreezeClient(srv.url, "t", DB, health_token="h").freeze()
 
 
 def test_a_freeze_that_could_not_be_lifted_is_reported(freeze_server):
     srv = freeze_server(delete_status=500)
-    c = lp.FreezeClient(srv.url, "t", DB)
+    c = lp.FreezeClient(srv.url, "t", DB, health_token="h")
     c.freeze()
     with pytest.raises(lp.L5Refused, match="NOT lifted"):
         c.thaw()
@@ -612,13 +644,13 @@ def test_a_freeze_that_could_not_be_lifted_is_reported(freeze_server):
 def test_require_refuses_an_open_store_and_says_how_to_freeze_it(freeze_server):
     srv = freeze_server()
     with pytest.raises(lp.L5Refused, match=f"local_primary.py freeze {DB}"):
-        lp.FreezeClient(srv.url, "t", DB).require("before the recheck")
+        lp.FreezeClient(srv.url, "t", DB, health_token="h").require("before the recheck")
     assert ("POST", f"/admin/freeze/{DB}") not in srv.methods()
 
 
 def test_an_unreachable_service_is_a_refusal():
     with pytest.raises(lp.L5Refused, match="not reachable"):
-        lp.FreezeClient("http://127.0.0.1:9", "t", DB, timeout=2).check("x")
+        lp.FreezeClient("http://127.0.0.1:9", "t", DB, health_token="h", timeout=2).check("x")
 
 
 def test_service_stopped_barrier_requires_the_container_stopped_at_every_check():
@@ -645,14 +677,23 @@ def _cli(tmp_path, replica_path, *args, env_extra=None):
     return r.returncode, out, r.stderr
 
 
+def token_args(tmp_path):
+    """--admin-token-file and --health-token-file: two different 0600 files."""
+    out = []
+    for flag, name, value in (("--admin-token-file", "admin.tok", "admin-tok"),
+                              ("--health-token-file", "health.tok", "health-tok")):
+        f = tmp_path / name
+        f.write_text(value)
+        f.chmod(0o600)
+        out += [flag, str(f)]
+    return out
+
+
 @pytest.fixture
 def cli_env(tmp_path, freeze_server):
-    tok = tmp_path / "admin.tok"
-    tok.write_text("admin-tok")
-    tok.chmod(0o600)
     srv = freeze_server()
     common = [DB, "--account", "acct", "--database-id", "replica-db", "--memora-url", srv.url,
-              "--admin-token-file", str(tok), "--r2-dir", str(tmp_path / "r2"),
+              *token_args(tmp_path), "--r2-dir", str(tmp_path / "r2"),
               "--out-dir", str(tmp_path / "exports")]
     return srv, common
 
@@ -671,8 +712,7 @@ def test_cli_export_then_recheck_in_separate_processes(replica, tmp_path, cli_en
     assert code == 0 and out["fresh_export"] is True, err
     assert json.loads(Path(out["receipt"]).read_text())["tables"] == d1_stats(replica)
     assert srv.state == "frozen" and ("DELETE", f"/admin/freeze/{DB}") not in srv.methods()
-    tok = common[common.index("--admin-token-file") + 1]
-    code, out, err = _cli(tmp_path, replica.path, "thaw", DB, "--memora-url", srv.url, "--admin-token-file", tok)
+    code, out, err = _cli(tmp_path, replica.path, "thaw", DB, "--memora-url", srv.url, *token_args(tmp_path))
     assert code == 0 and srv.state == "open", err
 
 
@@ -684,8 +724,7 @@ def test_cli_recheck_without_a_freeze_is_refused(replica, tmp_path, cli_env):
     code, out, _ = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
     assert code == 2 and f"local_primary.py freeze {DB}" in out["refused"]
     assert srv.state == "open"
-    tok = common[common.index("--admin-token-file") + 1]
-    code, out, err = _cli(tmp_path, replica.path, "freeze", DB, "--memora-url", srv.url, "--admin-token-file", tok)
+    code, out, err = _cli(tmp_path, replica.path, "freeze", DB, "--memora-url", srv.url, *token_args(tmp_path))
     assert code == 0 and srv.state == "frozen", err
     code, out, _ = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
     assert code == 0 and out["fresh_export"] is False
@@ -701,6 +740,8 @@ def test_cli_export_refuses_when_something_is_in_flight_after_the_export(replica
     assert code == 2 and "in_flight=1" in out["refused"], err
     assert not list((tmp_path / "exports").rglob("*.receipt.json"))
     assert srv.state == "frozen"
+    # 7630 (v): the freeze is kept on purpose, so the output names the way out
+    assert out["recovery"].startswith(f"to abandon the procedure: local_primary.py thaw {DB} --memora-url {srv.url}")
 
 
 def test_cli_recheck_refuses_a_tampered_receipt(replica, tmp_path, cli_env):
@@ -718,6 +759,15 @@ def test_cli_refuses_a_world_readable_admin_token(replica, tmp_path, cli_env):
     (tmp_path / "admin.tok").chmod(0o644)
     code, out, _ = _cli(tmp_path, replica.path, "export", *common)
     assert code == 2 and "0600" in out["refused"]
+    assert srv.requests == []
+
+
+def test_cli_needs_a_health_token_file(replica, tmp_path, cli_env):
+    srv, common = cli_env
+    i = common.index("--health-token-file")
+    without = common[:i] + common[i + 2:]
+    code, out, _ = _cli(tmp_path, replica.path, "export", *without)
+    assert code == 2 and "--health-token-file is required" in out["refused"]
     assert srv.requests == []
 
 

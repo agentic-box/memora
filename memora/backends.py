@@ -986,9 +986,11 @@ class LocalSQLiteBackend(StorageBackend):
             raise StoreLockedError(f"store refused in this process: {self.refused_reason}")
         # Every writer open of a live primary goes through the lock holder:
         # the first one takes the process-lifetime lock, or the open fails
-        # before anything (the file, its schema) is touched.
-        self.fence()
+        # before anything (the file, its schema) is touched. The parent
+        # directory comes first: the lock file lives in it, so on a first
+        # start the lock would otherwise fail with FileNotFoundError (§9 k).
         self._ensure_parent_dir()
+        self.fence()
         lock = _store_lock(self.db_path)
         with lock.exclusive():
             conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=factory)

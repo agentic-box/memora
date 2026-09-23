@@ -895,6 +895,11 @@ Other rules:
     sequence high-water, restore) require the freeze to be in place already,
     and refuse otherwise. Only the explicit `thaw` command lifts it.
     `freeze` places it by hand.
+  - Tokens (L2a cross-finding 7633):
+    - Every credential file is checked with `lstat`, is not a symlink, is a
+      regular file owned by the operator, and has mode exactly 0600.
+    - The freeze client takes its own `--health-token-file`, which never
+      defaults to the admin token: memora-all refuses equal tokens.
   - A receipt is bound to the D1 database, not only the store name:
     `account_id`, `database_id` and `d1_uri` must equal the command's.
   - `sqlite_sequence` is in the hashed set, ordered by name. The paged dump
@@ -904,9 +909,12 @@ Other rules:
 - **`seed <db> --receipt R --out /data/<db>.db`**
   1. Load the receipt's export into a fresh file.
   2. Run `ensure_schema`.
-  3. Rebuild FTS explicitly: `DELETE FROM memories_fts; INSERT INTO memories_fts(rowid, content, metadata, tags) SELECT id, content, metadata, tags FROM memories`.
-     L5 verifies this matches `_fts_upsert`'s form. `memories_fts` is a
-     standalone fts5 table, created empty.
+  3. Rebuild FTS explicitly: `DELETE FROM memories_fts; INSERT INTO memories_fts(rowid, content, metadata, tags) SELECT id, content, COALESCE(metadata, ''), COALESCE(tags, '') FROM memories`.
+     `memories_fts` is a standalone fts5 table, created empty. L5 verified
+     that the rebuild matches `_fts_upsert`'s form, which writes `''` for a
+     NULL `metadata` or `tags`; hence the `COALESCE`. A search-parity test
+     compares keyword and hybrid results on the seeded store and on its
+     source.
   4. Sequence high-water, local side:
      `sqlite_sequence.seq = max(local seq, D1 seq, max(id))` for `memories`
      and `memories_actions`. The D1 value is read by SELECT.
@@ -915,6 +923,17 @@ Other rules:
   6. Verify that the seeded file's per-table counts and content hashes equal
      the receipt's. This is deterministic, with no live read: D1 may have
      moved on since the export, and `recheck` covers that.
+     `sqlite_sequence` is raised on purpose by step 4, so it is checked as
+     "no counter below the export's".
+  - As built in L5:
+    - The seed runs under the freeze left by export/recheck. It is required
+      at the start and re-checked around the D1 read and before placing the
+      file.
+    - It holds the target's primary lock and creates the parent directory
+      first (§9 k).
+    - It builds `<out>.seed-partial` and hard-links it into place only after
+      it verifies. It never overwrites a file or its sidecars.
+    - `--rehearse` seeds into a temp directory.
 - **`restore <db> --receipt R`** (the default, H5) is a full re-seed from a
   new verified export. Unacked local writes at the time of a disk loss are
   lost; that was accepted in msg 7507.
@@ -952,9 +971,33 @@ Other rules:
     created with leader approval, never on a live one.
   - If D1 rejects it, the step HALTS and reports; the rollback or restore
     does not proceed. There is no fallback.
+  - As built in L5 (`sequence-highwater`):
+    - It runs `recheck` under the freeze already in place, reads the local
+      store read-only, and sends the UPDATE only for a table where D1 is
+      behind.
+    - The send goes through `OperatorD1Writer`: a `D1Connection` from a 0600
+      `--credential-file`, with an allow-list of exactly this statement.
+    - It reads the result back. The step HALTS (exit 3) when:
+      - D1 rejects the UPDATE;
+      - D1 accepts it but the counter did not move;
+      - D1 has no `sqlite_sequence` row for the table (no INSERT is
+        allowed).
+    - Whether D1 accepts the UPDATE at all is checked by an env-gated test on
+      the throwaway database.
 - **`snapshot <db>`**: `sqlite3.Connection.backup` to a temp file, gzip, then
   `r2://<bucket>/<db>/<date>.db.gz`. It keeps 14, runs nightly from cron,
   and refuses if free space is below 2× the DB size.
+  - As built in L5:
+    - The source is the store's read-only connection (a live primary is read
+      through its WAL sidecars).
+    - The copy must pass `integrity_check`, and the R2 object is read back
+      and hashed.
+    - The key is `<db>/<YYYY-MM-DD>T<HHMMSS>Z.db.gz`, so two runs in one day
+      do not overwrite each other.
+    - Retention deletes only keys of that exact form.
+- **`volume-check --store <path>...`**: alerts (exit 4) when a store's
+  volume has less free space than 2× the store, or less than
+  `--min-free-pct` (default 10%).
 - **`resume <db> [--accept-d1-epoch | --allow-deletes <attempt>]`**.
 - **`--rehearse`** on seed and restore runs into a temp path.
 
@@ -1452,7 +1495,7 @@ Pre-existing D1 writes the plan leaves as they are:
 | (h) replay validates every field it relies on (id, sql, outcome, next_id), inside the malformed-record path (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |
 | (i) `POST /admin/reconcile` requires, besides a verified export receipt for the database: `operator`, `intent_id` (equal to the path's), `decision` (applied / not-applied) and `evidence_sha256` equal to the evidence `GET /admin/intents` last showed (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |
 | (j) the journal-health re-check in `_execute_api` is not atomic with `_send`: a repair failure on another thread can land between the check and the send (L2 review 7588 P2). This is safe: the intent is already durable on disk before the check, so a request that goes out anyway is recorded as an open intent (frozen-unsafe until an operator accepts it), exactly like an unknown outcome. L3 may make the check and send one critical section if the replicator needs it. **L3:** it does not: the replicator never uses the application journal (its D1 writer is `ReplicaD1Connection`, guarded by its own durable H3 marker) | L3 | closed in L3: not needed |
-| (k) `acquire_primary_lock` runs before `_ensure_parent_dir`, so a live primary whose parent directory does not exist yet raises FileNotFoundError on first start instead of creating it (L2 review 7592 P2). The seed creates the parent | L5 | with L5 |
+| (k) `acquire_primary_lock` runs before `_ensure_parent_dir`, so a live primary whose parent directory does not exist yet raises FileNotFoundError on first start instead of creating it (L2 review 7592 P2). The seed creates the parent | L5 | **done in L5 piece b**: `_open_writer` creates the parent directory before `fence()`, and the seed creates it before taking the target's primary lock |
 | (l) watchdog alerts for replication (§2.5: `oldest_unacked_age_s > 300`, `status == halted`, `d1_missing_vectors > 0`). L3 exposes the metrics on `/health/db/<db>` (authorised); `scripts/memora_watchdog.py` is liveness-only by design, so the alert is a separate check | L9 | before the first cutover |
 | (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | with L6 |
 | (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week) | L9 | after the log-only week |
@@ -1463,3 +1506,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (s) `sweep_pending_images` cannot apply while a store is persisted-frozen (L4 review 7610 P2) | L5 | **done in L4 round 2**: `DELETE /admin/freeze/<db>` (`thaw_store`) runs the sweep for a local store |
 | (t) a memory whose `images` field keeps changing between the upload and the swap stays `images_pending` until a later startup or thaw sweep: conservative by design, since the swap never overwrites a newer `images` (L4 review 7614 P2) | L9 | add a metric for rows left `images_pending` |
 | (u) `_absorb_link`'s fixed savepoint name assumes `add_link` never opens a same-named nested savepoint (L4 review 7614 P2) | L5 | **done in L5 piece a**: `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection, and `add_link`'s docstring records the constraint |
+| (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |

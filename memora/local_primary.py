@@ -14,14 +14,17 @@ volume-check (piece b); restore, reconcile, resume (piece c).
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -71,17 +74,21 @@ def read_token(token_file: Optional[str] = None) -> str:
 
 
 def load_credential_file(path: str) -> str:
-    """A secret from a file that only its owner can read (mode 0600 or
-    stricter, owned by this user). Never from the environment."""
+    """A secret from a file, never from the environment. The same rule as
+    the L2a admin tokens (cross-finding 7633): lstat (a symlink is refused,
+    not followed), a regular file, owned by this user, mode exactly 0600.
+    Refused otherwise; the file is never chmod-ed."""
     p = Path(path)
     try:
-        st = p.stat()
+        st = os.lstat(p)
     except OSError as exc:
         raise L5Refused(f"credential file {path}: {exc}")
+    if stat.S_ISLNK(st.st_mode):
+        raise L5Refused(f"credential file {path} is a symlink")
     if not stat.S_ISREG(st.st_mode):
         raise L5Refused(f"credential file {path} is not a regular file")
-    if st.st_mode & 0o077:
-        raise L5Refused(f"credential file {path} must be mode 0600 (it is {oct(st.st_mode & 0o777)})")
+    if stat.S_IMODE(st.st_mode) != 0o600:
+        raise L5Refused(f"credential file {path} must be mode 0600 (it is {oct(stat.S_IMODE(st.st_mode))})")
     if hasattr(os, "getuid") and st.st_uid != os.getuid():
         raise L5Refused(f"credential file {path} is not owned by this user")
     token = p.read_text().strip()
@@ -364,14 +371,19 @@ class FreezeClient:
     only the explicit `thaw` command does (review 7621 P1-2), so the window
     between a recheck and the step that relies on it stays closed."""
 
-    def __init__(self, base_url: str, admin_token: str, db: str, *, health_token: Optional[str] = None,
+    def __init__(self, base_url: str, admin_token: str, db: str, *, health_token: str,
                  timeout: float = 60.0):
         self.base = base_url.rstrip("/")
         self.admin_token = admin_token
         # /health/db/<db> shows the freeze fields only to an authorised caller
         # (MEMORA_HEALTH_TOKEN, or a loopback peer -- not one behind docker's
-        # port mapping), so it may need its own token.
-        self.health_token = health_token or admin_token
+        # port mapping). It is its own token: memora-all refuses an admin
+        # token equal to the health token, so it never defaults to it (7633).
+        if not health_token:
+            raise L5Refused("the freeze client needs the health token (--health-token-file)")
+        if health_token == admin_token:
+            raise L5Refused("the health token must differ from the admin token")
+        self.health_token = health_token
         self.db = db
         self.timeout = timeout
         self.placed = False
@@ -616,3 +628,307 @@ def recheck(db: str, receipt_path: str, deps: Deps, out_dir: Path) -> Path:
     if same:
         return Path(receipt_path)
     return _export_frozen(db, deps, Path(out_dir) / db)
+
+
+# ------------------------------------------------------------------ seed (§4)
+
+SEQ_TABLES = ("memories", "memories_actions")
+FTS_REBUILD = (
+    "DELETE FROM memories_fts",
+    # The same values _fts_upsert writes: NULL metadata/tags become ''.
+    "INSERT INTO memories_fts(rowid, content, metadata, tags) "
+    "SELECT id, content, COALESCE(metadata, ''), COALESCE(tags, '') FROM memories",
+)
+
+
+def rebuild_fts(conn) -> int:
+    for sql in FTS_REBUILD:
+        conn.execute(sql)
+    return int(conn.execute("SELECT COUNT(*) FROM memories_fts").fetchone()[0])
+
+
+def _local_sequences(conn) -> Dict[str, Dict[str, int]]:
+    """{table: {seq, max_id}} for the AUTOINCREMENT tables the plan names."""
+    out = {}
+    for t in SEQ_TABLES:
+        row = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = ?", (t,)).fetchone()
+        max_id = conn.execute(f'SELECT COALESCE(MAX(id), 0) FROM "{t}"').fetchone()[0]
+        out[t] = {"seq": int(row[0]) if row else 0, "max_id": int(max_id)}
+    return out
+
+
+def _read_d1_sequences(deps: Deps) -> Dict[str, int]:
+    """D1's sqlite_sequence, read under the freeze (re-checked around it)."""
+    deps.freeze.check("before reading D1's sequences")
+    seqs = deps.reader.sequences()
+    deps.freeze.check("after reading D1's sequences")
+    return seqs
+
+
+def _file_sequences(db_path: Path) -> Dict[str, int]:
+    db = _scratch_connect(db_path)
+    try:
+        return {n: int(v) for n, v in db.execute("SELECT name, seq FROM sqlite_sequence")}
+    finally:
+        db.close()
+
+
+def _sql_sequences(sql_path: Path) -> Dict[str, int]:
+    """The counters an export carries: load it into memory and read them."""
+    db = _scratch_connect(Path(":memory:"))
+    try:
+        db.executescript(sql_path.read_text(encoding="utf-8"))
+        return {n: int(v) for n, v in db.execute("SELECT name, seq FROM sqlite_sequence")}
+    finally:
+        db.close()
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(str(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def seed(db: str, receipt_path: str, out: Path, deps: Deps, *, replica_uri: str,
+         rehearse: bool = False) -> Dict[str, Any]:
+    """§4 seed: a new local store from a verified export. Built beside the
+    target and linked into place only when it verifies; an existing target
+    is never touched. Holds the target's primary lock while it works, so a
+    memora-all already serving that path refuses it (and vice versa). Runs
+    under the freeze the export/recheck left in place (required, never
+    placed or lifted here; review 7621 P1-2)."""
+    from .backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock, release_primary_lock
+    from . import schema
+
+    receipt = load_receipt(receipt_path, db, account_id=deps.account_id, database_id=deps.database_id)
+    deps.freeze.require("before the seed")
+    if rehearse:
+        out = Path(tempfile.mkdtemp(prefix=f"l5-rehearse-{db}-")) / Path(out).name
+    out = Path(out)
+    for p in (out, Path(f"{out}-wal"), Path(f"{out}-shm"), Path(f"{out}-journal")):
+        if p.exists():
+            raise L5Refused(f"{p} already exists: seed never overwrites a store (restore handles an existing one)")
+    out.parent.mkdir(parents=True, exist_ok=True)  # §9 (k): before the primary lock
+    try:
+        acquire_primary_lock(out)
+    except StoreLockedError as exc:
+        raise L5Refused(f"cannot seed {out}: {exc}")
+    tmp = out.with_name(out.name + ".seed-partial")
+    try:
+        for p in (tmp, Path(f"{tmp}-journal")):
+            if p.exists():
+                p.unlink()  # our own leftover from an interrupted seed
+        load_sql(Path(receipt["sql_path"]), tmp)
+        d1_seq = _read_d1_sequences(deps)
+        conn = LocalSQLiteBackend(tmp).connect()
+        try:
+            schema.ensure_schema(conn)
+            conn.commit()
+            conn.execute("BEGIN IMMEDIATE")
+            fts_rows = rebuild_fts(conn)
+            local = _local_sequences(conn)
+            sequences = {}
+            for t in SEQ_TABLES:
+                hw = max(local[t]["seq"], local[t]["max_id"], int(d1_seq.get(t, 0)))
+                if conn.execute("UPDATE sqlite_sequence SET seq = ? WHERE name = ?", (hw, t)).rowcount == 0:
+                    conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES (?, ?)", (t, hw))
+                sequences[t] = {**local[t], "d1_seq": d1_seq.get(t), "set": hw}
+            conn.commit()
+            schema.install_sync(conn, replica_uri, receipt["epoch"])
+            state = dict(conn.execute("SELECT last_acked_seq, d1_epoch_expected FROM sync_state").fetchone())
+        finally:
+            conn.close()
+        # Every table as exported; sqlite_sequence is raised on purpose (the
+        # high-water above), so it is checked as "no counter went down".
+        data = sorted(t for t in receipt["tables"] if t != SEQUENCE_TABLE)
+        stats = local_stats(tmp, data)
+        want = {t: receipt["tables"][t] for t in data}
+        if stats != want:
+            bad = sorted(t for t in data if stats.get(t) != want[t])
+            raise L5Refused(f"the seeded file does not match the receipt in {bad}; nothing was placed")
+        exported = _sql_sequences(Path(receipt["sql_path"]))
+        seeded = _file_sequences(tmp)
+        lower = {n: (seeded.get(n), v) for n, v in exported.items() if (seeded.get(n) or 0) < v}
+        if lower:
+            raise L5Refused(f"the seeded sequences are below the export's: {lower}; nothing was placed")
+        deps.freeze.check("before placing the seeded store")
+        with open(tmp, "rb") as fh:
+            os.fsync(fh.fileno())
+        try:
+            os.link(tmp, out)  # fails if the target appeared meanwhile
+        except FileExistsError:
+            raise L5Refused(f"{out} appeared during the seed; nothing was placed")
+        _fsync_dir(out.parent)
+    finally:
+        for p in (tmp, Path(f"{tmp}-journal")):
+            if p.exists():
+                p.unlink()
+        release_primary_lock(out)
+    return {"out": str(out), "receipt": str(receipt_path), "epoch": receipt["epoch"], "tables": stats,
+            "fts_rows": fts_rows, "sequences": sequences, "sync_state": state, "rehearse": rehearse}
+
+
+# ------------------------------------------------------------------ sequence high-water on D1 (§4, H7)
+
+SEQ_UPDATE_SQL = "UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?"
+
+
+class OperatorD1Writer:
+    """The operator's D1 writer (§6.1): a D1Connection from memora/backends.py
+    with the credential from a 0600 file, restricted to a fixed statement
+    allow-list. It sends raw (no write gate, no journal): the store is
+    frozen while it runs, and each call is one statement the operator ran."""
+
+    ALLOWED = frozenset({SEQ_UPDATE_SQL})
+
+    def __init__(self, conn):
+        self.conn = conn  # backends.D1Connection (or a test double with _send)
+        self.sent: List[Tuple[str, tuple]] = []
+
+    @classmethod
+    def from_credential_file(cls, account_id: str, database_id: str, path: str) -> "OperatorD1Writer":
+        from .backends import D1Connection
+
+        return cls(D1Connection(account_id, database_id, load_credential_file(path)))
+
+    def send(self, sql: str, params: tuple) -> Dict[str, Any]:
+        if sql not in self.ALLOWED:
+            raise L5Refused(f"statement not on the operator allow-list: {sql[:80]}")
+        self.sent.append((sql, tuple(params)))
+        return self.conn._send(sql, tuple(params))
+
+
+def sequence_highwater(db: str, receipt_path: str, local_path: Path, deps: Deps, out_dir: Path, *,
+                       dry_run: bool = False) -> Dict[str, Any]:
+    """H7: before a rollback or a restore, raise D1's sqlite_sequence to the
+    local high-water so D1 never re-issues an id the local store used. Needs
+    a receipt and a passing recheck, under the freeze already in place
+    (checked at every boundary, left in place for the next step). One
+    UPDATE per table, only where D1 is behind; a rejected or unapplied
+    UPDATE HALTS the procedure -- there is no fallback."""
+    from .backends import LocalSQLiteBackend
+
+    used = recheck(db, receipt_path, deps, out_dir)  # requires the freeze; leaves it in place
+    conn = LocalSQLiteBackend(Path(local_path)).connect_read_only()
+    try:
+        local = _local_sequences(conn)
+    finally:
+        conn.close()
+    deps.freeze.check("before reading D1's sequences")
+    d1 = deps.reader.sequences()
+    plan = []
+    for t in SEQ_TABLES:
+        hw = max(local[t]["seq"], local[t]["max_id"])
+        if hw == 0:
+            continue
+        if t not in d1:
+            raise L5Halt(f"D1 has no sqlite_sequence row for {t} (local high-water {hw}); the plan "
+                         "allows only the UPDATE -- stop and report")
+        if d1[t] < hw:
+            plan.append((SEQ_UPDATE_SQL, (hw, t, hw)))
+    report = {"receipt": str(used), "local": local, "d1_before": d1, "statements": plan, "dry_run": dry_run}
+    if dry_run or not plan:
+        return report
+    if deps.writer_factory is None:
+        raise L5Refused("no operator writer: pass --credential-file")
+    writer = deps.writer_factory()
+    for sql, params in plan:
+        deps.freeze.check("before the sequence UPDATE")
+        try:
+            res = writer.send(sql, params)
+        except L5Refused:
+            raise
+        except Exception as exc:
+            raise L5Halt(f"D1 rejected {sql!r} {params}: {type(exc).__name__}: {exc}")
+        if isinstance(res, dict) and res.get("success") is False:
+            raise L5Halt(f"D1 rejected {sql!r} {params}: {res}")
+    deps.freeze.check("after the sequence UPDATE")
+    after = deps.reader.sequences()
+    short = {t: (after.get(t), params[0]) for _sql, params in plan for t in [params[1]]
+             if (after.get(t) or 0) < params[0]}
+    if short:
+        raise L5Halt(f"D1 accepted the sequence UPDATE but did not apply it: {short}")
+    report["d1_after"] = after
+    return report
+
+
+# ------------------------------------------------------------------ snapshot (§4)
+
+SNAPSHOT_KEEP = 14
+_SNAPSHOT_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z\.db\.gz$")
+
+
+def _store_bytes(path: Path) -> int:
+    return sum(p.stat().st_size for p in (path, Path(f"{path}-wal")) if p.exists())
+
+
+def snapshot(db: str, store_path: Path, r2, work_dir: Path, *, keep: int = SNAPSHOT_KEEP,
+             now: Optional[float] = None, disk_free: Callable[[Path], int] = lambda p: shutil.disk_usage(p).free
+             ) -> Dict[str, Any]:
+    """`sqlite3 .backup` of a live store through its read-only connection,
+    gzip, R2 `<db>/<ts>.db.gz` with a read-back hash, then retention: keep
+    the newest `keep` snapshots (only keys this command writes are ever
+    deleted). Refused when free space is below 2x the store's size."""
+    from .backends import LocalSQLiteBackend
+
+    store_path, work_dir = Path(store_path), Path(work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    size = _store_bytes(store_path)
+    free = disk_free(work_dir)
+    if free < 2 * size:
+        raise L5Refused(f"free space {free} B in {work_dir} is below 2x the store size ({size} B)")
+    ts = time.strftime("%Y-%m-%dT%H%M%SZ", time.gmtime(now if now is not None else time.time()))
+    key = f"{db}/{ts}.db.gz"
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"snapshot-{db}-", dir=str(work_dir)))
+    try:
+        copy, gz = tmpdir / "copy.db", tmpdir / f"{ts}.db.gz"
+        src = LocalSQLiteBackend(store_path).connect_read_only()
+        try:
+            dst = _scratch_connect(copy)
+            try:
+                src.backup(dst)
+                ok = dst.execute("PRAGMA integrity_check").fetchone()[0]
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        if ok != "ok":
+            raise L5Refused(f"the snapshot copy fails integrity_check: {ok}")
+        with open(copy, "rb") as fin, gzip.open(gz, "wb") as fout:
+            shutil.copyfileobj(fin, fout)
+        sha = _sha256_file(gz)
+        r2.put(key, gz)
+        back = hashlib.sha256(r2.get(key)).hexdigest()
+        if back != sha:
+            raise L5Refused(f"R2 read-back of {key} does not match the snapshot ({back} != {sha})")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    ours = sorted(k for k in r2.list(f"{db}/") if _SNAPSHOT_KEY.match(k[len(db) + 1:]))
+    removed = [k for k in ours[:-keep] if k != key] if keep > 0 else []
+    for k in removed:
+        r2.delete(k)
+    return {"key": key, "sha256": sha, "store_bytes": size, "kept": len(ours) - len(removed), "removed": removed}
+
+
+# ------------------------------------------------------------------ volume alert (§4)
+
+def volume_check(stores: List[Path], *, min_free_pct: float = 10.0,
+                 usage: Callable[[Path], Any] = shutil.disk_usage) -> Dict[str, Any]:
+    """For each store's volume: free space must be at least 2x the store (the
+    snapshot needs it) and at least `min_free_pct` of the volume. Returns
+    {ok, alerts, volumes}; the CLI exits 4 when an alert is raised."""
+    alerts, volumes = [], []
+    for store in stores:
+        store = Path(store)
+        u = usage(store.parent)
+        size = _store_bytes(store) if store.exists() else 0
+        pct = 100.0 * u.free / u.total if u.total else 0.0
+        volumes.append({"store": str(store), "store_bytes": size, "free": u.free, "total": u.total,
+                        "free_pct": round(pct, 2)})
+        if u.free < 2 * size:
+            alerts.append(f"{store}: free {u.free} B is below 2x the store ({size} B)")
+        if pct < min_free_pct:
+            alerts.append(f"{store}: only {pct:.1f}% of the volume is free (minimum {min_free_pct}%)")
+    return {"ok": not alerts, "alerts": alerts, "volumes": volumes}

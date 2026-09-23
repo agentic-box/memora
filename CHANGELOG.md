@@ -14,6 +14,19 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L5 (piece b): seed, sequence high-water, snapshot, volume alert
+- Per `docs/local-primary-implementation.md` §4 and §9 k/v.
+- **`seed <db> --receipt R --out P --replica-uri U`**: builds a new local store from a verified export, under the freeze already in place. Steps:
+  1. `ensure_schema`, then an explicit FTS rebuild in `_fts_upsert`'s form (`COALESCE` for NULL metadata/tags). Keyword and hybrid search on the seeded store match its source.
+  2. `sqlite_sequence` = max(local seq, D1 seq, max(id)) for `memories` and `memories_actions`.
+  3. `install_sync` with `last_acked_seq` 0 and the receipt's epoch.
+  4. Verification against the receipt.
+  - The target's primary lock is held throughout, and the file is hard-linked into place only after it verifies. An existing store or sidecar is never touched. `--rehearse` seeds into a temp directory.
+- **`sequence-highwater`**: after a passing recheck, raises D1's `sqlite_sequence` to the local high-water with `UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?`, only where D1 is behind. The UPDATE is sent through an allow-listed operator writer (`--credential-file`, mode 0600) and read back. A rejected or unapplied UPDATE, or a missing D1 row, HALTS (exit 3).
+- **`snapshot`**: backup through the read-only connection, `integrity_check`, gzip, R2 upload with read-back. Keeps the newest 14 of its own keys, and refuses below 2× the store size of free space. **`volume-check`**: exit 4 on low space.
+- `freeze`/`thaw`; a failed step's output names `local_primary.py thaw <db>` (the freeze is kept on purpose).
+- `LocalSQLiteBackend` creates a live primary's parent directory before taking its primary lock (§9 k).
+
 ### Local-primary L7: read-only viewer, blocking D1 write guard
 - Per `docs/local-primary-implementation.md` §6 F1/F2 and §9 (f)/(g). This slice issues no D1 statement; it removes the viewer's D1 writes. The Pages deploy is a separate user step.
 - `memora-graph/functions/api/memories/[id].ts`: `PATCH`, `PUT`, `POST` and `DELETE` answer `405` (`{"error": "read_only"}`, `Allow: GET, HEAD`) before any D1 call. `GET` is unchanged.
@@ -46,10 +59,9 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   - Brackets the export with D1's epoch, loads the file into scratch SQLite and compares per-table counts and content hashes with D1 (3 attempts).
   - Uploads the file to R2 and reads it back, then writes a version-1 receipt. Earlier exports and receipts are never overwritten.
 - **`recheck <db> --receipt R`**: under the freeze, compares D1's epoch, table set and full per-table hashes with the receipt. If anything changed, it takes a fresh export. Receipts are refused when they are for another store or another D1 database (account id, database id, URI), older than 24 h, not matched against R2, or when their SQL file changed.
-- Credential files (`--admin-token-file`, `--health-token-file`, `--read-token-file`) must be regular files with mode 0600, owned by the current user.
+- Credential files (`--admin-token-file`, `--health-token-file`, `--read-token-file`, `--credential-file`) follow the L2a rule: checked with `lstat`, not a symlink, a regular file owned by the current user, mode exactly 0600. They are never chmod-ed. `--health-token-file` is required with the freeze and must differ from the admin token.
 - `--service-stopped` swaps the freeze for a `docker inspect` check that memora-all is stopped.
 - `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection (§9 u).
-
 
 ### Local-primary L4: absorb in one local transaction
 - Per `docs/local-primary-implementation.md` §3. D1 SQL is unchanged, and the d1:// absorb path keeps its inflight lease, owned-id recovery and compensating deletes.
