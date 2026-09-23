@@ -108,7 +108,8 @@ def list_intents(name: str, *, reader=None) -> Result:
         "journal_error": broken,
         "open_intents": [
             {**{k: rec.get(k) for k in ("id", "sql", "target", "keys", "post_state", "sent_at", "params_sha256")},
-             "evidence": evidence.get(int(rec["id"]))}
+             "evidence": evidence.get(int(rec["id"])),
+             "evidence_sha256": evidence_sha256(evidence.get(int(rec["id"])))}
             for rec in journal.open_intents()
         ],
     }
@@ -129,7 +130,22 @@ def _load_receipt(name: str, receipt: Any) -> Tuple[Optional[Dict[str, Any]], Op
     return {"receipt": str(path), "receipt_sha256": hashlib.sha256(raw).hexdigest()}, None
 
 
-def accept_intent(name: str, intent_id: int, receipt: Any) -> Result:
+DECISIONS = ("applied", "not-applied")
+
+
+def evidence_sha256(evidence: Any) -> str:
+    """The digest an operator quotes to prove which evidence they decided on
+    (GET /admin/intents returns it per intent)."""
+    payload = json.dumps(evidence, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = None,
+                  body_intent_id: Any = None, decision: Any = None, evidence_digest: Any = None) -> Result:
+    """Operator acceptance of one open intent. Required (review 7584 P2): a
+    verified export receipt for this database, the operator, the intent id
+    (must match the path), the decision (applied | not-applied) and the
+    sha256 of the evidence the operator saw (must match the current one)."""
     backend, err = _backend(name)
     if err:
         return err
@@ -138,9 +154,22 @@ def accept_intent(name: str, intent_id: int, receipt: Any) -> Result:
     extra, err = _load_receipt(name, receipt)
     if err:
         return err
+    if not isinstance(operator, str) or not operator.strip():
+        return 400, {"error": "operator_required"}
+    if body_intent_id != intent_id:
+        return 400, {"error": "intent_id_mismatch", "message": "the body's intent_id must equal the path's"}
+    if decision not in DECISIONS:
+        return 400, {"error": "decision_required", "allowed": list(DECISIONS)}
     journal = backend.journal()
     if intent_id not in journal.status()[0]:
         return 404, {"error": "no_such_open_intent", "id": intent_id}
+    current = journal.evidence.get(intent_id)
+    if current is None:
+        return 409, {"error": "no_evidence_yet", "message": "GET /admin/intents first, and decide on its evidence"}
+    if evidence_digest != evidence_sha256(current):
+        return 409, {"error": "evidence_changed", "message": "the evidence is not the one this decision quotes"}
+    extra = {**extra, "operator": operator.strip(), "decision": decision,
+             "evidence_sha256": evidence_digest}
     if not journal.resolve(intent_id, "operator-accepted", durable=True, extra=extra):
         return 500, {"error": "resolution_not_recorded", "id": intent_id}
     return 200, {"id": intent_id, "outcome": "operator-accepted", **backend.write_gate().status()}
@@ -156,6 +185,11 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
         if hasattr(backend, "journal"):
             j = backend.journal()
             out["journal"] = {"path": str(j.path), "evidence": {str(k): v.get("status") for k, v in j.evidence.items()}}
+            ids, broken = j.status()
+            if broken:
+                out["journal"]["unusable"] = broken  # this process serves the store read-only
+        if getattr(backend, "refused_reason", None):
+            out["refused"] = backend.refused_reason
         return out
     except Exception as exc:
         return {"freeze": {"state": "unknown", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}}
@@ -204,5 +238,10 @@ def register_admin_routes(mcp: Any) -> None:
             body = await request.json()
         except (ValueError, json.JSONDecodeError):
             return respond((400, {"error": "bad_request"}))
-        receipt = body.get("receipt") if isinstance(body, dict) else None
-        return respond(await _run(accept_intent, request.path_params["name"], intent_id, receipt))
+        if not isinstance(body, dict):
+            return respond((400, {"error": "bad_request"}))
+        return respond(await _run(
+            accept_intent, request.path_params["name"], intent_id, body.get("receipt"),
+            operator=body.get("operator"), body_intent_id=body.get("intent_id"),
+            decision=body.get("decision"), evidence_digest=body.get("evidence_sha256"),
+        ))

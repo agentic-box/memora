@@ -744,22 +744,37 @@ def test_an_interrupt_during_a_write_is_recorded_and_re_raised(d1, tmp_path, mon
 # --- a live local primary is memora-all's alone (docs/local-primary-implementation.md §1 M10) ---
 
 def test_a_live_primary_whose_lock_is_held_is_refused(sqlite_store, tmp_path, monkeypatch):
-    import os
-
     from memora import backends
 
     with storage.connect() as conn:
         ids, preview = _seed(conn, with_skips=False)
         before = {k: _state(conn, v) for k, v in ids.items()}
+    import subprocess
+    import sys
+    import time
+    from pathlib import Path
+
     storage.STORAGE_BACKEND.store_name = "primary"
     monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"primary": "d1://acct/db"}))
-    held = backends.acquire_primary_lock(storage.STORAGE_BACKEND.db_path)  # memora-all's hold
+    root = Path(__file__).resolve().parent.parent
+    ready = tmp_path / "held"
+    holder = subprocess.Popen([sys.executable, "-c", (  # memora-all, in another process
+        "import sys, time, pathlib; sys.path.insert(0, %r)\nfrom memora import backends\n"
+        "backends.acquire_primary_lock(%r)\npathlib.Path(%r).write_text('1')\ntime.sleep(60)\n"
+    ) % (str(root), str(storage.STORAGE_BACKEND.db_path), str(ready))])
     try:
+        for _ in range(200):
+            if ready.exists():
+                break
+            time.sleep(0.05)
+        assert ready.exists()
         with pytest.raises(SystemExit, match="primary-lock is held"):
             apply.main(["--preview", str(_file(tmp_path, preview))])
-        with storage.connect() as conn:
+        with backends.LocalSQLiteBackend(storage.STORAGE_BACKEND.db_path).connect() as conn:
             assert {k: _state(conn, v) for k, v in ids.items()} == before
     finally:
-        os.close(held)
+        holder.kill()
+        holder.wait()
     rc, rows = _run(tmp_path, preview)  # no other holder: the script takes the lock itself
     assert rc == 0 and {r["outcome"] for r in rows.values()} == {"applied"}
+    assert not backends._PRIMARY_LOCKS  # and released it

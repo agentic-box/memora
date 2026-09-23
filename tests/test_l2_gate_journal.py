@@ -314,6 +314,7 @@ def test_live_primary_never_immutable(tmp_path, monkeypatch):
 
 def test_primary_lock_is_exclusive(tmp_path):
     fd = backends.acquire_primary_lock(tmp_path / "x.db")
+    assert backends.acquire_primary_lock(tmp_path / "x.db") == fd  # idempotent within a process
     try:
         code = ("import sys; sys.path.insert(0, %r)\n"
                 "from memora import backends\n"
@@ -322,7 +323,7 @@ def test_primary_lock_is_exclusive(tmp_path):
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
         assert r.returncode == 3, r.stderr
     finally:
-        os.close(fd)
+        backends.release_primary_lock(tmp_path / "x.db")
 
 
 # ------------------------------------------------------------------ D1 gate + journal
@@ -451,13 +452,22 @@ def test_repair_failure_keeps_gate_refusing(d1, monkeypatch):
     assert server.calls == []
 
 
-def test_malformed_middle_record_refuses_start(d1):
+@pytest.mark.parametrize("middle", ["NOT JSON", '{"type":"intent","sql":"no id"}', '{"type":"resolved","id":"1","outcome":"ok"}',
+                                    '{"type":"meta","next_id":0}', '{"type":"bogus","id":1}'])
+def test_malformed_middle_record_refuses_writes_keeps_reads(d1, middle):
+    """A malformed middle record -- unparseable, or a record replay could not
+    apply (review 7584 P2) -- makes the journal unusable: this process gets a
+    READ-ONLY connection (leader 7583); nothing is discarded."""
     server, backend = d1
     path = _journal_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text('{"type":"intent","id":1,"sql":"x"}\nNOT JSON\n{"type":"resolved","id":1,"outcome":"ok"}\n')
-    with pytest.raises(IntentJournalError, match="offset 35"):
-        backend.connect()
+    path.write_text('{"type":"intent","id":1,"sql":"x"}\n' + middle + '\n{"type":"resolved","id":1,"outcome":"ok"}\n')
+    conn = backend.connect()
+    assert conn.read_only and "offset 35" in conn.read_only_reason
+    assert conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == 0
+    with pytest.raises(StoreReadOnlyError):
+        conn.execute("INSERT INTO memories (content) VALUES (?)", ("x",))
+    assert server.calls == ["SELECT COUNT(*) AS n FROM memories"]
     assert path.read_text().count("\n") == 3  # nothing discarded
 
 
@@ -660,3 +670,189 @@ def test_setup_statements_are_not_gated(tmp_path, monkeypatch):
     conn = backend.connect()
     assert entered == [] and conn._memora_gate is backend.write_gate()
     conn.close()
+
+
+
+# ------------------------------------------------------------------ round 2 (review 7584)
+
+def test_no_writable_data_dir_gives_a_read_only_connection(d1, tmp_path, monkeypatch):
+    server, backend = d1
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("a file where the data dir should be")
+    monkeypatch.setenv("MEMORA_DATA_DIR", str(blocker))
+    _restart()
+    conn = backend.connect()
+    assert conn.read_only and "cannot open" in conn.read_only_reason
+    conn.execute("SELECT 1")
+    for attempt in (
+        lambda: conn.execute("INSERT INTO memories (content) VALUES (?)", ("x",)),
+        lambda: conn.executemany("INSERT INTO memories (content) VALUES (?)", [("x",)]),
+        lambda: conn.executescript("DELETE FROM memories; DELETE FROM memories"),
+        lambda: conn.execute("PRAGMA journal_mode=WAL"),
+        lambda: conn.execute("CREATE TABLE t (a)"),
+        lambda: conn.execute("PRAGMA optimize"),
+    ):
+        # refused by the connection itself, before the gate is consulted
+        with pytest.raises(StoreReadOnlyError, match="read-only D1 connection"):
+            attempt()
+    with pytest.raises(StoreReadOnlyError):
+        conn.execute_batch([("DELETE FROM memories WHERE id = ?", (1,))])
+    assert server.calls == ["SELECT 1"]
+
+
+def test_schema_connect_runs_no_ddl_on_a_read_only_connection(d1, tmp_path, monkeypatch):
+    from memora import schema
+
+    server, backend = d1
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    monkeypatch.setenv("MEMORA_DATA_DIR", str(blocker))
+    _restart()
+    conn = schema.connect(backend)
+    assert conn.read_only and server.calls == []  # no CREATE TABLE IF NOT EXISTS, no INSERT OR IGNORE
+
+
+def test_second_process_gets_read_only_and_writer_is_unaffected(d1):
+    """Process A (this test) holds the journal; process B connects: reads
+    work, every mutation is refused, schema setup sends nothing."""
+    server, backend = d1
+    backend.connect().execute("INSERT INTO memories (content) VALUES (?)", ("from A",))
+    child = f"""
+import os, sys, sqlite3, json
+sys.path.insert(0, {str(REPO)!r})
+os.environ['MEMORA_DATA_DIR'] = {str(write_gate.data_dir())!r}
+from memora import backends, schema
+from memora.write_gate import StoreReadOnlyError
+sent = []
+def send(self, sql, params=None):
+    sent.append(sql)
+    c = sqlite3.connect({str(server.path)!r}); c.row_factory = sqlite3.Row
+    rows = [dict(r) for r in c.execute(sql, tuple(params or ())).fetchall()]; c.close()
+    return {{"success": True, "result": [{{"results": rows, "meta": {{}}}}]}}
+backends.D1Connection._send = send
+b = backends.D1Backend('acct', 'db1', 'tok'); b.store_name = 's1'
+conn = schema.connect(b)
+out = {{"read_only": conn.read_only, "rows": conn.execute("SELECT content FROM memories").fetchall()[0]["content"]}}
+try:
+    conn.execute("INSERT INTO memories (content) VALUES (?)", ("from B",)); out["write"] = "sent"
+except StoreReadOnlyError:
+    out["write"] = "refused"
+out["sent"] = sent
+print(json.dumps(out))
+"""
+    r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr
+    out = json.loads(r.stdout.strip().splitlines()[-1])
+    assert out == {"read_only": True, "rows": "from A", "write": "refused",
+                   "sent": ["SELECT content FROM memories"]}
+    backend.connect().execute("INSERT INTO memories (content) VALUES (?)", ("A again",))  # writer unaffected
+    assert [r[1] for r in server.rows()] == ["from A", "A again"]
+
+
+def test_existing_connection_refuses_once_the_journal_breaks(d1):
+    server, backend = d1
+    conn = backend.connect()
+    conn.execute("INSERT INTO memories (content) VALUES (?)", ("ok",))
+    backend.journal().broken = "simulated: failed repair"
+    with pytest.raises(StoreReadOnlyError):
+        conn.execute("INSERT INTO memories (content) VALUES (?)", ("refused",))
+    assert conn.execute("SELECT COUNT(*) AS n FROM memories").fetchone()["n"] == 1
+    assert backend.connect().read_only  # new connections are read-only too
+
+
+def test_failed_compaction_does_not_send_the_triggering_write(d1, monkeypatch):
+    """Review 7584 P1-3, the reviewer's reproduction: threshold 1 and a
+    directory fsync that fails after the compaction's rename."""
+    server, backend = d1
+    conn = backend.connect()  # journal open before the fault is injected
+    monkeypatch.setenv("MEMORA_INTENT_COMPACT_BYTES", "1")
+
+    def eio(path):
+        raise OSError(5, "EIO")
+
+    monkeypatch.setattr(intent_journal, "_fsync_dir", eio)
+    with pytest.raises(IntentJournalError, match="not sent"):
+        conn.execute("INSERT INTO memories (content) VALUES (?)", ("x",))
+    ids, broken = backend.journal().status()
+    assert server.calls == [] and broken and ids == []
+
+
+def test_journal_rechecked_immediately_before_send(d1, monkeypatch):
+    server, backend = d1
+    conn = backend.connect()
+    j = backend.journal()
+    real = j.append_intent
+
+    def append_then_break(*a, **k):
+        iid = real(*a, **k)
+        j.broken = "broke between the append and the send"
+        return iid
+
+    monkeypatch.setattr(j, "append_intent", append_then_break)
+    with pytest.raises(IntentJournalError, match="not sent"):
+        conn.execute("INSERT INTO memories (content) VALUES (?)", ("x",))
+    assert server.calls == [] and j.status()[0] == []
+
+
+def _db_digest(path):
+    import hashlib
+
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def test_second_local_primary_process_is_fenced(tmp_path):
+    """Review 7584 P1-1: process A holds the primary lock; process B starts
+    (fence before prewarm), and no mutation -- not even schema setup --
+    reaches the SQLite file."""
+    path = tmp_path / "p.db"
+    b0 = LocalSQLiteBackend(path)
+    with b0.connect() as c:
+        c.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)")
+        c.execute("INSERT INTO memories (content) VALUES ('a')")
+    fd = backends.acquire_primary_lock(path)  # A: memora-all
+    before = _db_digest(path)
+    child = f"""
+import os, sys, json
+sys.path.insert(0, {str(REPO)!r})
+os.environ['MEMORA_DATA_DIR'] = {str(write_gate.data_dir())!r}
+os.environ['MEMORA_DATABASES'] = json.dumps({{"p": {str(path)!r}, "q": {str(tmp_path / 'q.db')!r}}})
+os.environ['MEMORA_REPLICAS'] = json.dumps({{"p": "d1://acct/db"}})
+os.environ['MEMORA_DEFAULT_DB'] = sys.argv[1]
+from memora import server, storage, backends
+try:
+    server._fence_live_primaries_or_exit()
+except SystemExit as e:
+    print(json.dumps({{"exit": e.code}})); sys.exit(0)
+def _fresh():
+    b = backends.LocalSQLiteBackend({str(path)!r}); b.store_name = "p"; return b
+out = {{"refused": bool(storage.backend_for("p").refused_reason)}}
+for label, fn in (("storage.connect", lambda: (storage.CURRENT_DB.set("p"), storage.connect())),
+                  ("fresh backend writer", lambda: _fresh().connect())):
+    try:
+        fn(); out[label] = "opened"
+    except backends.StoreLockedError:
+        out[label] = "refused"
+print(json.dumps(out))
+"""
+    try:
+        r = subprocess.run([sys.executable, "-c", child, "p"], capture_output=True, text=True, timeout=60)
+        assert json.loads(r.stdout.strip().splitlines()[-1]) == {"exit": 2}, r.stderr
+        r = subprocess.run([sys.executable, "-c", child, "q"], capture_output=True, text=True, timeout=60)
+        out = json.loads(r.stdout.strip().splitlines()[-1])
+        assert out == {"refused": True, "storage.connect": "refused", "fresh backend writer": "refused"}, r.stderr
+        assert _db_digest(path) == before  # no row, no schema, nothing
+        assert not Path(f"{path}-wal").exists()
+    finally:
+        backends.release_primary_lock(path)
+
+
+def test_append_intent_itself_refuses_after_its_compaction_breaks(tmp_path, monkeypatch):
+    """The journal's own check (independent of _execute_api's re-check)."""
+    j = intent_journal.IntentJournal("direct", tmp_path / "intent").open()
+    monkeypatch.setenv("MEMORA_INTENT_COMPACT_BYTES", "1")
+    monkeypatch.setattr(intent_journal, "_fsync_dir", lambda p: (_ for _ in ()).throw(OSError(5, "EIO")))
+    with pytest.raises(IntentJournalError, match="not sent"):
+        j.append_intent("INSERT INTO memories (content) VALUES (?)", ["x"], target="memories", keys=None,
+                        post_state={"content": "x"})
+    assert j.status()[0] == [] and j.status()[1]
+    j.close()

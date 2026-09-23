@@ -388,9 +388,30 @@ Not replicated:
       - Automatic resolution needs an ownership nonce: §9 items (d) and (e).
     - A fresh re-seed never resolves intents; the seed refuses while any are
       open.
+    - **Journal unavailable in this process (leader 7583, review 7584 P1-2).**
+      When the journal is held by another process, the data dir is not
+      writable, or the journal is corrupt or broken, `D1Backend.connect()`
+      returns a READ-ONLY connection: SELECTs work, and every mutation
+      (every execute variant, PRAGMA setters, DDL, `execute_batch`) raises
+      `StoreReadOnlyError`. `schema.connect` skips schema setup on it. A
+      connection whose journal breaks later refuses mutations through the
+      gate. The writer process is unaffected.
+    - **Not sent after a late journal failure (review 7584 P1-3).**
+      `append_intent` raises when its own compaction broke the journal, and
+      `_execute_api` re-checks journal health immediately before the send.
+      Either way the intent is abandoned (dropped from the open set, with a
+      `not-sent` resolution when the journal can still take one); it was
+      never sent.
 
   - `connect_replicator()` is the replicator's only entry point, and a test
     asserts that no other module calls it (H6).
+  - **Fencing live primaries (review 7584 P1-1).** `server.main` takes every
+    live primary's lock before any prewarm or writer open
+    (`fence_live_primaries`). A store whose lock another process holds is
+    refused in this process (every open raises; health reports `refused`);
+    a refused default store aborts startup. Every writer open of a live
+    primary (`_open_writer`) takes the lock first, in any process, so a
+    script cannot write it while memora-all runs.
 
 ## 2. Replicator (`memora/replicator.py`, L3)
 
@@ -1376,3 +1397,5 @@ Pre-existing D1 writes the plan leaves as they are:
 | (e) an ownership nonce so reconciliation can prove an effect: for example a `memories_actions` row keyed by the intent id, written in the same request, or a metadata field carrying the intent id. With it, INSERT (and, with (d), UPDATE and DELETE) reconciliation can become automatic | L3 | optional; until then, every intent needs `reconcile --accept` |
 | (f) `scripts/d1_write_guard.py` limits (L1b review 7574): H1 misses dynamically built write SQL (``db.prepare(`UPDATE ${table} SET …`)``, `"UPDATE " + table + …`); T2/T4 are line-based and miss `--remote` on a continuation line or from a variable; T5 accepts the guard's filename anywhere earlier on a deploy line, even in a comment or `echo`. An AST or data-flow guard, or targeted tests for those forms, must land before the handlers scope becomes blocking | L7 | before the handlers scope blocks |
 | (g) `memora-graph/README.md` still calls `npm run setup` a "full automated setup", although it now exits at the remote-migration step: label it retired or partial | L7 | with L7 |
+| (h) replay validates every field it relies on (id, sql, outcome, next_id), inside the malformed-record path (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |
+| (i) `POST /admin/reconcile` requires, besides a verified export receipt for the database: `operator`, `intent_id` (equal to the path's), `decision` (applied / not-applied) and `evidence_sha256` equal to the evidence `GET /admin/intents` last showed (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |

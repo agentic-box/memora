@@ -1,4 +1,5 @@
 import json
+import os
 import socket
 import sqlite3
 import time
@@ -29,6 +30,10 @@ def _isolated_write_gate_state(tmp_path_factory, monkeypatch):
     yield
     write_gate._reset_for_tests()
     intent_journal._reset_for_tests()
+    from memora import backends as _backends
+
+    for key in list(_backends._PRIMARY_LOCKS):  # primary locks a test took in-process
+        os.close(_backends._PRIMARY_LOCKS.pop(key))
 
 
 class FakeD1Connection(D1Connection):

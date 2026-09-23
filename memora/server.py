@@ -3412,6 +3412,28 @@ def _configure_memora_logging(env: Optional[Mapping[str, str]] = None) -> Option
     return level
 
 
+def _fence_live_primaries_or_exit() -> None:
+    """Take every live primary's lock (docs/local-primary-implementation.md
+    §1 M10). A refused store stays refused in this process (health reports
+    why); a refused DEFAULT store aborts startup (exit 2)."""
+    from .storage import default_database_name
+    from .write_gate import fence_live_primaries
+
+    try:
+        refused = {n: r for n, r in fence_live_primaries().items() if r}
+        default = default_database_name()
+    except DatabaseRegistryError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
+    for name, reason in refused.items():
+        logger.error("store %s refused: %s", name, reason)
+        print(f"Warning: store {name!r} refused: {reason}", file=sys.stderr)
+    if default is not None and default in refused:
+        print(f"Error: the default store {default!r} is a live primary served by another process: "
+              f"{refused[default]}", file=sys.stderr)
+        sys.exit(2)
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     from . import __version__
 
@@ -3524,6 +3546,12 @@ def main(argv: Optional[list[str]] = None) -> None:
         except ToolProfileError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
+
+        # Fence every live local primary BEFORE any open (review 7584
+        # P1-1): the prewarm below writes schema. A store whose primary lock
+        # another process holds is refused here; if it is the default store,
+        # this server does not start.
+        _fence_live_primaries_or_exit()
 
         # Pre-warm database connection (triggers cloud sync if needed)
         # This prevents "connection failed" on first MCP connection

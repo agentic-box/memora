@@ -242,15 +242,34 @@ def remove_freeze(name: str) -> None:
     _fsync_dir(path.parent)
 
 
-_PRIMARY_LOCK_FDS: List[int] = []
+def fence_live_primaries() -> Dict[str, Optional[str]]:
+    """Take the primary lock of every live-primary registry store BEFORE any
+    writer or prewarm open (review 7584 P1-1). {name: None} when held, or
+    {name: reason} when another process holds it -- that store is then
+    refused in this process (every open raises; health says why)."""
+    from .storage import backend_for, database_registry
+    from .backends import StoreLockedError
+
+    out: Dict[str, Optional[str]] = {}
+    for name in database_registry():
+        backend = backend_for(name)
+        if not getattr(backend, "live_primary", False):
+            continue
+        try:
+            backend.fence()
+            out[name] = None
+        except StoreLockedError as exc:
+            out[name] = str(exc)
+    return out
 
 
 def initialize_registry_gates() -> Dict[str, Dict[str, Any]]:
     """Server startup (plan §1): create every registry store's gate (applying
     the persisted freeze file and MEMORA_READONLY_DBS), open and replay each
-    d1:// store's intent journal, and take the primary lock of every live
-    local primary. Returns a per-store summary; problems are reported, and a
-    store whose journal cannot be used refuses its own connections."""
+    d1:// store's intent journal. Live primaries are fenced earlier, by
+    fence_live_primaries() (server.main, before any open). Returns a
+    per-store summary; a store whose journal cannot be used gives read-only
+    connections in this process."""
     import logging
 
     from .storage import backend_for, database_registry
@@ -262,12 +281,11 @@ def initialize_registry_gates() -> Dict[str, Dict[str, Any]]:
             backend = backend_for(name)
             if not hasattr(backend, "write_gate"):
                 continue
+            if getattr(backend, "refused_reason", None):
+                summary[name] = {"state": "refused", "error": backend.refused_reason}
+                continue
             gate = backend.write_gate()
             summary[name] = gate.status()
-            if getattr(backend, "live_primary", False):
-                from .backends import acquire_primary_lock
-
-                _PRIMARY_LOCK_FDS.append(acquire_primary_lock(backend.db_path))
         except Exception as exc:
             log.error("write gate for %s: %s", name, exc)
             summary[name] = {"state": "unknown", "error": f"{type(exc).__name__}: {exc}"}

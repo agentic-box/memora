@@ -91,6 +91,10 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
     lifetime — a new backend triggers a fresh ensure_schema pass.
     """
     conn = storage_backend.connect(check_same_thread=check_same_thread)
+    if getattr(conn, "read_only", False):
+        # A read-only connection (its store's write journal is unavailable in
+        # this process) never runs schema setup: it would be refused anyway.
+        return conn
     if not _backend_schema_ensured(storage_backend):
         with _schema_lock:
             if not _backend_schema_ensured(storage_backend):

@@ -116,7 +116,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
 import sys
 import uuid
 from pathlib import Path
@@ -618,7 +617,9 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
             except Exception:
                 pass
         if primary_fd is not None:
-            os.close(primary_fd)
+            from memora.backends import release_primary_lock
+
+            release_primary_lock(backend.db_path)
     return _finalize(report)
 
 

@@ -64,6 +64,26 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def _validate_record(rec: Any) -> None:
+    """Every field replay relies on (review 7584 P2): a record that would
+    not apply cleanly is malformed, handled like one that does not parse."""
+    if not isinstance(rec, dict):
+        raise ValueError("record is not an object")
+    kind = rec.get("type")
+    if kind == "meta":
+        if not isinstance(rec.get("next_id"), int) or rec["next_id"] < 1:
+            raise ValueError("meta.next_id must be a positive integer")
+    elif kind in ("intent", "resolved"):
+        if not isinstance(rec.get("id"), int) or isinstance(rec.get("id"), bool) or rec["id"] < 1:
+            raise ValueError(f"{kind}.id must be a positive integer")
+        if kind == "intent" and not isinstance(rec.get("sql"), str):
+            raise ValueError("intent.sql must be a string")
+        if kind == "resolved" and not isinstance(rec.get("outcome"), str):
+            raise ValueError("resolved.outcome must be a string")
+    else:
+        raise ValueError("unknown record type")
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -135,9 +155,8 @@ class IntentJournal:
         for raw in complete.split(b"\n")[:-1]:
             try:
                 rec = json.loads(raw.decode("utf-8"))
-                if not isinstance(rec, dict) or rec.get("type") not in ("intent", "resolved", "meta"):
-                    raise ValueError("unknown record")
-            except (ValueError, UnicodeDecodeError) as exc:
+                _validate_record(rec)
+            except (ValueError, UnicodeDecodeError, TypeError, KeyError) as exc:
                 raise IntentJournalError(
                     f"{self.path}: malformed record at byte offset {offset} (not the final line): {exc}; "
                     "refusing to start this store (later bytes are never discarded)"
@@ -154,7 +173,7 @@ class IntentJournal:
             finally:
                 os.close(fd)
 
-    def _apply(self, rec: Dict[str, Any]) -> None:
+    def _apply(self, rec: Dict[str, Any]) -> None:  # rec passed _validate_record
         kind = rec["type"]
         if kind == "meta":
             self._next_id = max(self._next_id, int(rec.get("next_id", 1)))
@@ -209,6 +228,11 @@ class IntentJournal:
             self._open[iid] = rec
             self._dirty = False  # this fsync also made any earlier resolution durable
             self._maybe_compact()
+            if self.broken:
+                # A compaction that failed after its rename broke the journal
+                # (review 7584 P1-3): this intent must NOT be sent.
+                self.abandon(iid, "not-sent")
+                raise IntentJournalError(f"not sent: {self.broken}")
             return iid
 
     def resolve(self, iid: int, outcome: str, *, durable: bool = False,
@@ -238,6 +262,27 @@ class IntentJournal:
             self._open.pop(iid, None)
             self.evidence.pop(iid, None)
             return True
+
+    def abandon(self, iid: int, outcome: str = "not-sent") -> None:
+        """An intent whose request was never sent. Dropped from the open set
+        (nothing is outstanding on D1), and a resolution is appended when the
+        journal can still take one. If it cannot (the journal is broken), the
+        on-disk intent may reappear as open after a restart: that is safe --
+        an open intent only blocks migration steps until an operator accepts
+        it, and it was never sent."""
+        with self._mutex:
+            self._open.pop(iid, None)
+            self.evidence.pop(iid, None)
+            if self._fd is None or self.fatal or self.broken:
+                return
+            line = (json.dumps({"type": "resolved", "id": iid, "outcome": outcome, "at": time.time()},
+                               separators=(",", ":")) + "\n").encode("utf-8")
+            try:
+                _write_all(self._fd, line)
+                self._dirty = True
+            except OSError as exc:
+                logger.error("intent journal %s: %s resolution of %d not recorded (%s)", self.path, outcome, iid, exc)
+                self._repair()
 
     def _repair(self) -> None:
         """Truncate to the last complete line and fsync file and directory.

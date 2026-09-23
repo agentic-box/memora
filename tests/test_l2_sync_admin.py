@@ -271,21 +271,44 @@ def test_evidence_without_read_token_is_reported_not_raised(registry, monkeypatc
     assert ev[1]["status"] == "error" and "MEMORA_D1_READ_TOKEN" in ev[1]["error"]
 
 
-def test_accept_intent_needs_a_receipt_for_this_database(registry, tmp_path):
+def test_accept_intent_requires_receipt_operator_id_decision_and_current_evidence(registry, tmp_path):
     _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
-    assert admin.accept_intent("remote", 1, None)[0] == 400
-    bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps({"db": "other", "verified_at": "t"}))
-    assert admin.accept_intent("remote", 1, str(bad))[1]["error"] == "receipt_invalid"
     good = tmp_path / "good.json"
     good.write_text(json.dumps({"db": "remote", "verified_at": "2026-09-23T00:00:00Z"}))
-    assert admin.accept_intent("remote", 99, str(good))[0] == 404
-    status, body = admin.accept_intent("remote", 1, str(good))
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"db": "other", "verified_at": "t"}))
+    status, listing = admin.list_intents("remote", reader=_Reader([([], {"served_by_primary": True})]))
+    digest = listing["open_intents"][0]["evidence_sha256"]
+    ok = dict(operator="spok", body_intent_id=1, decision="not-applied", evidence_digest=digest)
+
+    def accept(receipt=str(good), iid=1, **over):
+        return admin.accept_intent("remote", iid, receipt, **{**ok, **over})
+
+    assert accept(receipt=None)[1]["error"] == "receipt_required"
+    assert accept(receipt=str(bad))[1]["error"] == "receipt_invalid"
+    assert accept(operator=" ")[1]["error"] == "operator_required"
+    assert accept(body_intent_id=2)[1]["error"] == "intent_id_mismatch"
+    assert accept(decision="maybe")[1]["error"] == "decision_required"
+    assert accept(evidence_digest="0" * 64)[1]["error"] == "evidence_changed"
+    assert accept(iid=99, body_intent_id=99)[0] == 404
+    assert storage.backend_for("remote").journal().status()[0] == [1]  # nothing accepted so far
+    status, body = accept()
     assert status == 200 and body["open_intents"] == []
     recs = [json.loads(l) for l in storage.backend_for("remote").journal().path.read_text().splitlines()]
-    assert recs[-1]["outcome"] == "operator-accepted" and recs[-1]["receipt_sha256"]
+    assert recs[-1] == {**recs[-1], "outcome": "operator-accepted", "operator": "spok", "decision": "not-applied",
+                        "evidence_sha256": digest}
+    assert recs[-1]["receipt_sha256"]
     admin.freeze_store("remote", timeout_s=1)
     assert storage.backend_for("remote").write_gate().state == "frozen"
+
+
+def test_accept_needs_evidence_to_have_been_gathered(registry, tmp_path):
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    good = tmp_path / "good.json"
+    good.write_text(json.dumps({"db": "remote", "verified_at": "t"}))
+    status, body = admin.accept_intent("remote", 1, str(good), operator="spok", body_intent_id=1,
+                                       decision="applied", evidence_digest="x")
+    assert status == 409 and body["error"] == "no_evidence_yet"
 
 
 def test_list_intents_handler(registry):
@@ -342,10 +365,27 @@ def test_startup_initialises_gates_journals_and_primary_locks(registry, tmp_path
     summary = write_gate.initialize_registry_gates()
     assert summary["loc"]["state"] == "frozen" and summary["remote"]["state"] == "open"
     assert (write_gate.data_dir() / "intent" / "remote.lock").exists()
-    with pytest.raises(backends.StoreLockedError):
-        backends.acquire_primary_lock(tmp_path / "loc.db")
-    import os
+    assert write_gate.fence_live_primaries() == {"loc": None}
+    import subprocess
+    import sys
 
-    for fd in write_gate._PRIMARY_LOCK_FDS:
-        os.close(fd)
-    write_gate._PRIMARY_LOCK_FDS.clear()
+    code = ("import sys; sys.path.insert(0, %r)\nfrom memora import backends\n"
+            "try:\n    backends.acquire_primary_lock(%r)\nexcept backends.StoreLockedError:\n    sys.exit(3)\n"
+            ) % (str(__import__("pathlib").Path(__file__).resolve().parent.parent), str(tmp_path / "loc.db"))
+    try:
+        assert subprocess.run([sys.executable, "-c", code], timeout=60).returncode == 3
+    finally:
+        backends.release_primary_lock(tmp_path / "loc.db")
+
+
+def test_refused_store_is_reported_by_health(registry, tmp_path, monkeypatch):
+    from memora import health
+
+    monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"loc": "d1://acct/db1"}))
+    backend = storage.backend_for("loc")
+    backend.refused_reason = "held by another process"
+    assert health._gate_fields("loc")["refused"] == "held by another process"
+    assert write_gate.initialize_registry_gates()["loc"]["state"] == "refused"
+    with pytest.raises(backends.StoreLockedError):
+        backend.connect_read_only()
+    backend.refused_reason = None

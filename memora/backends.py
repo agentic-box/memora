@@ -752,6 +752,9 @@ class LocalSQLiteBackend(StorageBackend):
         # The registry name (set by storage.backend_for); None when the
         # backend was built directly.
         self.store_name: Optional[str] = None
+        # Set when this process may not serve the store at all (a live
+        # primary whose lock another process holds): every open raises.
+        self.refused_reason: Optional[str] = None
 
     def write_gate(self) -> _WriteGate:
         """This store's write gate (plan §1), shared by every backend object
@@ -796,7 +799,24 @@ class LocalSQLiteBackend(StorageBackend):
         asserts it."""
         return self._open_writer(check_same_thread, _ReplicatorConnection, gated=False)
 
+    def fence(self) -> None:
+        """A live primary is written only by the process holding its primary
+        lock (plan §1 M10): take it, or refuse this store in this process."""
+        if self.refused_reason is not None or not self.live_primary:
+            return
+        try:
+            acquire_primary_lock(self.db_path)
+        except StoreLockedError as exc:
+            self.refused_reason = str(exc)
+            raise
+
     def _open_writer(self, check_same_thread: bool, factory, *, gated: bool) -> sqlite3.Connection:
+        if self.refused_reason is not None:
+            raise StoreLockedError(f"store refused in this process: {self.refused_reason}")
+        # Every writer open of a live primary goes through the lock holder:
+        # the first one takes the process-lifetime lock, or the open fails
+        # before anything (the file, its schema) is touched.
+        self.fence()
         self._ensure_parent_dir()
         lock = _store_lock(self.db_path)
         with lock.exclusive():
@@ -847,6 +867,8 @@ class LocalSQLiteBackend(StorageBackend):
         defeat both the no-create guarantee (it can close, deleting the
         sidecars, between our check and our open) and immutable correctness.
         """
+        if self.refused_reason is not None:
+            raise StoreLockedError(f"store refused in this process: {self.refused_reason}")
         path = self.db_path
         lock = _store_lock(path)
         lock.acquire_shared()
@@ -1532,6 +1554,20 @@ class D1Connection:
 
     supports_transactions = False  # every statement autocommits (plan §1 M10)
 
+    # Set when the backend could not give this connection a usable write
+    # journal (plan §1; leader 7583): reads work, every mutation raises
+    # StoreReadOnlyError, and schema setup is skipped.
+    read_only_reason: Optional[str] = None
+
+    @property
+    def read_only(self) -> bool:
+        return self.read_only_reason is not None
+
+    def execute_batch(self, statements) -> list:
+        """Reserved for the replicator (plan §2.4, slice L3). Not available
+        on application connections."""
+        raise StoreReadOnlyError("execute_batch is not available on this connection")
+
     def _gate_and_journal(self):
         backend = self._backend
         if backend is not None and hasattr(backend, "write_gate"):
@@ -1554,12 +1590,21 @@ class D1Connection:
         c = classify_statement(sql)
         if c.kind == READ:
             return self._send(sql, params)
+        if self.read_only_reason is not None:
+            raise StoreReadOnlyError(f"read-only D1 connection: {self.read_only_reason}")
         gate, journal = self._gate_and_journal()
         token = gate.enter(c.main or c.kind)
         try:
             target, keys, post_state = derive_effect(sql, params)
             iid = journal.append_intent(sql, params, target=target or c.target,
                                         keys=keys, post_state=post_state)
+            # Re-check immediately before the send (plan round-2 P1-3): a
+            # journal that broke after the append (a failed compaction, a
+            # concurrent failed repair) must not let this write go out.
+            broken = journal.status()[1]
+            if broken:
+                journal.abandon(iid, "not-sent")
+                raise IntentJournalError(f"not sent: the write journal became unusable: {broken}")
             try:
                 result = self._send(sql, params)
             except D1DefiniteError:
@@ -1931,14 +1976,20 @@ class D1Backend(StorageBackend):
     def connect(self, *, check_same_thread: bool = True) -> D1Connection:
         """Return a D1 connection seeded with the backend's latest bookmark.
 
-        Refused when the store's intent journal cannot be used at all
-        (corrupt before its final line, held by another process, or not
-        openable): plan §1 "Startup replay"."""
+        When the store's intent journal cannot be used (held by another
+        process, no writable data dir, corrupt before its final line, or
+        broken), the connection is READ-ONLY: SELECTs work, every mutation
+        raises StoreReadOnlyError, and schema.connect skips schema setup.
+        A connection whose journal breaks later refuses mutations too (the
+        gate refuses while the journal is broken)."""
         journal = self.journal()
-        if journal.fatal:
-            raise IntentJournalError(journal.fatal)
+        unusable = journal.fatal or journal.broken
         self.write_gate()
         conn = D1Connection(self.account_id, self.database_id, self.api_token)
+        if unusable:
+            # Single writer, but reads stay available: this process gets a
+            # read-only connection (leader 7583, review 7584 P1-2).
+            conn.read_only_reason = unusable
         conn._session_token = self.get_latest_bookmark()
         conn._backend = self
         return conn
@@ -2015,20 +2066,43 @@ def primary_lock_path(db_path: Path) -> Path:
     return Path(f"{db_path}.primary-lock")
 
 
+# realpath of the lock file -> fd, for the locks THIS process holds. A flock
+# belongs to an open file description, so a second open+flock in the same
+# process would conflict with the first: every holder shares this one fd.
+_PRIMARY_LOCKS: Dict[str, int] = {}
+_PRIMARY_LOCKS_GUARD = threading.Lock()
+
+
 def acquire_primary_lock(db_path: Path) -> int:
-    """flock(LOCK_EX|LOCK_NB) on `<db>.primary-lock` (plan §1 M10). memora-all
-    holds it for its lifetime on every live primary; a script that writes
-    takes it too, and refuses when it is held. Returns the fd (keep it open);
-    raises StoreLockedError when another holder has it."""
+    """flock(LOCK_EX|LOCK_NB) on `<db>.primary-lock` (plan §1 M10). The one
+    process that holds it is the store's only writer: memora-all for its
+    lifetime, or a maintenance script while memora-all is stopped. Idempotent
+    within a process (returns the held fd). Raises StoreLockedError when
+    another process holds it."""
     import fcntl
 
-    fd = os.open(str(primary_lock_path(db_path)), os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        raise StoreLockedError(f"{primary_lock_path(db_path)} is held: memora-all is serving this store")
-    return fd
+    path = primary_lock_path(db_path)
+    key = os.path.realpath(str(path))
+    with _PRIMARY_LOCKS_GUARD:
+        held = _PRIMARY_LOCKS.get(key)
+        if held is not None:
+            return held
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise StoreLockedError(f"{path} is held by another process: it is this live primary's writer")
+        _PRIMARY_LOCKS[key] = fd
+        return fd
+
+
+def release_primary_lock(db_path: Path) -> None:
+    key = os.path.realpath(str(primary_lock_path(db_path)))
+    with _PRIMARY_LOCKS_GUARD:
+        fd = _PRIMARY_LOCKS.pop(key, None)
+    if fd is not None:
+        os.close(fd)  # releases the flock
 
 
 def parse_backend_uri(uri: str) -> StorageBackend:
