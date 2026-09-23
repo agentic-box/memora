@@ -3954,6 +3954,10 @@ def add_link(
 ) -> Dict[str, Any]:
     """Add an explicit link between two memories.
 
+    Must not open a SAVEPOINT named absorb_link, nor call _absorb_link:
+    absorb wraps this call in that savepoint (§9 u; _absorb_link refuses a
+    nested one).
+
     Args:
         from_id: Source memory ID
         to_id: Target memory ID
@@ -7347,14 +7351,26 @@ def _absorb_link(conn: sqlite3.Connection, tx: bool, from_id: int, to_id: int, *
     if not tx:
         add_link(conn, from_id, to_id, edge_type=edge_type, commit=False)
         return
-    conn.execute("SAVEPOINT absorb_link")
+    # The name is fixed, so a nested SAVEPOINT of the same name (add_link
+    # re-entering this helper) would make ROLLBACK TO / RELEASE act on the
+    # inner one only. Refuse it instead (L4 review 7614 P2, §9 u).
+    open_names = getattr(conn, "_memora_savepoints", None)
+    if open_names is None:
+        open_names = conn._memora_savepoints = set()
+    if "absorb_link" in open_names:
+        raise RuntimeError("SAVEPOINT absorb_link is already open on this connection; refusing to nest it")
+    open_names.add("absorb_link")
     try:
-        add_link(conn, from_id, to_id, edge_type=edge_type, commit=False)
-    except BaseException:
-        conn.execute("ROLLBACK TO absorb_link")
+        conn.execute("SAVEPOINT absorb_link")
+        try:
+            add_link(conn, from_id, to_id, edge_type=edge_type, commit=False)
+        except BaseException:
+            conn.execute("ROLLBACK TO absorb_link")
+            conn.execute("RELEASE absorb_link")
+            raise
         conn.execute("RELEASE absorb_link")
-        raise
-    conn.execute("RELEASE absorb_link")
+    finally:
+        open_names.discard("absorb_link")
 
 
 def _absorb_pregate_job(conn: sqlite3.Connection, corpus: "_CorpusSnapshot", job: Dict[str, Any],

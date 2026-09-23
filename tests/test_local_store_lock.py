@@ -166,6 +166,9 @@ EXPECTED_SQLITE_CONNECT_SITES = {
     ("backends.py", "CloudSQLiteBackend._create_and_upload_empty_database"),
     ("backends.py", "CloudSQLiteBackend._create_local_database_only"),
     ("backends.py", "CloudSQLiteBackend.connect"),
+    # L5 operator tool: scratch files only (export verification, a seed
+    # before it becomes a store); never a live store.
+    ("local_primary.py", "_scratch_connect"),
 }
 # Every storage backend class; each one's connect() is the only way a
 # connection to its store is made (storage.connect, schema.connect, the graph

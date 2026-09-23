@@ -495,3 +495,39 @@ def test_pending_images_are_swept_on_thaw(guard, monkeypatch, tmp_path):
     assert status == 200
     with backend.connect() as conn:
         assert "images_pending" not in json.loads(_row(conn, mid)[1])
+
+
+def test_a_nested_absorb_link_savepoint_is_refused(guard, monkeypatch):
+    """§9 (u): the savepoint name is fixed, so a nested one of the same name
+    is refused (it would make ROLLBACK TO act on the inner one only); the
+    outer savepoint still rolls back and the connection is usable after."""
+    from memora.backends import store_write
+
+    with storage.connect() as conn:
+        a = _mem(conn, "nested savepoint source memory")
+        b = _mem(conn, "nested savepoint target memory")
+    real_add_link = storage.add_link
+    seen = []
+
+    def reentrant(conn, from_id, to_id, **kw):
+        real_add_link(conn, from_id, to_id, **kw)  # the forward and reverse edges
+        try:
+            storage._absorb_link(conn, True, from_id, to_id, edge_type="related_to")
+        except RuntimeError as exc:
+            seen.append(str(exc))
+            raise
+
+    monkeypatch.setattr(storage, "add_link", reentrant)
+    conn = storage.STORAGE_BACKEND.connect()
+    try:
+        with store_write(conn):
+            with pytest.raises(RuntimeError, match="refusing to nest"):
+                storage._absorb_link(conn, True, a["id"], b["id"], edge_type="related_to")
+            assert not any(r["id"] == b["id"] for r in storage.get_crossrefs(conn, a["id"]))
+        assert seen and "already open" in seen[0]
+        monkeypatch.setattr(storage, "add_link", real_add_link)
+        with store_write(conn):
+            storage._absorb_link(conn, True, a["id"], b["id"], edge_type="related_to")
+        assert any(r["id"] == b["id"] for r in storage.get_crossrefs(conn, a["id"]))
+    finally:
+        conn.close()
