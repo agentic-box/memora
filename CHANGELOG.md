@@ -17,11 +17,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ### Local-primary L5 (piece a): verified export, receipt, recheck
 - Per `docs/local-primary-implementation.md` §0 P1, §4, §9 p. New operator tool `scripts/local_primary.py` (logic in `memora/local_primary.py`), run by hand; it reads D1 only with the read token.
 - **`export <db>`**:
-  - places the §1 freeze (`POST /admin/freeze/<db>`) and re-checks `/health/db/<db>` at every step boundary. It continues only while the store is `frozen` with 0 in flight and no open intent, and lifts only a freeze it placed itself.
+  - places the §1 freeze (`POST /admin/freeze/<db>`) if it is not already in place, and re-checks `/health/db/<db>` at every step boundary. It continues only while the store is `frozen` with 0 in flight and no open intent.
+  - No command lifts the freeze except the explicit `thaw <db>`. `recheck` requires the freeze to be in place already (`freeze <db>`); it never places or lifts one.
+  - `sqlite_sequence` is hashed, and the dump replaces SQLite's auto-created sequence rows with D1's counters.
   - `--native-export` tries `wrangler d1 export --remote` first, in an environment built from scratch that holds only the read token; if that is refused, it falls back to a paged SELECT.
   - Brackets the export with D1's epoch, loads the file into scratch SQLite and compares per-table counts and content hashes with D1 (3 attempts).
   - Uploads the file to R2 and reads it back, then writes a version-1 receipt. Earlier exports and receipts are never overwritten.
-- **`recheck <db> --receipt R`**: under the freeze, compares D1's epoch, table set and full per-table hashes with the receipt. If anything changed, it takes a fresh export. Receipts are refused when they are for another store, older than 24 h, not matched against R2, or when their SQL file changed.
+- **`recheck <db> --receipt R`**: under the freeze, compares D1's epoch, table set and full per-table hashes with the receipt. If anything changed, it takes a fresh export. Receipts are refused when they are for another store or another D1 database (account id, database id, URI), older than 24 h, not matched against R2, or when their SQL file changed.
 - Credential files (`--admin-token-file`, `--health-token-file`, `--read-token-file`) must be regular files with mode 0600, owned by the current user.
 - `--service-stopped` swaps the freeze for a `docker inspect` check that memora-all is stopped.
 - `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection (§9 u).

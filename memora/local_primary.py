@@ -124,7 +124,7 @@ class D1Reader:
         return [(r["name"], int(r["pk"] or 0)) for r in rows]
 
     def all_rows(self, table: str) -> Iterable[Dict[str, Any]]:
-        order = _order_by(self.columns(table))
+        order = _order_for(table, self.columns(table))
         offset = 0
         while True:
             page = self.rows(f'SELECT * FROM "{table}" ORDER BY {order} LIMIT ? OFFSET ?', (PAGE_ROWS, offset))
@@ -133,16 +133,35 @@ class D1Reader:
                 return
             offset += PAGE_ROWS
 
+    def has_sequence_table(self) -> bool:
+        return bool(self.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                              (SEQUENCE_TABLE,)))
+
     def sequences(self) -> Dict[str, int]:
-        try:
-            rows = self.rows("SELECT name, seq FROM sqlite_sequence")
-        except Exception:
+        """D1's sqlite_sequence ({} when D1 has none; a failed read raises)."""
+        if not self.has_sequence_table():
             return {}
+        rows = self.rows("SELECT name, seq FROM sqlite_sequence")
         return {r["name"]: int(r["seq"]) for r in rows}
+
+    def hashed_tables(self) -> List[str]:
+        """What a receipt covers: every user table, plus sqlite_sequence
+        (the AUTOINCREMENT counters; review 7621 P1-1)."""
+        names = sorted(n for n, _ in self.tables())
+        return names + [SEQUENCE_TABLE] if self.has_sequence_table() else names
 
 
 def _user_table(name: Optional[str]) -> bool:
     return bool(name) and not name.startswith(("sqlite_", "_cf_", "memories_fts"))
+
+
+SEQUENCE_TABLE = "sqlite_sequence"
+
+
+def _order_for(table: str, cols: List[Tuple[str, int]]) -> str:
+    # sqlite_sequence has no key and its rowids differ after a load (the
+    # dump rewrites its rows): order it by name on both sides.
+    return '"name"' if table == SEQUENCE_TABLE else _order_by(cols)
 
 
 def _order_by(cols: List[Tuple[str, int]]) -> str:
@@ -200,7 +219,7 @@ def local_stats(db_path: Path, tables: List[str]) -> Dict[str, Dict[str, Any]]:
         for t in tables:
             info = [(r[1], int(r[5] or 0)) for r in db.execute(f'PRAGMA table_info("{t}")')]
             cols = [c for c, _ in info]
-            rows = (dict(r) for r in db.execute(f'SELECT * FROM "{t}" ORDER BY {_order_by(info)}'))
+            rows = (dict(r) for r in db.execute(f'SELECT * FROM "{t}" ORDER BY {_order_for(t, info)}'))
             out[t] = table_stats(rows, cols)
         return out
     finally:
@@ -227,7 +246,8 @@ def _sql_literal(v: Any) -> str:
 
 def export_select(reader: D1Reader, out: Path) -> List[str]:
     """The paged-SELECT export (only under the freeze, §4): the schema from
-    sqlite_master, then one INSERT per row. Returns the exported tables."""
+    sqlite_master, then one INSERT per row, then D1's AUTOINCREMENT
+    counters. Returns the tables the receipt covers."""
     tables = reader.tables()
     names = [n for n, _ in tables]
     tmp = out.with_suffix(out.suffix + ".partial")
@@ -241,16 +261,19 @@ def export_select(reader: D1Reader, out: Path) -> List[str]:
             for row in reader.all_rows(name):
                 vals = ", ".join(_sql_literal(row.get(c)) for c in cols)
                 fh.write(f'INSERT INTO "{name}" ({collist}) VALUES ({vals});\n')
-        seqs = reader.sequences()
-        for name, seq in sorted(seqs.items()):
-            fh.write(f"INSERT INTO sqlite_sequence (name, seq) VALUES ({_sql_literal(name)}, {seq});\n")
+        # Loading the rows already made SQLite create a sequence row (max id);
+        # replace it, or a second row for the same name would be ignored and
+        # the next id would be max(id)+1 instead of D1's counter+1 (7621 P1-1).
+        for name, seq in sorted(reader.sequences().items()):
+            fh.write(f"DELETE FROM sqlite_sequence WHERE name = {_sql_literal(name)};\n")
+            fh.write(f"INSERT INTO sqlite_sequence (name, seq) VALUES ({_sql_literal(name)}, {int(seq)});\n")
         for ddl in reader.indexes_and_triggers():
             fh.write(ddl.rstrip(";") + ";\n")
         fh.write("COMMIT;\n")
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, out)
-    return names
+    return reader.hashed_tables()
 
 
 def export_native(account_id: str, d1_name: str, token: str, out: Path) -> None:
@@ -337,7 +360,9 @@ class FreezeClient:
     """memora-all's freeze barrier over HTTP: POST /admin/freeze/<db>, and
     GET /health/db/<db> re-checked at every step boundary (§9 p): the step
     continues only while the store reports `frozen` with 0 in flight and no
-    open intent (`frozen-unsafe` is a refusal)."""
+    open intent (`frozen-unsafe` is a refusal). No step lifts the freeze:
+    only the explicit `thaw` command does (review 7621 P1-2), so the window
+    between a recheck and the step that relies on it stays closed."""
 
     def __init__(self, base_url: str, admin_token: str, db: str, *, health_token: Optional[str] = None,
                  timeout: float = 60.0):
@@ -367,6 +392,7 @@ class FreezeClient:
             raise L5Refused(f"memora-all is not reachable at {self.base}: {exc}")
 
     def freeze(self) -> None:
+        """Place the freeze unless it is already in place, then check it."""
         status, body = self._request("GET", f"/health/db/{self.db}")
         already = (body.get("freeze") or {}).get("state") in ("frozen", "frozen-unsafe")
         if not already:
@@ -387,13 +413,21 @@ class FreezeClient:
                             f"state={fr.get('state')} in_flight={fr.get('in_flight')} "
                             f"open_intents={fr.get('open_intents')}")
 
-    def thaw_if_placed(self) -> None:
-        if self.placed:
-            self.placed = False
-            status, body = self._request("DELETE", f"/admin/freeze/{self.db}")
-            if status != 200:
-                raise L5Refused(f"the freeze this step placed on {self.db} was NOT lifted ({status}): {body}; "
-                                f"lift it with DELETE /admin/freeze/{self.db}")
+    def require(self, where: str) -> None:
+        """The freeze must ALREADY be in place (a step that relies on an
+        earlier one's result never places its own)."""
+        try:
+            self.check(where)
+        except L5Refused as exc:
+            raise L5Refused(f"{exc} -- this step needs the freeze already in place: run "
+                            f"`local_primary.py freeze {self.db}` (POST /admin/freeze/{self.db}) first")
+
+    def thaw(self) -> None:
+        """The explicit `thaw` command: the only way this tool lifts a freeze."""
+        status, body = self._request("DELETE", f"/admin/freeze/{self.db}")
+        if status != 200:
+            raise L5Refused(f"the freeze on {self.db} was NOT lifted ({status}): {body}")
+        self.placed = False
 
 
 class ServiceStopped:
@@ -413,13 +447,16 @@ class ServiceStopped:
     def freeze(self) -> None:
         self.check("at the start")
 
+    def require(self, where: str) -> None:
+        self.check(where)
+
     def check(self, where: str) -> None:
         state = self._running()
         if state != "false":
             raise L5Refused(f"{self.container} must be stopped {where} (State.Running={state})")
 
-    def thaw_if_placed(self) -> None:
-        return None
+    def thaw(self) -> None:
+        return None  # nothing to lift: memora-all is started by the operator
 
 
 # ------------------------------------------------------------------ receipts (P1)
@@ -460,14 +497,12 @@ class _Mismatch(Exception):
 
 def export(db: str, deps: Deps, out_dir: Path) -> Path:
     """P1: a verified export under the freeze, uploaded to R2 and read back,
-    with a receipt. Returns the receipt path."""
+    with a receipt. Returns the receipt path. Places the freeze if it is not
+    in place, and leaves it in place (success or not): only `thaw` lifts it."""
     out_dir = Path(out_dir) / db
     out_dir.mkdir(parents=True, exist_ok=True)
     deps.freeze.freeze()
-    try:
-        return _export_frozen(db, deps, out_dir)
-    finally:
-        deps.freeze.thaw_if_placed()
+    return _export_frozen(db, deps, out_dir)
 
 
 def _export_frozen(db: str, deps: Deps, out_dir: Path) -> Path:
@@ -491,7 +526,7 @@ def _export_frozen(db: str, deps: Deps, out_dir: Path) -> Path:
                 # paged SELECT -- still under this freeze.
                 deps.log(f"native export refused, using the paged SELECT: {exc}")
         if method == "native":
-            tables = [n for n, _ in deps.reader.tables()]
+            tables = deps.reader.hashed_tables()
         else:
             tables = export_select(deps.reader, sql_path)
         after = deps.reader.epoch()
@@ -516,6 +551,7 @@ def _export_frozen(db: str, deps: Deps, out_dir: Path) -> Path:
     deps.freeze.check("before the receipt")
     receipt = {
         "version": 1, "db": db, "account_id": deps.account_id, "database_id": deps.database_id,
+        "d1_uri": d1_uri(deps.account_id, deps.database_id),
         "epoch": before, "tables": stats, "sql_path": str(sql_path), "sql_sha256": sql_sha,
         "r2_key": r2_key, "r2_sha256": r2_sha, "method": method,
         "verified_at": _now_iso(), "verified_at_epoch": deps.clock(),
@@ -527,9 +563,16 @@ def _export_frozen(db: str, deps: Deps, out_dir: Path) -> Path:
     return rpath
 
 
-def load_receipt(path: str, db: str, *, now: Optional[float] = None, check_sql: bool = True) -> Dict[str, Any]:
-    """A usable receipt (P1): verified, for this database, younger than 24 h,
-    with the R2 read-back matched and (by default) its SQL file intact."""
+def d1_uri(account_id: str, database_id: str) -> str:
+    return f"d1://{account_id}/{database_id}"
+
+
+def load_receipt(path: str, db: str, *, account_id: str, database_id: str, now: Optional[float] = None,
+                 check_sql: bool = True) -> Dict[str, Any]:
+    """A usable receipt (P1): verified, for this store name AND this D1
+    database (account id, database id and URI; review 7621 P1-3), younger
+    than 24 h, with the R2 read-back matched and (by default) its SQL file
+    intact."""
     p = Path(path)
     try:
         r = json.loads(p.read_text())
@@ -539,6 +582,10 @@ def load_receipt(path: str, db: str, *, now: Optional[float] = None, check_sql: 
         raise L5Refused(f"receipt {path} is not a version-1 export receipt")
     if r.get("db") != db:
         raise L5Refused(f"receipt {path} is for {r.get('db')!r}, not {db!r}")
+    want = {"account_id": account_id, "database_id": database_id, "d1_uri": d1_uri(account_id, database_id)}
+    got = {k: r.get(k) for k in want}
+    if got != want:
+        raise L5Refused(f"receipt {path} is for another D1 database ({got}), not {want}")
     if not r.get("verified_at") or r.get("r2_sha256") != r.get("sql_sha256"):
         raise L5Refused(f"receipt {path} is not verified (R2 read-back unmatched)")
     age = (now if now is not None else time.time()) - float(r.get("verified_at_epoch") or 0)
@@ -551,24 +598,21 @@ def load_receipt(path: str, db: str, *, now: Optional[float] = None, check_sql: 
     return r
 
 
-def recheck(db: str, receipt_path: str, deps: Deps, out_dir: Path, *, hold: bool = False) -> Path:
-    """P1 freeze-recheck (review 7524 P1-4, 7531 P1-3): under the freeze,
-    compare D1's epoch, per-table counts AND full content hashes with the
-    receipt; if anything changed, take a fresh export while still frozen.
-    Returns the receipt to use (the same one, or the fresh one). With
-    hold=True the freeze stays in place (the caller's step continues)."""
-    receipt = load_receipt(receipt_path, db)
-    deps.freeze.freeze()
-    try:
-        deps.freeze.check("before the recheck")
-        tables = sorted(receipt["tables"])
-        same = (deps.reader.epoch() == receipt["epoch"]
-                and sorted(n for n, _ in deps.reader.tables()) == tables  # a table added or dropped
-                and remote_stats(deps.reader, tables) == receipt["tables"])
-        deps.freeze.check("after the recheck")
-        if same:
-            return Path(receipt_path)
-        return _export_frozen(db, deps, Path(out_dir) / db)
-    finally:
-        if not hold:
-            deps.freeze.thaw_if_placed()
+def recheck(db: str, receipt_path: str, deps: Deps, out_dir: Path) -> Path:
+    """P1 freeze-recheck (review 7524 P1-4, 7531 P1-3): under a freeze that
+    is ALREADY in place (refused otherwise), compare D1's epoch, table set,
+    per-table counts AND full content hashes (sqlite_sequence included) with
+    the receipt; if anything changed, take a fresh export, still frozen.
+    Returns the receipt to use (the same one, or the fresh one). Never lifts
+    the freeze: the step that relies on the recheck runs under the same one
+    (review 7621 P1-2)."""
+    receipt = load_receipt(receipt_path, db, account_id=deps.account_id, database_id=deps.database_id)
+    deps.freeze.require("before the recheck")
+    tables = sorted(receipt["tables"])
+    same = (deps.reader.epoch() == receipt["epoch"]
+            and sorted(deps.reader.hashed_tables()) == tables  # a table added or dropped
+            and remote_stats(deps.reader, tables) == receipt["tables"])
+    deps.freeze.check("after the recheck")
+    if same:
+        return Path(receipt_path)
+    return _export_frozen(db, deps, Path(out_dir) / db)

@@ -59,26 +59,32 @@ def replica_exec(replica: FakeReplica, sql: str, params=()) -> None:
 
 class FakeBarrier:
     """In-process freeze barrier: records calls; `bad_at` makes check()
-    refuse at the named step boundary."""
+    refuse at the named step boundary; require() refuses unless frozen."""
 
-    def __init__(self, bad_at=None):
+    def __init__(self, bad_at=None, frozen=False):
         self.calls = []
         self.bad_at = bad_at
-        self.placed = False
+        self.frozen = frozen
 
     def freeze(self):
         self.calls.append("freeze")
-        self.placed = True
+        self.frozen = True
 
     def check(self, where):
         self.calls.append(f"check {where}")
-        if self.bad_at and self.bad_at in where:
+        if not self.frozen or (self.bad_at and self.bad_at in where):
             raise lp.L5Refused(f"not frozen {where}")
 
-    def thaw_if_placed(self):
-        if self.placed:
-            self.calls.append("thaw")
-            self.placed = False
+    def require(self, where):
+        self.check(where)
+
+    def thaw(self):
+        self.calls.append("thaw")
+        self.frozen = False
+
+
+def load(path, **kw):
+    return lp.load_receipt(str(path), DB, account_id="acct", database_id="replica-db", **kw)
 
 
 @pytest.fixture
@@ -89,14 +95,14 @@ def replica(tmp_path):
 
 
 def make_deps(replica, tmp_path, barrier=None, reader=None, r2=None, **kw):
-    return lp.Deps(reader=reader or lp.D1Reader(replica.reader()), freeze=barrier or FakeBarrier(),
+    return lp.Deps(reader=reader or lp.D1Reader(replica.reader()), freeze=barrier or FakeBarrier(frozen=True),
                    r2=r2 or lp.FsR2(tmp_path / "r2"), account_id="acct", database_id="replica-db",
                    log=lambda msg: None, **kw)
 
 
 def d1_stats(replica):
     reader = lp.D1Reader(replica.reader())
-    return lp.remote_stats(reader, [n for n, _ in reader.tables()])
+    return lp.remote_stats(reader, reader.hashed_tables())
 
 
 # ---------------------------------------------------------------- credentials
@@ -167,11 +173,78 @@ def test_export_writes_a_verified_receipt_with_matching_r2_copy(replica, tmp_pat
     db = sqlite3.connect(scratch)
     assert db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'memories'").fetchone()[0] == 3
     db.close()
-    # the freeze spans the whole export and every boundary is re-checked (§9 p)
-    assert barrier.calls[0] == "freeze" and barrier.calls[-1] == "thaw"
-    assert [c for c in barrier.calls if c.startswith("check")] == [
-        "check before the export", "check after the export", "check before the receipt"]
-    assert lp.load_receipt(str(rpath), DB)["sql_sha256"] == r["sql_sha256"]
+    # the freeze spans the whole export, every boundary is re-checked (§9 p),
+    # and it is left in place (7621 P1-2: only `thaw` lifts it)
+    assert barrier.calls == ["freeze", "check before the export", "check after the export",
+                             "check before the receipt"]
+    assert barrier.frozen
+    assert load(rpath)["sql_sha256"] == r["sql_sha256"]
+    assert r["d1_uri"] == "d1://acct/replica-db" and "sqlite_sequence" in r["tables"]
+
+
+def test_export_keeps_d1s_autoincrement_counter_past_deleted_high_ids(replica, tmp_path):
+    """7621 P1-1: rows 4..9 were used and deleted on D1 (its counter is 9,
+    max(id) is 3). The loaded export must issue id 10 next, not 4."""
+    db = replica._db()
+    try:
+        for i in range(6):
+            db.execute("INSERT INTO memories (content) VALUES (?)", (f"gone {i}",))
+        db.execute("DELETE FROM memories WHERE id > 3")
+        db.commit()
+    finally:
+        db.close()
+    r = json.loads(lp.export(DB, make_deps(replica, tmp_path), tmp_path / "exports").read_text())
+    scratch = tmp_path / "load.db"
+    lp.load_sql(Path(r["sql_path"]), scratch)
+    db = sqlite3.connect(scratch)
+    try:
+        assert db.execute("SELECT seq FROM sqlite_sequence WHERE name = 'memories'").fetchall() == [(9,)]
+        assert db.execute("INSERT INTO memories (content) VALUES ('next')").lastrowid == 10
+    finally:
+        db.close()
+
+
+def test_sequence_rows_created_out_of_name_order_still_verify(replica, tmp_path):
+    """D1 created memories_events' counter before memories_actions'; the
+    load rewrites them in name order, so rowid order differs -- the hash
+    orders sqlite_sequence by name on both sides."""
+    replica_exec(replica, "INSERT INTO memories_events (memory_id, tags) VALUES (1, '[]')")
+    replica_exec(replica, "INSERT INTO memories_actions (memory_id, action, summary) VALUES (1, 'a', 's')")
+    names = [r[0] for r in sqlite3.connect(replica.path).execute("SELECT name FROM sqlite_sequence ORDER BY rowid")]
+    assert names.index("memories_events") < names.index("memories_actions")
+    r = json.loads(lp.export(DB, make_deps(replica, tmp_path), tmp_path / "exports").read_text())
+    assert r["tables"]["sqlite_sequence"]["count"] == 3
+
+
+class SequenceMovingReader(lp.D1Reader):
+    """D1's counter moves right after the dump (no row or epoch change): only
+    the sqlite_sequence hash can notice."""
+
+    def __init__(self, replica, moves):
+        super().__init__(replica.reader())
+        self.replica, self.moves = replica, moves
+
+    def indexes_and_triggers(self):
+        out = super().indexes_and_triggers()
+        if self.moves:
+            self.moves -= 1
+            replica_exec(self.replica, "UPDATE sqlite_sequence SET seq = seq + 5 WHERE name = 'memories'")
+        return out
+
+
+def test_a_sequence_that_differs_from_the_export_is_a_hash_mismatch(replica, tmp_path):
+    deps = make_deps(replica, tmp_path, reader=SequenceMovingReader(replica, moves=3))
+    with pytest.raises(lp.L5Refused, match=r"does not match D1 in \['sqlite_sequence'\]"):
+        lp.export(DB, deps, tmp_path / "exports")
+    deps = make_deps(replica, tmp_path, reader=SequenceMovingReader(replica, moves=1))
+    r = json.loads(lp.export(DB, deps, tmp_path / "exports").read_text())
+    assert r["tables"]["sqlite_sequence"] == d1_stats(replica)["sqlite_sequence"]
+
+
+def test_recheck_notices_a_moved_sequence(replica, tmp_path, receipt):
+    replica_exec(replica, "UPDATE sqlite_sequence SET seq = 50 WHERE name = 'memories'")
+    out = lp.recheck(DB, str(receipt), make_deps(replica, tmp_path), tmp_path / "exports")
+    assert out != receipt
 
 
 class MovingEpochReader(lp.D1Reader):
@@ -182,11 +255,11 @@ class MovingEpochReader(lp.D1Reader):
         super().__init__(replica.reader())
         self.replica, self.moves = replica, moves
 
-    def tables(self):
+    def indexes_and_triggers(self):  # once per dump, between the epoch reads
         if self.moves:
             self.moves -= 1
             replica_exec(self.replica, "UPDATE memories_meta SET value = value + 1 WHERE key = 'embedding_change_epoch'")
-        return super().tables()
+        return super().indexes_and_triggers()
 
 
 def test_export_retries_when_the_epoch_moves_and_records_the_stable_epoch(replica, tmp_path):
@@ -202,7 +275,7 @@ def test_export_refuses_after_three_moving_epochs_and_writes_nothing(replica, tm
         lp.export(DB, deps, tmp_path / "exports")
     assert not list((tmp_path / "exports").rglob("*.receipt.json"))
     assert not (tmp_path / "r2").exists()
-    assert barrier.calls[-1] == "thaw"
+    assert "thaw" not in barrier.calls and barrier.frozen
 
 
 class ChangingDataReader(lp.D1Reader):
@@ -247,12 +320,12 @@ def test_export_refuses_when_the_r2_read_back_differs(replica, tmp_path):
 
 
 @pytest.mark.parametrize("where", ["before the export", "after the export", "before the receipt"])
-def test_a_failed_freeze_check_at_any_boundary_refuses_and_lifts_the_freeze(replica, tmp_path, where):
+def test_a_failed_freeze_check_at_any_boundary_refuses_and_keeps_the_freeze(replica, tmp_path, where):
     barrier = FakeBarrier(bad_at=where)
     with pytest.raises(lp.L5Refused, match=where):
         lp.export(DB, make_deps(replica, tmp_path, barrier), tmp_path / "exports")
     assert not list((tmp_path / "exports").rglob("*.receipt.json"))
-    assert barrier.calls[-1] == "thaw"
+    assert "thaw" not in barrier.calls
 
 
 def test_native_export_runs_with_an_environment_built_from_scratch(replica, tmp_path, monkeypatch):
@@ -320,31 +393,63 @@ def _edit(path, **changes):
 def test_an_unusable_receipt_is_refused(receipt, change, match):
     _edit(receipt, **change)
     with pytest.raises(lp.L5Refused, match=match):
-        lp.load_receipt(str(receipt), DB)
+        load(receipt)
 
 
 def test_a_receipt_whose_export_file_changed_is_refused(receipt):
     sql = Path(json.loads(receipt.read_text())["sql_path"])
     sql.write_text(sql.read_text() + "-- edited\n")
     with pytest.raises(lp.L5Refused, match="missing or changed"):
-        lp.load_receipt(str(receipt), DB)
+        load(receipt)
 
 
 def test_a_receipt_is_accepted_up_to_24_hours(receipt):
     r = json.loads(receipt.read_text())
-    lp.load_receipt(str(receipt), DB, now=r["verified_at_epoch"] + lp.RECEIPT_MAX_AGE_S - 1)
+    load(receipt, now=r["verified_at_epoch"] + lp.RECEIPT_MAX_AGE_S - 1)
     with pytest.raises(lp.L5Refused, match="older than 24 h"):
-        lp.load_receipt(str(receipt), DB, now=r["verified_at_epoch"] + lp.RECEIPT_MAX_AGE_S + 1)
+        load(receipt, now=r["verified_at_epoch"] + lp.RECEIPT_MAX_AGE_S + 1)
+
+
+@pytest.mark.parametrize("account, database", [("acct", "other-db"), ("other-acct", "replica-db")])
+def test_a_receipt_for_another_d1_database_with_the_same_name_is_refused(receipt, account, database):
+    """7621 P1-3: the store name, data and epoch may all match; the D1
+    identity must too."""
+    with pytest.raises(lp.L5Refused, match="another D1 database"):
+        lp.load_receipt(str(receipt), DB, account_id=account, database_id=database)
+    assert load(receipt)["database_id"] == "replica-db"
+
+
+@pytest.mark.parametrize("field, value", [("database_id", "other-db"), ("d1_uri", "d1://acct/other-db"),
+                                          ("account_id", "x")])
+def test_a_receipt_whose_d1_identity_was_edited_is_refused(receipt, field, value):
+    _edit(receipt, **{field: value})
+    with pytest.raises(lp.L5Refused, match="another D1 database"):
+        load(receipt)
+
+
+def test_recheck_refuses_a_receipt_of_another_d1_database(replica, tmp_path, receipt):
+    deps = make_deps(replica, tmp_path)
+    deps.database_id = "other-db"
+    with pytest.raises(lp.L5Refused, match="another D1 database"):
+        lp.recheck(DB, str(receipt), deps, tmp_path / "exports")
 
 
 # ---------------------------------------------------------------- recheck (P1)
 
-def test_recheck_of_an_unchanged_d1_returns_the_same_receipt(replica, tmp_path, receipt):
-    barrier = FakeBarrier()
+def test_recheck_of_an_unchanged_d1_returns_the_same_receipt_and_keeps_the_freeze(replica, tmp_path, receipt):
+    barrier = FakeBarrier(frozen=True)
     out = lp.recheck(DB, str(receipt), make_deps(replica, tmp_path, barrier), tmp_path / "exports")
     assert out == receipt
-    assert barrier.calls[0] == "freeze" and barrier.calls[-1] == "thaw"
-    assert "check before the recheck" in barrier.calls and "check after the recheck" in barrier.calls
+    assert barrier.calls == ["check before the recheck", "check after the recheck"]  # no freeze, no thaw
+    assert barrier.frozen
+
+
+def test_recheck_without_a_freeze_in_place_is_refused(replica, tmp_path, receipt):
+    """7621 P1-2: a recheck never places (or lifts) a freeze of its own."""
+    barrier = FakeBarrier(frozen=False)
+    with pytest.raises(lp.L5Refused, match="not frozen before the recheck"):
+        lp.recheck(DB, str(receipt), make_deps(replica, tmp_path, barrier), tmp_path / "exports")
+    assert "freeze" not in barrier.calls and not barrier.frozen
 
 
 @pytest.mark.parametrize("change", [
@@ -359,18 +464,12 @@ def test_recheck_takes_a_fresh_export_when_d1_changed(replica, tmp_path, receipt
     assert out != receipt
     new = json.loads(out.read_text())
     assert new["tables"] == d1_stats(replica) and new["tables"] != old["tables"]
-    assert lp.load_receipt(str(receipt), DB)["tables"] == old["tables"]  # the earlier export is kept
-
-
-def test_recheck_with_hold_keeps_the_freeze(replica, tmp_path, receipt):
-    barrier = FakeBarrier()
-    lp.recheck(DB, str(receipt), make_deps(replica, tmp_path, barrier), tmp_path / "exports", hold=True)
-    assert "thaw" not in barrier.calls and barrier.placed
+    assert load(receipt)["tables"] == old["tables"]  # the earlier export is kept
 
 
 def test_recheck_refuses_a_stale_receipt_before_touching_d1(replica, tmp_path, receipt):
     _edit(receipt, verified_at_epoch=0)
-    barrier = FakeBarrier()
+    barrier = FakeBarrier(frozen=True)
     with pytest.raises(lp.L5Refused, match="older than 24 h"):
         lp.recheck(DB, str(receipt), make_deps(replica, tmp_path, barrier), tmp_path / "exports")
     assert barrier.calls == []
@@ -450,12 +549,13 @@ def freeze_server():
         s.close()
 
 
-def test_freeze_client_places_checks_and_lifts_its_own_freeze(freeze_server):
+def test_freeze_client_places_checks_and_thaws_only_on_request(freeze_server):
     srv = freeze_server()
     c = lp.FreezeClient(srv.url, "admin-tok", DB, health_token="health-tok")
     c.freeze()
     c.check("mid-step")
-    c.thaw_if_placed()
+    assert srv.state == "frozen"
+    c.thaw()
     assert srv.methods() == [("GET", f"/health/db/{DB}"), ("POST", f"/admin/freeze/{DB}"),
                              ("GET", f"/health/db/{DB}"), ("GET", f"/health/db/{DB}"),
                              ("DELETE", f"/admin/freeze/{DB}")]
@@ -468,7 +568,7 @@ def test_freeze_client_leaves_an_operator_placed_freeze_in_place(freeze_server):
     srv = freeze_server(already_frozen=True)
     c = lp.FreezeClient(srv.url, "t", DB)
     c.freeze()
-    c.thaw_if_placed()
+    c.require("mid-step")
     assert ("POST", f"/admin/freeze/{DB}") not in srv.methods()
     assert ("DELETE", f"/admin/freeze/{DB}") not in srv.methods()
     assert srv.state == "frozen"
@@ -485,8 +585,7 @@ def test_freeze_check_refuses_anything_but_frozen_with_nothing_in_flight(freeze_
     c = lp.FreezeClient(srv.url, "t", DB)
     with pytest.raises(lp.L5Refused, match=match):
         c.freeze()
-    c.thaw_if_placed()
-    assert srv.state == "open"  # the freeze it placed was lifted
+    assert srv.state == "frozen"  # left in place: only `thaw` lifts it
 
 
 def test_freeze_check_refuses_a_health_answer_without_freeze_fields(freeze_server):
@@ -507,7 +606,14 @@ def test_a_freeze_that_could_not_be_lifted_is_reported(freeze_server):
     c = lp.FreezeClient(srv.url, "t", DB)
     c.freeze()
     with pytest.raises(lp.L5Refused, match="NOT lifted"):
-        c.thaw_if_placed()
+        c.thaw()
+
+
+def test_require_refuses_an_open_store_and_says_how_to_freeze_it(freeze_server):
+    srv = freeze_server()
+    with pytest.raises(lp.L5Refused, match=f"local_primary.py freeze {DB}"):
+        lp.FreezeClient(srv.url, "t", DB).require("before the recheck")
+    assert ("POST", f"/admin/freeze/{DB}") not in srv.methods()
 
 
 def test_an_unreachable_service_is_a_refusal():
@@ -557,25 +663,44 @@ def test_cli_export_then_recheck_in_separate_processes(replica, tmp_path, cli_en
     assert code == 0, err
     receipt = out["receipt"]
     assert json.loads(Path(receipt).read_text())["tables"] == d1_stats(replica)
-    assert srv.state == "open"
+    assert srv.state == "frozen"  # left in place for the recheck and the step after it
     code, out, err = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
     assert (code, out["receipt"], out["fresh_export"]) == (0, receipt, False), err
     replica_exec(replica, "UPDATE memories SET tags = '[\"u\"]' WHERE id = 3")
     code, out, err = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
     assert code == 0 and out["fresh_export"] is True, err
     assert json.loads(Path(out["receipt"]).read_text())["tables"] == d1_stats(replica)
+    assert srv.state == "frozen" and ("DELETE", f"/admin/freeze/{DB}") not in srv.methods()
+    tok = common[common.index("--admin-token-file") + 1]
+    code, out, err = _cli(tmp_path, replica.path, "thaw", DB, "--memora-url", srv.url, "--admin-token-file", tok)
+    assert code == 0 and srv.state == "open", err
+
+
+def test_cli_recheck_without_a_freeze_is_refused(replica, tmp_path, cli_env):
+    srv, common = cli_env
+    code, out, _ = _cli(tmp_path, replica.path, "export", *common)
+    receipt = out["receipt"]
+    srv.state = "open"  # an operator thawed it
+    code, out, _ = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
+    assert code == 2 and f"local_primary.py freeze {DB}" in out["refused"]
+    assert srv.state == "open"
+    tok = common[common.index("--admin-token-file") + 1]
+    code, out, err = _cli(tmp_path, replica.path, "freeze", DB, "--memora-url", srv.url, "--admin-token-file", tok)
+    assert code == 0 and srv.state == "frozen", err
+    code, out, _ = _cli(tmp_path, replica.path, "recheck", *common, "--receipt", receipt)
+    assert code == 0 and out["fresh_export"] is False
 
 
 def test_cli_export_refuses_when_something_is_in_flight_after_the_export(replica, tmp_path, cli_env):
     """§9 p across a process boundary: the 3rd health read (after the export)
-    reports an in-flight exempt send; exit 2, no receipt, freeze lifted."""
+    reports an in-flight exempt send; exit 2, no receipt, freeze kept."""
     srv, common = cli_env
     ok = {"state": "frozen", "in_flight": 0, "open_intents": []}
     srv.health = [ok, ok, {"state": "frozen", "in_flight": 1, "open_intents": []}]
     code, out, err = _cli(tmp_path, replica.path, "export", *common)
     assert code == 2 and "in_flight=1" in out["refused"], err
     assert not list((tmp_path / "exports").rglob("*.receipt.json"))
-    assert srv.state == "open"
+    assert srv.state == "frozen"
 
 
 def test_cli_recheck_refuses_a_tampered_receipt(replica, tmp_path, cli_env):
@@ -619,7 +744,7 @@ def test_native_export_of_the_throwaway_database(tmp_path):
     if not ok:
         pytest.fail(f"refusing to touch D1: {why}")
     reader = lp.D1Reader(D1SelectOnlyConnection(account, database, token))
-    deps = lp.Deps(reader=reader, freeze=FakeBarrier(), r2=lp.FsR2(tmp_path / "r2"), account_id=account,
+    deps = lp.Deps(reader=reader, freeze=FakeBarrier(frozen=True), r2=lp.FsR2(tmp_path / "r2"), account_id=account,
                    database_id=database, d1_name=name, read_token=token, native_export=True)
     r = json.loads(lp.export(name, deps, tmp_path / "exports").read_text())
     print("native export method:", r["method"])

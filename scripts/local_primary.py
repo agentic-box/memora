@@ -4,8 +4,13 @@
 Run by hand, never by the service. The logic lives in memora/local_primary.py;
 this file only parses arguments and builds the dependencies.
 
+  freeze  <db>              place memora-all's freeze on the store (POST /admin/freeze)
   export  <db>              verified export under the freeze, R2 copy, receipt
-  recheck <db> --receipt R  under the freeze: D1 unchanged since R? (else a fresh export)
+  recheck <db> --receipt R  under the SAME freeze: D1 unchanged since R? (else a fresh export)
+  thaw    <db>              lift the freeze -- the only command that does
+
+No command lifts the freeze by itself: a recheck and the step that relies
+on it run under one freeze, lifted by `thaw` when the procedure is done.
 
 Exit codes: 0 done, 2 refused (nothing changed), 3 halted (see the message).
 Every run prints one JSON line on stdout with the outcome.
@@ -47,11 +52,23 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("--native-export", action="store_true",
                         help="try `wrangler d1 export --remote` first (read token); the paged SELECT is the fallback")
 
+    for name, text in (("freeze", "place the freeze"), ("thaw", "lift the freeze (the only command that does)")):
+        fz = sub.add_parser(name, help=text)
+        fz.add_argument("db")
+        fz.add_argument("--memora-url", default="http://127.0.0.1:8000")
+        fz.add_argument("--admin-token-file", required=True)
+        fz.add_argument("--health-token-file")
     common(sub.add_parser("export", help="P1 verified export with receipt"))
     rc = sub.add_parser("recheck", help="P1 freeze-recheck of a receipt")
     common(rc)
     rc.add_argument("--receipt", required=True)
     return p
+
+
+def _freeze_client(args) -> lp.FreezeClient:
+    admin = lp.load_credential_file(args.admin_token_file)
+    health = lp.load_credential_file(args.health_token_file) if args.health_token_file else None
+    return lp.FreezeClient(args.memora_url, admin, args.db, health_token=health)
 
 
 def _deps(args) -> lp.Deps:
@@ -64,9 +81,7 @@ def _deps(args) -> lp.Deps:
     else:
         if not args.admin_token_file:
             raise lp.L5Refused("--admin-token-file is required to place the freeze (or pass --service-stopped)")
-        admin = lp.load_credential_file(args.admin_token_file)
-        health = lp.load_credential_file(args.health_token_file) if args.health_token_file else None
-        barrier = lp.FreezeClient(args.memora_url, admin, args.db, health_token=health)
+        barrier = _freeze_client(args)
     r2 = lp.FsR2(Path(args.r2_dir)) if args.r2_dir else lp.S3R2(args.r2_bucket)
     return lp.Deps(reader=reader, freeze=barrier, r2=r2, account_id=args.account,
                    database_id=args.database_id, d1_name=args.d1_name, read_token=token,
@@ -76,6 +91,11 @@ def _deps(args) -> lp.Deps:
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.cmd in ("freeze", "thaw"):
+            client = _freeze_client(args)
+            client.freeze() if args.cmd == "freeze" else client.thaw()
+            print(json.dumps({"ok": True, args.cmd: args.db}))
+            return 0
         deps = _deps(args)
         if args.cmd == "export":
             receipt = lp.export(args.db, deps, Path(args.out_dir))

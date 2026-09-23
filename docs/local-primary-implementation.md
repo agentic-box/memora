@@ -889,6 +889,18 @@ Other rules:
     classes (`D1SelectOnlyConnection` for reads, and `D1Connection` with the
     operator credential for the write paths). So the F2 CI guard's
     allow-list stays `memora/backends.py` only.
+- **Freeze lifetime, receipt binding, sequences (L5 review 7621).**
+  - No command lifts the freeze by itself. `export` places it if needed and
+    leaves it in place. `recheck` and every step that relies on it (seed,
+    sequence high-water, restore) require the freeze to be in place already,
+    and refuse otherwise. Only the explicit `thaw` command lifts it.
+    `freeze` places it by hand.
+  - A receipt is bound to the D1 database, not only the store name:
+    `account_id`, `database_id` and `d1_uri` must equal the command's.
+  - `sqlite_sequence` is in the hashed set, ordered by name. The paged dump
+    replaces each auto-created sequence row with D1's counter
+    (`DELETE` then `INSERT`), so the next id after a load is D1's
+    counter + 1.
 - **`seed <db> --receipt R --out /data/<db>.db`**
   1. Load the receipt's export into a fresh file.
   2. Run `ensure_schema`.
