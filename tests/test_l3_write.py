@@ -190,9 +190,7 @@ os.environ['MEMORA_TEST_KILL_AFTER_SEND'] = '1'
 from memora import replicator as R
 from memora.backends import LocalSQLiteBackend
 from tests.l3_fakes import FakeReplica, URI
-rep = FakeReplica.__new__(FakeReplica)
-rep.path = __import__('pathlib').Path({str(replica.path)!r}); rep.statements = []; rep.reads = []
-rep.fail_before = None; rep.apply_then_raise = None; rep.reject_batch_400 = False; rep.result_override = None
+rep = FakeReplica(__import__('pathlib').Path({str(replica.path)!r}))
 r = R.StoreReplicator('s1', LocalSQLiteBackend({str(local.db_path)!r}), URI, mode='write',
                       writer_factory=rep.writer, reader_factory=rep.reader, broadcast=lambda: None)
 r._open(); r.run_once()
@@ -387,3 +385,165 @@ def test_a_thread_drains_after_a_commit(env):
         assert [r["content"] for r in replica.rows("memories")] == ["woke"]
     finally:
         rep.stop()
+
+
+# ------------------------------------------------------------------ round 2 (review 7599)
+
+def test_freeze_waits_for_a_replicator_send_and_never_certifies_an_empty_marker(env):
+    """P1-1: a held execute_batch is in flight on the store's gate; freeze()
+    waits for it, and the marker the gate sees is the durable one."""
+    import threading
+    import time
+
+    local, replica = env
+    _write_everything(local)
+    gate = local.write_gate()
+    box = {}
+
+    def send():  # the replicator's connection belongs to the thread that opened it
+        box["rep"] = _rep(local, replica)
+        gate.journal_status = lambda: (box["rep"].open_marker(), None)
+        box["rep"].run_once()
+
+    replica.hold, replica.arrived = threading.Event(), threading.Event()
+    sender = threading.Thread(target=send)
+    sender.start()
+    assert replica.arrived.wait(5)
+    rep = box["rep"]
+    assert rep.open_marker(), "the marker is set before the send"
+    done = threading.Event()
+    freezer = threading.Thread(target=lambda: (gate.freeze(timeout_s=5), done.set()))
+    freezer.start()
+    time.sleep(0.2)
+    assert not done.is_set() and gate.state == "draining"
+    replica.hold.set()
+    sender.join(5)
+    freezer.join(5)
+    assert done.is_set() and gate.state == "frozen" and rep.open_marker() == []
+    assert sync_state(local)["inflight_id"] is None
+    gate.thaw()
+
+
+def test_a_failed_send_leaves_the_store_frozen_unsafe(env):
+    local, replica = env
+    _write_everything(local)
+    rep = _rep(local, replica)
+    gate = local.write_gate()
+    gate.journal_status = lambda: (rep.open_marker(), None)
+    replica.fail_before = TimeoutError("unknown outcome")
+    with pytest.raises(TimeoutError):
+        rep.run_once()
+    gate.freeze(timeout_s=1)
+    assert gate.state == "frozen-unsafe" and rep.open_marker()
+    rep2 = _rep(local, replica)  # a new process sees the durable marker at once
+    assert rep2.open_marker() == rep.open_marker()
+    gate.thaw()
+
+
+def test_foreign_keys_parent_before_child_reviewers_sequence(env):
+    """P1-2: INSERT memories 1, INSERT embedding 1, UPDATE memories 1 --
+    coalescing puts the embedding (seq 2) before its parent (seq 3)."""
+    local, replica = env
+    conn = local.connect()
+    conn.execute("INSERT INTO memories (id, content, tags, created_at) VALUES (1, 'a', '[]', 't')")
+    conn.execute("INSERT INTO memories_embeddings (memory_id, embedding, writer_token) VALUES (1, '{}', 'w')")
+    conn.execute("UPDATE memories SET content = 'a2' WHERE id = 1")
+    conn.commit()
+    conn.close()
+    assert _drain(_rep(local, replica))[-1] == "idle"
+    _assert_converged(local, replica)
+
+
+def test_foreign_keys_across_a_batch_boundary(env):
+    """The child's outbox row comes first and the batch holds one row: the
+    parent's current row travels with it."""
+    local, replica = env
+    conn = local.connect()
+    conn.execute("INSERT INTO memories_embeddings (memory_id, embedding, writer_token) VALUES (1, '{}', 'w')")
+    conn.execute("INSERT INTO memories_crossrefs (memory_id, related) VALUES (1, '[]')")
+    conn.execute("INSERT INTO memories (id, content, tags, created_at) VALUES (1, 'a', '[]', 't')")
+    conn.commit()
+    conn.close()
+    rep = _rep(local, replica, batch_rows=1)
+    assert rep.run_once() == "sent"
+    assert [r["id"] for r in replica.rows("memories")] == [1]
+    assert _drain(rep)[-1] == "idle"
+    _assert_converged(local, replica)
+
+
+def test_foreign_keys_parent_delete_with_children(env):
+    local, replica = env
+    conn = local.connect()
+    for i in range(1, 121):  # enough rows that 1 delete stays under the P3 guard
+        conn.execute("INSERT INTO memories (id, content, tags, created_at) VALUES (?, 'x', '[]', 't')", (i,))
+        conn.execute("INSERT INTO memories_embeddings (memory_id, embedding, writer_token) VALUES (?, '{}', 'w')", (i,))
+        conn.execute("INSERT INTO memories_crossrefs (memory_id, related) VALUES (?, '[]')", (i,))
+    conn.commit()
+    conn.close()
+    rep = _rep(local, replica, batch_rows=10_000)
+    _drain(rep)
+    conn = local.connect()
+    conn.execute("DELETE FROM memories WHERE id = 7")  # the parent's outbox row comes FIRST
+    conn.execute("DELETE FROM memories_embeddings WHERE memory_id = 7")
+    conn.execute("DELETE FROM memories_crossrefs WHERE memory_id = 7")
+    conn.commit()
+    conn.close()
+    assert _drain(rep)[-1] == "idle"
+    _assert_converged(local, replica)
+    order = [s.split(" WHERE")[0] for s in replica.statements[-4:-1]]
+    assert order[-1] == "DELETE FROM memories"  # the parent is deleted last
+
+
+def test_a_result_without_success_is_not_acked(env):
+    """P1-4: every result must say success: true."""
+    local, replica = env
+    _write_everything(local)
+    replica.result_override = lambda out: [{k: v for k, v in out[0].items() if k != "success"}] + out[1:]
+    rep = _rep(local, replica)
+    with pytest.raises(RuntimeError, match="every statement"):
+        rep.run_once()
+    st = sync_state(local)
+    assert st["last_acked_seq"] == 0 and st["inflight_id"]
+    replica.result_override = None
+    assert rep.run_once() == "reconciled-acked"  # the H3 path, not a silent ack
+
+
+def test_live_d1_guard_refuses_a_database_that_is_not_the_named_throwaway():
+    """P1-3: the live module checks the API-reported name before any write."""
+    from tests.live_d1_guard import verify_throwaway
+
+    def fetch(name):
+        return lambda account, database, token: {"name": name}
+
+    ok, why = verify_throwaway("a", "d", "t", "my-throwaway-db", fetch=fetch("production-memora"))
+    assert not ok and "production-memora" in why
+    ok, why = verify_throwaway("a", "d", "t", "my-throwaway-db", fetch=fetch("other-throwaway-db"))
+    assert not ok
+    ok, why = verify_throwaway("a", "d", "t", "prod", fetch=fetch("prod"))
+    assert not ok and "throwaway" in why
+    ok, _ = verify_throwaway("a", "d", "t", "my-throwaway-db", fetch=fetch("my-throwaway-db"))
+    assert ok
+
+    def broken(account, database, token):
+        raise OSError("network down")
+
+    ok, why = verify_throwaway("a", "d", "t", "my-throwaway-db", fetch=broken)
+    assert not ok and "lookup failed" in why
+
+
+def test_marker_stays_visible_until_the_ack_commits(env, monkeypatch):
+    local, replica = env
+    _write_everything(local)
+    rep = _rep(local, replica)
+    seen = []
+    real = rep._ack_locked
+
+    def spy(*a, **k):
+        seen.append(list(rep.open_marker()))
+        real(*a, **k)
+        seen.append(list(rep.open_marker()))
+
+    monkeypatch.setattr(rep, "_ack_locked", spy)
+    assert rep.run_once() == "sent"
+    assert seen[0] and seen[1], "cleared before the ack committed"
+    assert rep.open_marker() == []

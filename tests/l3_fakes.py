@@ -38,10 +38,13 @@ class FakeReplica:
         self.apply_then_raise = None   # (k, exc): apply k statements, then raise exc
         self.reject_batch_400 = False
         self.result_override = None
+        self.hold = None       # threading.Event: a batch waits on it after arriving
+        self.arrived = None    # threading.Event: set when a batch arrives
 
     def _db(self):
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
+        db.execute("PRAGMA foreign_keys = ON")  # D1 enforces foreign keys by default
         return db
 
     def _run(self, db, sql, params):
@@ -51,6 +54,10 @@ class FakeReplica:
         return {"results": rows, "success": True, "meta": {"served_by_primary": True}}
 
     def post_json(self, body):
+        if self.arrived is not None:
+            self.arrived.set()
+        if self.hold is not None:
+            assert self.hold.wait(10), "test hold never released"
         if self.fail_before is not None:
             raise self.fail_before
         if "batch" in body and self.reject_batch_400:

@@ -88,8 +88,16 @@ class _WriteGate:
 
     # ------------------------------------------------------------ admission
 
-    def enter(self, desc: str) -> _GateToken:
+    def enter(self, desc: str, *, exempt: bool = False) -> _GateToken:
+        """Admit one write. `exempt` (the replicator only, plan §1 H6): not
+        refused while frozen or draining -- ingress is frozen, the replicator
+        must still drain -- but counted in flight, so freeze() waits for it
+        and a frozen store with it in flight is not "frozen, 0 in flight"."""
         with self._cond:
+            if exempt:
+                tok = _GateToken(desc, threading.get_ident())
+                self._in_flight[id(tok)] = tok
+                return tok
             if self._frozen or self._draining:
                 raise StoreReadOnlyError(
                     f"store {self.name or self.key!r} is {self.state_locked()}: writes are refused"

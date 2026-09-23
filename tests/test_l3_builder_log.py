@@ -119,9 +119,10 @@ def test_outbox_reader_coalesces_in_seq_order_and_current_row_decides(tmp_path):
     batch = R.read_batch(conn, 0, 100)
     conn.close()
     keys = [(k.tbl, k.pk, None if k.row is None else k.row.get("content", k.row.get("related"))) for k in batch.keys]
-    # coalesced to each key's HIGHEST seq, and ordered by it: 1 (seq 3), 2 (seq 4), crossrefs (seq 5)
-    assert keys == [("memories", [1], "a2"), ("memories", [2], None), ("memories_crossrefs", [1], "[]")]
-    assert [k.seq for k in batch.keys] == [3, 4, 5]
+    # coalesced to each key's HIGHEST seq; ordered parent upserts, other
+    # tables, then parent deletes (D1 foreign keys), by seq within each
+    assert keys == [("memories", [1], "a2"), ("memories_crossrefs", [1], "[]"), ("memories", [2], None)]
+    assert [k.seq for k in batch.keys] == [3, 5, 4]
     assert batch.lo == 1 and batch.hi == 5 and batch.deletes == {"memories": 1}
 
 

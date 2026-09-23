@@ -498,6 +498,13 @@ cycle.
   - `trg_embedding_external_insert` fires only when `writer_token IS NULL`,
     and then the local row is identical anyway.
 - **Delete:** `DELETE FROM <T> WHERE <all pk cols>=?`.
+- **Foreign keys (L3 review 7599 P1-2).** D1 enforces foreign keys
+  (https://developers.cloudflare.com/d1/sql-api/foreign-keys/), and
+  `memories_embeddings` and `memories_crossrefs` reference `memories(id)`.
+  A batch therefore sends parent upserts first, then every other table, then
+  parent deletes. A child upsert always travels with its parent's current
+  row, even when the parent's own outbox rows are outside the range. A
+  child whose parent is gone locally is sent as a delete.
 
 Explicit ids advance D1's `sqlite_sequence` for any row that reaches D1. For
 the one case that does not reach it, see §4 (sequence high-water).
@@ -1408,3 +1415,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (k) `acquire_primary_lock` runs before `_ensure_parent_dir`, so a live primary whose parent directory does not exist yet raises FileNotFoundError on first start instead of creating it (L2 review 7592 P2). The seed creates the parent | L5 | with L5 |
 | (l) watchdog alerts for replication (§2.5: `oldest_unacked_age_s > 300`, `status == halted`, `d1_missing_vectors > 0`). L3 exposes the metrics on `/health/db/<db>` (authorised); `scripts/memora_watchdog.py` is liveness-only by design, so the alert is a separate check | L9 | before the first cutover |
 | (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | with L6 |
+| (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week) | L9 | after the log-only week |

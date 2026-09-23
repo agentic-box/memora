@@ -37,6 +37,10 @@ MODE_LOG = "log"
 MODE_WRITE = "write"
 EPOCH_SQL = "SELECT value FROM memories_meta WHERE key = 'embedding_change_epoch'"
 EMBEDDINGS = "memories_embeddings"
+# D1 enforces foreign keys (https://developers.cloudflare.com/d1/sql-api/foreign-keys/);
+# memora's replicated children of memories(id) (schema.py, ON DELETE CASCADE).
+FK_PARENT = "memories"
+FK_CHILDREN = ("memories_embeddings", "memories_crossrefs")
 DELETE_GUARD_ROWS = 50
 DELETE_GUARD_FRACTION = 0.01
 BACKOFF_MAX_S = 60.0
@@ -203,9 +207,20 @@ def read_batch(conn, cursor: int, limit: int, *, hi_cap: Optional[int] = None) -
     for k in keys:
         if k.tbl not in SYNC_TABLES:
             raise ReplicatorStatementError(f"outbox names a table that is not replicated: {k.tbl!r}")
+        k.row = _local_row(conn, k.tbl, k.pk)
+    _add_parents(conn, batch)
+    # Dependency order (review 7599 P1-2; D1 enforces foreign keys): parent
+    # upserts first, then every other table, then parent deletes -- so a
+    # child is never written before its parent, and a parent is deleted
+    # only after its children.
+    def phase(k: _Key) -> int:
+        if k.tbl == FK_PARENT:
+            return 0 if k.row is not None else 2
+        return 1
+    batch.keys = sorted(batch.keys, key=lambda k: (phase(k), k.seq))
+    for k in batch.keys:
         if k.tbl not in columns:
             columns[k.tbl] = _table_columns(conn, k.tbl)
-        k.row = _local_row(conn, k.tbl, k.pk)
         if k.row is None:
             batch.deletes[k.tbl] = batch.deletes.get(k.tbl, 0) + 1
         k.statements = _build_statements(k.tbl, k.pk, k.row, columns[k.tbl])
@@ -213,6 +228,31 @@ def read_batch(conn, cursor: int, limit: int, *, hi_cap: Optional[int] = None) -
             _check_statement(stmt[0])
             batch.statements.append(stmt)
     return batch
+
+
+def _add_parents(conn, batch: _Batch) -> None:
+    """Every child upsert in the batch travels with its parent's CURRENT row,
+    even when the parent's own outbox rows are outside the range: a batch
+    never splits a child from the parent it needs. A child whose parent is
+    gone locally is sent as a delete (D1 cannot hold an orphan)."""
+    present = {(k.tbl, json.dumps(k.pk)) for k in batch.keys}
+    extra: List[_Key] = []
+    for k in batch.keys:
+        if k.tbl not in FK_CHILDREN or k.row is None:
+            continue
+        pid = k.row.get("memory_id")
+        key = (FK_PARENT, json.dumps([pid]))
+        if key in present:
+            continue
+        parent = _local_row(conn, FK_PARENT, [pid])
+        if parent is None:
+            logger.warning("replicator: %s row %s has no parent memories row %s locally; sending a delete",
+                           k.tbl, k.pk, pid)
+            k.row = None
+            continue
+        present.add(key)
+        extra.append(_Key(k.seq, FK_PARENT, [pid], parent))
+    batch.keys.extend(extra)
 
 
 def delete_guard(conn, batch: _Batch) -> Optional[str]:
@@ -417,6 +457,11 @@ class StoreReplicator:
         self._lock = threading.Lock()
         self._metrics: Dict[str, Any] = {"mode": mode, "status": "disabled", "last_error": None,
                                          "d1_missing_vectors": None}
+        # The H3 marker as the store's gate sees it (review 7599 P1-1): set in
+        # the same critical section as the marker's commit, BEFORE the send,
+        # and cleared only after the ack (or the reconcile) commits.
+        self._marker_lock = threading.RLock()  # re-entrant: the owner may read it during the ack
+        self._marker: Optional[str] = None
 
     # --------------------------------------------------------------- local state
 
@@ -525,30 +570,61 @@ class StoreReplicator:
             self._halt("config: sync_state.d1_epoch_expected is not set (the seed sets it)")
             return "halted"
         inflight = uuid.uuid4().hex
-        # H3: durable marker BEFORE anything is sent.
-        self._local_txn([("UPDATE sync_state SET inflight_id = ?, inflight_lo = ?, inflight_hi = ?, "
-                          "inflight_epoch_before = ?, inflight_at = ? WHERE id = 1",
-                          (inflight, batch.lo, batch.hi, int(expected), _now_iso()))])
-        # H2 preflight: its own request, before any mutating request.
-        pre = self._read_epoch()
-        relaxed = self._relaxed_epoch_before
-        if (relaxed is None and pre != int(expected)) or (relaxed is not None and pre < relaxed):
-            self._halt(f"foreign_writer: expected {expected} got {pre}")
-            return "halted"
-        results = self._d1().execute_batch(batch.statements + [(EPOCH_SQL, ())])
-        _test_hook("MEMORA_TEST_KILL_AFTER_SEND")
-        if len(results) != len(batch.statements) + 1 or not all(r.get("success", True) for r in results):
-            raise RuntimeError("D1 batch did not succeed for every statement")
-        post_rows = results[-1].get("results") or []
-        if not post_rows:
-            raise RuntimeError("the batch's epoch postcheck returned no row")
-        self._relaxed_epoch_before = None
-        self._ack(batch.hi, int(post_rows[0]["value"]), unverified=False)
-        return "sent"
+        # The whole send..ack is one in-flight entry of the store's gate
+        # (exempt: it drains while ingress is frozen), so freeze() waits for
+        # it; a failure leaves the durable marker, i.e. an open intent.
+        token = self._gate_enter("replicator send")
+        try:
+            # H3: durable marker BEFORE anything is sent.
+            with self._marker_lock:
+                self._local_txn([("UPDATE sync_state SET inflight_id = ?, inflight_lo = ?, inflight_hi = ?, "
+                                  "inflight_epoch_before = ?, inflight_at = ? WHERE id = 1",
+                                  (inflight, batch.lo, batch.hi, int(expected), _now_iso()))])
+                self._marker = inflight
+            # H2 preflight: its own request, before any mutating request.
+            pre = self._read_epoch()
+            relaxed = self._relaxed_epoch_before
+            if (relaxed is None and pre != int(expected)) or (relaxed is not None and pre < relaxed):
+                self._halt(f"foreign_writer: expected {expected} got {pre}")
+                return "halted"
+            results = self._d1().execute_batch(batch.statements + [(EPOCH_SQL, ())])
+            _test_hook("MEMORA_TEST_KILL_AFTER_SEND")
+            if len(results) != len(batch.statements) + 1 or not all(r.get("success") is True for r in results):
+                raise RuntimeError("D1 batch did not succeed for every statement")
+            post_rows = results[-1].get("results") or []
+            if not post_rows:
+                raise RuntimeError("the batch's epoch postcheck returned no row")
+            self._relaxed_epoch_before = None
+            self._ack(batch.hi, int(post_rows[0]["value"]), unverified=False)
+            return "sent"
+        finally:
+            self._gate_leave(token)
+
+    def _gate_enter(self, desc: str):
+        gate_fn = getattr(self.local, "write_gate", None)
+        if gate_fn is None or self.shadow:
+            return None
+        gate = gate_fn()
+        return (gate, gate.enter(desc, exempt=True))
+
+    def _gate_leave(self, token) -> None:
+        if token is not None:
+            token[0].leave(token[1])
 
     def _ack(self, hi: int, post_epoch: int, *, unverified: bool) -> None:
         """Ack and prune in one local transaction (plan §2.4). Outbox rows are
         kept until a clean compare consumed them, and for at least 24 h."""
+        with self._marker_lock:
+            self._ack_locked(hi, post_epoch, unverified=unverified)
+            self._marker = None
+        self._backoff = 0.0
+        self._refresh_metrics(status="running")
+        try:
+            self._broadcast()
+        except Exception as exc:  # the broadcast is advisory
+            logger.warning("replicator %s: broadcast after ack failed: %s", self.name, exc)
+
+    def _ack_locked(self, hi: int, post_epoch: int, *, unverified: bool) -> None:
         self._local_txn([
             ("UPDATE sync_state SET last_acked_seq = ?, d1_epoch_expected = ?, inflight_id = NULL, "
              "inflight_lo = NULL, inflight_hi = NULL, inflight_epoch_before = NULL, inflight_at = NULL, "
@@ -558,18 +634,19 @@ class StoreReplicator:
             ("DELETE FROM sync_outbox WHERE seq <= MIN(?, (SELECT compare_consumed_seq FROM sync_state WHERE id = 1)) "
              "AND created_at < julianday('now') - 1", (hi,)),
         ])
-        self._backoff = 0.0
-        self._refresh_metrics(status="running")
-        try:
-            self._broadcast()
-        except Exception as exc:  # the broadcast is advisory
-            logger.warning("replicator %s: broadcast after ack failed: %s", self.name, exc)
 
     def _reconcile(self, state: Dict[str, Any]) -> str:
         """H3: a marker is present, so the previous send's outcome is unknown.
         Read the range's keys back from D1: all equal -> ack (epoch
         unverified); otherwise clear the marker and resend with the
         preflight relaxed to >= the marker's epoch_before."""
+        token = self._gate_enter("replicator reconcile")
+        try:
+            return self._reconcile_entered(state)
+        finally:
+            self._gate_leave(token)
+
+    def _reconcile_entered(self, state: Dict[str, Any]) -> str:
         lo, hi = int(state["inflight_lo"]), int(state["inflight_hi"])
         batch = read_batch(self._conn, lo - 1, 1_000_000, hi_cap=hi)
         reader = self._read()
@@ -586,8 +663,10 @@ class StoreReplicator:
             self._ack(hi, self._read_epoch(), unverified=True)
             return "reconciled-acked"
         self._relaxed_epoch_before = int(state["inflight_epoch_before"])
-        self._local_txn([("UPDATE sync_state SET inflight_id = NULL, inflight_lo = NULL, inflight_hi = NULL, "
-                          "inflight_epoch_before = NULL, inflight_at = NULL WHERE id = 1", ())])
+        with self._marker_lock:
+            self._local_txn([("UPDATE sync_state SET inflight_id = NULL, inflight_lo = NULL, inflight_hi = NULL, "
+                              "inflight_epoch_before = NULL, inflight_at = NULL WHERE id = 1", ())])
+            self._marker = None
         return "reconciled-resend"
 
     # --------------------------------------------------------------- metrics
@@ -627,15 +706,19 @@ class StoreReplicator:
 
     def open_marker(self) -> List[str]:
         """The H3 in-flight marker, as an open intent of the store's gate
-        (plan §1): a frozen store with a marker is frozen-unsafe."""
-        with self._lock:
-            iid = self._metrics.get("inflight_id")
+        (plan §1): a frozen store with a marker is frozen-unsafe. It mirrors
+        the DURABLE marker (set with its commit, before the send; cleared
+        after the ack commits), never the last metrics refresh."""
+        with self._marker_lock:
+            iid = self._marker
         return [f"replica-inflight:{iid}"] if iid else []
 
     # --------------------------------------------------------------- thread
 
     def _open(self) -> None:
         self._conn = self.local.connect_replicator()
+        with self._marker_lock:
+            self._marker = self._state().get("inflight_id")  # a marker left by a previous process
         self._refresh_metrics(status="running")
 
     def start(self) -> None:

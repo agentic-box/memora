@@ -44,7 +44,17 @@ TABLE = "memories_meta"
 
 @pytest.fixture(scope="module")
 def ids():
-    return os.environ["MEMORA_D1_TEST_ACCOUNT"], os.environ["MEMORA_D1_TEST_DATABASE"]
+    """The database ids, only after the API confirms (read token) that this
+    id IS the named throwaway database. Nothing is set up or written before
+    this passes; a mismatch or a lookup failure FAILS the module."""
+    from tests.live_d1_guard import verify_throwaway
+
+    account, database = os.environ["MEMORA_D1_TEST_ACCOUNT"], os.environ["MEMORA_D1_TEST_DATABASE"]
+    ok, why = verify_throwaway(account, database, os.environ["MEMORA_D1_TEST_READ_TOKEN"],
+                               os.environ["MEMORA_D1_TEST_DATABASE_NAME"])
+    if not ok:
+        pytest.fail(f"refusing to touch D1: {why}")
+    return account, database
 
 
 @pytest.fixture(scope="module")
