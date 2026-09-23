@@ -9,6 +9,7 @@ The user's decisions (leader msgs 7507, 7520):
 - nuc8 `memora-all` becomes the only D1 writer.
 - **D1 is precious.** Today it is the only complete copy of every store, so
   §0 overrides every other section.
+- **D1 stays primary during the shadow period** (msg 7526; §2.9).
 
 Nothing runs against a live store before its cutover slice. All tests are
 offline, using local SQLite and FakeD1 (`tests/conftest.py`).
@@ -23,9 +24,27 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
     per-table row counts and content hashes must equal the same values read
     from D1 right after the export. The content hash is sha256 over rows
     ordered by pk. On a mismatch it retries up to 3 times, then fails.
-  - It writes a receipt, `<ts>.receipt.json`, containing the db, the D1
-    `database_id`, per-table counts and hashes, the sha256 of the SQL file,
-    the R2 key and `verified_at`.
+  - It records D1's `embedding_change_epoch` just before and just after the
+    export. The two must be equal, or it retries.
+  - It uploads the file to R2, then reads the object back and hashes it. The
+    receipt is accepted only when the read-back sha256 equals the local
+    file's.
+  - It writes a receipt, `<ts>.receipt.json`, containing:
+    - the db and the D1 `database_id`;
+    - the D1 epoch;
+    - per-table row counts and content hashes;
+    - the sha256 of the SQL file;
+    - the R2 key and the sha256 of the R2 object as read back;
+    - `verified_at`.
+  - **Freeze-recheck (`local_primary.py recheck <db> --receipt R`)** runs
+    immediately before seed and before any repoint (cutover, rollback,
+    restore). It:
+    1. freezes the source store (§1 freeze file);
+    2. re-reads D1's epoch and per-table `COUNT(*)`;
+    3. compares them with the receipt.
+    If anything differs, it takes a fresh export and receipt while still
+    frozen, and the step continues with that receipt. The freeze stays in
+    place until the step completes.
   - A fresh receipt is required for EVERY store before the first replicator
     write reaches D1. A receipt for the affected store is required before
     each cutover, rollback, restore and sequence high-water step. Each of
@@ -53,24 +72,33 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
     for that one attempt only.
   - Tables under 100 rows therefore halt on any delete; that is deliberate.
   - The same guard applies to restore replay (§4).
-- **P4. Log-only first.** `MEMORA_REPLICATION=log` builds, checks and logs
-  every statement (JSONL, `/data/replica-log/<db>/`). It sends nothing to D1
-  and acks nothing: a `log_cursor_seq` in `sync_state` avoids logging twice.
-  - The first migrated store runs log-only for at least 7 days. For that
-    week its D1 copy and the viewer are stale; the store's durability is the
-    local file plus the nightly R2 snapshot (§4).
-  - The §5.2 compare runs nightly by replaying the logs into a scratch copy
-    of the store's latest verified export and comparing that copy with the
-    local snapshot. Writes (`MEMORA_REPLICATION=write`) are enabled only after
-    7 consecutive clean nights.
+- **P4. Shadow-local first; D1 stays primary** (P0-1, user decision
+  7526). Each store first runs in shadow-local mode (§2.9) for at least 7
+  consecutive clean nights, while D1 remains its primary. During that time:
+  - the app writes D1 exactly as today;
+  - a single feature-flagged wrapper (`MEMORA_SHADOW_LOCAL`) mirrors each
+    successful D1 write into a local shadow file, best effort;
+  - the replicator runs with `MEMORA_REPLICATION=log` against the shadow's
+    outbox. It builds, checks and logs every statement (JSONL,
+    `/data/replica-log/<db>/`, made durable as in §2.2 step 5), sends nothing
+    and acks nothing;
+  - reads stay on D1.
+  Consequences:
+  - D1 is never stale, and a bug in the local path cannot touch D1.
+  - The cost is the temporary dual-write wrapper, which is removed after the
+    last cutover (L13).
+  Cutover never promotes the shadow file. It is: freeze, a FULL re-seed from
+  a fresh verified export, recheck, repoint, and write mode (§8 L9).
 - **P5. Order.** Least critical first; `memora` last. Each store waits until
   the previous one has completed a clean week with writes enabled (§8).
 - **P6. Old tools inert before L2.** `sync-to-d1.py` (every remote run, not
   only `--replace`), `link-r2-images.py` and `setup-cloudflare.sh` (remote
   migration and Pages deploy) must exit 1 before slice L2 lands. The CI
   guard (F2) holds them there.
-- **P7. No automatic D1 deletes by rollback or restore.** Any diff that would
-  need a D1 delete is reported for a human decision (§4, §5.3).
+- **P7. No automatic D1 writes by rollback or restore.** Rollback writes
+  nothing to D1 except the operator-run sequence step (§4). Restore writes
+  only the keys an operator selected one by one (§4). Every other difference
+  is reported for a human decision.
 
 §8 lists the D1 statements each slice can issue.
 
@@ -101,7 +129,8 @@ CREATE TABLE sync_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   replica_uri TEXT NOT NULL,
   last_acked_seq INTEGER NOT NULL,
-  log_cursor_seq INTEGER NOT NULL DEFAULT 0,   -- P4
+  log_cursor_seq INTEGER NOT NULL DEFAULT 0,   -- log mode (P4)
+  compare_consumed_seq INTEGER NOT NULL DEFAULT 0,  -- P1-5: highest seq a clean compare covered
   d1_epoch_expected INTEGER,
   trigger_version INTEGER NOT NULL,
   inflight_id TEXT, inflight_lo INTEGER, inflight_hi INTEGER,
@@ -154,8 +183,11 @@ Not replicated:
     `apply_backfill_47.py`), take that lock non-blocking and refuse if it is
     held. So no external writer runs while the service runs; maintenance goes
     through the API or a stopped service.
-- **`MEMORA_READONLY_DBS`** (a list of names): `LocalSQLiteBackend.connect()`
-  raises `StoreReadOnlyError`. `connect_replicator()` bypasses it; it is the
+- **Freeze.** A store is frozen when it is named in `MEMORA_READONLY_DBS` or
+  when the file `/data/freeze/<db>` exists. The file needs no restart.
+  `backend_for(name).connect()` raises `StoreReadOnlyError`, and this applies
+  to every backend kind, so a store still on `d1://` can be frozen before its
+  cutover. `connect_replicator()` bypasses it; it is the
   replicator's only entry point, and a test asserts no other module calls it
   (H6).
 
@@ -180,6 +212,11 @@ There is one daemon thread per store that is local, named in
 next to `_startup_import_sweep` (server.py:3550), only when
 `MEMORA_REPLICATION` is `log` or `write`.
 
+The replicator's D1 connection is schema-free: `D1Backend` is opened without
+`ensure_schema`, like `connect_without_schema`. The replicator therefore
+never sends DDL to D1. A test asserts that FakeD1 receives no
+`CREATE`/`DROP`/`ALTER`/`INSERT OR IGNORE INTO memories_meta` from it.
+
 ### 2.2 Loop
 
 The thread owns one anchor writer from `connect_replicator()` for the life of
@@ -187,13 +224,23 @@ the process. Holding a writer open does not hold a `_StoreRWLock` side: only
 open and close do. It wakes on `_notify_commit(db_path)`, a per-path
 `threading.Event` set by `_LockedWriterConnection.commit()`, or after
 `poll_s`. Each cycle:
-1. Read `SELECT seq,tbl,op,pk FROM sync_outbox WHERE seq > :acked ORDER BY seq LIMIT :n`.
+1. Read `SELECT seq,tbl,op,pk FROM sync_outbox WHERE seq > :cursor ORDER BY seq LIMIT :n`.
+   `:cursor` is `last_acked_seq` in write mode and `log_cursor_seq` in log
+   mode.
 2. Coalesce on (tbl, pk), keeping the highest seq.
 3. Read each key's current local row. A present row becomes an upsert; an
    absent row becomes a delete.
 4. Run P2 and P3.
-5. In **log** mode, append the statements to the log and advance
-   `log_cursor_seq`.
+5. In **log** mode:
+   1. Append one JSONL record per statement. Each record carries
+      `attempt_id`, `seq`, `tbl`, `pk`, `sql` and `params`.
+   2. `flush`, then `os.fsync` the file, plus the directory when the file is
+      new.
+   3. Only after the fsync returns, run a `store_write` that sets
+      `log_cursor_seq=:hi`.
+   A crash between steps 2 and 3 makes the next cycle append the same range
+   again. Readers deduplicate by `seq`, and apply is idempotent. A torn
+   final line is dropped when the log is read.
 6. In **write** mode:
    1. Write the H3 marker in a local transaction:
       `inflight_id = uuid`, `lo..hi`, `inflight_epoch_before = expected`.
@@ -244,8 +291,10 @@ Decision:
   - `last_acked_seq=:hi`;
   - `d1_epoch_expected=:post`;
   - clear the `inflight_*` marker;
-  - `DELETE FROM sync_outbox WHERE seq <= :acked AND created_at < julianday('now') - 1`.
-  Acked rows are kept for 24 h because §5.2 needs them.
+  - `DELETE FROM sync_outbox WHERE seq <= min(:acked, compare_consumed_seq) AND created_at < julianday('now') - 1`.
+  Outbox rows are kept until a clean compare has consumed them, and for at
+  least 24 h. In log mode nothing is acked, so nothing is pruned. The compare
+  can therefore also derive the expected key set from the outbox (§5.2).
 - **After the ack:** `cloud_sync.schedule_sync()`, which sends `/broadcast`.
 - **Anything else** leaves the marker in place and triggers reconciliation
   (§2.7), with backoff of 1, 2, 4 … 60 s.
@@ -319,6 +368,60 @@ store is halted at that point, the gap persists. This is accepted:
 `MEMORA_REPLICA_SYNC_WAIT_S`, default 0. `_notify_commit` waits, outside
 every lock, for `last_acked_seq >= MAX(seq)`, up to that many seconds. It
 never fails a write.
+
+### 2.9 Shadow-local mode (`memora/shadow.py`, L3b)
+
+`MEMORA_SHADOW_LOCAL='{"<db>": "/data/shadow/<db>.db"}'` holds one entry
+per store in shadow. The registry keeps the store on `d1://`, so every read
+and every primary write still go to D1.
+
+- **The only hook.** `D1Backend.connect()` returns a
+  `ShadowingD1Connection(D1Connection)` for a shadowed store. It overrides
+  `execute` (backends.py:1459), `executemany` (1478) and `executescript`
+  (1493). Every write storage.py makes to D1 goes through these three
+  methods, so no storage.py call site changes.
+  - Each override calls `super()` first and returns its result or exception
+    unchanged.
+  - Only after D1 reports success does it enqueue
+    `(sql, params, d1_last_row_id, d1_rows_written)`, and only for a
+    statement whose target table (the first `INSERT INTO` / `UPDATE` /
+    `DELETE FROM` / `REPLACE INTO` name) is one of the 7 in §1.
+  - DDL, SELECTs and other tables are not mirrored. A statement it cannot
+    parse is counted in `shadow_unparsed`.
+- **`ShadowApplier(name, shadow: LocalSQLiteBackend, reader: D1ReadOnly)`**
+  is one thread with a FIFO queue, off the request path, so it adds no D1
+  latency. For each item, in one local `store_write`:
+  1. Run the same SQL and params on the shadow. The local outbox triggers
+     fire and record the touched keys.
+  2. Add D1's `last_row_id` as a key for an INSERT into `memories` or
+     `memories_actions`.
+  3. For every touched key, read the row from D1 by pk, and make the local
+     row identical: upsert it, or delete it locally. This removes drift from
+     `datetime('now')` and autoincrement ids.
+  4. Compare local and D1 row counts, and count mismatches.
+- **Failure.** On an exception, it logs, counts `shadow_failures`, and marks
+  the shadow dirty. It never retries into the D1 path and never touches the
+  D1 result.
+  - A dirty shadow is re-seeded from a fresh export, and the 7-night clock
+    restarts.
+  - `D1ReadOnly` wraps a schema-free D1 connection and rejects any
+    non-SELECT with the P2 checker, so the shadow cannot write D1.
+- **Nightly check, shadow mode.** No barrier is needed: D1 is the source.
+  - **(a) Shadow vs D1.** A full-table compare of all §5.2 tables, after the
+    queue has drained. A diffed key is re-read from D1 once; a persistent
+    diff is a shadow-apply bug.
+  - **(b) Builder.** Replay the log up to `log_cursor_seq` into a scratch
+    copy of the shadow's seed export, then compare it with a `.backup`
+    snapshot of the shadow at the same seq. A diff is a statement-builder
+    bug.
+  - Both checks are found before any replicator write reaches D1. A clean
+    night means (a) and (b) both show zero diffs and `shadow_failures`,
+    `shadow_unparsed` and row-count mismatches are all 0.
+- **Metrics.** `/health/db/<name>` gets a `shadow` block:
+  - `queue_depth`, `shadow_failures`, `shadow_unparsed`, `dirty`;
+  - `last_clean_night`, `clean_nights`.
+- **Removal.** L13 deletes `ShadowingD1Connection`, `ShadowApplier` and
+  `MEMORA_SHADOW_LOCAL` after the last cutover.
 
 ## 3. Absorb on a transactional backend (L4)
 
@@ -413,35 +516,41 @@ Other rules:
      and `memories_actions`. The D1 value is read by SELECT.
   5. Run `install_sync` with `last_acked_seq = 0` and `d1_epoch_expected`
      taken from the receipt.
-  6. Run a §5.2 barrier compare, which must show zero diffs.
+  6. Verify that the seeded file's per-table counts and content hashes equal
+     the receipt's. This is deterministic, with no live read: D1 may have
+     moved on since the export, and `recheck` covers that.
 - **`restore <db> --receipt R`** (the default, H5) is a full re-seed from a
   new verified export. Unacked local writes at the time of a disk loss are
   lost; that was accepted in msg 7507.
 - **`restore <db> --from-r2 <key> --receipt R`** is only for D1 corruption or
-  operator error. It loads the snapshot, rebuilds FTS, then reconciles every
-  table against D1, key by key:
-  - The key has an outbox row in the snapshot with seq > the snapshot's
-    `last_acked_seq`:
-    - If the snapshot has the row, UPSERT it to D1, unless D1's
-      `memories.updated_at` is newer (for child tables, the parent memory's).
-      In that case keep D1 and report it.
-    - If the snapshot lacks the row (a pending delete), report it; never
-      delete (P7).
-  - The key exists only in D1: pull it into local.
-  - The key exists only in the snapshot, or differs, with no unacked row:
-    report it, and change neither side.
-  - `--dry-run` prints every decision.
-  - Apply requires `--approve <report sha256>`, and P3 applies to the
-    upserts.
+  operator error. There is no automatic resolution rule: `updated_at` is not
+  a freshness signal, because storage.py:5655, 8092, 9577 and 10348 change
+  metadata, tags or importance without touching it.
+  1. Load the snapshot and rebuild FTS.
+  2. Compare every §5.2 table with D1. **Every** difference is a CONFLICT,
+     including keys present on only one side. Differences are grouped per
+     memory id (the `memories` row plus its embeddings, crossrefs,
+     tombstones, tombstone_components and actions), plus one group per
+     `memories_meta` key.
+  3. Write `conflicts-<ts>.json`, containing both versions of every row in
+     each group.
+  4. The operator writes `--approve <file>`, choosing `d1` or `snapshot` for
+     each group. The file must name every group, and it carries the
+     conflicts file's sha256.
+     - `d1` changes only local, and never writes D1.
+     - `snapshot` sends per-key UPSERTs to D1, or a per-key DELETE when the
+       snapshot lacks the key. These are built by `_build_statements` and
+       pass `_check_statement` and P3.
+  5. Nothing is written to D1 for a group without a selection.
+  6. `--dry-run` prints the exact statements.
 - **Sequence high-water, D1 side** (H7): run before rollback and before
-  restore, with a receipt.
-  - First choice: `UPDATE sqlite_sequence SET seq=? WHERE name=? AND seq<?`.
-    L5 checks whether D1 allows this on a throwaway D1 database (with leader
-    approval), never on a live one.
-  - Fallback, which needs `--confirm`: INSERT a sentinel `memories` row
-    (`content='__memora_seq_sentinel__'`) at the high-water id, then DELETE
-    it by that id. This is the only D1 delete outside the replicator, and it
-    touches only the row it just inserted.
+  restore, with a receipt and a passing recheck.
+  - It is one statement per table:
+    `UPDATE sqlite_sequence SET seq=? WHERE name=? AND seq<?`.
+  - L5 first checks whether D1 accepts this, on a throwaway D1 database
+    created with leader approval, never on a live one.
+  - If D1 rejects it, the step HALTS and reports; the rollback or restore
+    does not proceed. There is no fallback.
 - **`snapshot <db>`**: `sqlite3.Connection.backup` to a temp file, gzip, then
   `r2://<bucket>/<db>/<date>.db.gz`. It keeps 14, runs nightly from cron,
   and refuses if free space is below 2× the DB size.
@@ -472,10 +581,13 @@ Local rows come from one consistent `.backup` snapshot `S`.
 
 Two modes:
 - **Barrier** (cutover, rollback, `resume`):
-  1. Freeze ingress (`MEMORA_READONLY_DBS`, restart).
+  1. Freeze ingress (the §1 freeze file, no restart).
   2. Drain to `lag_rows = 0`.
   3. Take `S`.
   4. Compare. Zero diffs are required.
+  5. Lift the freeze.
+  - A **weekly** barrier compare runs Sunday 04:00 under a brief freeze and
+    covers every key. It sets `compare_consumed_seq` to the drained head.
 - **Nightly**:
   1. Take `S`, and let `H` be `MAX(seq)` in `S`.
   2. Wait for `last_acked_seq >= H`. If that takes more than 30 minutes,
@@ -484,30 +596,42 @@ Two modes:
   4. Let `K` be the live outbox keys with seq > H. Acked rows are retained
      for 24 h, so every key written after `S` is in `K`.
   5. Compare, excluding `K`.
-  6. Retry each diffed key once, after a fresh drain. A diff that persists
-     alerts.
+  6. On any diff, retry the whole run once with a freshly taken `S`, `H` and
+     `K`. A diff that persists alerts.
+  7. When the run is clean, set `compare_consumed_seq = H`.
+  8. Report keys that were in `K` on two consecutive nightly runs. The weekly
+     barrier compare covers them.
 
   A key not in `K` had no local write after `S`, and it was acked. So D1
   must equal `S` for it, unless a foreign write happened.
 
-In log mode (P4), the "D1" side is the latest export with the logged
-statements replayed.
+The shadow period uses the §2.9 nightly check instead. There, the log's key
+set for seqs up to `log_cursor_seq` must first equal the outbox's key set
+over the same range; the outbox is retained, so this catches lost log
+lines.
 
 ### 5.3 Rollback (H6)
 
-1. Take an export receipt.
-2. Freeze ingress (`MEMORA_READONLY_DBS`, restart). The replicator keeps
-   draining through `connect_replicator()`.
-3. Wait for `lag_rows = 0`.
-4. Stop the service.
-5. Run a barrier compare. Diffs that need a D1 delete are reported (P7).
-6. Run the D1-side sequence high-water step.
-7. Recertify D1: `verify_embedding_integrity` against the `d1://` backend.
+1. Freeze ingress (the §1 freeze file). The replicator keeps draining
+   through `connect_replicator()`.
+2. Wait for `lag_rows = 0`, then stop the service.
+3. Take an export and receipt (P1) of the post-drain D1.
+4. Run a barrier compare against the local file. Any diff is reported and
+   stops the rollback (P7).
+5. Run the D1-side sequence high-water step (§4). If it halts, the rollback
+   stops.
+6. Validate D1 read-only: `verify_embedding_integrity(conn, stamp=False)`
+   against the `d1://` backend. It writes nothing.
+   - D1's `embedding_integrity` stamp is now stale (an older epoch). It is
+     restamped after the repoint by the normal primary path (an explicit
+     admin `verify_embedding_integrity` through memora-all), not by
+     rollback.
+7. Run `recheck` against step 3's receipt.
 8. Repoint `MEMORA_DATABASES` to `d1://` and remove the store from
    `MEMORA_REPLICAS`.
-9. Start the service.
+9. Start the service, then lift the freeze.
 
-A test drains under `MEMORA_READONLY_DBS`.
+A test drains under the freeze.
 
 ## 6. Writer freeze checklist
 
@@ -570,9 +694,31 @@ if it is in the dev deps.
   `_check_statement` (P2);
 - **`test_delete_guard_halts`**: 51 deletes, and 2% of a 100-row table (P3);
 - **`test_log_mode_sends_nothing`**: FakeD1 records zero requests (P4);
-- **`test_log_replay_compare`**;
+- **`test_log_crash_between_append_and_cursor`**: a real subprocess killed
+  after the fsync and before the cursor commit. Restart re-appends, and the
+  reader deduplicates (P1-5);
+- **`test_log_key_set_matches_outbox`**;
+- **`test_outbox_kept_until_compare_consumed`**;
+- **`test_nightly_retry_retakes_snapshot`** and
+  **`test_repeat_exclusion_reported`** (P2-6);
+- **`test_replicator_sends_no_ddl`**;
 - **`test_drain_under_readonly_flag`** (H6);
 - **`test_connect_replicator_single_caller`**.
+
+**Shadow-local** (L3b):
+- the wrapper returns D1's result and exception unchanged when the shadow
+  raises;
+- mirror after success only;
+- DDL and non-replicated tables are not mirrored;
+- copy-back makes local rows equal to D1's, including `datetime('now')`
+  columns and ids;
+- a dirty shadow is marked, and D1 is untouched;
+- `D1ReadOnly` rejects INSERT/UPDATE/DELETE/DDL (mutation: remove the
+  check);
+- property run: random writes through the app's D1 path, and the shadow
+  equals FakeD1 after the drain;
+- the nightly check finds an injected shadow bug and an injected builder
+  bug.
 
 **Schema and read policy** (L2):
 - D1 store has no sync objects;
@@ -600,8 +746,18 @@ if it is in the dev deps.
 - **`test_sequence_high_water`**, the reviewer's reproduction: insert and
   delete the highest id locally inside one batch, so D1 never sees it; after
   the high-water step, the next D1 insert gets a higher id;
-- the H5 rule table, one test per row, including "a pending delete is
-  reported, not applied";
+- **`test_sequence_step_halts_when_rejected`**: FakeD1 rejects
+  `UPDATE sqlite_sequence`; the step halts and nothing else is sent
+  (P1-3);
+- R2 restore (P0-2): every difference becomes a conflict group; D1 receives
+  nothing without a selection; a group missing from `--approve` refuses the
+  whole apply; `d1` selections never write D1; a wrong conflicts sha refuses;
+  P3 applies;
+- receipt (P1-4): refused when the R2 read-back hash differs; refused when
+  the epoch changes during the export; `recheck` detects a count or epoch
+  change and forces a fresh export;
+- **`test_rollback_validate_writes_nothing`**: FakeD1 records only SELECTs
+  during step 6 (P2-7);
 - receipt refusal (P1).
 
 **Launcher** (L2a):
@@ -617,21 +773,72 @@ Each slice's report lists its mutation checks.
 "Dark" means no effect on any store without `sync_state` / `MEMORA_REPLICAS`,
 with flags off.
 
-| slice | content | dark by | D1 statements it can issue | live rows touched |
-|---|---|---|---|---|
-| L1b | F3, plus F2 for the tools (P6) | — | none (removes writers) | 0 |
-| L2a | launcher and volume (C1). See the note below | only adds a mount | none | 0 |
-| L2 | §1, M10 (`supports_transactions`, `live_primary`, flock), `MEMORA_READONLY_DBS`, `connect_replicator` | no `sync_state` | none | 0 |
-| L3 | §2 (log and write modes, P2/P3/P4, H2/H3, metrics, F7) | `MEMORA_REPLICATION` unset | write mode only: P2's 4 shapes | 0 |
-| L4 | §3 | local stores only; none serve prod | none new (D1 absorb path unchanged) | 0 |
-| L5 | §4 | run by hand | export and read-back SELECTs; R2-restore UPSERTs with `--approve`; the sequence UPDATE or sentinel with `--confirm` | 0 at merge |
-| L6 | §5 compare and rollback | run by hand | SELECT only (rollback uses L5's sequence step) | 0 |
-| L7 | F1, F2 for handlers; viewer deploy | viewer deploy | none (removes writers) | 0 |
-| L8 | F4a–F6, `local_primary.py audit-configs` | ops | none | 0 |
-| L9 | first store (`re` or `bestation`, the less critical): export all (P1), seed, repoint, log-only ≥ 7 clean nights, then write mode | per store | L3 write mode | whole store |
-| L10 | the other of `re`/`bestation`, after L9 has a clean week in write mode | per store | same | whole store |
-| L11 | `ob1`, after a clean week | per store | same | whole store |
-| L12 | `memora`, after a clean week (P5); nightly R2 snapshot for all | per store | same | whole store |
+| slice | content | dark by | D1 reads | D1 writes | live rows touched |
+|---|---|---|---|---|---|
+| L1b | F3, plus F2 for the tools (P6) | — | none | none (removes writers) | 0 |
+| L2a | launcher and volume (C1); see below | only adds a mount | none | none | 0 |
+| L2 | §1, M10, freeze, `connect_replicator` | no `sync_state` | none | none. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
+| L3 | §2: log and write modes, P2/P3, H2/H3, metrics, F7 | `MEMORA_REPLICATION` unset | write mode: epoch SELECT (preflight and postcheck), pk SELECT read-back. Log mode: none | write mode only: per-key UPSERT on 6 tables; embeddings DELETE+INSERT by pk; per-key DELETE (P2, P3). Log mode: none | 0 |
+| L3b | §2.9 shadow-local | `MEMORA_SHADOW_LOCAL` unset | pk SELECT copy-back, through `D1ReadOnly`; compare full-table SELECTs | **none new**: the wrapper only forwards the app's existing writes, unchanged | 0 |
+| L4 | §3 | local stores only | none new | none new (D1 absorb path unchanged) | 0 |
+| L5 | §4 export, seed, recheck, restore, snapshot, sequence step | run by hand | `wrangler d1 export --remote`; per-table `COUNT(*)` and full-table SELECTs (hashes); epoch SELECT; `SELECT … FROM sqlite_sequence`; conflict reads | R2 restore: only per-key UPSERT/DELETE selected in `--approve` (P3). Sequence step: `UPDATE sqlite_sequence SET seq=? WHERE name=? AND seq<?` (≤ 2 statements, operator-run, receipt and recheck). Nothing else | 0 at merge |
+| L6 | §5 compare and rollback | run by hand | full-table SELECTs of the 7 tables; epoch; `verify_embedding_integrity(stamp=False)` reads | rollback: only L5's sequence UPDATE | 0 |
+| L7 | F1, F2 for handlers; viewer deploy | viewer deploy | viewer GET handlers (unchanged) | none (removes writers) | 0 |
+| L8 | F4a–F6, `audit-configs` | ops | none | none | 0 |
+| L9 | first store (`re` or `bestation`, the less critical), see below | per store | L3b, L5, L3 write-mode reads | the app's existing writes during shadow; after cutover, L3 write mode | whole store |
+| L10 | the other of `re`/`bestation`: same as L9, after L9 has had a clean week in write mode | per store | same | same | whole store |
+| L11 | `ob1`, same, after a clean week | per store | same | same | whole store |
+| L12 | `memora`, same, last (P5) | per store | same | same | whole store |
+| L13 | remove the shadow wrapper (§2.9) | — | — | — | 0 |
+
+**L9 sequence, per store:**
+1. The snapshot cron (§4) is installed and rehearsed on shadow files before
+   the first cutover. From each cutover on, it covers that local primary.
+2. Export every store (P1).
+3. Seed the shadow at `/data/shadow/<db>.db` from the export.
+4. Set `MEMORA_SHADOW_LOCAL` and `MEMORA_REPLICATION=log`.
+5. Wait for at least 7 consecutive clean nights (§2.9).
+6. Cutover:
+   1. freeze the `d1://` store;
+   2. drain the shadow queue;
+   3. take a fresh export and receipt;
+   4. FULL re-seed to `/data/<db>.db` (the shadow file is archived, not
+      promoted);
+   5. run `recheck`;
+   6. repoint (`MEMORA_DATABASES` to `sqlite://`, add `MEMORA_REPLICAS`,
+      remove the store from `MEMORA_SHADOW_LOCAL`);
+   7. set `MEMORA_REPLICATION=write` (the preflight epoch comes from the
+      receipt);
+   8. lift the freeze.
+7. Run a clean week in write mode.
+
+After cutover, the accepted RPO is the seconds of async loss (msg 7507).
+The next store's shadow may start once the previous store has cut over.
+
+**D1 write inventory** (the whole document was re-checked for automatic D1
+writes). Every D1 write the plan introduces is one of:
+1. replicator write mode: per-key, outbox-driven, P2/P3-guarded;
+2. R2 restore: only operator-selected per-key rows, P2/P3-guarded;
+3. the sequence UPDATE: operator-run, with receipt and recheck, halts on
+   rejection.
+
+Checked and found to write nothing to D1:
+- export, recheck, seed, default restore, compare and snapshot;
+- rollback: validation uses `stamp=False`;
+- `resume`;
+- H3 reconciliation: SELECTs, then a resend through (1);
+- the shadow applier: `D1ReadOnly`;
+- the ShadowingD1Connection wrapper: it forwards the app's existing writes
+  unchanged and adds none;
+- health and watchdog;
+- F4a: a scratch local store;
+- `cloud_sync` `/broadcast`: not D1;
+- the replicator's D1 connection: schema-free, no DDL.
+
+Pre-existing D1 writes the plan leaves as they are:
+- memora-all's own writes and `ensure_schema` DDL on stores still served
+  from `d1://` (including the shadow period, and after a rollback);
+- the post-rollback integrity restamp, which is that normal primary path.
 
 **L2a, launcher and volume (C1):**
 - `memora-instance.sh` `cmd_up`, in the `MEMORA_DATABASES` branch (line
@@ -652,7 +859,7 @@ with flags off.
 
 **Order:**
 - L1b first, then L2a and L2.
-- L3 to L6 in any order after L2.
+- L3, L3b and L4 to L6 in any order after L2.
 - L7 and L8 gate L9.
 - Each cutover can be reversed with §5.3 until the next store's slice
   starts.
