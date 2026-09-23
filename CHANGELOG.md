@@ -12,6 +12,11 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## Unreleased
+
+### Issue #47 backfill apply
+- `scripts/apply_backfill_47.py --preview <approved.json> [--db NAME] [--dry-run] [--report out.json]` applies ONLY the rows of an approved preview with `approved: true` and `status: "proposed"`: per row it re-reads the memory and skips it if it changed since the preview, is import-pending, retired or superseded (reported as such), reports a row already at the target as `already-applied` (re-runs are idempotent), and otherwise sets `metadata.project` through the normal `update_memory` path, which re-prefixes the memory's own typed tags and refreshes its embedding. Section is not changed (every proposal's target equals its section). On D1 it holds the store's import lease and reports each row truthfully; `--dry-run` writes nothing. The preview now records `content_sha256` so the apply can detect any content change.
+
 ## 0.4.6
 
 A plain JSON API (Phase 0 of the clmux memora daemon), the absorb type

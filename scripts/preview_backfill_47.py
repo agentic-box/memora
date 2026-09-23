@@ -201,7 +201,9 @@ def assess(memory_id: int, content: str, metadata: Dict[str, Any], tags: List[st
         "id": memory_id,
         "preview": content[:120],
         "stored": {"section": section, "subsection": subsection, "tags": list(tags),
-                   "metadata_project": metadata.get("project"), "type": metadata.get("type")},
+                   "metadata_project": metadata.get("project"), "type": metadata.get("type"),
+                   # lets the apply step detect ANY content change since this preview
+                   "content_sha256": __import__("hashlib").sha256(content.encode("utf-8")).hexdigest()},
         "approved": False,
     }
 
