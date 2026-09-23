@@ -204,7 +204,7 @@ Not replicated:
   - **Admission gate.** `_WriteGate` in backends.py holds one gate per
     registry store name, process-wide: a lock, a condition, `state`
     (`open`, `draining`, `frozen` or `frozen-unsafe`), an in-flight set and
-    a persistent indeterminate set (below). Each in-flight
+    the open intents of the write-ahead journal (below). Each in-flight
     entry records the statement class, the thread and the age.
     ```python
     def write_gate(name: str) -> _WriteGate
@@ -272,42 +272,68 @@ Not replicated:
     - When memora-all is stopped (the rollback steps after the stop), the
       scripts instead require `docker inspect … State.Running=false`.
   - Reads continue while frozen.
-  - **Indeterminate writes (round-8 P0).** A mutating D1 request whose
-    outcome is unknown (a client timeout, or a connection reset after
-    sending) does NOT count as complete. Cloudflare may still commit it
-    later.
-    - The gate removes it from in-flight and adds it to a persistent
-      `indeterminate` set. The record holds the id, store, SQL, a sha256
-      digest of the params, the target table, the touched keys when they
-      can be derived, the intended post-state (the INSERT column values, or
-      the `SET` values) and `sent_at`.
-    - The set lives in `/data/indeterminate/<db>.jsonl`, appended and
-      fsynced before the exception is re-raised to the app. It is a file,
-      not `sync_state`/`shadow_state`, because a store still on `d1://`
-      before its shadow week has neither table. The replicator's H3
-      `inflight_*` marker counts as an indeterminate record too.
-    - While the set is non-empty, the gate's state is `frozen-unsafe`, not
-      `frozen`. The freeze still drains to 0 in flight, but every export,
-      seed, recheck and repoint script refuses on `frozen-unsafe`. The
-      admin endpoint and `/health/db/<name>` report `frozen-unsafe` and the
-      record ids.
-    - **Automatic reconciliation** (in memora-all, per record) waits until
-      at least 60 s have passed since `sent_at`. That is 2 × the 30 s client
-      timeout (`_D1_TIMEOUT_SECONDS`, backends.py:1540), which also bounds
-      Cloudflare's per-request limit. It then re-reads the touched keys
-      through `D1SelectOnlyConnection` with the read token and
-      `served_by_primary`. For an INSERT without an explicit id, it looks up
-      rows matching the inserted column values. The record is resolved when
-      the write is visibly applied (the post-state is present) or visibly
-      not applied (the pre-state is intact, or no matching row exists).
-    - **Still ambiguous** (keys cannot be derived, or a key was rewritten
-      since): the record stays. Only
-      `local_primary.py reconcile <db> --accept <id> --receipt R` (an
-      operator decision, with a fresh receipt) or aborting the migration
-      step clears it.
-    - A fresh re-seed never clears the set; the seed script refuses while
-      it is non-empty.
+  - **Write-ahead intent journal (round-9 P0).** Every mutating D1 request
+    is journaled before it is sent, so no crash or disk failure can leave a
+    server-side write unrecorded.
+    - **Before send**, still inside the gate: append an intent record to
+      `/data/intent/<db>.jsonl`, then `flush` and `fsync`. The record holds
+      `{"type":"intent", "id", "sql", "params_sha256", "target", "keys",
+      "post_state", "sent_at"}`:
+      - `id` is monotonic per store; the next id is recovered from the file
+        at startup;
+      - `keys` and `post_state` hold the touched keys and intended values
+        (INSERT columns, `SET` values) when the classifier can derive them.
 
+      If the append or the fsync fails, the request is NOT sent. The app
+      gets the error (`IntentJournalError`), the gate token is released, and
+      the gate state does not change.
+    - **After a known response** (success, or a definite HTTP/SQL failure):
+      append `{"type":"resolved", "id", "outcome"}`. This record is fsynced
+      lazily: it rides on the next intent's fsync, or a 1 s timer. If it is
+      lost, or its append fails (for example on a full disk), the intent
+      simply stays open. That is an extra unsafe record, which is safe.
+    - **An unknown outcome** (client timeout, reset after send, or process
+      death between send and response) writes no resolution. So the earlier
+      "record after the exception" step is gone. There is nothing to write
+      after the fact, and a death before the catch still leaves the intent
+      open.
+    - **Open intents** (an intent with no resolution) are held in memory and
+      rebuilt from the journal at startup. While any exist:
+      - the gate reports `frozen-unsafe` instead of `frozen`;
+      - every export, seed, recheck and repoint script refuses;
+      - health and the admin endpoint list the ids.
+      The replicator's H3 `inflight_*` marker counts as an open intent too.
+    - **The journal is a file**, not `sync_state`/`shadow_state`, because a
+      store still on `d1://` before its shadow week has neither table.
+      Compaction runs when the file exceeds 8 MB: write a new file holding
+      only the open intents and the id counter, fsync it, `rename` it
+      atomically over the old one, and fsync the directory. Only resolved
+      pairs are dropped.
+    - **Cost:** one fsync per D1 mutation (milliseconds on NVMe, well under
+      the ~100 ms D1 round trip). Accepted. Reads are never journaled.
+    - **Automatic reconciliation** (in memora-all, per open intent) waits at
+      least 60 s after `sent_at`. That is 2 × the 30 s client timeout
+      (`_D1_TIMEOUT_SECONDS`, backends.py:1540), which also bounds
+      Cloudflare's per-request limit. It then reads back through
+      `D1SelectOnlyConnection` with the read token and `served_by_primary`.
+      It auto-resolves only a plain `INSERT` with derivable values:
+      - a matching row present with the post-state → `reconciled-applied`;
+      - no matching row → `reconciled-not-applied`.
+    - **Ambiguous (round-9 P2).** Everything else stays open and needs an
+      operator decision: `UPDATE`, `DELETE`, `INSERT OR IGNORE`, upserts,
+      and any record whose keys cannot be derived or were rewritten since.
+      - Reason: a no-op UPDATE, or a DELETE of an absent key, looks "not
+        applied" without proving it, and their trigger and meta effects (the
+        epoch bump, `memories_meta` rows) are not checked yet.
+      - `local_primary.py reconcile <db> --accept <id> --receipt R` (a fresh
+        receipt) appends `{"type":"resolved", "id",
+        "outcome":"operator-accepted"}`. Aborting the migration step is the
+        alternative.
+      - A cutover after any accepted-ambiguous intent still takes the fresh
+        full export and recheck it always takes.
+      - Making the effect checks automatic is §9 item (d).
+    - A fresh re-seed never resolves intents; the seed refuses while any are
+      open.
 
   - `connect_replicator()` is the replicator's only entry point, and a test
     asserts that no other module calls it (H6).
@@ -1048,18 +1074,26 @@ if it is in the dev deps.
   until it commits;
 - **`test_replicator_and_shadow_exempt_from_gate`**;
 - **`test_scripts_refuse_without_frozen_zero_inflight`**;
-- **`test_indeterminate_blocks_freeze_until_reconciled`** (round-8 P0):
-  FakeD1 holds a request's server-side commit while the client times out.
-  The freeze drains to 0 but reports `frozen-unsafe`, and export, seed,
-  recheck and repoint refuse. After the held commit lands and 60 s (a test
-  clock) have passed, reconcile resolves the record as applied and the state
-  becomes `frozen`. The same test without the commit resolves it as not
-  applied;
-- **`test_indeterminate_ambiguous_needs_operator`**: the key is rewritten
-  after the lost request, so the record stays until `reconcile --accept`;
-- **`test_indeterminate_survives_restart_and_reseed`**: the jsonl is
-  fsynced, it is reloaded at startup, and the seed refuses while it is
-  non-empty;
+- **`test_intent_kill_after_send_before_response`** (round-9 P0): a
+  subprocess is killed with `os._exit` after the request is sent and before
+  the response is handled. FakeD1 commits the write. At restart the intent is
+  open and the gate is `frozen-unsafe`, so export refuses. After 60 s (a test
+  clock), reconcile resolves an INSERT as applied, and the state becomes
+  `frozen`;
+- **`test_intent_fsync_failure_blocks_send`**: `os.fsync` is patched to
+  raise. FakeD1 receives nothing, the app gets `IntentJournalError`, and the
+  gate state is unchanged;
+- **`test_resolution_append_failure_is_extra_unsafe`**: a full disk during
+  the resolution append leaves an open intent, the store is `frozen-unsafe`,
+  and it is resolvable by reconciliation;
+- **`test_intent_not_applied_insert`** and
+  **`test_intent_update_delete_always_ambiguous`** (round-9 P2): a no-op
+  UPDATE and a DELETE of an absent key both stay open until
+  `reconcile --accept`;
+- **`test_intent_journal_compaction_keeps_open`**;
+- **`test_intent_survives_restart_and_reseed`**: the seed refuses while an
+  intent is open;
+- **`test_startup_refuses_d1_primary_without_mount`** (L2a);
 - **`test_cursor_is_gated`** (P2c): a mutation through
   `conn.cursor().execute(...)` on a frozen store is refused, and an admitted
   transaction's cursor shares its token;
@@ -1152,7 +1186,7 @@ with flags off.
 |---|---|---|---|---|---|
 | L1b | F3, plus F2 for the tools (P6) | — | none | none (removes writers) | 0 |
 | L2a | launcher and volume (C1); see below | only adds a mount | none | none | 0 |
-| L2 | §1, M10, freeze, `connect_replicator` | no `sync_state` | none | none. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
+| L2 | §1, M10, freeze gate with the write-ahead intent journal and reconciliation, `classify_statement`, `D1SelectOnlyConnection`, `_GatedCursor`, `connect_replicator` | sync pieces: no `sync_state`. The gate and journal are **live** for every `d1://` primary (a fsync per mutation; freeze and reconcile are used only by operators); deploy after L2a | reconciliation: pk and value SELECTs through `D1SelectOnlyConnection` with the read token | none new. The gate only admits or refuses the app's existing writes. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
 | L3 | §2: log and write modes, P2/P3, H2/H3, metrics, F7 | `MEMORA_REPLICATION` unset | write mode: epoch SELECT (preflight and postcheck), pk SELECT read-back. Log mode: none | write mode only: per-key UPSERT on 6 tables; embeddings DELETE+INSERT by pk; per-key DELETE (P2, P3). Log mode: none | 0 |
 | L3b | §2.9 shadow-local | `MEMORA_SHADOW_LOCAL` unset | pk SELECT copy-back through `D1SelectOnlyConnection` with the D1 Read token; `read_replication` config GET; compare full-table SELECTs | **none new**: the wrapper only forwards the app's existing writes, unchanged | 0 |
 | L4 | §3 | local stores only | none new | none new (D1 absorb path unchanged) | 0 |
@@ -1235,10 +1269,17 @@ Pre-existing D1 writes the plan leaves as they are:
   `docker inspect`, line 133) with the named volume `memora-all-data`. It
   copies the old volume once, with `docker run --rm -v old:/from -v new:/to`,
   and refuses if `docker volume inspect` shows an anonymous (64-hex) name.
-- Server startup refuses to serve a local store unless:
+- Server startup refuses to serve any store that uses `/data` unless the
+  checks below pass. From L2 onward that is every local store AND every
+  `d1://` primary store, because their gates keep the intent journal in
+  `/data/intent/` (round 9):
   - `/data` is a mount point (its `st_dev` differs from `/`'s);
-  - a probe file can be written, fsynced and removed;
+  - a probe file can be written, fsynced and removed, in `/data` and in
+    `/data/intent/`;
   - `MEMORA_DATA_VOLUME` is set and is not a 64-hex name.
+- For this reason the gate and the journal are live, not dark, for every
+  `d1://` primary from L2's deploy. L2 therefore deploys only after L2a's
+  named volume is in place.
 - **Memory gate:** measure RSS with four local stores (live-sized fixtures,
   964+ rows), FTS and the 384 MB corpus cache, against the 768 MB limit.
   The launcher default becomes max(768m, 1.5 × peak RSS).
@@ -1257,3 +1298,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (a) `/admin/freeze` auth: an admin-only token (not the health token), or binding the admin routes to loopback only, reached through `docker exec` | L2a | before L2's freeze code ships |
 | (b) the setup PRAGMAs on the raw connection in `connect()`: document that `journal_mode=WAL` and `busy_timeout` are the only ones; both are idempotent and cannot change row data on a frozen primary. A test asserts the set | L2 | with L2 |
 | (c) the `.cursor()` bypass on `_LockedWriterConnection`: **designed now** (§1, `_GatedCursor`) and tested by `test_cursor_is_gated` | L2 | with L2 |
+| (d) automatic trigger and meta effect checks in reconciliation (epoch bump, `memories_meta` rows), so that UPDATE and DELETE intents can auto-resolve instead of needing `--accept` | L3 | optional; until then, those intents need the operator |
