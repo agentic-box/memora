@@ -42,6 +42,11 @@ def receipt(replica, tmp_path):
     return lp.export(DB, make_deps(replica, tmp_path), tmp_path / "exports")
 
 
+def d1_now(replica):
+    reader = lp.D1Reader(replica.reader())
+    return lp.remote_stats(reader, reader.hashed_tables())
+
+
 def _rows(path, sql, params=()):
     db = sqlite3.connect(path)
     try:
@@ -55,7 +60,7 @@ def _rows(path, sql, params=()):
 def test_seed_builds_a_verified_store_with_sync_installed(replica, tmp_path, receipt):
     out = tmp_path / "new" / "nested" / f"{DB}.db"  # §9 (k): the parent does not exist yet
     barrier = FakeBarrier(frozen=True)
-    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), replica_uri=URI)
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), tmp_path / "exports", replica_uri=URI)
     r = json.loads(receipt.read_text())
     assert out.is_file() and rep["out"] == str(out)
     data = sorted(t for t in r["tables"] if t != "sqlite_sequence")
@@ -68,16 +73,18 @@ def test_seed_builds_a_verified_store_with_sync_installed(replica, tmp_path, rec
     assert not list(out.parent.glob("*.seed-partial*"))
     # under the freeze already in place: required at the start, re-checked at
     # every boundary, never placed or lifted (7621 P1-2)
-    assert barrier.calls == ["check before the seed", "check before reading D1's sequences",
-                             "check after reading D1's sequences", "check before placing the seeded store"]
+    assert barrier.calls == ["check before the recheck", "check after the recheck", "check before the seed",
+                             "check before reading D1's sequences", "check after reading D1's sequences",
+                             "check before placing the seeded store"]
+    assert rep["receipt"] == str(receipt) and rep["replica_uri"] == URI
     assert barrier.frozen
 
 
 def test_seed_without_the_freeze_in_place_is_refused(replica, tmp_path, receipt):
     barrier = FakeBarrier(frozen=False)
     out = tmp_path / "x" / f"{DB}.db"
-    with pytest.raises(lp.L5Refused, match="not frozen before the seed"):
-        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), replica_uri=URI)
+    with pytest.raises(lp.L5Refused, match="not frozen before the recheck"):
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), tmp_path / "exports", replica_uri=URI)
     assert not out.parent.exists() and "freeze" not in barrier.calls
 
 
@@ -85,7 +92,7 @@ def test_seed_refuses_a_receipt_of_another_d1_database(replica, tmp_path, receip
     deps = make_deps(replica, tmp_path)
     deps.database_id = "other-db"
     with pytest.raises(lp.L5Refused, match="another D1 database"):
-        lp.seed(DB, str(receipt), tmp_path / f"{DB}.db", deps, replica_uri=URI)
+        lp.seed(DB, str(receipt), tmp_path / f"{DB}.db", deps, tmp_path / "exports")
 
 
 def test_a_seed_whose_sequences_went_below_the_export_places_nothing(replica, tmp_path, receipt, monkeypatch):
@@ -99,7 +106,7 @@ def test_a_seed_whose_sequences_went_below_the_export_places_nothing(replica, tm
     monkeypatch.setattr(schema, "install_sync", lowering)
     out = tmp_path / f"{DB}.db"
     with pytest.raises(lp.L5Refused, match="below the export's"):
-        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
     assert not out.exists()
 
 
@@ -109,19 +116,92 @@ def test_seed_sets_the_sequence_to_the_highest_of_local_d1_and_max_id(replica, t
     and a sequence may lag max(id)."""
     replica_exec(replica, "UPDATE sqlite_sequence SET seq = 40 WHERE name = 'memories'")
     out = tmp_path / f"{DB}.db"
-    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
-    assert rep["sequences"]["memories"] == {"seq": 3, "max_id": 3, "d1_seq": 40, "set": 40}
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
+    # the recheck saw the moved counter and took a fresh export (7642 P1-1)
+    assert rep["receipt"] != str(receipt)
+    assert rep["sequences"]["memories"] == {"seq": 40, "max_id": 3, "d1_seq": 40, "set": 40}
     assert dict(_rows(out, "SELECT name, seq FROM sqlite_sequence"))["memories"] == 40
+
+
+def test_seed_sequence_takes_d1s_live_counter_when_it_reads_ahead(replica, tmp_path, receipt):
+    """The D1 term of the max: the counter read live at seed time wins when
+    it is ahead of the export's (defence in depth behind the recheck)."""
+    deps = make_deps(replica, tmp_path)
+    deps.reader.sequences = lambda: {"memories": 57}
+    rep = lp.seed(DB, str(receipt), tmp_path / f"{DB}.db", deps, tmp_path / "exports")
+    assert rep["sequences"]["memories"]["set"] == 57
 
 
 def test_seed_sequence_follows_max_id_when_the_sequence_lags(replica, tmp_path):
     replica_exec(replica, "UPDATE sqlite_sequence SET seq = 1 WHERE name = 'memories'")
     receipt = lp.export(DB, make_deps(replica, tmp_path), tmp_path / "exports")
     out = tmp_path / f"{DB}.db"
-    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
     assert rep["sequences"]["memories"]["set"] == 3
     # memories_actions has no row anywhere: a 0 row is created
     assert dict(_rows(out, "SELECT name, seq FROM sqlite_sequence"))["memories_actions"] == 0
+
+
+def test_seed_takes_a_fresh_export_when_d1_changed_after_the_receipt(replica, tmp_path, receipt):
+    """7642 P1-1: seed rechecks under the freeze and seeds from what the
+    recheck returns, so the seeded file is D1 NOW, not the old export."""
+    replica_exec(replica, "UPDATE memories SET content = 'edited on D1 after the export' WHERE id = 2")
+    replica_exec(replica, "INSERT INTO memories (content) VALUES ('added on D1 after the export')")
+    out = tmp_path / f"{DB}.db"
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports")
+    assert rep["receipt"] != str(receipt)
+    now = d1_now(replica)
+    data = sorted(t for t in now if t != "sqlite_sequence")
+    assert lp.local_stats(out, data) == {t: now[t] for t in data}
+    assert _rows(out, "SELECT content FROM memories WHERE id = 2") == [("edited on D1 after the export",)]
+
+
+def test_seed_refuses_before_placing_anything_when_the_recheck_refuses(replica, tmp_path, receipt):
+    out = tmp_path / "new" / f"{DB}.db"
+    with pytest.raises(lp.L5Refused, match="not frozen after the recheck"):
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, FakeBarrier(frozen=True, bad_at="after the recheck")),
+                tmp_path / "exports")
+    assert not out.parent.exists()
+
+
+def test_seed_derives_the_replica_uri_and_refuses_another(replica, tmp_path, receipt):
+    """7642 P1-2: sync_state.replica_uri is the verified D1 identity; a
+    supplied URI must equal it (refused before anything is placed)."""
+    out = tmp_path / "new" / f"{DB}.db"
+    for wrong in ("d1://acct/other-db", "d1://other/replica-db", "d1://acct/replica-db/", ""):
+        with pytest.raises(lp.L5Refused, match="is not the verified D1 database"):
+            lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=wrong)
+        assert not out.parent.exists()
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports")
+    assert rep["replica_uri"] == URI == _rows(out, "SELECT replica_uri FROM sync_state")[0][0]
+    out2 = tmp_path / "new2" / f"{DB}.db"
+    lp.seed(DB, str(receipt), out2, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
+    assert _rows(out2, "SELECT replica_uri FROM sync_state")[0][0] == URI
+
+
+def test_a_retry_after_an_interrupted_wal_seed_cleans_every_partial_sidecar(replica, tmp_path, receipt):
+    """7642 P2: a crash can leave <out>.seed-partial with -wal/-shm; a stale
+    -wal would be replayed into the next load. The retry removes them all."""
+    out = tmp_path / f"{DB}.db"
+    tmp = out.with_name(out.name + ".seed-partial")
+    # a WAL-mode partial whose committed page sits only in its -wal: copy the
+    # sidecars while the connection is open (what a crash leaves behind)
+    db = sqlite3.connect(tmp)
+    db.execute("PRAGMA journal_mode = WAL")
+    db.execute("PRAGMA wal_autocheckpoint = 0")
+    db.execute("CREATE TABLE stale (x)")
+    db.execute("INSERT INTO stale VALUES (1)")
+    db.commit()
+    left = {sfx: Path(f"{tmp}{sfx}").read_bytes() for sfx in ("", "-wal", "-shm")}
+    db.close()
+    for sfx, raw in left.items():
+        Path(f"{tmp}{sfx}").write_bytes(raw)
+    Path(f"{tmp}-journal").write_bytes(b"left by a crash")
+    assert Path(f"{tmp}-wal").stat().st_size > 0
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports")
+    assert Path(rep["out"]).is_file()
+    assert not [p for p in tmp_path.iterdir() if ".seed-partial" in p.name]
+    assert not _rows(out, "SELECT name FROM sqlite_master WHERE name = 'stale'")
 
 
 @pytest.mark.parametrize("existing", ["", "-wal", "-shm", "-journal"])
@@ -129,7 +209,7 @@ def test_seed_never_overwrites_a_store_or_its_sidecars(replica, tmp_path, receip
     out = tmp_path / f"{DB}.db"
     Path(f"{out}{existing}").write_bytes(b"precious")
     with pytest.raises(lp.L5Refused, match="already exists"):
-        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
     assert Path(f"{out}{existing}").read_bytes() == b"precious"
 
 
@@ -144,7 +224,7 @@ def test_seed_refuses_while_another_process_holds_the_primary_lock(replica, tmp_
     try:
         assert holder.stdout.readline().strip() == "held"
         with pytest.raises(lp.L5Refused, match="held by another process"):
-            lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+            lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
         assert not out.exists()
     finally:
         holder.kill()
@@ -162,7 +242,7 @@ def test_a_seed_that_does_not_match_the_receipt_places_nothing(replica, tmp_path
     monkeypatch.setattr(schema, "install_sync", tampering)
     out = tmp_path / f"{DB}.db"
     with pytest.raises(lp.L5Refused, match=r"does not match the receipt in \['memories'"):
-        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
     assert not out.exists() and not list(tmp_path.glob("*.seed-partial*"))
 
 
@@ -173,20 +253,20 @@ def test_seed_refuses_an_unusable_receipt_before_touching_anything(replica, tmp_
     barrier = FakeBarrier(frozen=True)
     out = tmp_path / "nope" / f"{DB}.db"
     with pytest.raises(lp.L5Refused, match="older than 24 h"):
-        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), replica_uri=URI)
+        lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path, barrier), tmp_path / "exports", replica_uri=URI)
     assert barrier.calls == [] and not out.parent.exists()
 
 
 def test_seed_rehearse_writes_to_a_temp_path(replica, tmp_path, receipt):
     out = tmp_path / f"{DB}.db"
-    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI, rehearse=True)
+    rep = lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI, rehearse=True)
     assert not out.exists() and Path(rep["out"]).is_file() and rep["rehearse"] is True
     assert Path(rep["out"]).name == out.name
 
 
 def test_a_seeded_store_serves_as_a_live_primary_and_replicates_new_writes(replica, tmp_path, receipt, monkeypatch):
     out = tmp_path / "fresh" / f"{DB}.db"
-    lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), replica_uri=URI)
+    lp.seed(DB, str(receipt), out, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({DB: str(out)}))
     monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({DB: URI}))
     backend = storage.backend_for(DB)
@@ -264,7 +344,7 @@ def test_search_on_a_seeded_store_matches_the_original(memory_factory, tmp_path)
     _replica_from_store(original, replica)
     receipt = lp.export(DB, make_deps(replica, tmp_path), tmp_path / "exports")
     seeded = tmp_path / "seeded" / f"{DB}.db"
-    lp.seed(DB, str(receipt), seeded, make_deps(replica, tmp_path), replica_uri=URI)
+    lp.seed(DB, str(receipt), seeded, make_deps(replica, tmp_path), tmp_path / "exports", replica_uri=URI)
 
     def results(path):
         conn = LocalSQLiteBackend(path).connect()

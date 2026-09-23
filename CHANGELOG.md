@@ -16,7 +16,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ### Local-primary L5 (piece b): seed, sequence high-water, snapshot, volume alert
 - Per `docs/local-primary-implementation.md` §4 and §9 k/v.
-- **`seed <db> --receipt R --out P --replica-uri U`**: builds a new local store from a verified export, under the freeze already in place. Steps:
+- **`seed <db> --receipt R --out P`**: builds a new local store from a verified export, under the freeze already in place. It first rechecks R under that freeze and seeds from what the recheck returns (a fresh export if D1 changed). The replica URI is derived from the verified D1 identity; a `--replica-uri` that differs is refused. Steps:
   1. `ensure_schema`, then an explicit FTS rebuild in `_fts_upsert`'s form (`COALESCE` for NULL metadata/tags). Keyword and hybrid search on the seeded store match its source.
   2. `sqlite_sequence` = max(local seq, D1 seq, max(id)) for `memories` and `memories_actions`.
   3. `install_sync` with `last_acked_seq` 0 and the receipt's epoch.

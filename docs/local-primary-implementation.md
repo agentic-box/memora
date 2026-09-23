@@ -929,6 +929,15 @@ Other rules:
     - The seed runs under the freeze left by export/recheck. It is required
       at the start and re-checked around the D1 read and before placing the
       file.
+    - The seed runs `recheck` itself under that freeze and seeds from the
+      receipt the recheck returns: the same one, or a fresh export if D1
+      changed (review 7642 P1-1). There is no shortcut based on proof of an
+      earlier recheck.
+    - `sync_state.replica_uri` is derived from the verified D1 identity,
+      `d1://<account_id>/<database_id>`. A supplied `--replica-uri` must equal
+      it (7642 P1-2).
+    - A retry removes a crashed seed's `.seed-partial` together with its
+      `-wal`, `-shm` and `-journal` files (7642 P2).
     - It holds the target's primary lock and creates the parent directory
       first (§9 k).
     - It builds `<out>.seed-partial` and hard-links it into place only after

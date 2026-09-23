@@ -7,7 +7,7 @@ this file only parses arguments and builds the dependencies.
   freeze  <db>              place memora-all's freeze on the store (POST /admin/freeze)
   export  <db>              verified export under the freeze, R2 copy, receipt
   recheck <db> --receipt R  under the SAME freeze: D1 unchanged since R? (else a fresh export)
-  seed    <db> --receipt R --out /data/<db>.db --replica-uri d1://<account>/<database-id>
+  seed    <db> --receipt R --out /data/<db>.db   (rechecks R under the same freeze first)
   sequence-highwater <db> --receipt R --local /data/<db>.db --credential-file F [--dry-run]
   thaw    <db>              lift the freeze -- the only command that does
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
@@ -72,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     common(sd)
     sd.add_argument("--receipt", required=True)
     sd.add_argument("--out", required=True)
-    sd.add_argument("--replica-uri", required=True, help="d1://<account>/<database-id> (sync_state.replica_uri)")
+    sd.add_argument("--replica-uri", help="optional; must equal d1://<account>/<database-id> (derived from them)")
     sd.add_argument("--rehearse", action="store_true", help="seed into a temp path instead of --out")
     sq = sub.add_parser("sequence-highwater", help="§4 H7 raise D1's sqlite_sequence to the local high-water")
     common(sq)
@@ -165,7 +165,7 @@ def main(argv=None) -> int:
             receipt = lp.recheck(args.db, args.receipt, deps, Path(args.out_dir))
             out = {"ok": True, "receipt": str(receipt), "fresh_export": str(receipt) != args.receipt}
         elif args.cmd == "seed":
-            out = {"ok": True, **lp.seed(args.db, args.receipt, Path(args.out), deps,
+            out = {"ok": True, **lp.seed(args.db, args.receipt, Path(args.out), deps, Path(args.out_dir),
                                          replica_uri=args.replica_uri, rehearse=args.rehearse)}
         else:
             out = {"ok": True, **lp.sequence_highwater(args.db, args.receipt, Path(args.local), deps,

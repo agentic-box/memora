@@ -683,6 +683,10 @@ def _sql_sequences(sql_path: Path) -> Dict[str, int]:
         db.close()
 
 
+def _with_sidecars(path: Path) -> Tuple[Path, ...]:
+    return (path, Path(f"{path}-wal"), Path(f"{path}-shm"), Path(f"{path}-journal"))
+
+
 def _fsync_dir(path: Path) -> None:
     fd = os.open(str(path), os.O_RDONLY)
     try:
@@ -691,25 +695,33 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
-def seed(db: str, receipt_path: str, out: Path, deps: Deps, *, replica_uri: str,
-         rehearse: bool = False) -> Dict[str, Any]:
+def seed(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
+         replica_uri: Optional[str] = None, rehearse: bool = False) -> Dict[str, Any]:
     """§4 seed: a new local store from a verified export. Built beside the
     target and linked into place only when it verifies; an existing target
     is never touched. Holds the target's primary lock while it works, so a
     memora-all already serving that path refuses it (and vice versa). Runs
-    under the freeze the export/recheck left in place (required, never
-    placed or lifted here; review 7621 P1-2)."""
+    under the freeze the export left in place (required, never placed or
+    lifted here; review 7621 P1-2), and seeds from what `recheck` returns
+    under it -- the same receipt, or a fresh export if D1 changed (review
+    7642 P1-1). The replica URI is the verified D1 identity's; a supplied
+    one must equal it (7642 P1-2)."""
     from .backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock, release_primary_lock
     from . import schema
 
-    receipt = load_receipt(receipt_path, db, account_id=deps.account_id, database_id=deps.database_id)
-    deps.freeze.require("before the seed")
+    derived = d1_uri(deps.account_id, deps.database_id)
+    if replica_uri is not None and replica_uri != derived:
+        raise L5Refused(f"--replica-uri {replica_uri!r} is not the verified D1 database {derived!r}")
+    replica_uri = derived
     if rehearse:
         out = Path(tempfile.mkdtemp(prefix=f"l5-rehearse-{db}-")) / Path(out).name
     out = Path(out)
-    for p in (out, Path(f"{out}-wal"), Path(f"{out}-shm"), Path(f"{out}-journal")):
+    for p in _with_sidecars(out):
         if p.exists():
             raise L5Refused(f"{p} already exists: seed never overwrites a store (restore handles an existing one)")
+    used = recheck(db, receipt_path, deps, out_dir)  # requires the freeze; a fresh export if D1 changed
+    receipt = load_receipt(str(used), db, account_id=deps.account_id, database_id=deps.database_id)
+    deps.freeze.check("before the seed")
     out.parent.mkdir(parents=True, exist_ok=True)  # §9 (k): before the primary lock
     try:
         acquire_primary_lock(out)
@@ -717,9 +729,9 @@ def seed(db: str, receipt_path: str, out: Path, deps: Deps, *, replica_uri: str,
         raise L5Refused(f"cannot seed {out}: {exc}")
     tmp = out.with_name(out.name + ".seed-partial")
     try:
-        for p in (tmp, Path(f"{tmp}-journal")):
+        for p in _with_sidecars(tmp):
             if p.exists():
-                p.unlink()  # our own leftover from an interrupted seed
+                p.unlink()  # our own leftovers from an interrupted seed, sidecars included (7642 P2)
         load_sql(Path(receipt["sql_path"]), tmp)
         d1_seq = _read_d1_sequences(deps)
         conn = LocalSQLiteBackend(tmp).connect()
@@ -762,11 +774,12 @@ def seed(db: str, receipt_path: str, out: Path, deps: Deps, *, replica_uri: str,
             raise L5Refused(f"{out} appeared during the seed; nothing was placed")
         _fsync_dir(out.parent)
     finally:
-        for p in (tmp, Path(f"{tmp}-journal")):
+        for p in _with_sidecars(tmp):
             if p.exists():
                 p.unlink()
         release_primary_lock(out)
-    return {"out": str(out), "receipt": str(receipt_path), "epoch": receipt["epoch"], "tables": stats,
+    return {"out": str(out), "receipt": str(used), "replica_uri": replica_uri, "epoch": receipt["epoch"],
+            "tables": stats,
             "fts_rows": fts_rows, "sequences": sequences, "sync_state": state, "rehearse": rehearse}
 
 
