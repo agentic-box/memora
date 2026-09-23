@@ -626,6 +626,7 @@ def store_write(conn):
         if conn.in_transaction:
             conn._memora_commit_now()  # earlier, independent writes of this caller
         conn.execute("BEGIN IMMEDIATE")
+        conn._memora_store_write_poisoned = False
         conn._memora_store_write_depth = 1
         _STORE_WRITE_TLS.depth = getattr(_STORE_WRITE_TLS, "depth", 0) + 1
         stack = getattr(_STORE_WRITE_TLS, "after", None)
@@ -643,6 +644,10 @@ def store_write(conn):
                 logger.exception("store_write: rollback failed")
             raise
         conn._memora_store_write_depth = 0
+        if conn._memora_store_write_poisoned:
+            conn._memora_store_write_poisoned = False
+            conn._memora_rollback_now()
+            raise StoreWriteAborted("a rollback() inside this store_write was caught; nothing was committed")
         try:
             conn._memora_commit_now()
         except BaseException:
@@ -777,6 +782,7 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
     # transaction: phase 3 of absorb, an import, a replicator ack are one
     # transaction however their helpers are written (plan §3).
     _memora_store_write_depth = 0
+    _memora_store_write_poisoned = False
 
     def commit(self):
         if self._memora_store_write_depth:
@@ -795,6 +801,9 @@ class _LockedWriterConnection(_ThreadCheckedConnection):
     def rollback(self):
         if self._memora_store_write_depth:
             self._memora_check()
+            # Poison it: even if a caller catches this, store_write refuses to
+            # commit (L4 review 7610 P2, §9 r).
+            self._memora_store_write_poisoned = True
             raise StoreWriteAborted("rollback() inside store_write: the whole transaction is rolled back")
         return self._memora_rollback_now()
 

@@ -89,7 +89,27 @@ def thaw_store(name: str) -> Result:
     remove_freeze(name)
     gate = backend.write_gate()
     gate.thaw()
+    _sweep_pending_images(backend)
     return 200, gate.status()
+
+
+def _sweep_pending_images(backend) -> None:
+    """Deferred images cannot be applied while a store is frozen; retry them
+    on thaw (L4 review 7610 P2, §9 s). Local stores only; never raises."""
+    from .backends import LocalSQLiteBackend
+
+    if not isinstance(backend, LocalSQLiteBackend):
+        return
+    try:
+        from .storage import sweep_pending_images
+
+        conn = backend.connect()
+        try:
+            sweep_pending_images(conn)
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("pending-image sweep after thaw failed: %s", exc)
 
 
 def list_intents(name: str, *, reader=None) -> Result:

@@ -1126,34 +1126,49 @@ def _prepare_metadata(
 
 def _apply_deferred_images(conn: sqlite3.Connection, memory_id: int) -> bool:
     """After a store_write committed a row with `images_pending`: upload its
-    images (network, OUTSIDE the write lock), then swap the metadata in its
-    own short store_write -- only if the row is unchanged meanwhile. On any
-    failure the flag stays, an ERROR is logged, and the startup sweep
-    retries. Returns True when the images were applied."""
+    images (network, OUTSIDE the write lock), then, in its own short
+    store_write, RE-READ the current row and swap in the uploaded sources
+    only if its `images` field is still byte-identical to what was uploaded
+    (L4 review 7610 P1-1). Any other concurrent edit -- content, tags,
+    other metadata -- is kept: the swap applies onto the CURRENT metadata,
+    and FTS is re-indexed from the CURRENT content and tags. Otherwise the
+    flag stays for the sweep. Returns True when the images were applied."""
     from .backends import store_write
 
-    row = conn.execute("SELECT content, metadata, tags FROM memories WHERE id = ?", (memory_id,)).fetchone()
+    row = conn.execute("SELECT metadata FROM memories WHERE id = ?", (memory_id,)).fetchone()
     if row is None:
         return False
-    raw = row["metadata"]
     try:
-        meta = json.loads(raw) if raw else {}
+        meta = json.loads(row["metadata"]) if row["metadata"] else {}
     except json.JSONDecodeError:
         return False
     if not meta.get("images_pending"):
         return False
+    uploaded_from = json.dumps(meta.get("images"), sort_keys=True)
     try:
         base = {k: v for k, v in meta.items() if k != "images_pending"}
         processed = _process_metadata_images(base, memory_id=memory_id)
-        new_json = json.dumps(processed, ensure_ascii=False)
         with store_write(conn):
-            cur = conn.execute("UPDATE memories SET metadata = ? WHERE id = ? AND metadata = ?",
-                               (new_json, memory_id, raw))
-            if cur.rowcount != 1:
-                logger.warning("deferred images of #%s not applied: the row changed meanwhile; "
+            cur = conn.execute("SELECT content, metadata, tags FROM memories WHERE id = ?", (memory_id,)).fetchone()
+            if cur is None:
+                return False
+            cur_meta = json.loads(cur["metadata"]) if cur["metadata"] else {}
+            if not cur_meta.get("images_pending"):
+                return False
+            if json.dumps(cur_meta.get("images"), sort_keys=True) != uploaded_from:
+                logger.warning("deferred images of #%s not applied: its images changed during the upload; "
                                "it stays images_pending", memory_id)
                 return False
-            _fts_upsert(conn, memory_id, row["content"], new_json, row["tags"])
+            new_meta = {k: v for k, v in cur_meta.items() if k != "images_pending"}
+            new_meta["images"] = processed.get("images")
+            new_json = json.dumps(new_meta, ensure_ascii=False)
+            done = conn.execute(
+                "UPDATE memories SET metadata = ? WHERE id = ? AND metadata IS ? AND content IS ? AND tags IS ?",
+                (new_json, memory_id, cur["metadata"], cur["content"], cur["tags"]),
+            )
+            if done.rowcount != 1:
+                return False
+            _fts_upsert(conn, memory_id, cur["content"], new_json, cur["tags"])
         return True
     except Exception as exc:
         logger.error("deferred images of #%s failed (%s: %s); images_pending stays for the startup sweep",
@@ -7322,6 +7337,26 @@ def _absorb_gate_updates(
 _ABSORB_TX_REGATES = 3
 
 
+def _absorb_link(conn: sqlite3.Connection, tx: bool, from_id: int, to_id: int, *, edge_type: str) -> None:
+    """add_link for a link absorb reports as created_unlinked when it fails.
+    add_link writes the forward crossref before the reverse one, so on a
+    transactional backend it runs inside a SAVEPOINT: a failure after the
+    first write is rolled back to the savepoint -- no half edge survives --
+    while the memory itself stays in the transaction (L4 review 7610 P1-2).
+    The D1 path is unchanged."""
+    if not tx:
+        add_link(conn, from_id, to_id, edge_type=edge_type, commit=False)
+        return
+    conn.execute("SAVEPOINT absorb_link")
+    try:
+        add_link(conn, from_id, to_id, edge_type=edge_type, commit=False)
+    except BaseException:
+        conn.execute("ROLLBACK TO absorb_link")
+        conn.execute("RELEASE absorb_link")
+        raise
+    conn.execute("RELEASE absorb_link")
+
+
 def _absorb_pregate_job(conn: sqlite3.Connection, corpus: "_CorpusSnapshot", job: Dict[str, Any],
                         *, context: Optional[str]) -> None:
     """Before BEGIN: gate every leaf the write boundary can meet -- the
@@ -7895,7 +7930,7 @@ def _absorb_memory_impl(
                             continue
                         try:
                             with absorb_phase("phase3_link"):
-                                add_link(conn, record["id"], related_leaf, edge_type="related_to", commit=False)
+                                _absorb_link(conn, tx, record["id"], related_leaf, edge_type="related_to")
                         except Exception as link_err:
                             logger.warning(
                                 "Absorb link failed (memory #%d -> #%d): %s",
@@ -8094,7 +8129,7 @@ def _absorb_memory_impl(
                 link_error: Optional[Exception] = None
                 try:
                     with absorb_phase("phase3_link"):
-                        add_link(conn, record["id"], target_id, edge_type=edge_type, commit=False)
+                        _absorb_link(conn, tx, record["id"], target_id, edge_type=edge_type)
                 except (ValueError, Exception) as link_err:
                     logger.warning(
                         "Absorb link failed (memory #%d -> #%d): %s",

@@ -46,10 +46,16 @@ def test_store_write_defers_inner_commits_to_its_end(tmp_path):
 def test_inner_rollback_or_error_aborts_everything(tmp_path):
     b = _store(tmp_path)
     conn = b.connect()
+    raised = []
     with pytest.raises(StoreWriteAborted):
         with store_write(conn):
             conn.execute("INSERT INTO t VALUES (1)")
-            conn.rollback()
+            try:
+                conn.rollback()
+            except StoreWriteAborted:
+                raised.append(True)
+                raise
+    assert raised, "rollback() inside store_write must raise at the call site"
     with pytest.raises(ZeroDivisionError):
         with store_write(conn):
             conn.execute("INSERT INTO t VALUES (1)")
@@ -170,3 +176,23 @@ def test_exempt_gate_entries_are_for_the_replicator_only(tmp_path):
     with pytest.raises(PermissionError, match="replicator only"):
         gate.enter("not the replicator", exempt=True)
     assert gate.status()["in_flight"] == 0
+
+
+
+def test_a_caught_inner_rollback_still_refuses_the_commit(tmp_path):
+    """§9 (r): catching StoreWriteAborted does not make the commit possible."""
+    b = _store(tmp_path)
+    conn = b.connect()
+    with pytest.raises(StoreWriteAborted, match="caught"):
+        with store_write(conn):
+            conn.execute("INSERT INTO t VALUES (1)")
+            try:
+                conn.rollback()
+            except StoreWriteAborted:
+                pass
+            conn.execute("INSERT INTO t VALUES (2)")
+    assert _count(b.db_path) == 0
+    with store_write(conn):  # the next transaction is clean
+        conn.execute("INSERT INTO t VALUES (3)")
+    assert _count(b.db_path) == 1
+    conn.close()
