@@ -23,20 +23,39 @@ Cloud-hosted knowledge graph visualization for Memora, deployed on Cloudflare Pa
 - **Pages**: Static graph UI + API functions
 - **DO Worker**: Durable Object for WebSocket connections (real-time updates)
 
-## Quick Setup
+## Read-only viewer
+
+The deployed viewer never writes D1 (`docs/local-primary-implementation.md`
+§6 F1, slice L7). memora-all on nuc8 is the only D1 writer; memories are
+created and edited through memora itself.
+
+- `PATCH`, `PUT`, `POST` and `DELETE` on `/api/memories/:id` answer `405`
+  (`{"error": "read_only"}`, `Allow: GET, HEAD`) without touching D1.
+- `/api/chat` searches and answers. The model is offered no tools, and a tool
+  call it emits anyway is not executed; the answer says no memory was changed.
+- `GET /api/capabilities` answers `{"read_only": true}`. The shared page
+  (`public/index.html`, the same file memora's own graph server serves) shows
+  a "Read-only viewer" badge and hides or disables its edit controls unless a
+  server answers `read_only: false`, which only memora's local graph server
+  does. `force-graph.html` has no edit controls.
+- `scripts/d1_write_guard.py --scope all` is clean and blocking in CI
+  (`graph-ui.yml`), and `npm run deploy` runs it first.
+- Tests: `node --experimental-strip-types scripts/test_readonly.mjs [baseUrl]`.
+
+## Quick Setup (partial: stops after creating the D1 database)
 
 ```bash
 cd memora-graph
 npm run setup
 ```
 
-This will:
-1. Install dependencies
-2. Create D1 database
-3. Deploy WebSocket Worker (Durable Object)
-4. Deploy Pages site
-5. Guide you through binding configuration
-6. Run initial data sync
+`npm run setup` is no longer a full automated setup. It checks the
+prerequisites, installs dependencies, checks the Cloudflare login and creates
+the D1 database if it is missing, then **exits 1** at the retired remote
+migration step (remote D1 writes are retired: `docs/local-primary-implementation.md`
+§0 P6, §6 F3). It never reaches its later steps (Worker, Pages, bindings,
+initial sync). Follow the manual steps below for the rest; the D1 database is
+filled by memora-all, not by this repository.
 
 ## Manual Setup
 
@@ -107,7 +126,7 @@ In Cloudflare Dashboard:
 npm run deploy
 ```
 
-`npm run deploy` runs `scripts/d1_write_guard.py --scope all` first and refuses on any finding. Until the viewer is read-only (slice L7) the guard fails, so the deploy refuses. A direct `wrangler pages deploy` bypasses the guard and is forbidden by operator rule until then (plan §0 P6).
+`npm run deploy` runs `scripts/d1_write_guard.py --scope all` first and refuses on any finding. Since slice L7 the viewer is read-only and the guard is clean, so the deploy proceeds. Deploy through `npm run deploy` only: a direct `wrangler pages deploy` skips the guard (plan §0 P6). The Pages deploy credential is held by the user only.
 
 ### 10. Initial sync
 
@@ -131,7 +150,7 @@ Now any memory create/update/delete will automatically sync to the cloud graph a
 
 | Script | Description |
 |--------|-------------|
-| `npm run setup` | Full automated setup |
+| `npm run setup` | Partial: prerequisites, dependencies, login and D1 database creation, then exits 1 at the retired remote migration step |
 | `npm run deploy` | Deploy Pages site (runs the D1 write guard first; refuses on findings) |
 | `npm run deploy:worker` | Deploy WebSocket worker |
 | `npm run sync` | Sync to a local D1 (development) |
@@ -163,7 +182,7 @@ memora-graph/
 ├── public/
 │   └── index.html             # Graph SPA
 ├── scripts/
-│   ├── setup-cloudflare.sh    # Automated setup script
+│   ├── setup-cloudflare.sh    # Partial setup: stops at the retired remote migration
 │   ├── sync.sh                # Sync wrapper with env loading (local D1 only)
 │   ├── sync-to-d1.py          # Export to a local D1 (remote runs exit 1)
 │   └── link-r2-images.py      # Retired: exits 1

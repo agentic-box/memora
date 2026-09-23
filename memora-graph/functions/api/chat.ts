@@ -1,18 +1,15 @@
 /**
- * POST /api/chat - Chat about memories using LLM with RAG + tool calling
- * Uses semantic search (embeddings) + keyword search for memory retrieval.
- * Supports create/update/delete memories via OpenAI-style tool calling.
+ * POST /api/chat - Chat about memories using LLM with RAG. READ-ONLY.
+ * Uses semantic search (embeddings) + keyword search for memory retrieval,
+ * then streams an answer. It never writes D1: the viewer is read-only
+ * (docs/local-primary-implementation.md §6 F1, slice L7). The model is
+ * offered no tools, and any tool call it emits anyway is ignored. Memories
+ * are created and edited through memora itself, never through the viewer.
  * Requires OPENROUTER_API_KEY secret and optionally CHAT_MODEL env var.
  * Supports ?db=<configured name> to select a database.
  */
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "./_db.ts";
-import {
-  loadTagPolicy,
-  tagPolicyUnavailableResponse,
-  validateTags,
-  type TagPolicy,
-} from "./_tags.ts";
 
 interface Env extends DatabaseEnv {
   OPENROUTER_API_KEY?: string;
@@ -31,12 +28,6 @@ interface MemoryRow {
 interface ChatMessage {
   role: string;
   content: string | null;
-  tool_calls?: Array<{
-    id: string;
-    type: string;
-    function: { name: string; arguments: string };
-  }>;
-  tool_call_id?: string;
 }
 
 interface ChatRequest {
@@ -57,204 +48,6 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
     return JSON.parse(str);
   } catch {
     return defaultValue;
-  }
-}
-
-// ── Tool definitions ──────────────────────────────────────────────────
-
-const CHAT_TOOLS = [
-  {
-    type: "function" as const,
-    function: {
-      name: "create_memory",
-      description:
-        "Create a new memory in the knowledge base. Use when the user asks to save, create, add, or remember something.",
-      parameters: {
-        type: "object",
-        properties: {
-          content: {
-            type: "string",
-            description: "The full text content of the memory.",
-          },
-          tags: {
-            type: "array",
-            items: { type: "string" },
-            description: "Optional tags to categorize the memory.",
-          },
-        },
-        required: ["content"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "update_memory",
-      description:
-        "Update an existing memory by ID. Use when the user asks to modify, edit, or change a specific memory.",
-      parameters: {
-        type: "object",
-        properties: {
-          memory_id: {
-            type: "integer",
-            description: "The ID of the memory to update.",
-          },
-          content: {
-            type: "string",
-            description: "New full text content. Replaces existing content.",
-          },
-          tags: {
-            type: "array",
-            items: { type: "string" },
-            description: "New tags. Replaces all existing tags.",
-          },
-        },
-        required: ["memory_id"],
-      },
-    },
-  },
-  {
-    type: "function" as const,
-    function: {
-      name: "delete_memory",
-      description:
-        "Delete a memory by ID. Use when the user asks to remove or delete a specific memory.",
-      parameters: {
-        type: "object",
-        properties: {
-          memory_id: {
-            type: "integer",
-            description: "The ID of the memory to delete.",
-          },
-        },
-        required: ["memory_id"],
-      },
-    },
-  },
-];
-
-// ── Tool execution via D1 ─────────────────────────────────────────────
-
-export async function executeToolCall(
-  db: D1Database,
-  toolName: string,
-  args: Record<string, unknown>,
-  apiKey: string,
-  embeddingModel: string,
-  tagPolicy: TagPolicy,
-): Promise<string> {
-  try {
-    if (toolName === "create_memory") {
-      const content = String(args.content || "");
-      const validation = validateTags(args.tags === undefined ? [] : args.tags, tagPolicy);
-      if (!validation.ok) {
-        return JSON.stringify({ success: false, error: validation.error, message: validation.message });
-      }
-      const tags = validation.tags;
-      const result = await db
-        .prepare(
-          "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, '{}', ?, datetime('now'))"
-        )
-        .bind(content, JSON.stringify(tags))
-        .run();
-      const newId = result.meta?.last_row_id;
-      if (newId) {
-        await computeAndStoreEmbedding(db, newId, content, apiKey, embeddingModel);
-      }
-      return JSON.stringify({
-        success: true,
-        action: "created",
-        memory_id: newId,
-        preview: content.slice(0, 100),
-      });
-    }
-
-    if (toolName === "update_memory") {
-      const mid = Number(args.memory_id);
-      if (!mid || isNaN(mid)) {
-        return JSON.stringify({ success: false, error: "Invalid memory_id." });
-      }
-      // Fetch existing
-      const existing = await db
-        .prepare("SELECT id, content, tags FROM memories WHERE id = ?")
-        .bind(mid)
-        .first<MemoryRow>();
-      if (!existing) {
-        return JSON.stringify({
-          success: false,
-          error: `Memory #${mid} not found.`,
-        });
-      }
-      const newContent =
-        args.content !== undefined ? String(args.content) : existing.content;
-      let validatedTags: string[] | undefined;
-      if (args.tags !== undefined) {
-        const validation = validateTags(args.tags, tagPolicy);
-        if (!validation.ok) {
-          return JSON.stringify({ success: false, error: validation.error, message: validation.message });
-        }
-        validatedTags = validation.tags;
-      }
-      const newTags =
-        validatedTags !== undefined
-          ? JSON.stringify(validatedTags)
-          : existing.tags;
-      await db
-        .prepare(
-          "UPDATE memories SET content = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"
-        )
-        .bind(newContent, newTags, mid)
-        .run();
-      if (args.content !== undefined || args.tags !== undefined) {
-        await computeAndStoreEmbedding(db, mid, newContent, apiKey, embeddingModel);
-      }
-      return JSON.stringify({
-        success: true,
-        action: "updated",
-        memory_id: mid,
-        preview: newContent.slice(0, 100),
-      });
-    }
-
-    if (toolName === "delete_memory") {
-      const mid = Number(args.memory_id);
-      if (!mid || isNaN(mid)) {
-        return JSON.stringify({ success: false, error: "Invalid memory_id." });
-      }
-      const existing = await db
-        .prepare("SELECT id, content FROM memories WHERE id = ?")
-        .bind(mid)
-        .first<{ id: number; content: string }>();
-      if (!existing) {
-        return JSON.stringify({
-          success: false,
-          error: `Memory #${mid} not found.`,
-        });
-      }
-      // Delete embedding separately — table may not exist
-      try {
-        await db.prepare("DELETE FROM memories_embeddings WHERE memory_id = ?").bind(mid).run();
-      } catch (e: unknown) {
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!msg.includes("no such table")) throw e;
-      }
-      // Delete remaining related data and the memory
-      await db.batch([
-        db.prepare("DELETE FROM memories_crossrefs WHERE memory_id = ?").bind(mid),
-        db.prepare("DELETE FROM memories WHERE id = ?").bind(mid),
-      ]);
-      return JSON.stringify({
-        success: true,
-        action: "deleted",
-        memory_id: mid,
-        preview: existing.content.slice(0, 100),
-      });
-    }
-
-    return JSON.stringify({ success: false, error: `Unknown tool: ${toolName}` });
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return JSON.stringify({ success: false, error: msg.slice(0, 200) });
   }
 }
 
@@ -284,46 +77,6 @@ async function getQueryEmbedding(
     return data.data?.[0]?.embedding || null;
   } catch {
     return null;
-  }
-}
-
-function denseToSparse(vector: number[]): string {
-  const pairs: Array<[string, number]> = [];
-  for (let i = 0; i < vector.length; i++) {
-    if (Math.abs(vector[i]) > 0.001) {
-      pairs.push([String(i), vector[i]]);
-    }
-  }
-  return JSON.stringify(pairs);
-}
-
-async function computeAndStoreEmbedding(
-  db: D1Database,
-  memoryId: number,
-  content: string,
-  apiKey: string,
-  model: string
-): Promise<void> {
-  try {
-    const embedding = await getQueryEmbedding(content, apiKey, model);
-    if (!embedding) return;
-    const sparse = denseToSparse(embedding);
-    await db
-      .prepare(
-        "CREATE TABLE IF NOT EXISTS memories_embeddings (" +
-          "memory_id INTEGER PRIMARY KEY, embedding TEXT, " +
-          "FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE)"
-      )
-      .run();
-    await db
-      .prepare(
-        "INSERT INTO memories_embeddings (memory_id, embedding) VALUES (?, ?) " +
-          "ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding"
-      )
-      .bind(memoryId, sparse)
-      .run();
-  } catch (e) {
-    console.error(`Failed to compute embedding for memory #${memoryId}:`, e);
   }
 }
 
@@ -652,7 +405,6 @@ interface LLMCallOptions {
   model: string;
   messages: ChatMessage[];
   origin: string;
-  tools?: typeof CHAT_TOOLS;
 }
 
 async function callLLM(opts: LLMCallOptions): Promise<Response> {
@@ -663,9 +415,7 @@ async function callLLM(opts: LLMCallOptions): Promise<Response> {
     temperature: 0.7,
     max_tokens: 2000,
   };
-  if (opts.tools) {
-    body.tools = opts.tools;
-  }
+  // No `tools`: the viewer is read-only (§6 F1).
   return fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -677,14 +427,13 @@ async function callLLM(opts: LLMCallOptions): Promise<Response> {
   });
 }
 
-// ── Parse one SSE stream, accumulating content + tool_call deltas ─────
+// ── Parse one SSE stream, forwarding content tokens ───────────────────
 
 interface StreamResult {
   content: string;
-  toolCalls: Record<
-    number,
-    { id: string; name: string; arguments: string }
-  >;
+  // Tool calls the model emitted although it was offered none. Counted so the
+  // handler can say so; never executed (the viewer is read-only, §6 F1).
+  ignoredToolCalls: number;
 }
 
 async function consumeStream(
@@ -693,7 +442,8 @@ async function consumeStream(
 ): Promise<StreamResult> {
   const decoder = new TextDecoder();
   let buffer = "";
-  const result: StreamResult = { content: "", toolCalls: {} };
+  const result: StreamResult = { content: "", ignoredToolCalls: 0 };
+  const seenToolCalls = new Set<number>();
 
   const reader = response.body!.getReader();
   while (true) {
@@ -714,25 +464,12 @@ async function consumeStream(
         const delta = chunk.choices?.[0]?.delta;
         if (!delta) continue;
 
-        // Content tokens
         if (delta.content) {
           result.content += delta.content;
           await onToken(delta.content);
         }
-
-        // Tool call deltas
         if (delta.tool_calls) {
-          for (const tc of delta.tool_calls) {
-            const idx = tc.index ?? 0;
-            if (!result.toolCalls[idx]) {
-              result.toolCalls[idx] = { id: "", name: "", arguments: "" };
-            }
-            const entry = result.toolCalls[idx];
-            if (tc.id) entry.id = tc.id;
-            if (tc.function?.name) entry.name = tc.function.name;
-            if (tc.function?.arguments)
-              entry.arguments += tc.function.arguments;
-          }
+          for (const tc of delta.tool_calls) seenToolCalls.add(tc.index ?? 0);
         }
       } catch {
         // Skip malformed chunks
@@ -740,6 +477,7 @@ async function consumeStream(
     }
   }
 
+  result.ignoredToolCalls = seenToolCalls.size;
   return result;
 }
 
@@ -766,10 +504,6 @@ export const onRequestPost: PagesFunction<Env> = async ({
       { status: 503 }
     );
   }
-
-  const tagPolicyResult = await loadTagPolicy(db);
-  if (!tagPolicyResult.ok) return tagPolicyUnavailableResponse();
-  const tagPolicy = tagPolicyResult.policy;
 
   let body: ChatRequest;
   try {
@@ -837,23 +571,11 @@ export const onRequestPost: PagesFunction<Env> = async ({
       "When referencing a memory, cite it as [Memory #<id>].",
       "If the memories don't contain relevant information, say so honestly.",
       "",
-      "## Tool Use — IMPORTANT",
+      "## Read-only",
       "",
-      "You have tools to create, update, and delete memories. You MUST call the appropriate tool when the user asks to:",
-      "- Create/save/add/remember something → call create_memory",
-      "- Update/edit/modify a memory → call update_memory",
-      "- Delete/remove a memory → call delete_memory",
-      "",
-      "ALWAYS call the tool directly. Do NOT ask for confirmation, do NOT say you can't find the memory, do NOT suggest content without calling the tool.",
-      "The memory database has many more entries than what's shown in context below — if the user references a memory ID, trust them and call the tool.",
-      "When creating a memory, write substantive, well-structured content.",
-      "When updating, apply the user's requested changes to the existing content.",
-      "",
-      "## When NOT to use tools",
-      "",
-      "Do NOT create, update, or delete memories unless the user EXPLICITLY asks you to.",
-      "If the user asks a question, searches for something, or wants to discuss a topic — just answer using the context provided.",
-      "Asking about a memory is NOT a request to create one.",
+      "This viewer is read-only: you cannot create, update or delete memories, and you have no tools.",
+      "If the user asks to change a memory, say that edits are made through memora itself, not this viewer,",
+      "and, if useful, suggest the exact change they could make there.",
     ].join("\n"),
   };
 
@@ -872,7 +594,7 @@ export const onRequestPost: PagesFunction<Env> = async ({
     { role: "user", content: message },
   ];
 
-  // ── Streaming response with tool calling ──────────────────────────
+  // ── Streaming response ────────────────────────────────────────────
 
   const encoder = new TextEncoder();
   const { readable, writable } = new TransformStream();
@@ -891,14 +613,8 @@ export const onRequestPost: PagesFunction<Env> = async ({
       if (references.length > 0) references[0].method = searchMethod;
       await writeSSE("references", JSON.stringify(references));
 
-      // First LLM call — with tools
-      const llmResponse = await callLLM({
-        apiKey,
-        model,
-        messages,
-        origin,
-        tools: CHAT_TOOLS,
-      });
+      // One LLM call, no tools: the viewer is read-only (§6 F1).
+      const llmResponse = await callLLM({ apiKey, model, messages, origin });
 
       if (!llmResponse.ok || !llmResponse.body) {
         const errText = await llmResponse
@@ -908,85 +624,16 @@ export const onRequestPost: PagesFunction<Env> = async ({
         return;
       }
 
-      // Consume stream, forwarding content tokens
-      const streamResult = await consumeStream(
-        llmResponse,
-        async (token) => {
-          await writeSSE("token", token);
-        }
-      );
-
-      // No tool calls → done
-      const tcIndices = Object.keys(streamResult.toolCalls).map(Number);
-      if (tcIndices.length === 0) {
-        await writeSSE("done", "");
-        return;
-      }
-
-      // Execute tool calls
-      const toolResults: ChatMessage[] = [];
-      for (const idx of tcIndices.sort((a, b) => a - b)) {
-        const tc = streamResult.toolCalls[idx];
-        let args: Record<string, unknown> = {};
-        try {
-          args = JSON.parse(tc.arguments);
-        } catch {
-          /* empty args */
-        }
-
-        const resultStr = await executeToolCall(
-          db, tc.name, args, apiKey, embeddingModel, tagPolicy
-        );
-
-        // Emit action event to frontend
-        const actionData = JSON.parse(resultStr);
-        actionData.tool = tc.name;
-        await writeSSE("action", JSON.stringify(actionData));
-
-        toolResults.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content: resultStr,
-        });
-      }
-
-      // Build assistant message with tool_calls for context
-      const assistantMsg: ChatMessage = {
-        role: "assistant",
-        content: streamResult.content || null,
-        tool_calls: tcIndices
-          .sort((a, b) => a - b)
-          .map((i) => ({
-            id: streamResult.toolCalls[i].id,
-            type: "function",
-            function: {
-              name: streamResult.toolCalls[i].name,
-              arguments: streamResult.toolCalls[i].arguments,
-            },
-          })),
-      };
-
-      // Second LLM call — with tool results, no tools (prevent loops)
-      const llmResponse2 = await callLLM({
-        apiKey,
-        model,
-        messages: [...messages, assistantMsg, ...toolResults],
-        origin,
-        // no tools on second call
-      });
-
-      if (!llmResponse2.ok || !llmResponse2.body) {
-        const errText = await llmResponse2
-          .text()
-          .catch(() => "Unknown error");
-        await writeSSE("error", errText.slice(0, 200));
-        return;
-      }
-
-      // Stream second response content
-      await consumeStream(llmResponse2, async (token) => {
+      const streamResult = await consumeStream(llmResponse, async (token) => {
         await writeSSE("token", token);
       });
+      if (streamResult.ignoredToolCalls > 0) {
+        // Never executed. Say so rather than leave the user expecting a change.
+        await writeSSE(
+          "token",
+          "\n\n(This viewer is read-only; no memory was changed. Edits are made through memora.)"
+        );
+      }
 
       await writeSSE("done", "");
     } catch (e: unknown) {

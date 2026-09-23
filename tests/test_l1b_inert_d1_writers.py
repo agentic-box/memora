@@ -128,29 +128,52 @@ def _deploy_pages_harness(tmp_path: Path) -> Path:
     return lib
 
 
-def test_setup_cloudflare_pages_deploy_runs_guard_first(tmp_path):
+def _failing_guard(bindir: Path) -> None:
+    """A python3 that stands in for a guard run with findings (exit 1)."""
+    exe = bindir / "python3"
+    exe.write_text('#!/bin/sh\necho "d1_write_guard: 1 finding(s)" >&2\nexit 1\n')
+    exe.chmod(0o755)
+
+
+@pytest.mark.parametrize("guard", ["clean", "findings"])
+def test_setup_cloudflare_pages_deploy_runs_guard_first(tmp_path, guard):
+    """Since slice L7 the real guard is clean, so the deploy proceeds to
+    wrangler; a guard with findings still stops it before wrangler runs."""
     bindir, log = _recorders(tmp_path, ["npx", WR])
+    if guard == "findings":
+        _failing_guard(bindir)
     lib = _deploy_pages_harness(tmp_path)
     script = f'source "{lib}"; PROJECT_DIR="{GRAPH}"; deploy_pages; echo reached-after'
     r = subprocess.run(["/bin/bash", "-c", script], env=_env(bindir), capture_output=True, text=True, timeout=120)
-    # The guard's handler scope fails until slice L7, so the deploy must refuse.
-    assert r.returncode == 1
-    assert "reached-after" not in r.stdout
-    assert log.read_text() == "", "wrangler must not run when the guard fails"
+    if guard == "findings":
+        assert r.returncode == 1
+        assert "reached-after" not in r.stdout
+        assert log.read_text() == "", "wrangler must not run when the guard fails"
+    else:
+        assert "pages deploy" in log.read_text(), r.stdout + r.stderr
 
 
 def _package_scripts() -> dict:
     return json.loads((GRAPH / "package.json").read_text())["scripts"]
 
 
-def test_package_deploy_runs_guard_first_and_refuses(tmp_path):
+@pytest.mark.parametrize("guard", ["clean", "findings"])
+def test_package_deploy_runs_guard_first(tmp_path, guard):
     deploy = _package_scripts()["deploy"]
     assert deploy.startswith("python3 ../scripts/d1_write_guard.py --scope all && ")
     bindir, log = _recorders(tmp_path, [WR, "npx"])
-    r = subprocess.run(["/bin/sh", "-c", deploy], cwd=GRAPH, env=_env(bindir),
+    if guard == "findings":
+        _failing_guard(bindir)
+    env = _env(bindir, real_python=guard == "clean")
+    r = subprocess.run(["/bin/sh", "-c", deploy], cwd=GRAPH, env=env,
                        capture_output=True, text=True, timeout=120)
-    assert r.returncode != 0
-    assert log.read_text() == ""
+    if guard == "findings":
+        assert r.returncode != 0
+        assert log.read_text() == ""
+    else:
+        assert r.returncode == 0, r.stdout + r.stderr
+        assert "d1_write_guard: clean" in r.stdout
+        assert log.read_text().startswith(f"{WR} pages deploy"), "wrangler runs only after the guard passed"
 
 
 def test_package_d1_migrate_refused(tmp_path):
@@ -244,14 +267,11 @@ def test_repo_tools_scope_clean():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
-def test_repo_handlers_scope_reports_viewer_writers_until_l7():
-    """The viewer still writes D1 until slice L7 (plan §6 F1). L7 flips this
-    test to expect a clean run and makes the CI handler step blocking."""
+def test_repo_handlers_scope_clean():
+    """Slice L7 made the viewer read-only (plan §6 F1); the handler scope is
+    clean and CI blocks on it (graph-ui.yml)."""
     r = _guard(REPO, "handlers")
-    assert r.returncode == 1
-    assert "memora-graph/functions/api/chat.ts" in r.stdout
-    assert "memora-graph/functions/api/memories/[id].ts" in r.stdout
-    assert all(" H1 " in line for line in r.stdout.splitlines())
+    assert r.returncode == 0, r.stdout + r.stderr
 
 
 H1_VERBS = [

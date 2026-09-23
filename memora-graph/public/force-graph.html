@@ -65,8 +65,8 @@
   #tlhead h2 { margin: 0; font-size: 14px; color: #a855f7; flex: 1; }
   #tlfav { background: none; border: 1px solid #30363d; color: #6e7681; padding: 2px 9px; border-radius: 6px; cursor: pointer; }
   #tlfav.active { color: #e3b341; border-color: #e3b341; }
-  .trow .star { color: #4d535b; cursor: pointer; flex: none; font-size: 12px; }
-  .trow .star.on, .trow .star:hover { color: #e3b341; }
+  .trow .star { color: #4d535b; flex: none; font-size: 12px; }  /* shows favorite state; read-only */
+  .trow .star.on { color: #e3b341; }
   /* ---- timeline controls: year + month + order dropdowns ---- */
   #tlctrls { display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #21262d; }
   #tlctrls select { flex: 1 1 calc(50% - 3px); min-width: 0; }
@@ -138,6 +138,9 @@
   #panel .imgs figure { margin: 0 0 10px; }
   #panel .imgs img { max-width: 100%; border-radius: 6px; border: 1px solid #30363d; display: block; }
   #panel .imgs figcaption { font-size: 11px; color: #7d8590; text-align: center; margin-top: 4px; }
+  /* Read-only viewer (§6 F1): a fixed corner note, outside #bar's layout. */
+  #readonly { position: fixed; left: 12px; bottom: 12px; z-index: 29; padding: 4px 10px; border-radius: 12px;
+    font-size: 12px; color: #e3b341; background: rgba(13, 17, 23, 0.9); border: 1px solid #e3b341; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -154,6 +157,7 @@
   <div class="pill"><button id="btl">☰ Timeline</button></div>
   <div class="pill" id="stats">loading…</div>
 </div>
+<div id="readonly" title="This viewer cannot change memories; edit them through memora (docs/local-primary-implementation.md §6 F1).">Read-only viewer</div>
 
 <div id="refresh" onclick="doRefresh()"></div>
 <div id="truncation-banner" role="status">
@@ -310,17 +314,6 @@ function renderImages(m) {
   return `<div class="imgs">` + imgs.map(im =>
     `<figure><img src="${esc(fix(im.src))}" loading="lazy" alt="${esc(im.caption || "")}">` +
     (im.caption ? `<figcaption>${esc(im.caption)}</figcaption>` : "") + `</figure>`).join("") + `</div>`;
-}
-async function toggleFav(m, row) {
-  const next = !isFav(m);
-  try {
-    const r = await fetch(`/api/memories/${m.id}?db=${encodeURIComponent(el("db").value)}`, {
-      method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ favorite: next }) });
-    if (!r.ok) throw new Error("HTTP " + r.status);
-    m.metadata = m.metadata || {}; if (next) m.metadata.favorite = true; else delete m.metadata.favorite;
-    const s = row && row.querySelector(".star"); if (s) s.classList.toggle("on", next);
-    if (el("tlfav").classList.contains("active") && !next) drawTimeline();   // dropped out of favorites view
-  } catch (e) { /* leave state unchanged on failure */ }
 }
 function webglOK() { try { const c = document.createElement("canvas");
   return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
@@ -1197,7 +1190,6 @@ function drawTimeline() {
     row.innerHTML = `<div class="l1"><span class="star${isFav(m) ? " on" : ""}">★</span><span class="type">${esc(typeLabel)}</span><span class="ttl">${esc(labelOf(m))}</span></div>` +
       `<div class="day">${m.created.slice(0, 10)} · #${m.id}${badges}</div>`;
     rowById[m.id] = row;
-    row.querySelector(".star").onclick = (e) => { e.stopPropagation(); toggleFav(m, row); };
     // Pass superseded explicitly — do not rely on openDetail fallback after paint.
     row.onclick = () => selectMemory(m.id, m._dupe, m, !!m._superseded);
     list.appendChild(row);

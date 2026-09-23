@@ -810,9 +810,17 @@ def start_graph_server(host: str, port: int) -> None:
         except Exception as e:
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
+    async def api_capabilities(request):
+        # The shared index.html hides its edit controls unless the server
+        # says it may write (fail closed). This server edits through memora
+        # itself, so it may; the Pages viewer answers read_only: true
+        # (docs/local-primary-implementation.md §6 F1).
+        return JSONResponse({"read_only": False})
+
     app = Starlette(
         routes=[
             Route("/graph", graph_handler),
+            Route("/api/capabilities", api_capabilities),
             Route("/_graph_limit.mjs", graph_limit_module),
             Route("/api/graph", api_graph),
             Route("/api/events", graph_events),

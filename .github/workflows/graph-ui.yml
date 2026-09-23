@@ -42,13 +42,12 @@ jobs:
           python-version: "3.13"
       - name: "Guard: retired tools and deploy/migration commands (blocking)"
         run: python3 scripts/d1_write_guard.py --scope tools
-      - name: "Guard: viewer write handlers (reports; blocking from slice L7)"
-        # FAILS BY DESIGN until slice L7 makes the viewer read-only (plan §6 F1,
-        # §8 L7). The plan assigns the handler half of F2 to L7, which removes
-        # this continue-on-error. Scripted Pages deploys already run --scope all
-        # and refuse on these findings.
-        continue-on-error: true
+      - name: "Guard: viewer write handlers (blocking)"
+        # Slice L7 made the viewer read-only (plan §6 F1): the handler scope is
+        # clean and any write SQL in memora-graph/functions or worker fails CI.
         run: python3 scripts/d1_write_guard.py --scope handlers
+      - name: "Guard: both scopes, as every scripted Pages deploy runs it"
+        run: python3 scripts/d1_write_guard.py --scope all
 
   graph-ui:
     runs-on: ubuntu-latest
@@ -119,8 +118,10 @@ jobs:
         # workflow and ran nowhere.
         run: node --experimental-strip-types scripts/test_lineage.mjs
 
-      - name: Tag write policy tests
-        run: node --experimental-strip-types scripts/test_tag_writes.mjs http://localhost:8788
+      - name: Read-only viewer tests
+        # No write handler, no chat tools, 405 on every write method -- also
+        # over HTTP against the seeded server (plan §6 F1).
+        run: node --experimental-strip-types scripts/test_readonly.mjs http://localhost:8788
 
       - name: Graph limit UI logic tests
         run: node --experimental-strip-types scripts/test_graph_limit_ui.mjs

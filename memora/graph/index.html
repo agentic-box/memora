@@ -558,9 +558,23 @@ div.vis-tooltip {
 #panel .lineage-banner.unknown { background: #21262d; border: 1px solid #484f58; color: #8b949e; }
 .issue-row.superseded-row, .dup-pair.superseded-row { opacity: 0.75; }
 .issue-row .lineage-badge, .dup-pair .lineage-badge { vertical-align: middle; }
+        /* Read-only viewer (docs/local-primary-implementation.md §6 F1). The
+           Pages deployment answers /api/capabilities with read_only: true;
+           only memora's own graph server says false. Unknown = read-only. */
+        #read-only-badge { display: none; position: fixed; left: 12px; bottom: 12px; z-index: 1000;
+            padding: 4px 10px; border-radius: 12px; font-size: 12px; background: rgba(40, 44, 52, 0.9);
+            color: #e5c07b; border: 1px solid #e5c07b; pointer-events: none; }
+        body.read-only #read-only-badge { display: block; }
+        body.read-only #panel-edit-btn,
+        body.read-only #panel-save-btn,
+        body.read-only #panel-cancel-btn { display: none !important; }
+        /* Stars and issue status/category still SHOW state; they just do nothing. */
+        body.read-only .favorite-star,
+        body.read-only .issue-select { pointer-events: none; cursor: default; }
     </style>
 </head>
-<body>
+<body class="read-only">
+    <div id="read-only-badge" title="This viewer cannot change memories; edit them through memora.">Read-only viewer</div>
     <div id="lineage-warn">Lineage unavailable — cannot confirm which memories are current</div>
     <div id="graph"><div id="loading">Loading memories...</div></div>
     <div id="resize-handle"></div>
@@ -691,6 +705,22 @@ div.vis-tooltip {
         </div>
     </div>
     <script>
+        // Read-only until the server says otherwise (fail closed). The Pages
+        // viewer is read-only (§6 F1) and its write routes answer 405 anyway;
+        // memora's own graph server (memora/graph/server.py) declares
+        // read_only: false and keeps its edit controls.
+        var viewerReadOnly = true;
+        function applyReadOnly() {
+            document.body.classList.toggle('read-only', viewerReadOnly);
+        }
+        function readOnlyRefusal() {
+            alert('This viewer is read-only. Edit memories through memora.');
+        }
+        fetch('/api/capabilities')
+            .then(function(r) { return r.ok ? r.json() : null; })
+            .then(function(c) { viewerReadOnly = !(c && c.read_only === false); applyReadOnly(); })
+            .catch(function() { viewerReadOnly = true; applyReadOnly(); });
+
         var MEMORA_CONFIG = window.MEMORA_CONFIG || {
             version: '',
             r2Prefix: '/api/r2/',
@@ -1423,6 +1453,7 @@ div.vis-tooltip {
         }
 
         async function patchMemory(memId, payload) {
+            if (viewerReadOnly) throw new Error('This viewer is read-only.');
             var response = await fetch('/api/memories/' + memId + getDbParam(), {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
@@ -1436,6 +1467,7 @@ div.vis-tooltip {
         }
 
         async function enterPanelEditMode() {
+            if (viewerReadOnly) { readOnlyRefusal(); return; }
             if (!currentPanelMemoryId) return;
             if (!memoryCache[currentPanelMemoryId]) {
                 var response = await fetch('/api/memories/' + currentPanelMemoryId + getDbParam());
@@ -1464,6 +1496,7 @@ div.vis-tooltip {
         }
 
         async function savePanelEdits() {
+            if (viewerReadOnly) { readOnlyRefusal(); return; }
             if (!currentPanelMemoryId || !panelDraftMemory) return;
             syncPanelDraftFromDom();
             var validationError = validatePanelDraft();
@@ -2116,6 +2149,7 @@ div.vis-tooltip {
         }
 
         function changeIssueStatus(memId, selectedKey, selectEl) {
+            if (viewerReadOnly) { readOnlyRefusal(); loadIssues(true); return; }
             // Parse: "open" | "closed-complete" | "closed-not_planned"
             var newStatus, newClosedReason;
             if (selectedKey === 'open') {
@@ -2165,6 +2199,7 @@ div.vis-tooltip {
         }
 
         function changeIssueCategory(memId, newValue, inputEl) {
+            if (viewerReadOnly) { readOnlyRefusal(); return; }
             var trimmed = (newValue || '').trim();
             inputEl.classList.add('saving');
             inputEl.disabled = true;
@@ -2426,6 +2461,7 @@ div.vis-tooltip {
         var favoriteSeq = {};
 
         function toggleFavorite(memId, el) {
+            if (viewerReadOnly) { readOnlyRefusal(); return; }
             var isActive = el.classList.contains('active');
             var newState = !isActive;
             el.classList.toggle('active', newState);

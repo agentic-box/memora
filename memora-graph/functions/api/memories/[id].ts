@@ -1,10 +1,10 @@
 /**
  * GET /api/memories/:id - Returns a single memory by ID
  * Supports ?db=<configured name> to select a database
+ * PATCH/PUT/POST/DELETE - 405: the viewer is read-only (§6 F1)
  */
 
 import { resolveDatabase, selectionErrorResponse, type DatabaseEnv } from "../_db.ts";
-import { loadTagPolicy, tagPolicyUnavailableResponse, validateTags } from "../_tags.ts";
 
 interface Env extends DatabaseEnv {}
 
@@ -75,86 +75,23 @@ function toMemoryResponse(result: Memory): MemoryResponse {
   };
 }
 
-export const onRequestPatch: PagesFunction<Env> = async ({ env, params, request }) => {
-  const url = new URL(request.url);
-  const dbName = url.searchParams.get("db");
-  const selection = resolveDatabase(env, dbName);
-  if (!selection.ok) return selectionErrorResponse(selection);
-  const db = selection.binding;
+// The viewer is read-only (docs/local-primary-implementation.md §6 F1, slice
+// L7): every write method answers 405 before touching the database. Memories
+// are edited through memora itself. Exported explicitly rather than left to
+// the platform, so the answer is the same in every runtime and is tested.
+const readOnly: PagesFunction<Env> = async () =>
+  Response.json(
+    {
+      error: "read_only",
+      message: "The memora viewer is read-only; edit memories through memora.",
+    },
+    { status: 405, headers: { Allow: "GET, HEAD" } },
+  );
 
-  const id = parseInt(params.id as string, 10);
-  if (isNaN(id)) {
-    return Response.json({ error: "invalid_id" }, { status: 400 });
-  }
-
-  const body = await request.json<{
-    favorite?: boolean;
-    tags?: string[];
-    metadata?: Record<string, unknown>;
-  }>();
-
-  const row = await db.prepare(
-    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories WHERE id = ?"
-  ).bind(id).first<Memory>();
-
-  if (!row) {
-    return Response.json({ error: "not_found" }, { status: 404 });
-  }
-
-  let validatedTags: string[] | undefined;
-  if (body.tags !== undefined) {
-    const policy = await loadTagPolicy(db);
-    if (!policy.ok) return tagPolicyUnavailableResponse();
-    const validation = validateTags(body.tags, policy.policy);
-    if (!validation.ok) {
-      return Response.json(
-        { error: validation.error, message: validation.message },
-        { status: 400 },
-      );
-    }
-    validatedTags = validation.tags;
-  }
-  if (body.metadata !== undefined && (!body.metadata || Array.isArray(body.metadata) || typeof body.metadata !== "object")) {
-    return Response.json({ error: "invalid_metadata" }, { status: 400 });
-  }
-
-  const existingMeta = parseJson<Record<string, unknown>>(row.metadata, {});
-  const meta = body.metadata !== undefined
-    ? (() => {
-        const merged = { ...existingMeta };
-        for (const [key, value] of Object.entries(body.metadata)) {
-          if (value === null) {
-            delete merged[key];
-          } else {
-            merged[key] = value;
-          }
-        }
-        return merged;
-      })()
-    : existingMeta;
-  if (body.favorite !== undefined) {
-    if (body.favorite) {
-      meta.favorite = true;
-    } else {
-      delete meta.favorite;
-    }
-  }
-  const tags = validatedTags ?? parseJson<string[]>(row.tags, []);
-
-  await db.prepare(
-    "UPDATE memories SET metadata = ?, tags = ?, updated_at = datetime('now') WHERE id = ?"
-  ).bind(JSON.stringify(meta), JSON.stringify(tags), id).run();
-
-  const updated = await db.prepare(
-    "SELECT id, content, metadata, tags, created_at, updated_at FROM memories WHERE id = ?"
-  ).bind(id).first<Memory>();
-
-  if (!updated) {
-    return Response.json({ error: "not_found" }, { status: 404 });
-  }
-
-  return Response.json(toMemoryResponse(updated));
-};
+export const onRequestPatch = readOnly;
+export const onRequestPut = readOnly;
+export const onRequestPost = readOnly;
+export const onRequestDelete = readOnly;
 
 export const onRequestGet: PagesFunction<Env> = async ({ env, params, request }) => {
   const url = new URL(request.url);

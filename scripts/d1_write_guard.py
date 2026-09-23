@@ -8,28 +8,40 @@ copy of every store, so the only code allowed to write it is memora itself
 Scopes:
   tools     retired scripts and deploy/migration commands (slice L1b). CI
             blocks on this scope.
-  handlers  write SQL in the memora-graph Pages functions and worker (slice
-            L7). Until L7 makes the viewer read-only this scope FAILS by
-            design; CI reports it without blocking, and every scripted Pages
-            deploy runs `--scope all`, so no scripted deploy can republish the
-            viewer's write handlers.
+  handlers  write SQL in the memora-graph Pages functions and worker. Since
+            slice L7 made the viewer read-only this scope is clean, and CI
+            blocks on it too.
   all       both (what a deploy runs).
 
 Rules (tools):
   T1  `requests.post` / `requests.request` in a file that names a D1 REST
       endpoint (`/d1/database/`).
-  T2  a wrangler D1 `execute` with the remote flag on the same line.
+  T2  a wrangler D1 `execute` with the remote flag.
   T3  a Python list that runs a wrangler D1 `execute` or `migrations`
       without a `--local` element.
-  T4  a wrangler D1 `migrations apply` without `--local` on the same line.
-  T5  a wrangler Pages `deploy` on a line that does not run this guard
-      (`d1_write_guard.py`) before it.
-Rules (handlers):
+  T4  a wrangler D1 `migrations apply` without `--local`.
+  T5  a wrangler Pages `deploy` not directly preceded, in the same command
+      line, by an EXECUTED run of this guard with `--scope all`:
+      `python3 …/d1_write_guard.py --scope all && … deploy`, or
+      `… --scope all || { …; exit 1; }; … deploy`. The guard's name in a
+      comment, an `echo` or a string does not count.
+  T6  a wrangler D1 `execute` or `migrations apply` whose arguments come
+      from a shell variable (`$X`, `${X}`) and that has no literal
+      `--local`: the remote flag may be in the variable.
+  T2, T4, T5 and T6 read LOGICAL lines: a line ending in a backslash is
+  joined with the next, so a flag on a continuation line is seen.
+Rules (handlers), in files under memora-graph/functions/ or
+memora-graph/worker/; findings name the D1 binding names the file uses
+(DB_MEMORA/DB_OB1/DB_BESTATION/DB_RE, or the dynamic `DB_${…}` lookup):
   H1  a string literal that starts with write SQL (INSERT … INTO, REPLACE
-      INTO, UPDATE … SET, DELETE FROM, CREATE/DROP/ALTER …) in a file under
-      memora-graph/functions/ or memora-graph/worker/. The finding names the
-      D1 binding names the file uses (DB_MEMORA/DB_OB1/DB_BESTATION/DB_RE, or
-      the dynamic `DB_${…}` lookup).
+      INTO, UPDATE … SET, DELETE FROM, CREATE/DROP/ALTER …), including a
+      template literal whose table is interpolated
+      (`UPDATE ${table} SET`).
+  H2  a string literal or template fragment that starts with an UPPERCASE
+      write verb (INSERT, REPLACE, UPDATE, DELETE, CREATE, DROP, ALTER)
+      followed by a space or the end of the literal: the head of write SQL
+      built by concatenation (`"UPDATE " + table + " SET …"`). Uppercase
+      only, so prose ("Update an existing memory") is not a finding.
 
 Only code and config are scanned (*.py *.sh *.ts *.js *.mjs *.json *.toml
 *.yml *.yaml); prose (docs, CHANGELOG, READMEs) is not executable. The
@@ -57,6 +69,14 @@ _I = re.IGNORECASE
 T1_POST = re.compile(r"\brequests\.(post|request)\s*\(")
 T1_URL = re.compile(r"/d1/database/")
 T2 = re.compile(r"wrangler\s+d1\s+execute\b[^\n]*--remote\b")
+T6 = re.compile(r"wrangler\s+d1\s+(?:execute|migrations\s+apply)\b[^\n]*")
+T6_VAR = re.compile(r"\$\{?[A-Za-z_]\w*")
+# The prefix of a deploy line must END with an executed guard run.
+T5_GUARD = re.compile(
+    r"(?:^|[;&|({]|\$\(|\":\s*\")\s*python3?\s+\"?[^\s\"]*d1_write_guard\.py\"?\s+--scope\s+all\s*"
+    r"(?:&&\s*|\|\|\s*\{[^{}]*\bexit\s+1\s*;?\s*\}\s*;\s*)"
+    r"(?:[A-Za-z_]\w*=\$\(\s*)?(?:npx\s+)?$"
+)
 T3_LIST = re.compile(r"\[[^\[\]]*?[\"']wrangler[\"']\s*,\s*[\"']d1[\"']\s*,\s*[\"'](execute|migrations)[\"'][^\[\]]*\]", re.S)
 T4 = re.compile(r"wrangler\s+d1\s+migrations\s+apply\b[^\n]*")
 T5 = re.compile(r"wrangler\s+pages\s+deploy\b")
@@ -64,14 +84,34 @@ H1 = re.compile(
     r"([\"'`])\s*("
     r"INSERT\s+(?:OR\s+\w+\s+)?INTO\b|REPLACE\s+INTO\b|UPDATE\s+(?:OR\s+\w+\s+)?[\w\"`\[\]]+\s+SET\b|"
     r"DELETE\s+FROM\b|CREATE\s+(?:TEMP\w*\s+|UNIQUE\s+|VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER|VIEW)\b|"
-    r"DROP\s+(?:TABLE|INDEX|TRIGGER|VIEW)\b|ALTER\s+TABLE\b)",
+    r"DROP\s+(?:TABLE|INDEX|TRIGGER|VIEW)\b|ALTER\s+TABLE\b|"
+    r"UPDATE\s+(?:OR\s+\w+\s+)?\$\{[^}]*\}\s*SET\b)",
     _I,
 )
+# Case-SENSITIVE on purpose: the head of concatenated write SQL.
+H2 = re.compile(r"([\"'`]|\})\s*(INSERT|REPLACE|UPDATE|DELETE|CREATE|DROP|ALTER)(?=\s|[\"'`]|\$\{)")
 BINDINGS = re.compile(r"\bDB_(MEMORA|OB1|BESTATION|RE)\b|DB_\$\{")
 
 
 def _line(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
+
+
+def _logical_lines(text: str):
+    """(first line number, text) per logical line: a physical line ending in
+    a backslash is joined with the next one."""
+    start, buf = 1, []
+    for n, line in enumerate(text.split("\n"), 1):
+        if not buf:
+            start = n
+        if line.rstrip().endswith("\\"):
+            buf.append(line.rstrip()[:-1])
+            continue
+        buf.append(line)
+        yield start, " ".join(buf)
+        buf = []
+    if buf:
+        yield start, " ".join(buf)
 
 
 def _files(root: Path):
@@ -94,26 +134,33 @@ def scan(root: Path, scope: str) -> list[str]:
             if T1_POST.search(text) and T1_URL.search(text):
                 m = T1_POST.search(text)
                 findings.append(f"{rel}:{_line(text, m.start())}: T1 requests call to a D1 REST endpoint")
-            for m in T2.finditer(text):
-                findings.append(f"{rel}:{_line(text, m.start())}: T2 remote wrangler D1 execute")
             for m in T3_LIST.finditer(text):
                 if not re.search(r"[\"']--local[\"']", m.group(0)):
                     findings.append(f"{rel}:{_line(text, m.start())}: T3 wrangler D1 command list without --local")
-            for m in T4.finditer(text):
-                if "--local" not in m.group(0):
-                    findings.append(f"{rel}:{_line(text, m.start())}: T4 wrangler D1 migrations apply without --local")
-            for m in T5.finditer(text):
-                start = text.rfind("\n", 0, m.start()) + 1
-                end = text.find("\n", m.end())
-                line = text[start: end if end != -1 else len(text)]
-                if "d1_write_guard.py" not in line[: m.start() - start]:
-                    findings.append(f"{rel}:{_line(text, m.start())}: T5 Pages deploy not preceded by the guard")
+            for n, line in _logical_lines(text):
+                if T2.search(line):
+                    findings.append(f"{rel}:{n}: T2 remote wrangler D1 execute")
+                for m in T4.finditer(line):
+                    if "--local" not in m.group(0):
+                        findings.append(f"{rel}:{n}: T4 wrangler D1 migrations apply without --local")
+                for m in T6.finditer(line):
+                    if T6_VAR.search(m.group(0)) and "--local" not in m.group(0) and not T2.search(line):
+                        findings.append(f"{rel}:{n}: T6 wrangler D1 command with flags from a variable and no --local")
+                for m in T5.finditer(line):
+                    if not T5_GUARD.search(line[: m.start()]):
+                        findings.append(f"{rel}:{n}: T5 Pages deploy not directly preceded by an executed guard run (--scope all)")
         if scope in ("handlers", "all") and rel.startswith(HANDLER_DIRS):
             names = sorted({b.group(0) for b in BINDINGS.finditer(text)})
+            via = f" (bindings: {', '.join(names)})" if names else ""
+            h1_at = set()
             for m in H1.finditer(text):
                 sql = " ".join(m.group(2).split())
-                via = f" (bindings: {', '.join(names)})" if names else ""
+                h1_at.add(m.start(2))
                 findings.append(f"{rel}:{_line(text, m.start())}: H1 write SQL `{sql}`{via}")
+            for m in H2.finditer(text):
+                if m.start(2) in h1_at:
+                    continue
+                findings.append(f"{rel}:{_line(text, m.start())}: H2 write verb `{m.group(2)}` heading a SQL string{via}")
     return findings
 
 
