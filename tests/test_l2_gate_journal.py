@@ -856,3 +856,73 @@ def test_append_intent_itself_refuses_after_its_compaction_breaks(tmp_path, monk
                         post_state={"content": "x"})
     assert j.status()[0] == [] and j.status()[1]
     j.close()
+
+
+# ------------------------------------------------------------------ round 3 (review 7588)
+
+def _aliases(tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    db = real_dir / "primary.db"
+    sqlite3.connect(db).close()
+    file_alias = tmp_path / "alias.db"
+    file_alias.symlink_to(db)
+    dir_alias = tmp_path / "dirlink"
+    dir_alias.symlink_to(real_dir)
+    return db, file_alias, dir_alias / "primary.db"
+
+
+def test_symlink_aliases_name_the_same_lock(tmp_path):
+    db, file_alias, dir_alias = _aliases(tmp_path)
+    assert backends.primary_lock_path(file_alias) == backends.primary_lock_path(db) \
+        == backends.primary_lock_path(dir_alias)
+    fd = backends.acquire_primary_lock(db)
+    try:
+        assert backends.acquire_primary_lock(file_alias) == fd  # same process, same lock
+        assert backends.acquire_primary_lock(dir_alias) == fd
+    finally:
+        backends.release_primary_lock(file_alias)  # released through the alias: same identity
+    assert not backends._PRIMARY_LOCKS
+
+
+def test_second_process_through_a_symlink_is_refused(tmp_path):
+    db, file_alias, dir_alias = _aliases(tmp_path)
+    backends.acquire_primary_lock(db)  # process A, direct path
+    try:
+        for alias in (file_alias, dir_alias):
+            code = ("import sys; sys.path.insert(0, %r)\n"
+                    "from memora import backends\n"
+                    "try:\n    backends.acquire_primary_lock(%r)\nexcept backends.StoreLockedError:\n    sys.exit(3)\n"
+                    ) % (str(REPO), str(alias))
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+            assert r.returncode == 3, (alias, r.stderr)
+    finally:
+        backends.release_primary_lock(db)
+
+
+@pytest.mark.parametrize("second", ["file_alias", "dir_alias", "dotdot"])
+def test_registry_with_two_aliases_of_one_file_refuses_to_start(tmp_path, monkeypatch, second):
+    from memora import server
+
+    db, file_alias, dir_alias = _aliases(tmp_path)
+    other = {"file_alias": file_alias, "dir_alias": dir_alias,
+             "dotdot": tmp_path / "real" / ".." / "real" / "primary.db"}[second]
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(db), "b": str(other)}))
+    monkeypatch.setenv("MEMORA_DEFAULT_DB", "a")
+    with pytest.raises(write_gate.RegistryAliasError, match="'a' and 'b'"):
+        write_gate.check_registry_aliases()
+    with pytest.raises(SystemExit) as exc:
+        server._fence_live_primaries_or_exit()
+    assert exc.value.code == 2
+
+
+def test_registry_with_two_names_for_one_d1_database_refuses(monkeypatch):
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": "d1://acct/db1", "b": "d1://acct/db1", "c": "d1://acct/db2"}))
+    with pytest.raises(write_gate.RegistryAliasError):
+        write_gate.check_registry_aliases()
+
+
+def test_distinct_stores_pass_the_alias_check(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"a": str(tmp_path / "a.db"), "b": str(tmp_path / "b.db"),
+                                                         "c": "d1://acct/db1"}))
+    write_gate.check_registry_aliases()

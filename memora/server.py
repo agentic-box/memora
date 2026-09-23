@@ -3417,8 +3417,13 @@ def _fence_live_primaries_or_exit() -> None:
     §1 M10). A refused store stays refused in this process (health reports
     why); a refused DEFAULT store aborts startup (exit 2)."""
     from .storage import default_database_name
-    from .write_gate import fence_live_primaries
+    from .write_gate import RegistryAliasError, check_registry_aliases, fence_live_primaries
 
+    try:
+        check_registry_aliases()
+    except (RegistryAliasError, DatabaseRegistryError) as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(2)
     try:
         refused = {n: r for n, r in fence_live_primaries().items() if r}
         default = default_database_name()

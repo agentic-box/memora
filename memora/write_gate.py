@@ -242,6 +242,37 @@ def remove_freeze(name: str) -> None:
     _fsync_dir(path.parent)
 
 
+class RegistryAliasError(RuntimeError):
+    """Two registry names resolve to one store (review 7588 P1)."""
+
+
+def check_registry_aliases() -> None:
+    """Refuse a registry in which two names are the same store: two local
+    stores whose canonical paths collide (symlinks, `..`, a symlinked parent
+    directory), or two d1:// URIs naming one database. Either would split one
+    store's write gate, freeze and lock identity across two names."""
+    from .storage import database_registry
+    from .backends import LocalSQLiteBackend, parse_backend_uri
+
+    seen: Dict[str, str] = {}
+    for name, uri in database_registry().items():
+        if uri.startswith("d1://"):
+            ident = "d1:" + uri[5:].split("/", 1)[-1]
+        elif uri.startswith("s3://"):
+            continue
+        else:
+            backend = parse_backend_uri(uri)
+            if not isinstance(backend, LocalSQLiteBackend):
+                continue
+            ident = "sqlite:" + os.path.realpath(str(backend.db_path))
+        other = seen.get(ident)
+        if other is not None:
+            raise RegistryAliasError(
+                f"MEMORA_DATABASES names one store twice: {other!r} and {name!r} both resolve to {ident[ident.index(':') + 1:]}"
+            )
+        seen[ident] = name
+
+
 def fence_live_primaries() -> Dict[str, Optional[str]]:
     """Take the primary lock of every live-primary registry store BEFORE any
     writer or prewarm open (review 7584 P1-1). {name: None} when held, or

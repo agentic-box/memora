@@ -405,6 +405,11 @@ Not replicated:
 
   - `connect_replicator()` is the replicator's only entry point, and a test
     asserts that no other module calls it (H6).
+  - **One identity per store (review 7588 P1).** The primary lock file is
+    derived from the canonical path (`realpath` of the database, parents
+    included) with the suffix appended afterwards, so symlink aliases share
+    one lock. At startup, a registry that names one store twice (colliding
+    canonical paths, or one D1 database under two names) refuses to start.
   - **Fencing live primaries (review 7584 P1-1).** `server.main` takes every
     live primary's lock before any prewarm or writer open
     (`fence_live_primaries`). A store whose lock another process holds is
@@ -1399,3 +1404,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (g) `memora-graph/README.md` still calls `npm run setup` a "full automated setup", although it now exits at the remote-migration step: label it retired or partial | L7 | with L7 |
 | (h) replay validates every field it relies on (id, sql, outcome, next_id), inside the malformed-record path (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |
 | (i) `POST /admin/reconcile` requires, besides a verified export receipt for the database: `operator`, `intent_id` (equal to the path's), `decision` (applied / not-applied) and `evidence_sha256` equal to the evidence `GET /admin/intents` last showed (L2 review 7584 P2) | L2-followup | **done in L2 round 2** |
+| (j) the journal-health re-check in `_execute_api` is not atomic with `_send`: a repair failure on another thread can land between the check and the send (L2 review 7588 P2). This is safe: the intent is already durable on disk before the check, so a request that goes out anyway is recorded as an open intent (frozen-unsafe until an operator accepts it), exactly like an unknown outcome. L3 may make the check and send one critical section if the replicator needs it | L3 | documented; optional |

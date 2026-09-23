@@ -2063,7 +2063,11 @@ class D1SelectOnlyConnection:
 
 
 def primary_lock_path(db_path: Path) -> Path:
-    return Path(f"{db_path}.primary-lock")
+    """The lock file of a store, derived from its CANONICAL path (review 7588
+    P1): the database path and every parent directory are resolved first, so
+    a symlink alias of the file, or of a directory above it, names the same
+    lock. The suffix is appended after canonicalisation."""
+    return Path(os.path.realpath(str(db_path)) + ".primary-lock")
 
 
 # realpath of the lock file -> fd, for the locks THIS process holds. A flock
@@ -2082,7 +2086,7 @@ def acquire_primary_lock(db_path: Path) -> int:
     import fcntl
 
     path = primary_lock_path(db_path)
-    key = os.path.realpath(str(path))
+    key = str(path)  # already canonical
     with _PRIMARY_LOCKS_GUARD:
         held = _PRIMARY_LOCKS.get(key)
         if held is not None:
@@ -2098,7 +2102,7 @@ def acquire_primary_lock(db_path: Path) -> int:
 
 
 def release_primary_lock(db_path: Path) -> None:
-    key = os.path.realpath(str(primary_lock_path(db_path)))
+    key = str(primary_lock_path(db_path))  # the same canonical identity as acquire
     with _PRIMARY_LOCKS_GUARD:
         fd = _PRIMARY_LOCKS.pop(key, None)
     if fd is not None:
