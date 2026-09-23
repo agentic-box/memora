@@ -287,6 +287,42 @@ Not replicated:
       If the append or the fsync fails, the request is NOT sent. The app
       gets the error (`IntentJournalError`), the gate token is released, and
       the gate state does not change.
+    - **One journal mutex per store, and one writer (round-10 P1).** A
+      single mutex covers all of these:
+      - intent append plus fsync;
+      - resolution append;
+      - updating the in-memory open set;
+      - the whole compaction: snapshot, write, fsync, rename and directory
+        fsync.
+
+      memora-all also holds `fcntl.flock(LOCK_EX)` on the journal for its
+      lifetime, and asserts that it is the only writer.
+      - Operator actions (`reconcile --accept`) do not write the file. They
+        go through the admin endpoint (`POST /admin/reconcile/<db>/<id>`,
+        which needs a receipt), so the process is the only journal writer.
+      - When memora-all is stopped, `local_primary.py` takes the same flock
+        before touching the file.
+    - **Repair after any write error (round-10 P0).** After ANY failed append
+      or fsync (intent or resolution), under the mutex and before any further
+      D1 send for that store:
+      1. truncate the file to the last byte that ends a verified newline
+         (re-read from disk);
+      2. fsync the file and the directory;
+      3. only then reopen admission.
+
+      Until repair completes, the gate refuses mutations. If the repair
+      itself fails, the gate stays `frozen-unsafe` and refusing, and health
+      names the file, until an operator repairs it (by stopping the
+      container, or fixing the mount). A torn tail can therefore never have
+      a valid record appended after it.
+    - **Startup replay (round-10 P0):**
+      - A malformed record that is **not** the final line means that store
+        refuses to start (health names the file and offset). Later bytes are
+        never discarded.
+      - A torn **final** line is dropped, with a log line. This is safe: an
+        intent is sent only after the fsync of its complete line has
+        returned, which cannot have happened for an incomplete final line. A
+        torn final resolution just leaves its intent open (safe).
     - **After a known response** (success, or a definite HTTP/SQL failure):
       append `{"type":"resolved", "id", "outcome"}`. This record is fsynced
       lazily: it rides on the next intent's fsync, or a 1 s timer. If it is
@@ -305,33 +341,39 @@ Not replicated:
       The replicator's H3 `inflight_*` marker counts as an open intent too.
     - **The journal is a file**, not `sync_state`/`shadow_state`, because a
       store still on `d1://` before its shadow week has neither table.
-      Compaction runs when the file exceeds 8 MB: write a new file holding
+      Compaction runs under the journal mutex when the file exceeds 8 MB. No
+      intent can be appended between the snapshot and the rename; a mutation
+      that arrives meanwhile waits on the mutex. It writes a new file holding
       only the open intents and the id counter, fsync it, `rename` it
       atomically over the old one, and fsync the directory. Only resolved
       pairs are dropped.
     - **Cost:** one fsync per D1 mutation (milliseconds on NVMe, well under
       the ~100 ms D1 round trip). Accepted. Reads are never journaled.
-    - **Automatic reconciliation** (in memora-all, per open intent) waits at
-      least 60 s after `sent_at`. That is 2 × the 30 s client timeout
-      (`_D1_TIMEOUT_SECONDS`, backends.py:1540), which also bounds
-      Cloudflare's per-request limit. It then reads back through
-      `D1SelectOnlyConnection` with the read token and `served_by_primary`.
-      It auto-resolves only a plain `INSERT` with derivable values:
-      - a matching row present with the post-state → `reconciled-applied`;
-      - no matching row → `reconciled-not-applied`.
-    - **Ambiguous (round-9 P2).** Everything else stays open and needs an
-      operator decision: `UPDATE`, `DELETE`, `INSERT OR IGNORE`, upserts,
-      and any record whose keys cannot be derived or were rewritten since.
-      - Reason: a no-op UPDATE, or a DELETE of an absent key, looks "not
-        applied" without proving it, and their trigger and meta effects (the
-        epoch bump, `memories_meta` rows) are not checked yet.
-      - `local_primary.py reconcile <db> --accept <id> --receipt R` (a fresh
-        receipt) appends `{"type":"resolved", "id",
-        "outcome":"operator-accepted"}`. Aborting the migration step is the
-        alternative.
-      - A cutover after any accepted-ambiguous intent still takes the fresh
-        full export and recheck it always takes.
-      - Making the effect checks automatic is §9 item (d).
+    - **Reconciliation (round-10 P2): every open intent needs an operator.**
+      No automatic resolution exists today, because no intent carries a
+      unique proof of its effect:
+      - INSERTs omit the AUTOINCREMENT id (storage.py:5640, 5669, 5788), and
+        identical rows can already exist, so a matching row is not proof;
+      - a no-op UPDATE, or a DELETE of an absent key, cannot prove "not
+        applied", and trigger and meta effects are unchecked.
+
+      So memora-all only assists. At least 60 s after `sent_at` (2 × the 30 s
+      client timeout, `_D1_TIMEOUT_SECONDS`, backends.py:1540, which also
+      bounds Cloudflare's per-request limit), it reads back the keys and
+      values it can derive, through `D1SelectOnlyConnection` with the read
+      token and `served_by_primary`. It shows that evidence on health and in
+      `local_primary.py reconcile <db> --show`.
+      - Resolution is always
+        `local_primary.py reconcile <db> --accept <id> --receipt R`, sent
+        through the admin endpoint, which appends
+        `{"type":"resolved", "id", "outcome":"operator-accepted"}`.
+        Aborting the migration step is the alternative.
+      - A cutover after any accept still takes the full fresh export and
+        recheck it always takes.
+      - **Operational cost:** any D1 write with an unknown outcome (a client
+        timeout, or a reset) needs a human before the next export, seed,
+        recheck or repoint of that store. That is rare and accepted.
+      - Automatic resolution needs an ownership nonce: §9 items (d) and (e).
     - A fresh re-seed never resolves intents; the seed refuses while any are
       open.
 
@@ -1078,18 +1120,30 @@ if it is in the dev deps.
   subprocess is killed with `os._exit` after the request is sent and before
   the response is handled. FakeD1 commits the write. At restart the intent is
   open and the gate is `frozen-unsafe`, so export refuses. After 60 s (a test
-  clock), reconcile resolves an INSERT as applied, and the state becomes
-  `frozen`;
+  clock), the evidence is shown, and after `reconcile --accept` the state
+  becomes `frozen`;
 - **`test_intent_fsync_failure_blocks_send`**: `os.fsync` is patched to
   raise. FakeD1 receives nothing, the app gets `IntentJournalError`, and the
   gate state is unchanged;
 - **`test_resolution_append_failure_is_extra_unsafe`**: a full disk during
   the resolution append leaves an open intent, the store is `frozen-unsafe`,
-  and it is resolvable by reconciliation;
-- **`test_intent_not_applied_insert`** and
-  **`test_intent_update_delete_always_ambiguous`** (round-9 P2): a no-op
-  UPDATE and a DELETE of an absent key both stay open until
-  `reconcile --accept`;
+  and it is resolvable by `reconcile --accept`;
+- **`test_partial_append_then_send_survives_restart`** (round-10 P0): a
+  partial intent write, then an fsync failure (so no send), then repair,
+  then a successful D1 write, then a kill and restart. That write's intent is
+  present and open, and no record was merged into a torn line;
+- **`test_repair_failure_keeps_gate_refusing`**;
+- **`test_malformed_middle_record_refuses_start`**, and
+  **`test_torn_final_line_dropped_and_logged`**;
+- **`test_compaction_serialized_with_append`** (round-10 P1): compaction is
+  paused before its rename while another thread attempts a mutation. The
+  mutation waits, then appears in the replacement journal;
+- **`test_journal_single_writer_flock`**: a second opener, and
+  `local_primary.py` while memora-all runs, are refused; `--accept` goes
+  through the endpoint;
+- **`test_every_open_intent_needs_accept`** (round-10 P2): an INSERT whose
+  row is present, a no-op UPDATE and a DELETE of an absent key all stay open
+  until `reconcile --accept`;
 - **`test_intent_journal_compaction_keeps_open`**;
 - **`test_intent_survives_restart_and_reseed`**: the seed refuses while an
   intent is open;
@@ -1186,7 +1240,7 @@ with flags off.
 |---|---|---|---|---|---|
 | L1b | F3, plus F2 for the tools (P6) | — | none | none (removes writers) | 0 |
 | L2a | launcher and volume (C1); see below | only adds a mount | none | none | 0 |
-| L2 | §1, M10, freeze gate with the write-ahead intent journal and reconciliation, `classify_statement`, `D1SelectOnlyConnection`, `_GatedCursor`, `connect_replicator` | sync pieces: no `sync_state`. The gate and journal are **live** for every `d1://` primary (a fsync per mutation; freeze and reconcile are used only by operators); deploy after L2a | reconciliation: pk and value SELECTs through `D1SelectOnlyConnection` with the read token | none new. The gate only admits or refuses the app's existing writes. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
+| L2 | §1, M10, freeze gate with the write-ahead intent journal and reconciliation, `classify_statement`, `D1SelectOnlyConnection`, `_GatedCursor`, `connect_replicator` | sync pieces: no `sync_state`. The gate and journal are **live** for every `d1://` primary (a fsync per mutation; freeze and reconcile are used only by operators); deploy after L2a. There is **no bypass flag**; the operator controls are stopping the container, or repairing the mount or journal | reconciliation: pk and value SELECTs through `D1SelectOnlyConnection` with the read token | none new. The gate only admits or refuses the app's existing writes. `ensure_schema`'s existing D1 DDL is unchanged; `_ensure_sync_outbox` returns early on D1 | 0 |
 | L3 | §2: log and write modes, P2/P3, H2/H3, metrics, F7 | `MEMORA_REPLICATION` unset | write mode: epoch SELECT (preflight and postcheck), pk SELECT read-back. Log mode: none | write mode only: per-key UPSERT on 6 tables; embeddings DELETE+INSERT by pk; per-key DELETE (P2, P3). Log mode: none | 0 |
 | L3b | §2.9 shadow-local | `MEMORA_SHADOW_LOCAL` unset | pk SELECT copy-back through `D1SelectOnlyConnection` with the D1 Read token; `read_replication` config GET; compare full-table SELECTs | **none new**: the wrapper only forwards the app's existing writes, unchanged | 0 |
 | L4 | §3 | local stores only | none new | none new (D1 absorb path unchanged) | 0 |
@@ -1298,4 +1352,5 @@ Pre-existing D1 writes the plan leaves as they are:
 | (a) `/admin/freeze` auth: an admin-only token (not the health token), or binding the admin routes to loopback only, reached through `docker exec` | L2a | before L2's freeze code ships |
 | (b) the setup PRAGMAs on the raw connection in `connect()`: document that `journal_mode=WAL` and `busy_timeout` are the only ones; both are idempotent and cannot change row data on a frozen primary. A test asserts the set | L2 | with L2 |
 | (c) the `.cursor()` bypass on `_LockedWriterConnection`: **designed now** (§1, `_GatedCursor`) and tested by `test_cursor_is_gated` | L2 | with L2 |
-| (d) automatic trigger and meta effect checks in reconciliation (epoch bump, `memories_meta` rows), so that UPDATE and DELETE intents can auto-resolve instead of needing `--accept` | L3 | optional; until then, those intents need the operator |
+| (d) automatic trigger and meta effect checks in reconciliation (epoch bump, `memories_meta` rows) | L3 | optional; until then, every intent needs the operator |
+| (e) an ownership nonce so reconciliation can prove an effect: for example a `memories_actions` row keyed by the intent id, written in the same request, or a metadata field carrying the intent id. With it, INSERT (and, with (d), UPDATE and DELETE) reconciliation can become automatic | L3 | optional; until then, every intent needs `reconcile --accept` |
