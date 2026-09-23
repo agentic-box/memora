@@ -648,3 +648,94 @@ def test_a_refused_artifact_still_writes_the_report(store, tmp_path):
         apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(report)])
     data = json.loads(report.read_text())
     assert data["summary"]["refused"] is True and "approval.rule" in data["summary"]["error"]
+
+
+# --- round 5 (review 7483) -----------------------------------------------------------
+
+def test_an_unknown_store_still_writes_the_report(store, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        _ids, preview = _seed(conn, with_skips=False)
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"local": str(tmp_path / "l.db")}))
+    report = tmp_path / "r.json"
+    with pytest.raises(SystemExit, match="unknown store"):
+        apply.main(["--preview", str(_file(tmp_path, preview)), "--db", "nosuch", "--report", str(report)])
+    data = json.loads(report.read_text())
+    assert data["summary"]["refused"] is True and "unknown store" in data["summary"]["error"]
+
+
+def test_a_missing_report_directory_is_refused_before_connecting(store, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        _ids, preview = _seed(conn, with_skips=False)
+    for name in ("connect", "connect_without_schema"):
+        monkeypatch.setattr(storage, name, lambda *a, **k: pytest.fail("connected before the report preflight"))
+    with pytest.raises(SystemExit, match="does not exist"):
+        apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(tmp_path / "no" / "r.json")])
+
+
+def test_a_report_write_failure_prints_the_full_report(store, tmp_path, monkeypatch, capsys):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+
+    def unwritable(path, text):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(apply, "_write_report", unwritable)  # after the preflight passed
+    rc = apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(tmp_path / "r.json")])
+    out = capsys.readouterr().out
+    assert rc == 1 and "REPORT WRITE FAILED" in out
+    after = out.split("the full report follows:\n", 1)[1]
+    fallback, _end = json.JSONDecoder().raw_decode(after)
+    assert {r["id"]: r["outcome"] for r in fallback["rows"]} == {
+        ids["contradiction"]: "applied", ids["keyword"]: "applied"}
+
+
+def test_a_lease_whose_read_back_fails_is_still_released(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        _ids, preview = _seed(conn, with_skips=False)
+    real_connect = d1.connect
+    state = {"n": 0}
+
+    def fail_first_read_back(sql, params):
+        if sql.startswith("SELECT owner, lease_until FROM import_lease"):
+            state["n"] += 1
+            return state["n"] == 1  # the INSERT committed; its read-back fails
+        return False
+
+    def connect(**kw):
+        conn = real_connect(**kw)
+        conn.fail_when = fail_first_read_back
+        return conn
+
+    monkeypatch.setattr(d1, "connect", connect)
+    rc, rows = _run(tmp_path, preview)
+    monkeypatch.setattr(d1, "connect", real_connect)
+    assert rc == 1 and set(r["outcome"] for r in rows.values()) == {"not-attempted"}
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0  # released
+
+
+def test_an_interrupt_during_a_write_is_recorded_and_re_raised(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn)  # considered: contradiction, stale, pending, keyword, retired
+        # make row 4 (keyword) the second WRITE: rows 2-3 are skips
+    real = storage.update_memory
+    calls = {"n": 0}
+
+    def interrupt_second(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt()
+        return real(*a, **k)
+
+    monkeypatch.setattr(storage, "update_memory", interrupt_second)
+    report = tmp_path / "r.json"
+    with pytest.raises(KeyboardInterrupt):
+        apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(report), "--allow-skips"])
+    data = json.loads(report.read_text())
+    rows = {r["id"]: r["outcome"] for r in data["rows"]}
+    assert rows[ids["contradiction"]] == "applied"
+    assert rows[ids["keyword"]] == "uncertain"
+    assert rows[ids["retired"]] == "not-attempted"
+    assert data["summary"]["error"] == "interrupted: KeyboardInterrupt"
+    with storage.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM import_lease").fetchone()[0] == 0  # released in finally

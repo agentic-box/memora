@@ -76,9 +76,20 @@ Usage:
 4. EXIT 0 only when every considered row is applied, repaired or
    already-applied, with no summary.error; --allow-skips also accepts
    skipped-* (not failed, raced, verify-error, uncertain, refused,
-   canonicalization-diff or not-attempted). The --report JSON is ALWAYS
-   written: also when the artifact is refused, the store cannot be opened or
-   the import lease cannot be taken (summary.error, zero rows attempted).
+   canonicalization-diff or not-attempted).
+   REPORT: its destination is checked (directory exists, a probe file can be
+   created and removed) BEFORE any store connection, else the run is
+   refused. It is then written on every CLASSIFIED path: also when the
+   artifact or the store (unknown, unsupported) is refused, the store cannot
+   be opened or the import lease cannot be taken (summary.error, zero rows
+   attempted). If the final write still fails, the full report is printed
+   to stdout after a "REPORT WRITE FAILED" line, exit 1.
+   INTERRUPTION (KeyboardInterrupt or any other BaseException) is the stated
+   exception: the current row is marked "uncertain" (in its write) or
+   "failed", the rest "not-attempted", summary.error "interrupted: <type>";
+   the report is written best-effort and the exception re-raised. The lease
+   (held from before its acquire, released owner-qualified) and the SQLite
+   transaction are still cleaned up in finally.
    --dry-run performs every check on a read-only connection (no schema
    setup, no lease), prints the expected diff per row, and writes nothing.
 
@@ -441,10 +452,54 @@ def _stopped(rows: List[Dict[str, Any]], detail: str) -> List[Dict[str, Any]]:
     return [{"id": int(r["id"]), "group": r["group"], "outcome": "not-attempted", "detail": detail} for r in rows]
 
 
-def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Optional[int]) -> Dict[str, Any]:
-    """Always returns a report (never raises): a failure before or during the
-    run is recorded in summary.error, with every row not reached reported as
-    "not-attempted"."""
+def _finalize(report: Dict[str, Any]) -> Dict[str, Any]:
+    counts: Dict[str, int] = {}
+    for r in report["rows"]:
+        r.pop("snapshot", None)
+        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
+    report["summary"]["outcomes"] = counts
+    return report
+
+
+def _write_report(path: Path, text: str) -> None:
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def _report_text(report: Dict[str, Any]) -> str:
+    return json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n"
+
+
+def preflight_report(path: Path) -> Optional[str]:
+    """None when the report can be written (its directory exists and accepts
+    a probe file, created and removed), else why not -- checked BEFORE any
+    store connection, so a run never writes rows it cannot report."""
+    parent = path.parent if str(path.parent) else Path(".")
+    if not parent.is_dir():
+        return f"the report directory {parent} does not exist"
+    probe = parent / f".{path.name}.probe-{uuid.uuid4().hex}"
+    try:
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("probe")
+        probe.unlink()
+    except OSError as exc:
+        return f"the report directory {parent} is not writable: {exc}"
+    return None
+
+
+def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Optional[int],
+        report_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Returns a report for every CLASSIFIED path -- a setup refusal (unknown or
+    unsupported store, refused artifact), a store or lease failure, any
+    per-row error -- recorded in summary.error, with every row not reached
+    reported as "not-attempted".
+
+    INTERRUPTION (KeyboardInterrupt or any other BaseException): the current
+    row is marked "uncertain" if it was in its write stage, else "failed";
+    the rest "not-attempted"; summary.error = "interrupted: <type>"; the
+    report is written best-effort to report_path; and the exception is
+    re-raised. The finally blocks still release the lease and roll back the
+    SQLite transaction."""
     report: Dict[str, Any] = {"summary": {"preview": str(preview_path), "dry_run": dry_run, "considered": 0,
                                           "error": None, "refused": False, "outcomes": {}},
                               "rows": []}
@@ -453,9 +508,15 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
     storage = None
     token = conn = lease = None
     transactional = False
+    current = {"row": None, "stage": "setup"}
     try:
         data = json.loads(preview_path.read_text())
-        preview._bootstrap(db)  # refuse a non-local, non-D1 store; pin; import memora
+        try:
+            preview._bootstrap(db)  # refuse a non-local, non-D1 store; pin; import memora
+        except Refused:
+            raise
+        except SystemExit as exc:  # the preview's own refusal (unsupported or unknown store)
+            raise Refused(f"refused: {exc.code}")
         storage = preview.storage
         from memora.backends import D1Connection
 
@@ -467,21 +528,23 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
         d1 = isinstance(conn, D1Connection)
         transactional = not dry_run and not d1
         if not dry_run and d1:
-            candidate = storage._ImportLease(conn, uuid.uuid4().hex)
-            candidate.acquire()
-            lease = candidate
+            # Held BEFORE acquire: an acquire that inserted its row and then
+            # failed (read-back, interruption) is still released in finally;
+            # the release is owner-qualified, a no-op if nothing was inserted.
+            lease = storage._ImportLease(conn, uuid.uuid4().hex)
+            lease.acquire()
         for index, row in enumerate(considered):
-            stage = "lease fence"
+            current.update(row=row, stage="lease fence")
             try:
                 if lease is not None:
                     lease.fence()
-                stage = "BEGIN IMMEDIATE"
+                current["stage"] = "BEGIN IMMEDIATE"
                 if transactional:
                     conn.execute("BEGIN IMMEDIATE")  # re-read, checks, write, read-back: one transaction
-                stage = "assessment"
+                current["stage"] = "assessment"
                 decision = assess(storage, conn, row, known)
                 if decision["outcome"] in ("apply", "repair") and not dry_run:
-                    stage = "write"
+                    current["stage"] = "write"
                     result = write(storage, conn, decision, transactional=transactional)
                 else:
                     if transactional:
@@ -495,10 +558,11 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
                 lost = storage is not None and isinstance(exc, storage.ImportLeaseLostError)
                 result = {"id": int(row["id"]), "group": row["group"],
                           # during the write it is unknown whether it landed (D1 commits per statement)
-                          "outcome": "uncertain" if stage == "write" else "failed",
+                          "outcome": "uncertain" if current["stage"] == "write" else "failed",
                           "detail": (f"import lease lost: {exc}" if lost
-                                     else f"{stage} raised {type(exc).__name__}: {exc}")}
+                                     else f"{current['stage']} raised {type(exc).__name__}: {exc}")}
             results.append(result)
+            current["row"] = None
             if result["outcome"] in STOPPERS:
                 results += _stopped(considered[index + 1:], f"the run stopped at #{result['id']}")
                 break
@@ -507,6 +571,21 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
     except Exception as exc:
         report["summary"]["error"] = f"{type(exc).__name__}: {exc}"
         results += _stopped(considered[len(results):], f"the run could not start or continue: {exc}")
+    except BaseException as exc:  # interruption: record, write best-effort, re-raise
+        row = current["row"]
+        if row is not None:
+            results.append({"id": int(row["id"]), "group": row["group"],
+                            "outcome": "uncertain" if current["stage"] == "write" else "failed",
+                            "detail": f"interrupted ({type(exc).__name__}) in {current['stage']}"})
+        results += _stopped(considered[len(results):], f"interrupted: {type(exc).__name__}")
+        report["summary"]["error"] = f"interrupted: {type(exc).__name__}"
+        _finalize(report)
+        if report_path is not None:
+            try:
+                _write_report(report_path, _report_text(report))
+            except BaseException:
+                print("REPORT WRITE FAILED (interrupted run):\n" + _report_text(report))
+        raise
     finally:
         if lease is not None:
             try:
@@ -521,13 +600,11 @@ def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Opti
             except Exception:
                 pass
         if token is not None:
-            storage.CURRENT_DB.reset(token)
-    counts: Dict[str, int] = {}
-    for r in results:
-        r.pop("snapshot", None)
-        counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
-    report["summary"]["outcomes"] = counts
-    return report
+            try:
+                storage.CURRENT_DB.reset(token)
+            except Exception:
+                pass
+    return _finalize(report)
 
 
 def exit_status(report: Dict[str, Any], allow_skips: bool) -> int:
@@ -546,17 +623,26 @@ def main(argv=None) -> int:
     ap.add_argument("--expect-count", type=int, help="the number of approved+proposed rows expected")
     ap.add_argument("--dry-run", action="store_true", help="every check, no write")
     ap.add_argument("--allow-skips", action="store_true", help="skipped-* rows do not fail the run")
-    ap.add_argument("--report", type=Path, help="write the JSON report here (always written)")
+    ap.add_argument("--report", type=Path, help="write the JSON report here (preflighted before connecting)")
     args = ap.parse_args(argv)
-    report = run(args.preview, args.db, args.dry_run, args.expect_count)
-    if args.report:  # ALWAYS, whatever happened
-        args.report.write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    if args.report is not None:
+        problem = preflight_report(args.report)
+        if problem:
+            raise SystemExit(f"refused before connecting: {problem}")
+    report = run(args.preview, args.db, args.dry_run, args.expect_count, report_path=args.report)
     for r in report["rows"]:
         line = f"#{r['id']} [{r['group']}] {r['outcome']}: {r.get('detail', '')}"
         if r.get("diff"):
             line += "  diff " + json.dumps(r["diff"], ensure_ascii=False)
         print(line)
     status = exit_status(report, args.allow_skips)
+    if args.report is not None:
+        try:
+            _write_report(args.report, _report_text(report))
+        except OSError as exc:
+            print(f"REPORT WRITE FAILED ({args.report}: {exc}); the full report follows:")
+            print(_report_text(report))
+            status = 1
     if args.allow_skips and any(r["outcome"] in SKIPS for r in report["rows"]):
         print("!!! --allow-skips: skipped rows are accepted for the exit status !!!")
     print(("DRY RUN (nothing written): " if args.dry_run else "") + json.dumps(report["summary"]["outcomes"])

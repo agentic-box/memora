@@ -390,7 +390,9 @@ def test_carry_drops_a_row_modified_after_the_approved_file_was_generated(store,
     assert f"#{ids['keyword']}\tcarried" in out
     data = json.loads((outdir / "new.json").read_text())
     rule = data["approval"]["carried_rule"]
-    assert "content beyond the 120-char preview unverified" in rule and old["summary"]["generated_at"] in rule
+    assert rule.startswith("policy carry: approval scoped to id/target/retag/section")
+    assert "metadata not shown in the approved file are unverified" in rule
+    assert "NULL updated_at is not proof of no modification" in rule and old["summary"]["generated_at"] in rule
 
 
 def test_carry_without_generated_at_uses_the_end_of_the_approval_day_and_warns(store, tmp_path, capsys):

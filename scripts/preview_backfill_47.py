@@ -76,25 +76,31 @@ def metadata_sha256(raw_metadata: Optional[str]) -> str:
 
 
 def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) -> List[str]:
-    """Copy approved=true from an older approved preview onto THIS preview,
-    mechanically: only for a memory id that OLD approved with status
-    proposed AND that this preview also proposes in the same group, with the
-    identical target, proposal.retag_typed, evidence and content preview, and
-    identical stored section, subsection, tags, type and metadata.project.
-    Any difference drops the row (the field is named). The row must also not
-    have been modified since OLD was generated (stored updated_at <= OLD's
-    summary.generated_at; without one, the end of approval.at's day, with a
-    warning): the approval covers id, target, retag and section, not content
-    beyond the 120-char preview. Every other row stays unapproved (back to
-    the user); the rule is recorded in the new approval block. Returns a
-    per-row table."""
+    """POLICY carry of an older approval onto THIS preview -- NOT a proof that
+    the row is unchanged. The user's approval is scoped to the memory id, the
+    target project, the typed-tag retag and the section; content beyond the
+    old file's 120-char preview and metadata the old file did not show are
+    NOT verified.
+
+    A row carries only when OLD approved it with status proposed and this
+    preview proposes it in the same group, with the identical target,
+    proposal.retag_typed, evidence and content preview, and identical stored
+    section, subsection, tags, type and metadata.project; and its updated_at
+    is not after OLD's summary.generated_at (without one, the end of
+    approval.at's day, with a warning). That bound is BEST-EFFORT: the old
+    file has no generated_at and its rows no updated_at, and a NULL
+    updated_at is not proof of no modification (normalize_tags_and_sections
+    and the import/sweep paths update fields without setting it). Anything
+    else drops the row (the reason is named) and it stays unapproved (back
+    to the user). The rule is recorded verbatim in the new approval block
+    (carried_rule). Returns a per-row table."""
     from datetime import datetime, timezone
 
     if not isinstance(old.get("approval"), dict):
         raise SystemExit(f"{old_path}: no approval block to carry")
-    # The approval covers id + target + typed-tag retag + section, not content
-    # beyond the 120-char preview; a carry is acceptable only for rows not
-    # modified since the approved file was generated.
+    # Policy carry (see the docstring): the approval covers id + target +
+    # typed-tag retag + section; the updated_at bound below is best-effort,
+    # not proof that the row is unmodified.
     bound_text = (old.get("summary") or {}).get("generated_at")
     lines: List[str] = []
     if not bound_text:
@@ -109,7 +115,7 @@ def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) 
     def modified_after(stored: Dict[str, Any]) -> Optional[str]:
         raw = stored.get("updated_at")
         if not raw:
-            return None  # never updated since creation (and it existed at approval)
+            return None  # no updated_at: not provable either way (best-effort bound, see above)
         try:
             when = datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
         except ValueError:
@@ -152,8 +158,13 @@ def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) 
                 lines.append(f"#{o['id']}\tdropped\t{reason}")
     preview["approval"] = dict(
         old["approval"], carried_from=old_path, carried=carried, dropped=dropped,
-        carried_rule=(f"carried: content beyond the 120-char preview unverified; rows with updated_at "
-                      f"after {bound_text} dropped"),
+        carried_rule=(
+            "policy carry: approval scoped to id/target/retag/section; content beyond the 120-char "
+            "preview and metadata not shown in the approved file are unverified; the updated_at bound "
+            f"({bound_text}) is best-effort (old file has no generated_at and old rows have no "
+            "updated_at; NULL updated_at is not proof of no modification because "
+            "normalize_tags_and_sections and import/sweep paths update fields without setting it)"
+        ),
     )
     lines.append(f"carried {carried}, dropped {dropped} (dropped rows stay unapproved: back to the user)")
     return lines
