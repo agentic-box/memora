@@ -34,8 +34,10 @@
 #     metadata contains "import_attempt" in each live store (the startup
 #     sweep would complete or remove them). Either failing aborts with the
 #     old container untouched and still serving.
-#  4. Recreate memora-all -- same image tag, mounts, ports, memory/cpu limits,
-#     restart policy and env as the v0.4.5 deploy. Old container kept stopped
+#  4. Recreate memora-all -- same image tag, ports, cpu limit, restart policy
+#     and env as the v0.4.5 deploy, except (L2a) the named /data volume,
+#     MEMORA_DATA_VOLUME, MEMORA_ADMIN_TOKEN and --memory 960m (see below).
+#     Old container kept stopped
 #     as memora-all-grok-<ts> (the name predates the model switch being a
 #     no-op; it still means "the container before this deploy", and the
 #     rollback commands below depend on it).
@@ -59,6 +61,27 @@
 #     /api/v1/memora/health must be an actual HTTP 404 (the API is not
 #     registered without a tokens file); no HTTP answer within ~20 s, or any
 #     other status, fails the deploy.
+#
+# /data VOLUME (local-primary L2a): memora-all used to reuse its existing data
+# volume by id. The image declares VOLUME /data, so that id is normally an
+# ANONYMOUS (64-hex) volume, and the server now refuses to serve a store that
+# keeps state under /data from one (memora/data_volume.py). This deploy mounts
+# the NAMED volume memora-all-data instead and passes MEMORA_DATA_VOLUME. On
+# the first such deploy, after memora-all is stopped, it copies the old volume
+# into memora-all-data once (docker run --rm -v old:/from:ro -v new:/to) and
+# marks the copy complete; a rerun with an incomplete copy repeats it. It
+# refuses to mount a volume whose name is 64-hex. The old container (renamed,
+# stopped) keeps its old volume, so the rollback below is unchanged; writes
+# made to /data after the switch are not in the old volume.
+#
+# MEMORY: --memory 960m (was 768m), the local-primary memory gate:
+# max(768m, 1.5 x measured peak RSS), scripts/measure_memory_gate.py; see
+# docs/local-primary-implementation.md §8 L2a.
+#
+# ADMIN TOKEN (local-primary §9 (a)): /admin/* routes take MEMORA_ADMIN_TOKEN,
+# never the health token. It is read from ~/.config/memora/all.admin-token on
+# nuc8 (minted there on first use, 48 alphanumerics, 0600) and must differ
+# from the health token.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
 # credentials-env parser used to stream straight into the while loop via
@@ -129,9 +152,34 @@ HEALTH_TOKEN_FILE=~/.config/memora/all.health-token
 [ -f "$HEALTH_TOKEN_FILE" ] || { echo "missing $HEALTH_TOKEN_FILE — refusing to mint a new one for a live container" >&2; exit 1; }
 HEALTH_TOKEN=$(cat "$HEALTH_TOKEN_FILE")
 
-# Reuse memora-all's EXISTING data volume by id — nothing about it changes.
-VOLUME_ID=$(docker inspect memora-all --format '{{range .Mounts}}{{.Name}}{{end}}')
-[ -n "$VOLUME_ID" ] || { echo "could not read memora-all's data volume id" >&2; exit 1; }
+# Admin token: read, or mint once. Same shape as the health token (48
+# alphanumerics, no newline); an unusable existing file is refused, not
+# replaced, because a script may already hold it.
+ADMIN_TOKEN_FILE=~/.config/memora/all.admin-token
+if [ ! -e "$ADMIN_TOKEN_FILE" ]; then
+  tmp="$(mktemp ~/.config/memora/.admin-token.XXXXXX)"
+  chmod 600 "$tmp"
+  ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 ) > "$tmp"
+  mv -f "$tmp" "$ADMIN_TOKEN_FILE"
+  echo "minted $ADMIN_TOKEN_FILE"
+fi
+ADMIN_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
+[ "${#ADMIN_TOKEN}" -eq 48 ] && [ -z "$(printf '%s' "$ADMIN_TOKEN" | LC_ALL=C tr -d 'A-Za-z0-9')" ] \
+  || { echo "$ADMIN_TOKEN_FILE is not 48 alphanumerics — fix or remove it" >&2; exit 1; }
+[ "$ADMIN_TOKEN" != "$HEALTH_TOKEN" ] || { echo "admin token equals the health token — remove $ADMIN_TOKEN_FILE" >&2; exit 1; }
+
+# /data: the NAMED volume memora-all-data (see the header). OLD_VOLUME is what
+# the running container mounts at /data today; it is copied after the stop.
+DATA_VOLUME=memora-all-data
+OLD_VOLUME=$(docker inspect memora-all --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')
+[ -n "$OLD_VOLUME" ] || { echo "could not read memora-all's /data volume" >&2; exit 1; }
+# Created and checked BEFORE the stop, so a runtime that cannot create or
+# name it fails with memora-all still serving.
+docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || docker volume create "$DATA_VOLUME" >/dev/null
+MOUNTED=$(docker volume inspect "$DATA_VOLUME" --format '{{.Name}}')
+if [ "$MOUNTED" != "$DATA_VOLUME" ] || printf '%s' "$MOUNTED" | grep -Eqx '[0-9a-f]{64}'; then
+  echo "volume $DATA_VOLUME resolved to '$MOUNTED' — refusing to mount it at /data" >&2; exit 1
+fi
 
 # Captured to a variable FIRST, not streamed straight into the while loop
 # via process substitution (`done < <(python3 ...)`) — a parser failure
@@ -154,7 +202,7 @@ ENV_ARGS=()
 while IFS='=' read -r key value; do
   [ -z "$key" ] && continue
   case "$key" in
-    MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB|MEMORA_PROJECTS) continue ;;
+    MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB|MEMORA_PROJECTS|MEMORA_DATA_VOLUME|MEMORA_ADMIN_TOKEN) continue ;;
   esac
   ENV_ARGS+=(-e "$key=$value")
 done <<< "$ENV_LINES"
@@ -201,15 +249,32 @@ if bad:
 PY
 
 docker stop memora-all
+
+# One-time copy of the old /data into the named volume, while memora-all is
+# stopped (nothing writes either side). Skipped once memora-all already
+# mounts memora-all-data, or when an earlier deploy completed the copy.
+if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
+  if docker run --rm -v "$DATA_VOLUME:/to" memora:latest test -e /to/.memora-copied-from-previous-volume; then
+    echo "$DATA_VOLUME already holds a completed copy; not copying again"
+  else
+    docker run --rm -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" memora:latest \
+      sh -c 'cp -a /from/. /to/ && sync && touch /to/.memora-copied-from-previous-volume && sync' \
+      || { echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
+    echo "copied /data from $OLD_VOLUME into $DATA_VOLUME"
+  fi
+fi
+
 docker rename memora-all "memora-all-grok-$TS"
 
 docker run -d --name memora-all \
   --restart unless-stopped \
-  --memory 768m --cpus 4 \
+  --memory 960m --cpus 4 \
   -p 0.0.0.0:8920:8000 \
-  -v "$VOLUME_ID:/data" \
+  -v "$DATA_VOLUME:/data" \
+  -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
   -e "MEMORA_TOOL_PROFILE=leader" \
   -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
+  -e "MEMORA_ADMIN_TOKEN=$ADMIN_TOKEN" \
   -e "MEMORA_HEALTH_TIMEOUT=30" \
   -e "MEMORA_HEALTH_REFRESH_INTERVAL=15" \
   -e "MEMORA_VECTOR_SCAN_PAGE_SIZE=100" \

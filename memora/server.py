@@ -3417,6 +3417,28 @@ def _configure_memora_logging(env: Optional[Mapping[str, str]] = None) -> Option
     return level
 
 
+def _apply_data_volume_check() -> None:
+    """Record the /data startup refusals (memora/data_volume.py) in storage,
+    and say which stores were refused and why."""
+    from .data_volume import startup_refusals
+    from .storage import (
+        DatabaseRegistryError,
+        database_registry,
+        set_store_refusals,
+        single_store_uri,
+    )
+
+    try:
+        registry = database_registry()
+    except DatabaseRegistryError:
+        return
+    refusals = startup_refusals(registry, single_store_uri())
+    set_store_refusals(refusals)
+    for name, reason in sorted(refusals.items(), key=lambda kv: kv[0] or ""):
+        logger.error("refusing to serve database %s: %s", name or "default", reason)
+        print(f"Error: refusing to serve database {name or 'default'}: {reason}", file=sys.stderr)
+
+
 def _fence_live_primaries_or_exit() -> None:
     """Take every live primary's lock (docs/local-primary-implementation.md
     §1 M10). A refused store stays refused in this process (health reports
@@ -3557,6 +3579,14 @@ def main(argv: Optional[list[str]] = None) -> None:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
 
+        # Stores kept under /data are refused unless /data is a named,
+        # writable mount (memora/data_volume.py). Per store: the process
+        # stays up so /health/db can name the reason. Runs before the
+        # pre-warm, which would otherwise create a database in the
+        # container's root filesystem. A broken registry is left to the
+        # pre-warm below, which exits on it.
+        _apply_data_volume_check()
+
         # Fence every live local primary BEFORE any open (review 7584
         # P1-1): the prewarm below writes schema. A store whose primary lock
         # another process holds is refused here; if it is the default store,
@@ -3643,11 +3673,18 @@ def main(argv: Optional[list[str]] = None) -> None:
 
             register_health_routes(mcp)
 
-            # /admin/freeze, /admin/intents, /admin/reconcile (plan §1). The
-            # handlers refuse every request until the admin auth layer
-            # (L2a) installs require_admin via memora.admin.set_admin_auth.
+            # /admin/freeze, /admin/intents, /admin/reconcile (plan §1), and
+            # /admin/data-volume. Auth (§9 (a), L2a): MEMORA_ADMIN_TOKEN only,
+            # never the health token, never loopback; installed through
+            # memora.admin.set_admin_auth. An unusable token is fatal.
             from .admin import register_admin_routes
+            from .admin_auth import AdminConfigError, install_admin_auth
 
+            try:
+                install_admin_auth(mcp)
+            except AdminConfigError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(2)
             register_admin_routes(mcp)
 
             # /api/v1: the plain JSON API for clmuxd (memora/api_v1.py).

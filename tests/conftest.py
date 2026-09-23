@@ -27,7 +27,15 @@ def _isolated_write_gate_state(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("MEMORA_READONLY_DBS", raising=False)
     write_gate._reset_for_tests()
     intent_journal._reset_for_tests()
+    # server.main() records /data refusals and installs the admin auth hook
+    # (L2a); neither may leak into the next test.
+    from memora import admin, storage
+
+    saved_auth = admin._admin_auth
+    storage.set_store_refusals({})
     yield
+    storage.set_store_refusals({})
+    admin.set_admin_auth(saved_auth)
     write_gate._reset_for_tests()
     intent_journal._reset_for_tests()
     from memora import backends as _backends

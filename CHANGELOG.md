@@ -14,6 +14,15 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L2a: named /data volume, startup mount check, admin token, memory gate
+- Per `docs/local-primary-implementation.md` §8 L2a and §9 (a)/(b). This slice issues no D1 statement.
+- `scripts/memora-instance.sh up`: a store that keeps state under `/data` (any registry entry or `STORAGE_URI` that is not `s3://`: a local SQLite path, or a `d1://` primary, whose L2 write gate keeps its freeze file and intent journal there) now gets the NAMED volume `memora-<instance>-data` at `/data` (created with `volume create` if missing) and `-e MEMORA_DATA_VOLUME=<name>`. Before, only the single-store `VOLUME` branch mounted anything, so every registry instance wrote `/data` into the image's anonymous `VOLUME /data`, which the next `up` (stop, rm, run) replaced with an empty one. A host-directory `VOLUME` stays a bind mount, with its path as the marker. `MEMORA_DATA_VOLUME` and `MEMORA_ADMIN_TOKEN` from a credential file are ignored (instance-owned).
+- `scripts/deploy-memora-all.sh`: mounts the named volume `memora-all-data` instead of reusing memora-all's current `/data` volume by id (normally anonymous). It creates and checks the volume before stopping memora-all, then, while memora-all is stopped, copies the old volume in once (`docker run --rm -v old:/from:ro -v memora-all-data:/to`, marked complete; skipped once memora-all already mounts it). It refuses a 64-hex volume name. The rollback container keeps the old volume.
+- Server startup (`memora/data_volume.py`), before L2's primary fence and the prewarm: a store that keeps state in the data directory (`MEMORA_DATA_DIR`, default `/data`: a local SQLite path under it, and every `d1://` store) is refused unless `MEMORA_DATA_VOLUME` is set and not a 64-hex anonymous id, the directory is a mount point (`st_dev` differs from `/`'s), and a probe file can be created, written, fsynced and removed in it and in its `intent/`. The refusal is per store: the process keeps serving the other stores; the refused one raises `DataVolumeRefused` on every connection (nothing is created), gets no primary fence, gate or journal, and `/health/db` names the reason.
+- `/admin/*` auth (§9 (a), `memora/admin_auth.py`, installed through L2's `memora.admin.set_admin_auth`): `MEMORA_ADMIN_TOKEN` only, as a Bearer token; not the health token and no loopback exemption. Unset: 403 `admin_disabled`. Shorter than 32 characters, non-ASCII, or equal to `MEMORA_HEALTH_TOKEN`: the server refuses to start. New `GET /admin/data-volume` (read-only: the startup decision per store). A test calls every registered `/admin/*` route and method without the token. The launchers mint the token (`~/.config/memora/<instance>.admin-token`, 48 alphanumerics, 0600); operators can also call the routes through `docker exec` with the container's own token.
+- §9 (b): `tests/test_connect_pragmas.py` traces the raw connection inside `LocalSQLiteBackend.connect()` and requires exactly L4's `writer_setup_pragmas()` (`busy_timeout` on every writer, `journal_mode=WAL` on a live primary) plus the touch read; L4's own test checks the tuple, this one catches a statement run outside it.
+- Memory gate (§8 L2a): new `scripts/measure_memory_gate.py` (offline, synthetic stores; one process imports `memora.server` and runs semantic, hybrid and FTS searches over 4 local stores with the 384 MB corpus cache). It was measured on server2 inside the memora image (podman, python 3.12.14). Peak RSS: 525.7 MB (4 × 1000 rows, 1024-dim), 581.0 MB (4 × 1500) and 629.7 MB (4 × 1500, 1536-dim). The container default is therefore max(768M, 1.5 × 629.7 MB) rounded up to 64 MiB = **960M** (`memora-instance.sh` `DEFAULT_MEMORY`, was 512M; `deploy-memora-all.sh` `--memory 960m`, was 768m). With `MEMORA_CORPUS_CACHE_BUDGET_MB=256` the peak is about 426 MB. Full table in the plan, §8 L2a.
+
 ### Local-primary L5 (piece a): verified export, receipt, recheck
 - Per `docs/local-primary-implementation.md` §0 P1, §4, §9 p. New operator tool `scripts/local_primary.py` (logic in `memora/local_primary.py`), run by hand; it reads D1 only with the read token.
 - **`export <db>`**:
@@ -27,6 +36,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - Credential files (`--admin-token-file`, `--health-token-file`, `--read-token-file`) must be regular files with mode 0600, owned by the current user.
 - `--service-stopped` swaps the freeze for a `docker inspect` check that memora-all is stopped.
 - `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection (§9 u).
+
 
 ### Local-primary L4: absorb in one local transaction
 - Per `docs/local-primary-implementation.md` §3. D1 SQL is unchanged, and the d1:// absorb path keeps its inflight lease, owned-id recovery and compensating deletes.
@@ -45,6 +55,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - **Writers:** `connect()` sets `PRAGMA busy_timeout = 5000` on every writer, and `journal_mode = WAL` on live primaries only.
 - `_WriteGate.enter(exempt=True)` is refused unless called from `memora.replicator`.
 - Deferred images re-read the row under the lock and swap only when its `images` field is unchanged. The swap applies onto the current metadata, so concurrent content, tag and metadata edits are kept, and FTS is re-indexed from the current row. On a transactional store, absorb's `created_unlinked` links run in a `SAVEPOINT`, so no half edge survives. A caught inner `rollback()` poisons the transaction, which then refuses to commit. Thawing a store sweeps its pending images.
+
 
 ### Local-primary L3: the replicator (dark)
 - Per `docs/local-primary-implementation.md` §2 and §0 P2-P4. `memora/replicator.py`: one thread per replicated store reads `sync_outbox` in seq order, coalesces it per key, and builds statements from each key's CURRENT local row. A present row becomes an UPSERT of every column (`memories_embeddings`: a DELETE+INSERT pair, so D1's update trigger cannot null `representation`); an absent row becomes a DELETE by the full primary key. `memories_meta` exclusions are enforced by the triggers.
@@ -65,6 +76,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - **Metrics and wake-up:** `/health/db/<db>` (authorised) gains a `replication` block: mode, status, head, acked and log cursors, `lag_rows`, `oldest_unacked_age_s`, `last_ack_at`, `last_error`, `halted_reason`, `epoch_unverified_batches` and `d1_missing_vectors` (null until the compare, L6). A commit wakes the replicator (`commit_event`). The in-flight marker counts as an open intent of the store's write gate.
 - `sync_state` gains `allow_deletes_attempt`, `epoch_unverified_batches`, `last_ack_at` and `last_error`; existing tables are upgraded by `ensure_schema`.
 - `tests/test_l3b_live_d1.py` holds live checks against a throwaway D1 database, and is skipped unless `MEMORA_D1_TEST_*` is set.
+
 
 ### Local-primary L2: write gate, D1 intent journal, sync schema
 - Per `docs/local-primary-implementation.md` §1 and §2.9. This slice sends no new statement to D1; its only D1 reads are the reconciliation evidence SELECTs, through `D1SelectOnlyConnection` with `MEMORA_D1_READ_TOKEN`.

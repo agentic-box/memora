@@ -255,7 +255,7 @@ Not replicated:
   - **Placing and holding a freeze.** The gate is in-process, so a freeze
     is valid only while memora-all is the sole D1 writer (F1–F6 require
     that).
-    - Placed through `POST /admin/freeze/<db>` (health-token auth). It calls
+    - Placed through `POST /admin/freeze/<db>` (admin-token auth, §9 (a)). It calls
       `freeze()` and then writes `/data/freeze/<db>`, the persisted intent.
       It returns 200 `{"state":"frozen","in_flight":0}`, or 409 with the
       in-flight list if it timed out.
@@ -1402,6 +1402,34 @@ Pre-existing D1 writes the plan leaves as they are:
 - **Memory gate:** measure RSS with four local stores (live-sized fixtures,
   964+ rows), FTS and the 384 MB corpus cache, against the 768 MB limit.
   The launcher default becomes max(768m, 1.5 × peak RSS).
+  **Measured in L2a** (`scripts/measure_memory_gate.py`, offline synthetic
+  stores): on server2 (Fedora, x86_64), inside the memora image built from
+  this tree with podman (python 3.12.14, the container's interpreter). One
+  process imports `memora.server`, then runs 3 passes over the 4 stores:
+  `semantic_search` (loads and caches the corpus snapshot), `hybrid_search`
+  (FTS5 plus vector) and `list_memories` with a query (FTS5). Peak RSS is
+  `ru_maxrss`. Rows are written through `add_memory` with 600-character
+  content, 3 tags and a synthetic dense vector; no embedding API is called.
+  Baseline after import: 69.6 MB.
+
+  | stores × rows | dim | cache budget | snapshots cached (estimated MB) | peak RSS | 1.5 × peak |
+  |---|---|---|---|---|---|
+  | 4 × 1000 | 1024 | 384 MB | 4 (358) | 525.7 MB | 789 MB |
+  | 4 × 1500 | 1024 | 384 MB | 2 (269) | 581.0 MB | 872 MB |
+  | 4 × 1500 | 1536 | 384 MB | 1 (201) | 629.7 MB | 945 MB |
+  | 4 × 1000 | 1024 | 256 MB | 2 (179) | 422.5 MB | 634 MB |
+  | 4 × 1500 | 1024 | 256 MB | 1 (134) | 425.5 MB | 639 MB |
+  | 4 × 1500, under `--memory=768m` | 1024 | 384 MB | 2 (269) | 580.9 MB, not OOM-killed | — |
+
+  - The corpus-cache estimate undercounts: with all 4 snapshots cached
+    (358 MB estimated), RSS grew 456 MB over the baseline.
+  - The launcher default is therefore **960M** (945 MB rounded up to
+    64 MiB), in `memora-instance.sh` and `deploy-memora-all.sh`
+    (`--memory 960m`).
+  - The alternative that keeps 768m is `MEMORA_CORPUS_CACHE_BUDGET_MB=256`
+    (peak ≈ 426 MB). The cost: only 1–2 of 4 snapshots stay cached, so the
+    others are reloaded on use. That is cheap for a local store but costs
+    D1 round trips for a store still on `d1://`.
 
 **Order:**
 - L1b first, then L2a and L2.
@@ -1414,8 +1442,8 @@ Pre-existing D1 writes the plan leaves as they are:
 
 | item | owner | resolution due |
 |---|---|---|
-| (a) `/admin/freeze` auth: an admin-only token (not the health token), or binding the admin routes to loopback only, reached through `docker exec` | L2a | before L2's freeze code ships |
-| (b) the setup PRAGMAs on the raw connection in `connect()`: document that `journal_mode=WAL` and `busy_timeout` are the only ones; both are idempotent and cannot change row data on a frozen primary. A test asserts the set. **L2 status:** `connect()` issues no PRAGMA yet (its only setup statement is one read); the gate is armed after setup (`test_setup_statements_are_not_gated`). L4 adds the two PRAGMAs there and extends the test to assert the exact set | L2 (arming order), L4 (the PRAGMA set) | with L2 / L4 |
+| (a) `/admin/freeze` auth: an admin-only token (not the health token), or binding the admin routes to loopback only, reached through `docker exec` | L2a | **resolved in L2a**: `MEMORA_ADMIN_TOKEN` only (`memora/admin_auth.py`, installed with `admin.set_admin_auth`), no loopback exemption, 403 when unset, startup refusal when it is short or equals the health token. A test calls every `/admin/*` route without it. Operators call the routes through `docker exec` with the container's own env token |
+| (b) the setup PRAGMAs on the raw connection in `connect()`: document that `journal_mode=WAL` and `busy_timeout` are the only ones; both are idempotent and cannot change row data on a frozen primary. A test asserts the set. **L2 status:** `connect()` issues no PRAGMA yet (its only setup statement is one read); the gate is armed after setup (`test_setup_statements_are_not_gated`). L4 adds the two PRAGMAs there and extends the test to assert the exact set | L2 (arming order), L4 (the PRAGMA set) | with L2 / L4. L2a adds `tests/test_connect_pragmas.py`: a trace of the raw connection must show exactly `writer_setup_pragmas()` plus the touch read |
 | (c) the `.cursor()` bypass on `_LockedWriterConnection`: **designed now** (§1, `_GatedCursor`) and tested by `test_cursor_is_gated` | L2 | with L2 |
 | (d) automatic trigger and meta effect checks in reconciliation (epoch bump, `memories_meta` rows) | L3 | optional; until then, every intent needs the operator |
 | (e) an ownership nonce so reconciliation can prove an effect: for example a `memories_actions` row keyed by the intent id, written in the same request, or a metadata field carrying the intent id. With it, INSERT (and, with (d), UPDATE and DELETE) reconciliation can become automatic | L3 | optional; until then, every intent needs `reconcile --accept` |

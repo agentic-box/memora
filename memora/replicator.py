@@ -831,7 +831,7 @@ def start_replicators(*, start: bool = True) -> Dict[str, Any]:
     MEMORA_REPLICATION is log|write and MEMORA_REPLICAS or MEMORA_SHADOW_LOCAL
     names the store. Returns {name: status or {"error": ...}}."""
     from .backends import LocalSQLiteBackend
-    from .storage import backend_for
+    from .storage import _store_refusals, backend_for
 
     mode = os.getenv("MEMORA_REPLICATION", "").strip().lower()
     if mode not in (MODE_LOG, MODE_WRITE):
@@ -844,6 +844,12 @@ def start_replicators(*, start: bool = True) -> Dict[str, Any]:
         try:
             if name in _REPLICATORS:
                 continue
+            if name in _store_refusals:
+                # The /data check refused this store (memora/data_volume.py).
+                # A shadow file is built from its path, not through
+                # backend_for, so without this it would be created on the
+                # unfit /data.
+                raise ReplicatorConfigError(f"{name}: store refused: {_store_refusals[name]}")
             if shadow:
                 local = LocalSQLiteBackend(Path(value))
                 store_mode = MODE_LOG  # forced: a shadow never writes D1

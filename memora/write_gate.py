@@ -296,12 +296,16 @@ def fence_live_primaries() -> Dict[str, Optional[str]]:
     """Take the primary lock of every live-primary registry store BEFORE any
     writer or prewarm open (review 7584 P1-1). {name: None} when held, or
     {name: reason} when another process holds it -- that store is then
-    refused in this process (every open raises; health says why)."""
-    from .storage import backend_for, database_registry
+    refused in this process (every open raises; health says why). A store
+    the /data check refused (memora/data_volume.py) is skipped: its lock
+    file would live on the unfit /data."""
+    from .storage import _store_refusals, backend_for, database_registry
     from .backends import StoreLockedError
 
     out: Dict[str, Optional[str]] = {}
     for name in database_registry():
+        if name in _store_refusals:
+            continue
         backend = backend_for(name)
         if not getattr(backend, "live_primary", False):
             continue
@@ -326,7 +330,14 @@ def initialize_registry_gates() -> Dict[str, Dict[str, Any]]:
 
     log = logging.getLogger(__name__)
     summary: Dict[str, Dict[str, Any]] = {}
+    from .storage import _store_refusals
+
     for name in database_registry():
+        if name in _store_refusals:
+            # Refused by the /data check: no gate, freeze file or journal is
+            # opened on an unfit /data.
+            summary[name] = {"state": "refused", "error": _store_refusals[name]}
+            continue
         try:
             backend = backend_for(name)
             if not hasattr(backend, "write_gate"):

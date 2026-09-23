@@ -20,6 +20,10 @@
 #   PORT          host port the proxy listens on (127.0.0.1:<PORT>)
 #   STORAGE_URI   d1://account/database   (single-store instance)
 #   VOLUME        host dir mounted at /data (single-store, local sqlite)
+#                 Otherwise, whenever a store keeps state under /data (any
+#                 registry entry or STORAGE_URI that is not s3://), up mounts
+#                 the NAMED volume memora-<INSTANCE>-data at /data and passes
+#                 MEMORA_DATA_VOLUME; the server refuses such stores without it.
 #   MEMORA_DATABASES   {"name":"uri",...} registry; serves /mcp/<name> per session
 #   MEMORA_DEFAULT_DB  which registry entry a bare /mcp resolves to
 #                 At least one of STORAGE_URI, VOLUME, MEMORA_DATABASES.
@@ -27,7 +31,7 @@
 #   CONTAINER     optional: adopt an existing container name instead of memora-<INSTANCE>
 #   IMAGE         optional: pin this instance to its own image tag
 #   CRED_SOURCE   optional: this instance's own credential file (see below)
-#   MEMORY/CPUS   optional: per-instance VM size (defaults 512M / 2)
+#   MEMORY/CPUS   optional: per-instance VM size (defaults 960M / 2)
 #   TOOL_PROFILE  optional: full|leader|agent (default leader — see note below)
 #
 # CREDENTIALS are never in these files, never in the image, never in git. They
@@ -54,10 +58,14 @@ CONTAINER_BIN="${MEMORA_CONTAINER_BIN:-container}"
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
 TARGET_PORT="${MEMORA_TARGET_PORT:-8000}"      # port memora listens on INSIDE the container
-# Each container is a VM. 1024MB was the runtime default; measured use inside a
-# live container is 116-230MB, and ~250MB of any figure is VM overhead. 512MB is
-# generous and halves the per-VM ceiling on a 16GB host running five workspaces.
-DEFAULT_MEMORY="${MEMORA_MEMORY:-512M}"
+# Each container is a VM. The default is the local-primary memory gate
+# (docs/local-primary-implementation.md §8 L2a): max(768M, 1.5 x the peak RSS
+# of one server holding four local stores with FTS and the 384 MB corpus
+# cache), rounded up to 64 MiB. scripts/measure_memory_gate.py, run in the
+# Linux image (python 3.12.14) on server2: worst peak 629.7 MB (4 x 1500 rows,
+# 1536-dim) -> 945 MB -> 960M. The old 512M (measured 116-230 MB on D1-only
+# stores, which hold no corpus locally) is too small once stores are local.
+DEFAULT_MEMORY="${MEMORA_MEMORY:-960M}"
 DEFAULT_CPUS="${MEMORA_CPUS:-2}"
 # One container serves EVERY agent in a workspace, leader and workers alike,
 # so the profile must be the SUPERSET the leader needs. 'agent' (12 tools)
@@ -120,8 +128,11 @@ env = json.load(open(sys.argv[1]))["mcpServers"]["memora"].get("env", {})
 # credentials AFTER, so a stale MEMORA_DATABASES left in a credential file
 # would win as the later duplicate -e and start the container against the
 # wrong set of databases -- silently, and with cross-database consequences.
+# The /data volume marker and the admin token are instance-owned for the
+# same reason: a stale copy in a credential file would override them.
 skip = {"MEMORA_STORAGE_URI", "MEMORA_DB_PATH",
-        "MEMORA_DATABASES", "MEMORA_DEFAULT_DB"}
+        "MEMORA_DATABASES", "MEMORA_DEFAULT_DB",
+        "MEMORA_DATA_VOLUME", "MEMORA_ADMIN_TOKEN"}
 out = []
 for k, v in env.items():
     if k in skip or v == "":
@@ -142,7 +153,19 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
   # Requests reach the container through the proxy, so their peer address is
   # the bridge host, never loopback -- without a token the detailed readiness
   # body is unreachable and only an aggregate status is served (memora #996).
-  local f="$SECRET_DIR/$INSTANCE.health-token"
+  secret_token health
+}
+
+admin_token() {  # per-instance secret for /admin/* (memora/admin.py)
+  # Separate from the health token, which every prober holds: from L2 on the
+  # admin routes place and lift write freezes. The server refuses to start if
+  # the two are equal.
+  secret_token admin
+}
+
+secret_token() {  # secret_token KIND -- read or mint $SECRET_DIR/$INSTANCE.KIND-token
+  local kind="$1"
+  local f="$SECRET_DIR/$INSTANCE.$kind-token"
   mkdir -p "$SECRET_DIR"; chmod 700 "$SECRET_DIR"
 
   # WHOLE-FILE validation, on EVERY read rather than only at creation. A
@@ -160,7 +183,7 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
   if [ "$valid" -eq 1 ]; then
     chmod 600 "$f"
   else
-    if [ -e "$f" ]; then echo "replacing unusable health token at $f" >&2; fi
+    if [ -e "$f" ]; then echo "replacing unusable $kind token at $f" >&2; fi
     # Temp file + rename: a reader must never see a half-written token, and a
     # crash must not leave one behind. The subshell drops pipefail because
     # `head -c` closing the pipe SIGPIPEs `tr`, which would otherwise abort
@@ -174,6 +197,29 @@ health_token() {  # per-instance secret so an operator can read health DETAIL
   cat "$f"
 }
 
+uri_needs_data() {  # uri_needs_data URI -- does this store keep state under /data?
+  # Everything but s3:// (whose cache is disposable): a local SQLite path, and
+  # a d1:// primary, whose write gate journals to /data/intent/ from L2 on.
+  case "$1" in s3://*) return 1 ;; *) return 0 ;; esac
+}
+
+registry_needs_data() {  # registry_needs_data JSON -- does any entry?
+  local uris
+  uris="$(python3 -c 'import json,sys;print("\n".join(json.loads(sys.argv[1]).values()))' "$1")" \
+    || die "MEMORA_DATABASES is not a JSON object of name -> uri"
+  local u
+  while IFS= read -r u; do
+    [ -n "$u" ] && uri_needs_data "$u" && return 0
+  done <<< "$uris"
+  return 1
+}
+
+ensure_volume() {  # ensure_volume NAME -- the named volume exists afterwards
+  "$CONTAINER_BIN" volume inspect "$1" >/dev/null 2>&1 \
+    || "$CONTAINER_BIN" volume create "$1" >/dev/null \
+    || die "could not create volume $1"
+}
+
 cmd_up() {
   load "$1"
   # Every runtime call goes through $CONTAINER_BIN, not just the final `run`.
@@ -182,7 +228,10 @@ cmd_up() {
   "$CONTAINER_BIN" stop "$CONTAINER" >/dev/null 2>&1 || true
   "$CONTAINER_BIN" rm   "$CONTAINER" >/dev/null 2>&1 || true
   local args=(run -d --name "$CONTAINER" --memory "$MEMORY" --cpus "$CPUS" -e "MEMORA_TOOL_PROFILE=$TOOL_PROFILE")
-  args+=(-e "MEMORA_HEALTH_TOKEN=$(health_token)")
+  local htok atok
+  htok="$(health_token)"; atok="$(admin_token)"
+  [ "$htok" != "$atok" ] || die "admin token equals health token; delete $SECRET_DIR/$INSTANCE.admin-token and rerun"
+  args+=(-e "MEMORA_HEALTH_TOKEN=$htok" -e "MEMORA_ADMIN_TOKEN=$atok")
   args+=(-e "MEMORA_HEALTH_TIMEOUT=${MEMORA_HEALTH_TIMEOUT:-15}")
   args+=(-e "MEMORA_HEALTH_REFRESH_INTERVAL=${MEMORA_HEALTH_REFRESH_INTERVAL:-15}")
   # Vector-scan page size. The default of 1000 means a store under 1000 rows
@@ -201,13 +250,28 @@ cmd_up() {
   args+=(-e "MEMORA_VECTOR_SCAN_PAGE_SIZE=${MEMORA_VECTOR_SCAN_PAGE_SIZE:-100}")
   # A multi-database instance carries a REGISTRY instead of one storage URI;
   # it is what makes a single container serve every workspace by URL path.
+  #
+  # /data: the image declares VOLUME /data, so without a -v every recreate
+  # gets a NEW anonymous volume and whatever was under /data is gone. A store
+  # that keeps state there gets the NAMED volume memora-<INSTANCE>-data, which
+  # survives stop/rm/run, and MEMORA_DATA_VOLUME names it; the server refuses
+  # such a store without both (memora/data_volume.py).
+  local data_vol=""
   if [ -n "${MEMORA_DATABASES:-}" ]; then
     args+=(-e "MEMORA_DATABASES=$MEMORA_DATABASES" -e "MEMORA_DEFAULT_DB=${MEMORA_DEFAULT_DB:-}")
+    if registry_needs_data "$MEMORA_DATABASES"; then data_vol="memora-$INSTANCE-data"; fi
   elif [ -n "$STORAGE_URI" ]; then
     # CLOUDFLARE_API_TOKEN comes through cred_args with everything else.
     args+=(-e "MEMORA_STORAGE_URI=$STORAGE_URI")
+    if uri_needs_data "$STORAGE_URI"; then data_vol="memora-$INSTANCE-data"; fi
   else
-    mkdir -p "$VOLUME"; args+=(-v "$VOLUME:/data")
+    # A host directory is a bind mount: a real mount, and it outlives the
+    # container. Its path is the marker.
+    mkdir -p "$VOLUME"; args+=(-v "$VOLUME:/data" -e "MEMORA_DATA_VOLUME=$VOLUME")
+  fi
+  if [ -n "$data_vol" ]; then
+    ensure_volume "$data_vol"
+    args+=(-v "$data_vol:/data" -e "MEMORA_DATA_VOLUME=$data_vol")
   fi
   while IFS= read -r -d '' a; do args+=("$a"); done < <(cred_args)
   args+=("$IMAGE")

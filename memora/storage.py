@@ -196,13 +196,49 @@ def default_database_name() -> Optional[str]:
     return name
 
 
+# Stores the server refused at startup because they need /data and /data
+# failed its check (memora/data_volume.py). Keyed by registry name, or None for
+# the single (registry-less) store. Empty unless server main() set it, so
+# scripts and tests that import storage are unaffected.
+_store_refusals: Dict[Optional[str], str] = {}
+
+
+def set_store_refusals(refusals: Mapping[Optional[str], str]) -> None:
+    """Replace the startup refusals (server main(), tests)."""
+    global _store_refusals
+    _store_refusals = dict(refusals)
+
+
+def single_store_uri() -> str:
+    """The registry-less store's URI, as this module resolved it at import."""
+    return _storage_uri or str(DB_PATH)
+
+
+def _raise_if_refused(name: Optional[str]) -> None:
+    reason = _store_refusals.get(name)
+    if reason is not None:
+        from .data_volume import DataVolumeRefused
+        raise DataVolumeRefused(
+            f"database {name or 'default'!r} is refused: {reason}"
+        )
+
+
 def backend_for(name: str):
     """Resolve a registered database NAME to a backend, cached per name.
 
     An unknown name raises. It must NEVER fall through to the default: a
     request for a database this server does not serve is an error, not an
-    invitation to use someone else's store.
+    invitation to use someone else's store. A store refused at startup
+    (_store_refusals) raises DataVolumeRefused on every call -- after the
+    backend object is built, so a CONFIGURATION error (DatabaseRegistryError)
+    still wins; constructing a backend touches no file.
     """
+    backend = _backend_for_unchecked(name)
+    _raise_if_refused(name)
+    return backend
+
+
+def _backend_for_unchecked(name: str):
     global _registry_cache, _registry_source
     raw = os.getenv("MEMORA_DATABASES", "").strip()
     with _registry_lock:
@@ -307,6 +343,7 @@ def current_backend():
         default_name = default_database_name()
         if default_name is not None:
             return backend_for(default_name)
+    _raise_if_refused(None)
     return STORAGE_BACKEND
 
 
