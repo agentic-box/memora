@@ -20,6 +20,7 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
   - `scripts/local_primary.py export <db>` runs
     `wrangler d1 export <name> --remote --output` and writes the result to
     `/data/exports/<db>/<ts>.sql` and to `r2://<bucket>/exports/<db>/<ts>.sql`.
+  - The export runs under the §1 freeze from start to receipt (§4).
   - It checks the export: the file is loaded into scratch SQLite, and its
     per-table row counts and content hashes must equal the same values read
     from D1 right after the export. The content hash is sha256 over rows
@@ -98,12 +99,19 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
   only `--replace`), `link-r2-images.py`, and the remote migration in
   `setup-cloudflare.sh` and `package.json` `d1:migrate` must exit 1 before
   slice L2 lands.
-  - Pages deploys (`setup-cloudflare.sh`'s `wrangler pages deploy`, and
-    `package.json` `deploy`) are not disabled outright: L7 must deploy the
-    read-only viewer. Instead, they run the F2 guard first and refuse on any
-    finding. Until F1 lands, the guard fails, so no deploy can republish the
-    old write handlers.
-  - The CI guard (F2) holds all of this.
+  - **Scripted** Pages deploys (`setup-cloudflare.sh`'s
+    `wrangler pages deploy`, and `package.json` `deploy`) run the F2 guard
+    first and refuse on any finding. Only these scripted paths are tested.
+  - **Direct** `wrangler pages deploy` bypasses the guard. It is forbidden
+    by operator rule until F1 lands.
+  - The Pages deploy credential (a `wrangler login` OAuth session, or a
+    token with Pages permission) is held only by the user, on no agent
+    host. Checked on the Mac on 2026-09-23: there is no wrangler config at
+    `~/.wrangler`, `~/Library/Preferences/.wrangler` or `~/.config/.wrangler`.
+    nuc8, ob1, bestation and re are checked by `audit-configs` (L8).
+  - The §6.1 tokens (a), (b) and (c) are minted with D1 permissions only,
+    and no Pages permission.
+  - The CI guard (F2) holds the scripted paths.
 - **P7. No automatic D1 writes by rollback or restore.** Rollback writes
   nothing to D1 except the operator-run sequence step (§4). Restore writes
   only the keys an operator selected one by one (§4). Every other difference
@@ -194,9 +202,15 @@ Not replicated:
     through the API or a stopped service.
 - **Freeze.** A store is frozen when it is named in `MEMORA_READONLY_DBS` or
   when the file `/data/freeze/<db>` exists. The file needs no restart.
-  `backend_for(name).connect()` raises `StoreReadOnlyError`, and this applies
-  to every backend kind, so a store still on `d1://` can be frozen before its
-  cutover. `connect_replicator()` bypasses it; it is the
+  A frozen store refuses writes and keeps serving reads, for every backend
+  kind, so a store still on `d1://` can be frozen before its cutover:
+  - **Local:** `connect()` sets `PRAGMA query_only = 1` on the writer
+    connection, so any write raises.
+  - **`d1://`:** `D1Backend.connect()` wraps the connection. Its
+    `_execute_api` raises `StoreReadOnlyError` for any statement that
+    `classify_statement` (§2.9) does not class as `read`.
+  - Reads continue in both cases. The check runs per statement, so a freeze
+    placed while a connection is open applies to its next statement. `connect_replicator()` bypasses it; it is the
   replicator's only entry point, and a test asserts no other module calls it
   (H6).
 
@@ -413,19 +427,38 @@ and every primary write still go to D1.
     a timeout with an unknown outcome.
   - The new `execute_batch` (§2.4) is overridden to raise on a shadowed
     connection; the app never calls it.
-- Which statements are mirrored:
-  - A statement is read-only per the existing `_is_read_statement(sql)`
-    (backends.py:1549): ignored.
-  - It starts with `CREATE`, `ALTER` or `DROP`: DDL, not mirrored. This is
-    classified by the leading keyword, so the `UPDATE` inside a
-    `CREATE TRIGGER` body is never taken as a target.
-  - It starts with `INSERT`, `REPLACE`, `UPDATE`, `DELETE` or `WITH`: the
-    target is the table after `INTO`, `UPDATE` or `DELETE FROM`. It is
-    mirrored if the target is one of the 7 in §1; other tables are ignored.
-  - Anything else, or a target that cannot be parsed: dirty (row 7).
-  - A schema change D1 receives during the shadow period (for example a new
-    column from `ensure_schema`) makes later copy-backs mismatch, so the
-    shadow goes dirty and is re-seeded.
+- **Which statements are mirrored (P1-1).** A new shared parser,
+  `classify_statement(sql) -> (kind, target)` in backends.py, works as
+  follows:
+  1. Strip leading whitespace, `-- …` line comments and `/* … */` block
+     comments.
+  2. Tokenize, respecting quoted strings, identifiers and parentheses. More
+     than one top-level statement means `unknown`.
+  3. If the statement starts with `WITH [RECURSIVE]`, skip each
+     `name[(cols)] AS [NOT] [MATERIALIZED] ( … )` (balanced parentheses,
+     comma-separated) to reach the main statement. CTE bodies are SELECT-only
+     in SQLite.
+  4. Classify the main statement:
+     - `SELECT`, `VALUES`, `EXPLAIN`, or `PRAGMA` without `=` or an argument
+       list → `read`: never mirrored, never dirty;
+     - `INSERT` / `REPLACE` (target after `INTO`), `UPDATE` (the next name,
+       after an optional `OR <conflict>`), `DELETE FROM` → `mutation` with
+       that target;
+     - `CREATE`, `ALTER`, `DROP` → `ddl`;
+     - anything else → `unknown`.
+  Rules applied to the result:
+  - `mutation` with a §1 target is mirrored; any other target is ignored.
+  - `ddl` that succeeds on D1 marks the shadow dirty at once (P2-3). Schema
+    drift with no later row write therefore cannot leave the shadow stale
+    but clean. The parent's `executescript` splitter is unchanged; each
+    split statement is classified on its own.
+  - `unknown` marks dirty: fail closed, but only for genuinely unrecognised
+    statements.
+  - The existing `_is_read_statement` (which is `startswith("SELECT")`,
+    used only for `retry_safe`) stays unchanged. It is not used for
+    classification.
+  - The same parser backs the §1 freeze wrapper and
+    `D1SelectOnlyConnection`.
 
 **`ShadowApplier(name, shadow: LocalSQLiteBackend, reader: D1SelectOnlyConnection)`**
 is one thread with a FIFO queue, off the request path. For each item, in
@@ -461,11 +494,11 @@ gives no guarantee over REST. The plan does not rely on it:
 
 **`D1SelectOnlyConnection` (P0-1).** This is a separate class. It is not
 `D1Connection` and not the P2 checker.
-- Its `execute` accepts exactly one statement that is `SELECT …` or
-  `WITH … SELECT …`: no `;` outside string literals, and none of
-  `INSERT`, `UPDATE`, `DELETE`, `REPLACE`, `UPSERT`, `PRAGMA`, `CREATE`,
-  `DROP`, `ALTER`, `ATTACH`, `VACUUM` or `RETURNING` as tokens. It rejects
-  everything else, including the per-key UPSERT and DELETE that P2 allows.
+- Its `execute` accepts only statements that `classify_statement` classes
+  as `read` and whose main statement is `SELECT`, with or without a
+  `WITH … SELECT` prefix. It rejects everything else: `EXPLAIN`, `PRAGMA`,
+  `VALUES`, every mutation (including the per-key UPSERT and DELETE that P2
+  allows), DDL, `unknown`, `RETURNING`, and more than one statement.
 - It has no `executemany`, `executescript`, `commit` or `execute_batch`.
 - It is opened schema-free.
 - Credential: Cloudflare offers a "D1 Read" API-token permission ("Grants
@@ -492,7 +525,8 @@ a fresh export, and the 7-night clock restarts.
 | 4 | local replay raises | dirty; roll back this item's local transaction |
 | 5 | a copy-back read fails, stays replica-served, or shows a written-value mismatch after the retries | dirty |
 | 6 | after copy-back, a touched key's local row ≠ D1's row, or a key deleted on D1 is still present locally | dirty |
-| 7 | a mutating statement on a §1 table cannot be parsed for a target table | dirty |
+| 7 | `classify_statement` returns `unknown`, or a `mutation` target cannot be resolved | dirty |
+| 7b | a `ddl` statement succeeds through the shadowed connection | dirty, at once (P2-3) |
 | 8 | the applier thread dies (its run loop catches `BaseException`) | dirty; health shows `applier_alive=false` |
 | 9 | process exit or restart with a non-empty queue: the queue is in memory | dirty via the marker below |
 | 10 | a D1 write not made through the wrapper (a foreign writer) | cannot be seen per write; the nightly shadow-vs-D1 compare finds it, and the writer freeze (§6) prevents it |
@@ -609,7 +643,17 @@ Other rules:
 
 ## 4. Export, seed, restore, snapshot (`scripts/local_primary.py`, L5)
 
-- **`export <db>`**: P1. Credentials (P2-3):
+- **`export <db>`**: P1.
+  - **Frozen (P1-2).** Export places the §1 freeze on the store before
+    starting, and keeps it through schema capture, data capture, the
+    post-export hashes and the receipt write. This applies to native and
+    fallback exports alike. The native `wrangler d1 export` is preferred;
+    the paged-SELECT fallback is allowed only under this freeze, because
+    the epoch bracket covers only `memories` and `memories_embeddings`.
+    Under the freeze, memora-all's writes fail loudly instead of being
+    captured half-way. The viewer and every other writer are already gone
+    by L9 (L7, L8).
+  - Credentials:
   - `wrangler d1 export --remote` runs as a subprocess with an environment
     built from scratch: `PATH`, `HOME`, `CLOUDFLARE_ACCOUNT_ID`, and
     `CLOUDFLARE_API_TOKEN` set to the value of `MEMORA_D1_READ_TOKEN`.
@@ -874,8 +918,22 @@ if it is in the dev deps.
   table (`tombstones`), and a memories write that fires the epoch triggers,
   both stay clean;
 - **`test_copyback_mismatch_marks_dirty`**;
-- **`test_trigger_ddl_not_mirrored`**: a `CREATE TRIGGER … UPDATE memories_meta …`
-  is not mirrored;
+- **`test_trigger_ddl_not_mirrored`** and **`test_ddl_marks_dirty`**: a
+  `CREATE TRIGGER … UPDATE memories_meta …` through `execute` is not
+  mirrored and marks dirty at once (P2-3);
+- **`test_classify_retirement_query`**: the exact
+  `WITH ids(id) AS (…) SELECT … UNION …` query from storage.py:4921-4950 is
+  `read` and never dirties the shadow (P1-1);
+- classifier cases: leading `--` and `/* */` comments; `WITH … INSERT`
+  (mirrored, target resolved); `WITH … SELECT` (read);
+  `INSERT OR IGNORE`; `UPDATE OR REPLACE`; `REPLACE INTO`; string literals
+  containing `;` and keywords; two statements (unknown, so dirty);
+- **`test_freeze_d1_rejects_writes_keeps_reads`** and
+  **`test_freeze_local_query_only`**;
+- **`test_export_frozen_rejects_concurrent_child_write`**: a same-count
+  crossref write during the paged fallback fails with `StoreReadOnlyError`
+  and is not captured; **`test_export_frozen_rejects_schema_change`**
+  (P1-2);
 - **`test_executemany_partial_then_fail_marks_dirty`** and
   **`test_executescript_partial_then_fail_marks_dirty`**: completed elements
   are enqueued, dirty is set, and the original exception propagates;
@@ -975,9 +1033,16 @@ with flags off.
 **L9 sequence, per store:**
 1. The snapshot cron (§4) is installed and rehearsed on shadow files before
    the first cutover. From each cutover on, it covers that local primary.
-2. Export every store (P1).
-3. Seed the shadow at `/data/shadow/<db>.db` from the export.
-4. Set `MEMORA_SHADOW_LOCAL` and `MEMORA_REPLICATION=log`.
+2. Export every store (P1). Each export is frozen per store, one store at
+   a time.
+3. For store X, under one continuous freeze:
+   1. export and receipt;
+   2. seed the shadow at `/data/shadow/<db>.db` from that same export;
+   3. set `MEMORA_SHADOW_LOCAL` and `MEMORA_REPLICATION=log`, and restart
+      memora-all (the freeze file survives the restart);
+   4. confirm `applier_alive` and `dirty = 0` on `/health/db/<name>`;
+   5. lift the freeze.
+   No D1 write can fall between the export and the start of mirroring.
 5. Wait for at least 7 consecutive clean nights (§2.9).
 6. Cutover:
    1. freeze the `d1://` store;
