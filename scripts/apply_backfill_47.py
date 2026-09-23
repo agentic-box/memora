@@ -46,6 +46,10 @@ Usage:
    are second-resolution). This is biased toward "repair" and may
    over-trigger -- float noise in a remote model's vectors, or any later
    action -- at the cost of a harmless idempotent reindex.
+   KNOWN LIMITATION (heuristic derived-state check, accepted): a same-second
+   action plus a near-identical stale vector can pass as current; a later
+   link action or provider variance can over-trigger repair, which rewrites
+   updated_at and an action row. There is no durable progress marker.
    The write is ONE update_memory(conn, id, metadata={"project": target},
    expected_row=<the row just read>, commit=False): memora's own rules apply
    as on any edit (project validation, typed-tag re-prefix, allowlist,
@@ -59,8 +63,10 @@ Usage:
    event row (only with the event-trigger tag) may differ, else "failed"; a
    verification that raises is "verify-error". SECTION is never changed.
 
-3. FAIL-STOP: the first "failed", "raced" or "verify-error" row stops the
-   run; the rest are "not-attempted". On SQLite the transaction is rolled
+3. FAIL-STOP: the first "failed", "raced", "verify-error" or "uncertain" row
+   stops the run -- any exception in a row's lease fence, BEGIN, assessment
+   or write is caught per row ("failed" before the write, "uncertain" during
+   it); the rest are "not-attempted". On SQLite the transaction is rolled
    back (nothing written). On D1 each statement has already committed, so a
    stop can leave a row written-but-unverified or part-written (row
    updated, FTS or embedding not); a re-run classifies it through the same
@@ -68,8 +74,11 @@ Usage:
    blindly. A lost import lease also stops the run.
 
 4. EXIT 0 only when every considered row is applied, repaired or
-   already-applied; --allow-skips also accepts skipped-* (not failed, raced,
-   verify-error, refused, canonicalization-diff or not-attempted).
+   already-applied, with no summary.error; --allow-skips also accepts
+   skipped-* (not failed, raced, verify-error, uncertain, refused,
+   canonicalization-diff or not-attempted). The --report JSON is ALWAYS
+   written: also when the artifact is refused, the store cannot be opened or
+   the import lease cannot be taken (summary.error, zero rows attempted).
    --dry-run performs every check on a read-only connection (no schema
    setup, no lease), prints the expected diff per row, and writes nothing.
 
@@ -79,7 +88,9 @@ REPORTED OUTCOMES (the complete vocabulary):
   skipped-missing, skipped-pending,
   skipped-retired, skipped-stale          -- not written; accepted only with --allow-skips
   refused, canonicalization-diff          -- not written; never accepted
-  raced, failed, verify-error             -- the run stops here
+  raced, failed, verify-error, uncertain  -- the run stops here ("uncertain":
+                                             an unexpected error during the write,
+                                             so it is unknown whether it landed)
   not-attempted                           -- after a stop
 ("repair" in section 2 is the classification; its reported outcome is
 "repaired", or "would-repair" in a dry run.)
@@ -108,7 +119,7 @@ import preview_backfill_47 as preview  # noqa: E402  (importing it has no side e
 OK = {"applied", "repaired", "already-applied"}
 SKIPS = {"skipped-missing", "skipped-pending", "skipped-retired", "skipped-stale"}
 DRY_OK = {"would-apply", "would-repair", "already-applied"}
-STOPPERS = {"failed", "raced", "verify-error"}
+STOPPERS = {"failed", "raced", "verify-error", "uncertain"}
 COSINE_EQUAL = 0.9999
 
 
@@ -426,69 +437,102 @@ def _rollback(conn) -> None:
 
 # --- run ----------------------------------------------------------------------------
 
-def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Optional[int]) -> Dict[str, Any]:
-    data = json.loads(preview_path.read_text())
-    preview._bootstrap(db)  # refuse a non-local, non-D1 store; pin; import memora
-    storage = preview.storage
-    from memora.backends import D1Connection
+def _stopped(rows: List[Dict[str, Any]], detail: str) -> List[Dict[str, Any]]:
+    return [{"id": int(r["id"]), "group": r["group"], "outcome": "not-attempted", "detail": detail} for r in rows]
 
-    considered = validate_artifact(data, storage, expect_count)  # before any connection
-    token = storage.CURRENT_DB.set(db) if db else None
-    results: List[Dict[str, Any]] = []
+
+def run(preview_path: Path, db: Optional[str], dry_run: bool, expect_count: Optional[int]) -> Dict[str, Any]:
+    """Always returns a report (never raises): a failure before or during the
+    run is recorded in summary.error, with every row not reached reported as
+    "not-attempted"."""
+    report: Dict[str, Any] = {"summary": {"preview": str(preview_path), "dry_run": dry_run, "considered": 0,
+                                          "error": None, "refused": False, "outcomes": {}},
+                              "rows": []}
+    results: List[Dict[str, Any]] = report["rows"]
+    considered: List[Dict[str, Any]] = []
+    storage = None
+    token = conn = lease = None
+    transactional = False
     try:
+        data = json.loads(preview_path.read_text())
+        preview._bootstrap(db)  # refuse a non-local, non-D1 store; pin; import memora
+        storage = preview.storage
+        from memora.backends import D1Connection
+
+        considered = validate_artifact(data, storage, expect_count)  # before any connection
+        report["summary"]["considered"] = len(considered)
+        token = storage.CURRENT_DB.set(db) if db else None
         known = list(storage.configured_projects(db) if db else storage.configured_projects())
         conn = storage.connect_without_schema() if dry_run else storage.connect()
         d1 = isinstance(conn, D1Connection)
-        lease = None
-        try:
-            if not dry_run and d1:
-                lease = storage._ImportLease(conn, uuid.uuid4().hex)
-                lease.acquire()
-            for index, row in enumerate(considered):
+        transactional = not dry_run and not d1
+        if not dry_run and d1:
+            candidate = storage._ImportLease(conn, uuid.uuid4().hex)
+            candidate.acquire()
+            lease = candidate
+        for index, row in enumerate(considered):
+            stage = "lease fence"
+            try:
                 if lease is not None:
-                    try:
-                        lease.fence()
-                    except storage.ImportLeaseLostError as exc:
-                        results.append({"id": int(row["id"]), "group": row["group"], "outcome": "failed",
-                                        "detail": f"import lease lost: {exc}"})
-                        results += [{"id": int(r["id"]), "group": r["group"], "outcome": "not-attempted",
-                                     "detail": "the run stopped earlier"} for r in considered[index + 1:]]
-                        break
-                if not dry_run and not d1:
-                    conn.execute("BEGIN IMMEDIATE")  # re-read, checks and write: one transaction
+                    lease.fence()
+                stage = "BEGIN IMMEDIATE"
+                if transactional:
+                    conn.execute("BEGIN IMMEDIATE")  # re-read, checks, write, read-back: one transaction
+                stage = "assessment"
                 decision = assess(storage, conn, row, known)
                 if decision["outcome"] in ("apply", "repair") and not dry_run:
-                    result = write(storage, conn, decision, transactional=not d1)
+                    stage = "write"
+                    result = write(storage, conn, decision, transactional=transactional)
                 else:
-                    if not dry_run and not d1:
+                    if transactional:
                         _rollback(conn)  # nothing to write: end the transaction
                     if dry_run and decision["outcome"] in ("apply", "repair"):
                         decision["outcome"] = "would-" + decision["outcome"]
                     result = decision
-                results.append(result)
-                if result["outcome"] in STOPPERS:
-                    results += [{"id": int(r["id"]), "group": r["group"], "outcome": "not-attempted",
-                                 "detail": f"the run stopped at #{result['id']}"} for r in considered[index + 1:]]
-                    break
-        finally:
-            if lease is not None:
-                try:
-                    lease.release()
-                except Exception:
-                    pass
-            conn.close()
+            except Exception as exc:
+                if transactional:
+                    _rollback(conn)
+                lost = storage is not None and isinstance(exc, storage.ImportLeaseLostError)
+                result = {"id": int(row["id"]), "group": row["group"],
+                          # during the write it is unknown whether it landed (D1 commits per statement)
+                          "outcome": "uncertain" if stage == "write" else "failed",
+                          "detail": (f"import lease lost: {exc}" if lost
+                                     else f"{stage} raised {type(exc).__name__}: {exc}")}
+            results.append(result)
+            if result["outcome"] in STOPPERS:
+                results += _stopped(considered[index + 1:], f"the run stopped at #{result['id']}")
+                break
+    except Refused as exc:
+        report["summary"].update(error=str(exc.code), refused=True)
+    except Exception as exc:
+        report["summary"]["error"] = f"{type(exc).__name__}: {exc}"
+        results += _stopped(considered[len(results):], f"the run could not start or continue: {exc}")
     finally:
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                pass
+        if conn is not None:
+            if transactional:
+                _rollback(conn)
+            try:
+                conn.close()
+            except Exception:
+                pass
         if token is not None:
             storage.CURRENT_DB.reset(token)
     counts: Dict[str, int] = {}
     for r in results:
         r.pop("snapshot", None)
         counts[r["outcome"]] = counts.get(r["outcome"], 0) + 1
-    return {"summary": {"preview": str(preview_path), "dry_run": dry_run, "considered": len(considered),
-                        "outcomes": counts}, "rows": results}
+    report["summary"]["outcomes"] = counts
+    return report
 
 
 def exit_status(report: Dict[str, Any], allow_skips: bool) -> int:
+    if report["summary"].get("error"):
+        return 1
     ok = set(DRY_OK if report["summary"]["dry_run"] else OK)
     if allow_skips:
         ok |= SKIPS
@@ -502,9 +546,11 @@ def main(argv=None) -> int:
     ap.add_argument("--expect-count", type=int, help="the number of approved+proposed rows expected")
     ap.add_argument("--dry-run", action="store_true", help="every check, no write")
     ap.add_argument("--allow-skips", action="store_true", help="skipped-* rows do not fail the run")
-    ap.add_argument("--report", type=Path, help="write the JSON report here")
+    ap.add_argument("--report", type=Path, help="write the JSON report here (always written)")
     args = ap.parse_args(argv)
     report = run(args.preview, args.db, args.dry_run, args.expect_count)
+    if args.report:  # ALWAYS, whatever happened
+        args.report.write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
     for r in report["rows"]:
         line = f"#{r['id']} [{r['group']}] {r['outcome']}: {r.get('detail', '')}"
         if r.get("diff"):
@@ -515,8 +561,10 @@ def main(argv=None) -> int:
         print("!!! --allow-skips: skipped rows are accepted for the exit status !!!")
     print(("DRY RUN (nothing written): " if args.dry_run else "") + json.dumps(report["summary"]["outcomes"])
           + f"  exit {status}")
-    if args.report:
-        args.report.write_text(json.dumps(report, indent=1, ensure_ascii=False, default=str) + "\n")
+    if report["summary"]["refused"]:
+        raise SystemExit(report["summary"]["error"])  # exit 1, with the reason, after the report
+    if report["summary"]["error"]:
+        print(f"ERROR: {report['summary']['error']}", file=sys.stderr)
     return status
 
 

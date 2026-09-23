@@ -438,12 +438,15 @@ def _emit_event(
 # Any memory's crossrefs holding a "supersedes" edge to memory ? (one bound
 # parameter). json_each of malformed JSON would raise, hence the json_valid
 # fallback; the LIKE is only a cheap prefilter.
+# Any valid JSON is tolerated: only OBJECT elements are inspected (a scalar,
+# array, null or bare-string related yields no match instead of raising
+# "malformed JSON"), via CASE -- SQLite does not promise AND short-circuits.
 _SUPERSEDES_EDGE_TO_SQL = (
     "SELECT 1 FROM memories_crossrefs c, "
     "json_each(CASE WHEN json_valid(c.related) THEN c.related ELSE '[]' END) j "
     "WHERE c.related LIKE '%supersedes%' "
-    "AND json_extract(j.value, '$.edge_type') = 'supersedes' "
-    "AND CAST(json_extract(j.value, '$.id') AS INTEGER) = ?"
+    "AND (CASE WHEN j.type = 'object' THEN json_extract(j.value, '$.edge_type') END) = 'supersedes' "
+    "AND (CASE WHEN j.type = 'object' THEN CAST(json_extract(j.value, '$.id') AS INTEGER) END) = ?"
 )
 
 

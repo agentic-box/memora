@@ -356,3 +356,54 @@ def test_carry_approval_names_every_differing_field(store, tmp_path, capsys, fie
     capsys.readouterr()
     preview.main(["--out", str(outdir / "new.json"), "--carry-approval", str(outdir / "old.json")])
     assert f"#{ids['legacy_issue']}\tdropped\t{expected}" in capsys.readouterr().out
+
+
+def _old_approved(store_ids, outdir, *, generated_at=True):
+    fresh = outdir / "fresh.json"
+    assert preview.main(["--out", str(fresh)]) == 0
+    old = json.loads(fresh.read_text())
+    for g in ("contradictions", "keyword_only"):
+        for r in old[g]:
+            if r["status"] == "proposed":
+                r["approved"] = True
+    old["approval"] = {"approved_by": "user", "at": "2026-09-23", "rule": "proposed rows"}
+    if not generated_at:
+        old["summary"].pop("generated_at")
+    path = outdir / "old.json"
+    path.write_text(json.dumps(old))
+    return path, old
+
+
+def test_carry_drops_a_row_modified_after_the_approved_file_was_generated(store, tmp_path, capsys):
+    with storage.connect() as conn:
+        ids = _seed(conn)
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    old_path, old = _old_approved(ids, outdir)
+    with storage.connect() as conn:
+        conn.execute("UPDATE memories SET updated_at = '2099-01-01 00:00:00' WHERE id = ?", (ids["legacy_issue"],))
+        conn.commit()
+    capsys.readouterr()
+    preview.main(["--out", str(outdir / "new.json"), "--carry-approval", str(old_path)])
+    out = capsys.readouterr().out
+    assert f"#{ids['legacy_issue']}\tdropped\tmodified after approval (2099-01-01 00:00:00 >" in out
+    assert f"#{ids['keyword']}\tcarried" in out
+    data = json.loads((outdir / "new.json").read_text())
+    rule = data["approval"]["carried_rule"]
+    assert "content beyond the 120-char preview unverified" in rule and old["summary"]["generated_at"] in rule
+
+
+def test_carry_without_generated_at_uses_the_end_of_the_approval_day_and_warns(store, tmp_path, capsys):
+    with storage.connect() as conn:
+        ids = _seed(conn)
+        conn.execute("UPDATE memories SET updated_at = '2026-09-24 00:00:01' WHERE id = ?", (ids["keyword"],))
+        conn.commit()
+    outdir = tmp_path / "out"
+    outdir.mkdir()
+    old_path, _old = _old_approved(ids, outdir, generated_at=False)
+    capsys.readouterr()
+    preview.main(["--out", str(outdir / "new.json"), "--carry-approval", str(old_path)])
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "2026-09-23T23:59:59Z" in out
+    assert f"#{ids['keyword']}\tdropped\tmodified after approval" in out
+    assert f"#{ids['legacy_issue']}\tcarried" in out

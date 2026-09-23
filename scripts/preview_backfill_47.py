@@ -81,12 +81,43 @@ def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) 
     proposed AND that this preview also proposes in the same group, with the
     identical target, proposal.retag_typed, evidence and content preview, and
     identical stored section, subsection, tags, type and metadata.project.
-    Any difference drops the row (the field is named); every other row stays
-    unapproved (back to the user). Returns a per-row table."""
+    Any difference drops the row (the field is named). The row must also not
+    have been modified since OLD was generated (stored updated_at <= OLD's
+    summary.generated_at; without one, the end of approval.at's day, with a
+    warning): the approval covers id, target, retag and section, not content
+    beyond the 120-char preview. Every other row stays unapproved (back to
+    the user); the rule is recorded in the new approval block. Returns a
+    per-row table."""
+    from datetime import datetime, timezone
+
     if not isinstance(old.get("approval"), dict):
         raise SystemExit(f"{old_path}: no approval block to carry")
+    # The approval covers id + target + typed-tag retag + section, not content
+    # beyond the 120-char preview; a carry is acceptable only for rows not
+    # modified since the approved file was generated.
+    bound_text = (old.get("summary") or {}).get("generated_at")
+    lines: List[str] = []
+    if not bound_text:
+        bound_text = f"{str(old['approval'].get('at') or '').strip()}T23:59:59Z"
+        lines.append(f"WARNING: {old_path} has no summary.generated_at; using the coarser bound "
+                     f"{bound_text} (the end of approval.at)")
+    try:
+        bound = datetime.strptime(bound_text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise SystemExit(f"{old_path}: cannot read the approval time bound {bound_text!r}")
+
+    def modified_after(stored: Dict[str, Any]) -> Optional[str]:
+        raw = stored.get("updated_at")
+        if not raw:
+            return None  # never updated since creation (and it existed at approval)
+        try:
+            when = datetime.strptime(str(raw)[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return f"modified after approval (unreadable updated_at {raw!r})"
+        return f"modified after approval ({raw} > {bound_text})" if when > bound else None
+
     new_rows = {r["id"]: (g, r) for g in ("contradictions", "keyword_only") for r in preview.get(g, [])}
-    lines, carried, dropped = [], 0, 0
+    carried, dropped = 0, 0
     for group in ("contradictions", "keyword_only"):
         for o in old.get(group) or []:
             if not (o.get("approved") is True and o.get("status") == "proposed"):
@@ -111,7 +142,7 @@ def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) 
             else:
                 reason = next((f"stored {key} differs" for key in
                                ("section", "subsection", "tags", "type", "metadata_project")
-                               if nst.get(key) != ost.get(key)), None)
+                               if nst.get(key) != ost.get(key)), None) or modified_after(nst)
             if reason is None:
                 n["approved"] = True
                 carried += 1
@@ -119,7 +150,11 @@ def carry_approval(preview: Dict[str, Any], old: Dict[str, Any], old_path: str) 
             else:
                 dropped += 1
                 lines.append(f"#{o['id']}\tdropped\t{reason}")
-    preview["approval"] = dict(old["approval"], carried_from=old_path, carried=carried, dropped=dropped)
+    preview["approval"] = dict(
+        old["approval"], carried_from=old_path, carried=carried, dropped=dropped,
+        carried_rule=(f"carried: content beyond the 120-char preview unverified; rows with updated_at "
+                      f"after {bound_text} dropped"),
+    )
     lines.append(f"carried {carried}, dropped {dropped} (dropped rows stay unapproved: back to the user)")
     return lines
 
@@ -338,6 +373,9 @@ def build_preview(conn, known: List[str]) -> Dict[str, Any]:
                 "for rows to apply; the apply step is a separate item.",
         "scanned": len(rows),
         "configured_projects": known,
+        # The carry step's bound: rows updated after this are not what was approved.
+        "generated_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     for group, items in out.items():
         summary[group] = {"total": len(items),

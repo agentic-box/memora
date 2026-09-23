@@ -553,3 +553,98 @@ def test_a_forward_only_supersedes_edge_between_check_and_write_is_raced(d1, tmp
     assert rc == 1 and rows[ids["contradiction"]]["outcome"] == "raced"
     with storage.connect() as conn:
         assert "project" not in _state(conn, ids["contradiction"])[1]
+
+
+# --- round 4 (review 7477) -----------------------------------------------------------
+
+@pytest.mark.parametrize("related", [
+    '["supersedes"]', '[1, null, "x"]', '[[{"id": %(A)d, "edge_type": "supersedes"}]]', '"supersedes"',
+    None, 'not json {supersedes',
+])
+def test_any_crossrefs_json_is_tolerated_by_the_scan_and_the_guard(store, related):
+    with storage.connect() as conn:
+        a = _row(conn, NOTE, ["architecture"], {"section": "clmux"})
+        b = _row(conn, NOTE + " other", [], {"section": "clmux"})
+        value = related % {"A": a} if related else None
+        conn.execute("INSERT OR REPLACE INTO memories_crossrefs (memory_id, related) VALUES (?, ?)", (b, value))
+        conn.commit()
+        assert storage._superseding_edge_sources(conn, a) == []
+        row = conn.execute("SELECT content, metadata, tags, updated_at FROM memories WHERE id = ?", (a,)).fetchone()
+        guard = {"content": row[0], "metadata": row[1], "tags": row[2], "updated_at": row[3], "related": None}
+        storage.update_memory(conn, a, metadata={"project": "clmux"}, expected_row=guard)
+        assert _state(conn, a)[1]["project"] == "clmux"
+        # Positive control: a real object edge IS found.
+        conn.execute("INSERT OR REPLACE INTO memories_crossrefs (memory_id, related) VALUES (?, ?)",
+                     (b, json.dumps([1, "x", {"id": a, "edge_type": "supersedes"}])))
+        conn.commit()
+        assert storage._superseding_edge_sources(conn, a) == [b]
+
+
+def test_a_transient_assessment_error_after_an_applied_row_is_reported(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn)  # considered: contradiction, stale, pending, keyword, retired
+    seen = {"n": 0}
+
+    def fail_third_row_select(sql, params):
+        if sql.startswith("SELECT * FROM memories WHERE id = ?"):
+            seen["n"] += 1
+            return seen["n"] == 3  # row 1: assess + read-back; row 2: its assessment fails
+        return False
+
+    real_connect = d1.connect
+
+    def connect(**kw):
+        conn = real_connect(**kw)
+        conn.fail_when = fail_third_row_select
+        return conn
+
+    monkeypatch.setattr(d1, "connect", connect)
+    rc, rows = _run(tmp_path, preview, "--allow-skips")
+    assert rc == 1
+    assert rows[ids["contradiction"]]["outcome"] == "applied"
+    assert rows[ids["stale"]]["outcome"] == "failed" and "assessment raised" in rows[ids["stale"]]["detail"]
+    assert {rows[i]["outcome"] for i in (ids["pending"], ids["keyword"], ids["retired"])} == {"not-attempted"}
+
+
+def test_a_lease_that_cannot_be_acquired_still_writes_the_report(d1, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+    real_connect = d1.connect
+
+    def connect(**kw):
+        conn = real_connect(**kw)
+        conn.fail_when = lambda sql, params: sql.startswith("INSERT OR IGNORE INTO import_lease")
+        return conn
+
+    monkeypatch.setattr(d1, "connect", connect)
+    report = tmp_path / "r.json"
+    rc = apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(report)])
+    data = json.loads(report.read_text())
+    assert rc == 1 and data["summary"]["error"]
+    assert {r["outcome"] for r in data["rows"]} == {"not-attempted"} and len(data["rows"]) == 2
+
+
+def test_an_unexpected_error_during_the_write_is_uncertain(store, tmp_path, monkeypatch):
+    with storage.connect() as conn:
+        ids, preview = _seed(conn, with_skips=False)
+    real = apply.write
+
+    def write_then_boom(*a, **k):
+        real(*a, **k)
+        raise RuntimeError("connection reset after the write")
+
+    monkeypatch.setattr(apply, "write", write_then_boom)
+    rc, rows = _run(tmp_path, preview)
+    assert rc == 1 and rows[ids["contradiction"]]["outcome"] == "uncertain"
+    assert rows[ids["keyword"]]["outcome"] == "not-attempted"
+
+
+def test_a_refused_artifact_still_writes_the_report(store, tmp_path):
+    with storage.connect() as conn:
+        _ids, preview = _seed(conn, with_skips=False)
+    preview["approval"]["rule"] = ""
+    report = tmp_path / "r.json"
+    with pytest.raises(SystemExit, match="refused"):
+        apply.main(["--preview", str(_file(tmp_path, preview)), "--report", str(report)])
+    data = json.loads(report.read_text())
+    assert data["summary"]["refused"] is True and "approval.rule" in data["summary"]["error"]
