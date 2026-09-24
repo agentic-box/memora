@@ -790,6 +790,18 @@ CREATE TABLE shadow_state (   -- in the shadow file only
   same seq. A diff is a statement-builder bug.
 - A clean night means (a) and (b) show zero diffs and `dirty = 0`. Either
   failure resets `clean_nights`.
+- **As built (L9a):** `local_primary.py shadow-night <db> --shadow S
+  --seed-export SQL --account A --database-id D` (`memora/shadow_night.py`)
+  runs both checks. (a) re-reads each diffed key once after a pause. (b)
+  also fails while the replicator's log is halted: L3's delete guard (P3)
+  halts log mode as well, and a table under 100 rows halts on any delete.
+  So a shadow night stays not-clean until `resume` is run. The shadow itself
+  is not marked dirty for that. A diff in (a) or (b) marks the shadow dirty.
+  A clean night counts once per UTC day, and the command reports
+  `ready_for_cutover` at 7. Exit 5 when the night is not clean.
+- `/health/db/<name>` carries the `shadow` block (`enabled`, `dirty`,
+  `dirty_reason`, `queue_depth`, `pending_keys`, `applier_alive`,
+  `clean_nights`, and `refused` when the applier could not start).
 
 **Metrics.** `/health/db/<name>` gets a `shadow` block with `queue_depth`,
 `applier_alive`, `dirty`, `dirty_reason` and `clean_nights`.

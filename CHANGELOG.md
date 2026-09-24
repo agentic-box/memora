@@ -14,6 +14,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L9a (piece b): nightly shadow check, health block
+- `local_primary.py shadow-night <db> --shadow S --seed-export SQL --account A --database-id D [--read-token-file F]` (`memora/shadow_night.py`, §2.9), no barrier and no D1 write:
+  - (a) compares the seven replicated tables of the shadow with D1, read through the READ token (the replicator's `memories_meta` exclusions apart). A diffed key is re-read once after a pause, so a write in flight during the read does not count.
+  - (b) checks that the replicator log's key set equals the outbox key set up to `log_cursor_seq`, and that the log is not halted. It replays the log into a scratch copy of the seed export and compares it with a `.backup` of the shadow; keys touched after the cursor are left out.
+  - A clean night increments `clean_nights` once per UTC day; `ready_for_cutover` at 7. A diff resets the count and marks the shadow dirty; a halted log resets the count without marking the shadow dirty. Exit 5 when the night is not clean.
+- `/health/db/<name>` gets a `shadow` block for a shadowed store: `enabled`, `dirty`, `dirty_reason`, `queue_depth`, `pending_keys`, `applier_alive`, `clean_nights`, `last_clean_night`, and `refused` when the applier could not start.
+
 ### Local-primary L9a (piece a): shadow-local hook, applier, dirty rule
 - Per `docs/local-primary-implementation.md` §2.9 and §0 P4. No new D1 statement: the shadow only forwards the app's existing writes, unchanged, and reads D1 through `D1SelectOnlyConnection` with `MEMORA_D1_READ_TOKEN`. Dark unless `MEMORA_SHADOW_LOCAL` names a store.
 - `memora/shadow.py`: for a store named in `MEMORA_SHADOW_LOCAL` (`{"<db>": "/data/shadow/<db>.db"}`), `D1Backend.connect()` returns a `ShadowingD1Connection`. The L2 gated and journaled `_execute_api` stays the parent and runs unchanged; the app gets D1's result and exception objects as they were. After a mutating statement D1 answered successfully, still inside the write gate (enter, D1 request, enqueue, leave), a new `_after_mutation` hook enqueues it when its target is one of the seven replicated tables. Other targets are ignored, DDL marks the shadow dirty at once, and an unknown statement marks it dirty. Any exception from a mutating statement marks the shadow dirty and is re-raised as the same object; a refusal before sending (write gate, intent journal) reached nothing and is not dirty. `execute_batch` raises.

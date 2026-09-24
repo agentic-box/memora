@@ -518,6 +518,16 @@ def test_the_first_reason_is_kept(world):
     assert _state(world.shadow_path)["dirty_reason"] == "first"
 
 
+def test_the_first_reason_survives_another_instance(world):
+    """A reason already persisted (by an earlier run or another process) is
+    kept when a fresh applier -- one that never read the state -- marks the
+    shadow dirty again."""
+    world.app.mark_dirty("persisted first")
+    fresh = shadow.ShadowApplier("s1", str(world.shadow_path))
+    fresh.mark_dirty("second")
+    assert _state(world.shadow_path)["dirty_reason"] == "persisted first"
+
+
 def test_dirty_restarts_the_clean_night_count(world):
     db = sqlite3.connect(world.shadow_path)
     db.execute("UPDATE shadow_state SET clean_nights = 5")

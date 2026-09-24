@@ -249,6 +249,14 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
                 out["journal"]["unusable"] = broken  # this process serves the store read-only
         if getattr(backend, "refused_reason", None):
             out["refused"] = backend.refused_reason
+        from .shadow import shadow_status
+
+        try:
+            sh = shadow_status(name)
+        except Exception as exc:  # the freeze/journal fields must still be reported
+            sh = {"enabled": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        if sh is not None:
+            out["shadow"] = sh
         from .replicator import replicator_for
 
         rep = replicator_for(name)
