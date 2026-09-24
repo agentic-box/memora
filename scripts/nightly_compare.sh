@@ -25,8 +25,9 @@
 # diff (tool exit 5), a skipped compare (6), a refusal (2), a halt (3) or
 # any other failure, missing vectors on D1, a halted replicator, or new
 # would_halt events (counted per store in $NC_LOG_DIR/would-halt-<db>.count).
-# Exit 75 when another run holds the lock ($NC_LOG_DIR/.lock): two compares
-# never run at once.
+# Exit 75 when another LIVE run holds the lock ($NC_LOG_DIR/.lock, with its
+# owner's PID): two compares never run at once. The refusal is logged; a lock
+# left by a killed run (or a reboot) is reclaimed by the next run.
 #
 # Where: on the deploy host, next to memora-all (the default), or from
 # elsewhere with DEPLOY_HOST=<ssh host>. RUNTIME (docker) and
@@ -123,16 +124,38 @@ if [ "$DRY" = 1 ]; then
 fi
 
 mkdir -p "$LOG_DIR"
+LOG="$LOG_DIR/compare-$(date +%Y-%m-%d).log"
+# One run at a time (review 8111): a lock directory holding its owner's PID.
+# A lock whose owner is gone (killed, or the host rebooted) is reclaimed, so
+# an interrupted run never disables the schedule. The owner is alive only if
+# that PID still runs nightly_compare (PID reuse after a reboot is not an
+# owner). A lock without a PID yet is busy for its first minute (a run
+# between mkdir and writing its PID), then stale. A refusal is logged.
 LOCK="$LOG_DIR/.lock"
-mkdir "$LOCK" 2>/dev/null || { echo "another nightly_compare run holds $LOCK" >&2; exit 75; }
+take_lock() {
+  local owner
+  if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid"; return 0; fi
+  owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+  if [ -n "$owner" ]; then
+    ps -p "$owner" -o args= 2>/dev/null | grep -q nightly_compare && return 1
+  elif [ -z "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    return 1
+  fi
+  echo "note: reclaiming a stale lock $LOCK (owner ${owner:-unknown} is gone)" | tee -a "$LOG" >&2
+  rm -rf "$LOCK" && mkdir "$LOCK" 2>/dev/null && echo $$ > "$LOCK/pid"
+}
+if ! take_lock; then
+  echo "$(date +%Y-%m-%dT%H:%M:%S%z) (all) mode=$MODE result=locked exit=75 detail='another nightly_compare run (pid $(cat "$LOCK/pid" 2>/dev/null || echo '?')) holds $LOCK'" | tee -a "$LOG" >&2
+  exit 75
+fi
 TOKENS=0
 cleanup() {
   [ "$TOKENS" = 1 ] && { cexec rm -rf "$SHM" >/dev/null 2>&1 || echo "note: remove $SHM in $CONTAINER by hand" >&2; }
-  rmdir "$LOCK" 2>/dev/null || true
+  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
+  return 0
 }
 trap cleanup EXIT
 
-LOG="$LOG_DIR/compare-$(date +%Y-%m-%d).log"
 find "$LOG_DIR" -maxdepth 1 -name 'compare-*.log' -mtime +"$KEEP_DAYS" -exec rm -f {} + 2>/dev/null || true
 
 if [ -n "$PLAN" ]; then

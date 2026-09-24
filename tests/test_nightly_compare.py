@@ -134,11 +134,57 @@ class TestRun:
         proc, calls = nc("--mode", "nightly", env={"NC_RUNNING": str(running), "NC_SLEEP": "0.2"})
         assert proc.returncode == 0 and "OVERLAP" not in proc.stdout
 
-    def test_a_second_run_while_one_holds_the_lock_refuses(self, nc):
+    def test_a_live_run_holding_the_lock_refuses_and_says_so_in_the_log(self, nc):
         nc.logs.mkdir()
         (nc.logs / ".lock").mkdir()
+        owner = subprocess.Popen(["bash", "-c", "exec -a nightly_compare_owner sleep 30"])
+        try:
+            time.sleep(0.2)
+            (nc.logs / ".lock" / "pid").write_text(str(owner.pid))
+            proc, calls = nc("--mode", "nightly")
+        finally:
+            owner.kill()
+            owner.wait()
+        assert proc.returncode == 75 and _compares(calls) == []
+        assert f"result=locked exit=75 detail='another nightly_compare run (pid {owner.pid})" in _log_lines(nc)[0]
+        assert (nc.logs / ".lock").exists(), "the live owner's lock is left alone"
+
+    def test_a_lock_left_by_a_killed_run_is_reclaimed(self, nc):
+        """Review 8111: SIGKILL or a reboot leaves the lock; the next run
+        must not be disabled by it."""
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        nc.logs.mkdir()
+        (nc.logs / ".lock").mkdir()
+        (nc.logs / ".lock" / "pid").write_text(str(dead.pid))
         proc, calls = nc("--mode", "nightly")
-        assert proc.returncode == 75 and "holds" in proc.stderr and _compares(calls) == []
+        assert proc.returncode == 0, proc.stderr
+        assert [c[5] for c in _compares(calls)] == ["alpha", "beta"]
+        lines = _log_lines(nc)
+        assert "reclaiming a stale lock" in lines[0] and f"owner {dead.pid} is gone" in lines[0]
+        assert not (nc.logs / ".lock").exists()
+
+    def test_a_pid_reused_by_another_program_is_not_an_owner(self, nc):
+        other = subprocess.Popen(["sleep", "30"])
+        try:
+            nc.logs.mkdir()
+            (nc.logs / ".lock").mkdir()
+            (nc.logs / ".lock" / "pid").write_text(str(other.pid))
+            proc, _ = nc("--mode", "nightly")
+        finally:
+            other.kill()
+            other.wait()
+        assert proc.returncode == 0 and "reclaiming a stale lock" in _log_lines(nc)[0]
+
+    def test_a_lock_without_a_pid_is_busy_briefly_then_stale(self, nc):
+        nc.logs.mkdir()
+        (nc.logs / ".lock").mkdir()
+        proc, _ = nc("--mode", "nightly")
+        assert proc.returncode == 75  # fresh: a run between mkdir and its pid
+        past = time.time() - 300
+        os.utime(nc.logs / ".lock", (past, past))
+        proc, _ = nc("--mode", "nightly")
+        assert proc.returncode == 0 and "owner unknown is gone" in "\n".join(_log_lines(nc))
 
     def test_the_lock_is_released_after_a_run(self, nc):
         nc("--mode", "nightly")
