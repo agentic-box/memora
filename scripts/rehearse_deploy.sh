@@ -2,8 +2,14 @@
 # Deployment REHEARSAL (R1): the L2a deploy and migration, and the L2-L6
 # startup, against a REAL container runtime on a rehearsal host (server2,
 # podman). No Cloudflare, no nuc8, no tokens that exist anywhere else: every
-# store is a local SQLite file, every name is suffixed "-rh", the port is
-# 18920, and all state lives under $RH_ROOT.
+# store is a local SQLite file, the port is 18920, and all state lives under
+# $RH_ROOT. Every runtime object it creates goes through
+# scripts/rehearse_objects.sh: a name unique to this run (memora-rh-<epoch>-<pid>…),
+# the label memora.rehearsal=<run id>, its ID captured from a successful
+# create, and removal at the end of the run by that ID after the label is
+# re-checked (review 7747). RH_KEEP=1 keeps the objects for inspection; they
+# are then listed in $RH_ROOT/run-<run id>.objects for a later
+# `scripts/rehearse_teardown.sh <run id>`.
 #
 #   scripts/rehearse_deploy.sh OLD_SRC
 #
@@ -35,9 +41,11 @@ OLD_SRC="${1:?usage: rehearse_deploy.sh OLD_SRC}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RT="${RUNTIME:-podman}"
 RH_ROOT="${RH_ROOT:-$HOME/rehearsal-r1}"
-NAME=memora-rh
-VOL=memora-rh-data
-IMAGE=memora-rh:latest
+RUN_ID="rh-$(date +%s)-$$"
+RUN_START="$(date +%s)"
+NAME="memora-$RUN_ID"              # memora-rh-<epoch>-<pid>: unique to this run
+VOL="memora-$RUN_ID-data"
+IMAGE="memora-$RUN_ID:latest"
 PORT=18920
 PY="${PYTHON:-python3}"
 CFG="$RH_ROOT/config"
@@ -46,12 +54,21 @@ RESULTS="$RH_ROOT/results.txt"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")"
 REG='{"memora": "/data/memora.db", "ob1": "/data/ob1.db", "bestation": "/data/bestation.db", "re": "/data/re.db"}'
 
-# Every container and volume this run creates carries this label (review
-# 7729); the cleanup removes only what carries a run id from its own ledger.
-RUN_ID="rh-$(date +%s)-$$"
-RUN_LABEL="memora.rehearsal=$RUN_ID"
-LEDGER="$RH_ROOT/ledger.txt"
+OBJECTS="$RH_ROOT/run-$RUN_ID.objects"
 mkdir -p "$RH_ROOT" "$CFG" "$RH_ROOT/fixtures"
+echo "start $RUN_START $RUN_ID" > "$OBJECTS"
+. "$ROOT/scripts/rehearse_objects.sh"   # new_container/new_volume/new_image/adopt/once/teardown
+finish() {
+  if [ "${RH_KEEP:-0}" = 1 ]; then echo "RH_KEEP=1: objects kept; see $OBJECTS"; return; fi
+  echo "== teardown of run $RUN_ID (by captured ID, label re-checked)"
+  # A run that stopped early may not have adopted what the deploy created:
+  # adopt the per-run names now (each refused unless it carries this run's label).
+  ( adopt _ container "$NAME" ) >/dev/null 2>&1
+  ( adopt _ volume "$VOL" ) >/dev/null 2>&1
+  ( adopt _ image "$IMAGE" ) >/dev/null 2>&1
+  teardown "$OBJECTS"
+}
+trap finish EXIT
 chmod 700 "$CFG"
 : > "$RESULTS"
 FAILS=0
@@ -62,21 +79,15 @@ check() {  # check "description" command... -- PASS/FAIL on the exit status
   if "$@" >>"$RH_ROOT/commands.log" 2>&1; then pass "$what"; else fail "$what (exit $?; see commands.log)"; fi
 }
 mint() { ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 ); }
-# Never `run --rm` with a volume mounted by name: podman's --rm deletes an
-# ANONYMOUS volume once no container references it (this rehearsal's finding).
-# Every helper container is named and removed with a plain `rm`.
-once() {  # once NAME ARGS... -- run a helper container, then remove it (never its volumes)
-  local name="rh-helper-$1-$$"; shift
-  "$RT" run --name "$name" --label "$RUN_LABEL" --tmpfs /data "$@"; local rc=$?  # --tmpfs: no anonymous /data volume
-  "$RT" rm "$name" >/dev/null 2>&1
-  return $rc
-}
+# (Never `run --rm` with a volume mounted by name: podman's --rm deletes an
+# ANONYMOUS volume once no container references it -- this rehearsal's
+# finding. Helpers are `once`: create, start attached, remove by ID.)
 mig_digest() {  # mig_digest VOLUME -- the migration program's own digest of a volume
-  once dig -v "$1:/from:ro" --entrypoint sh "$IMAGE" -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
+  once -v "$1:/from:ro" --entrypoint sh "$IMAGE" -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
     migrate_data_volume digest
 }
 vol_digest() {  # vol_digest VOLUME -- sha256 of every file except the migration's own
-  once vd -v "$1:/v:ro" --entrypoint python "$IMAGE" -c '
+  once -v "$1:/v:ro" --entrypoint python "$IMAGE" -c '
 import hashlib, os, json
 out = {}
 for d, _, fs in os.walk("/v"):
@@ -102,11 +113,7 @@ deploy() {
     bash "$ROOT/scripts/deploy-memora-all.sh"
 }
 
-echo "== 0. clean up earlier rehearsals: only what they labelled and recorded; never by name alone, never prune"
-. "$ROOT/scripts/rehearse_cleanup.sh"   # cleanup_ledger, created_in_run (shared with its self-test)
-record() { echo "$*" >> "$LEDGER"; }
-cleanup_ledger "$LEDGER"
-record run "$RUN_ID" "$(date +%s)"
+echo "== run $RUN_ID: container $NAME, volume $VOL, image $IMAGE"
 
 # The rehearsal's own config: throwaway tokens (0600), no Cloudflare anything.
 HEALTH_TOKEN="$(mint)"
@@ -118,17 +125,16 @@ JSON
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
 
 echo "== 1. the OLD image (production's memora:latest today) from $OLD_SRC"
-check "build the old image from $OLD_SRC" "$RT" build -t "$IMAGE" "$OLD_SRC"
+new_image OLD_IMAGE_ID "$IMAGE" "$OLD_SRC" && pass "build the old image from $OLD_SRC ($OLD_IMAGE_ID)"
 
 echo "== 2. the old container, the production way (anonymous /data)"
-check "start the old container" "$RT" run -d --name "$NAME" --label "$RUN_LABEL" --restart unless-stopped -p "0.0.0.0:$PORT:8000" \
+new_container OLD_ID --name "$NAME" --restart unless-stopped -p "0.0.0.0:$PORT:8000" \
   -e "MEMORA_DATABASES=$REG" -e MEMORA_DEFAULT_DB=memora -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
   -e MEMORA_EMBEDDING_MODEL=tfidf -e MEMORA_ALLOW_ANY_TAG=1 "$IMAGE"
+pass "start the old container ($OLD_ID)"
 check "the old container answers /health" wait_health
-OLD_VOL="$(old_anon "$NAME")"
-record anon "$RUN_ID" "$("$RT" inspect "$NAME" --format '{{.Id}}')" "$OLD_VOL"
-if printf '%s' "$OLD_VOL" | grep -Eqx '[0-9a-f]{64}'; then pass "the old container's /data is an anonymous volume ($OLD_VOL)"; \
-  else fail "the old container's /data is not an anonymous volume: '$OLD_VOL'"; fi
+anon_of OLD_VOL "$OLD_ID"   # dies unless it is an anonymous 64-hex volume
+pass "the old container's /data is an anonymous volume ($OLD_VOL)"
 check "write memories to all four stores" "$RT" exec -i "$NAME" python - <<'PY'
 import json, os
 from memora import storage
@@ -161,32 +167,33 @@ check "the WAL sidecars exist" "$RT" exec "$NAME" sh -c 'test -s /data/wal-probe
 echo "== 3. deploy (scripts/deploy-memora-all.sh in rehearsal mode)"
 if deploy > "$RH_ROOT/deploy-1.log" 2>&1; then pass "first deploy (log: deploy-1.log)"; \
   else fail "first deploy (exit $?; see deploy-1.log)"; tail -30 "$RH_ROOT/deploy-1.log"; fi
-GROK1="$("$RT" ps -a --format '{{.Names}}' | grep -E "^$NAME-grok-[0-9]+$" | sort | tail -1)"
-[ -n "$GROK1" ] && pass "the old container is kept as $GROK1" || fail "no renamed old container"
-[ "$("$RT" inspect "$GROK1" --format '{{.State.Running}}' 2>/dev/null)" = false ] \
+adopt NEW_IMAGE_ID image "$IMAGE"; adopt VOL_ID volume "$VOL"; adopt NEW1_ID container "$NAME"
+GROK1="$("$RT" inspect "$OLD_ID" --format '{{.Name}}')"   # the old container, by its ID
+[[ "$GROK1" == "$NAME-grok-"* ]] && pass "the old container is kept as $GROK1 (same ID)" || fail "the old container is named '$GROK1'"
+[ "$("$RT" inspect "$OLD_ID" --format '{{.State.Running}}' 2>/dev/null)" = false ] \
   && pass "the old container is stopped" || fail "the old container is not stopped"
-[ "$(old_anon "$GROK1")" = "$OLD_VOL" ] && pass "the old container still mounts its anonymous volume" \
+[ "$(old_anon "$OLD_ID")" = "$OLD_VOL" ] && pass "the old container still mounts its anonymous volume" \
   || fail "the old container's volume changed"
 [ "$(old_anon "$NAME")" = "$VOL" ] && pass "the new container mounts the named volume $VOL" \
   || fail "the new container mounts '$(old_anon "$NAME")'"
 # The new server has been writing to the named volume since it started (the
 # schema upgrade), so it is compared through what the copy recorded, plus an
 # independent copy made by the same program before any server touches it.
-once mk -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-1.txt" 2>&1
+once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-1.txt" 2>&1
 grep -q "source=$OLD_VOL" "$RH_ROOT/marker-1.txt" && pass "the marker names the source volume" || fail "marker: $(cat "$RH_ROOT/marker-1.txt")"
 OLD_DIGEST="$(mig_digest "$OLD_VOL")"
 grep -q "digest=$OLD_DIGEST" "$RH_ROOT/marker-1.txt" \
   && pass "the marker's digest is the old volume's content (the copy verified exactly this source)" \
   || fail "marker digest != the old volume's digest $OLD_DIGEST"
-"$RT" volume create --label "$RUN_LABEL" memora-rh-scratch >/dev/null
-if once mig -v "$OLD_VOL:/from:ro" -v memora-rh-scratch:/to "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
+new_volume SCRATCH "memora-$RUN_ID-scratch"
+if once -v "$OLD_VOL:/from:ro" -v "$SCRATCH:/to" "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
      migrate_data_volume migrate "$OLD_VOL" >> "$RH_ROOT/commands.log" 2>&1 \
-   && [ "$(vol_digest "$OLD_VOL")" = "$(vol_digest memora-rh-scratch)" ]; then
+   && [ "$(vol_digest "$OLD_VOL")" = "$(vol_digest "$SCRATCH")" ]; then
   pass "a copy by the same program on this runtime is byte-identical, file by file (WAL sidecars, intent journal)"
 else
   fail "the independent copy differs from the old volume"
 fi
-once wal -v "$OLD_VOL:/a:ro" -v "$VOL:/b:ro" --entrypoint sh "$IMAGE" -c \
+once -v "$OLD_VOL:/a:ro" -v "$VOL:/b:ro" --entrypoint sh "$IMAGE" -c \
   'test -s /a/wal-probe.db-wal && cmp /a/wal-probe.db-wal /b/wal-probe.db-wal && cmp /a/intent/memora.jsonl /b/intent/memora.jsonl' \
   && pass "the WAL sidecar and the intent journal reached the named volume byte-identical" \
   || fail "the WAL sidecar or the intent journal differs in the named volume"
@@ -218,45 +225,53 @@ echo "== 3b. a second deploy copies nothing"
 MARK1="$(cat "$RH_ROOT/marker-1.txt")"
 if deploy > "$RH_ROOT/deploy-2.log" 2>&1; then pass "second deploy"; else fail "second deploy (exit $?; see deploy-2.log)"; fi
 grep -q migrate_data_volume "$RH_ROOT/deploy-2.log" && fail "the second deploy ran a copy" || pass "the second deploy ran no copy"
-once mk -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-2.txt" 2>&1
+once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-2.txt" 2>&1
+GROK2="$("$RT" inspect "$NEW1_ID" --format '{{.Name}}')"   # the first new container, renamed by the second deploy
+adopt NEW2_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"
 [ "$(cat "$RH_ROOT/marker-2.txt")" = "$MARK1" ] && pass "the marker is unchanged" || fail "the marker changed"
 "$RT" inspect "$NAME" > "$RH_ROOT/fixtures/inspect-new.raw.json"
 
 echo "== 3c. rollback to the old container, write to it, redeploy: the copy is redone"
-GROK2="$("$RT" ps -a --format '{{.Names}}' | grep -E "^$NAME-grok-[0-9]+$" | sort | tail -1)"
-check "rollback: remove the new container" "$RT" rm -f "$NAME"
-check "rollback: rename the ORIGINAL old container back" "$RT" rename "$GROK1" "$NAME"
-check "rollback: start it" "$RT" start "$NAME"
+remove_one container "$NEW2_ID" | grep -q removed && pass "rollback: remove the new container (by its ID, label checked)" \
+  || fail "rollback: the new container was not removed"
+check "rollback: rename the ORIGINAL old container back" "$RT" rename "$OLD_ID" "$NAME"
+check "rollback: start it" "$RT" start "$OLD_ID"
 check "the rolled-back container answers /health" wait_health
-check "write to the rolled-back (old) container" "$RT" exec -i "$NAME" python - <<'PY'
+check "write to the rolled-back (old) container" "$RT" exec -i "$OLD_ID" python - <<'PY'
 from memora import storage
 conn = storage.backend_for("ob1").connect()
 storage.add_memory(conn, content="written after the rollback", tags=["rehearsal"]); conn.commit(); conn.close()
 PY
-[ -n "$GROK2" ] && [ "$GROK2" != "$GROK1" ] && "$RT" rm -f "$GROK2" >/dev/null   # the second deploy's leftover
+remove_one container "$NEW1_ID" >> "$RH_ROOT/commands.log"   # the second deploy's leftover ($GROK2), by ID
 if deploy > "$RH_ROOT/deploy-3.log" 2>&1; then pass "redeploy after the rollback"; else fail "redeploy (exit $?; see deploy-3.log)"; fi
-once mk -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-3.txt" 2>&1
+adopt NEW3_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"
+once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-3.txt" 2>&1
 NEW_OLD_DIGEST="$(mig_digest "$OLD_VOL")"
 [ "$NEW_OLD_DIGEST" != "$OLD_DIGEST" ] && grep -q "digest=$NEW_OLD_DIGEST" "$RH_ROOT/marker-3.txt" \
   && pass "the redeploy recopied: the marker now records the old volume WITH the post-rollback writes" \
   || fail "the redeploy did not recopy the post-rollback content (marker: $(cat "$RH_ROOT/marker-3.txt"))"
-once ls -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'ls -a /v' > "$RH_ROOT/volume-listing.txt"
+once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'ls -a /v' > "$RH_ROOT/volume-listing.txt"
 grep -q '^\.memora-previous-' "$RH_ROOT/volume-listing.txt" && pass "the replaced content was moved aside (.memora-previous-*), not overwritten" \
   || fail "no .memora-previous-* after the recopy"
 
 echo "== 3d. podman: run --rm deletes an unreferenced anonymous volume; the migration form does not"
-"$RT" run -d --name rh-helper-probe-$$ --label "$RUN_LABEL" --entrypoint sleep "$IMAGE" 600 >/dev/null
-PROBE="$(old_anon rh-helper-probe-$$)"
-record anon "$RUN_ID" "$("$RT" inspect rh-helper-probe-$$ --format '{{.Id}}')" "$PROBE"
-"$RT" exec rh-helper-probe-$$ sh -c 'echo precious > /data/p'
-"$RT" rm -f rh-helper-probe-$$ >/dev/null   # the container goes, its volume stays (no -v)
-"$RT" volume create --label "$RUN_LABEL" memora-rh-scratch2 >/dev/null
-once mig2 -v "$PROBE:/from:ro" -v memora-rh-scratch2:/to "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
+new_container PROBE_ID --name "memora-$RUN_ID-probe" --entrypoint sleep "$IMAGE" 600
+anon_of PROBE "$PROBE_ID"
+"$RT" exec "$PROBE_ID" sh -c 'echo precious > /data/p'
+remove_one container "$PROBE_ID" >> "$RH_ROOT/commands.log"   # the container goes, its volume stays (no -v)
+new_volume SCRATCH2 "memora-$RUN_ID-scratch2"
+once -v "$PROBE:/from:ro" -v "$SCRATCH2:/to" "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
   migrate_data_volume migrate "$PROBE" >> "$RH_ROOT/commands.log" 2>&1
 "$RT" volume exists "$PROBE" && pass "the migration form (named container + plain rm) keeps an unreferenced source volume" \
   || fail "the migration deleted its unreferenced source volume"
-"$RT" run --rm -v "$PROBE:/from:ro" --entrypoint true "$IMAGE" >/dev/null 2>&1
-if "$RT" volume exists "$PROBE"; then pass "note: this runtime's run --rm kept the volume"; \
+# The hazard itself, on this run's own probe volume. It is specific to
+# `run --rm` (a `create --rm` + `start` keeps the volume and leaks its own
+# anonymous /data). `run -d --rm` prints the ID of a successful create.
+DEMO="$("$RT" run -d --rm --label "$RUN_LABEL" -v "$PROBE:/from:ro" --entrypoint true "$IMAGE")" \
+  || die "create failed: --rm demo"
+track container "$DEMO"
+"$RT" wait "$DEMO" >/dev/null 2>&1; sleep 2
+if "$RT" volume exists "$PROBE"; then fail "this runtime's run --rm kept the probe volume (the hazard did not reproduce)"; \
   else pass "confirmed the hazard: '$RT run --rm -v <anonymous>:/from' deleted the unreferenced probe volume (the fixed scripts never do this)"; fi
 
 echo "== 4. local_primary.py through the live admin routes"
@@ -269,7 +284,7 @@ check "local_primary.py freeze memora" "${LP[@]}" freeze memora "${TOK[@]}"
 code="$(curl -s -o "$RH_ROOT/health-db.json" -w '%{http_code}' -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/memora")"
 "$PY" -c 'import json,sys; f=json.load(open(sys.argv[1]))["freeze"]; assert f["state"]=="frozen" and f["in_flight"]==0, f' \
   "$RH_ROOT/health-db.json" && pass "/health/db/memora shows frozen, 0 in flight ($code)" || fail "health/db: $(cat "$RH_ROOT/health-db.json")"
-check "a write to the frozen store is refused" bash -c "! \"$RT\" exec -i \"$NAME\" python -c '
+check "a write to the frozen store is refused" bash -c "! \"$RT\" exec -i \"$NEW3_ID\" python -c '
 from memora import storage
 c = storage.backend_for(\"memora\").connect(); c.execute(\"INSERT INTO memories (content) VALUES (1)\"); c.commit()'"
 STORE_HOST="$("$RT" volume inspect "$VOL" --format '{{.Mountpoint}}')/memora.db"
@@ -303,36 +318,10 @@ done
 grep -l "$HEALTH_TOKEN\|$ADMIN_TOKEN" "$RH_ROOT"/fixtures/*.json && fail "a token survived the redaction" \
   || pass "inspect samples saved without token values"
 
-echo "== 6. the cleanup: labelled with a recorded run AND the expected name, nothing else (7725, 7729)"
-DL="$RH_ROOT/decoy-ledger.txt"; S="rh-decoyrun-$RUN_ID"
-echo "run $S $(date +%s)" > "$DL"
-"$RT" run -d --name rh-helper-pos-$$ --label "memora.rehearsal=$S" --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null
-"$RT" volume create --label "memora.rehearsal=$S" memora-rh-scratch9 >/dev/null            # control: removed
-"$RT" run -d --name rh-helper-backup --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null   # unlabelled: kept
-"$RT" volume create --label memora.rehearsal=another-run memora-rh-scratch8 >/dev/null   # another run's: kept
-"$RT" run -d --name not-a-rehearsal-name-$$ --label "memora.rehearsal=$S" --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null  # our label, wrong name: kept
-cleanup_ledger "$DL" >> "$RH_ROOT/commands.log"
-exists_c() { "$RT" container exists "$1"; }
-! exists_c rh-helper-pos-$$ && ! "$RT" volume exists memora-rh-scratch9 \
-  && pass "cleanup removed the container and volume labelled with its recorded run (control)" \
-  || fail "cleanup did not remove its own labelled container/volume"
-exists_c rh-helper-backup && "$RT" volume exists memora-rh-scratch8 && exists_c not-a-rehearsal-name-$$ \
-  && pass "cleanup kept an unlabelled rh-helper-backup, a volume labelled by another run, and a labelled container with an unexpected name" \
-  || fail "cleanup removed something it must keep"
-"$RT" rm -f rh-helper-backup not-a-rehearsal-name-$$ >/dev/null; "$RT" volume rm memora-rh-scratch8 >/dev/null  # this step's decoys
-# An anonymous volume recorded with a run whose window it was NOT created in
-# is kept, even though its (labelled, rightly named) container goes.
-DL2="$RH_ROOT/decoy-ledger2.txt"; S2="rh-decoywin-$RUN_ID"
-echo "run $S2 $(( $(date +%s) + 3600 ))" > "$DL2"
-"$RT" run -d --name rh-helper-anon-$$ --label "memora.rehearsal=$S2" --entrypoint sleep "$IMAGE" 600 >/dev/null
-AV="$(old_anon rh-helper-anon-$$)"
-echo "anon $S2 $("$RT" inspect rh-helper-anon-$$ --format '{{.Id}}') $AV" >> "$DL2"
-cleanup_ledger "$DL2" >> "$RH_ROOT/commands.log"
-! exists_c rh-helper-anon-$$ && "$RT" volume exists "$AV" \
-  && pass "cleanup kept an anonymous volume created outside its recorded run's window" \
-  || fail "the anonymous-volume time window was not enforced"
-"$RT" volume rm "$AV" >/dev/null 2>&1   # this step's decoy
-record end "$RUN_ID" "$(date +%s)"
+echo "== 6. the teardown rules (scripts/rehearse_cleanup_selftest.sh, per-run decoys)"
+RUNTIME="$RT" PYTHON="$PY" bash "$ROOT/scripts/rehearse_cleanup_selftest.sh" "$IMAGE" >> "$RH_ROOT/commands.log" 2>&1 \
+  && pass "the teardown removes only this run's labelled, captured objects (self-test)" \
+  || fail "the teardown self-test failed (see commands.log)"
 
 echo
 echo "== summary: $(grep -c '^PASS' "$RESULTS") passed, $FAILS failed ($RESULTS)"

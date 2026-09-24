@@ -348,7 +348,8 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     assert not [t for t in tools if t.startswith(("ssh", "git", "docker"))], tools
     assert ["inspect", "memora-rh", "--format"] == calls[_index(calls, lambda c: c[0] == "inspect")][:3]
     assert ["stop", "memora-rh"] in calls
-    assert ["build", "-t", "memora-rh:latest"] == calls[_index(calls, lambda c: c[0] == "build")][:3]
+    b = calls[_index(calls, lambda c: c[0] == "build")]
+    assert b[0] == "build" and b[b.index("-t") + 1] == "memora-rh:latest"
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-rh" and run[-1] == "memora-rh:latest"
     assert _flag_values(run, "-v") == ["memora-rh-data:/data"]
@@ -361,7 +362,8 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     # 7729: everything the deploy creates carries the rehearsal run's label
     create = calls[_index(calls, lambda c: c[:2] == ["volume", "create"])]
     copy = calls[_index(calls, _is_copy)]
-    for made in (create, copy, run):
+    build = calls[_index(calls, lambda c: c[0] == "build")]
+    for made in (create, copy, run, build):
         assert _flag_values(made, "--label") == ["memora.rehearsal=rh-run-7"], made
 
 

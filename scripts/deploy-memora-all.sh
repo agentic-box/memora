@@ -209,7 +209,7 @@ fi
 
 # Keep the currently-running image for rollback before building over it.
 "$RT" tag "$IMAGE" "${IMAGE%%:*}:rollback-$TS" 2>/dev/null || true
-"$RT" build -t "$IMAGE" "$REPO"
+"$RT" build ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} -t "$IMAGE" "$REPO"
 
 CRED=$CONFIG_DIR/credentials.mcp.json
 [ -f "$CRED" ] || { echo "missing $CRED" >&2; exit 1; }

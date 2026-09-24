@@ -14,30 +14,34 @@ ssh server2 'cd ~/verify/feat-r1-rehearsal && PYTHON=~/verify/venv312/bin/python
 Everything it creates is suffixed `-rh`: the container `memora-rh`, the
 volume `memora-rh-data`, the image `memora-rh:latest`, port 18920. State lives
 under `~/rehearsal-r1` (`results.txt`, `commands.log`, `deploy-*.log`,
-`fixtures/`). The cleanup never removes anything by name alone, and it never prunes
-(reviews 7725 and 7729).
-- **Labels.** Every run gets a run id. Every container and volume it
-  creates carries `--label memora.rehearsal=<run id>`: helpers, the old and
-  probe containers, and the scratch volumes. The deploy's own container,
-  volume and migrator get it too, through `DEPLOY_LABELS`, which is honoured
-  only under `DEPLOY_REHEARSAL=1` and must carry the label there.
-- **The ledger** (`~/rehearsal-r1/ledger.txt`) records `run ID START`,
-  `end ID END` and `anon ID CONTAINER_ID VOLUME`.
-- **Removal (`scripts/rehearse_cleanup.sh`).**
-  - A container or labelled volume is removed only when its label is a run
-    id from the ledger AND its name matches the rehearsal pattern.
-  - The image's anonymous `/data` volumes cannot be labelled when they are
-    created. One is removed only when all of these hold:
-    - it is recorded with its run and container;
-    - it is 64-hex and flagged anonymous by the runtime;
-    - no other container uses it;
-    - its `CreatedAt` falls inside that run's recorded window.
-- **Self-test.** `scripts/rehearse_cleanup_selftest.sh IMAGE` checks every
-  rule against the real runtime: a labelled control is removed, and eight
-  decoys survive. Among the decoys: an unlabelled container, another run's
-  volume, a labelled but unexpected name, a named volume with a 64-hex
-  name, and an anonymous volume from outside its window. Step 6 of the
-  rehearsal repeats this.
+`fixtures/`). **Objects (review 7747): structurally scoped to one run.** Every runtime
+object is created and removed through `scripts/rehearse_objects.sh`:
+- **Per-run names.** Each run has a `RUN_ID` (`rh-<epoch>-<pid>`), and every
+  name contains it: container `memora-<RUN_ID>`, volume
+  `memora-<RUN_ID>-data`, image `memora-<RUN_ID>:latest`, scratch volumes,
+  probe. There are no fixed names.
+- **Captured creates.** Every create labels the object
+  `memora.rehearsal=<RUN_ID>` and captures its ID only from a successful
+  create, or dies: `new_container`, `new_volume`, `new_image`, helpers via
+  `once` (create, start attached, remove), and the `run -d --rm` hazard
+  demo.
+- **Adopted deploy objects.** What the deploy creates is labelled through
+  `DEPLOY_LABELS` (container, data volume, migrator, image build). It is
+  adopted by its per-run name only when it carries this run's label.
+- **Teardown** runs on exit (`RH_KEEP=1` keeps the objects; then
+  `scripts/rehearse_teardown.sh <run-objects file>`).
+  - It removes only the recorded objects, by ID, after re-checking the
+    label.
+  - An image is un-tagged tag by tag, never with `-f`.
+  - An anonymous `/data` volume goes only when it is flagged anonymous,
+    unused, and created during the run.
+  - Nothing is ever removed by name or pruned.
+- **Self-test.** `scripts/rehearse_cleanup_selftest.sh IMAGE` checks 17
+  rules against the real runtime; its decoys carry per-run names and a
+  `decoy-of` label.
+- **Survival check.** `scripts/rehearse_survival_check.sh OLD_SRC IMAGE`
+  creates `rh-helper-backup` and `memora-rh-scratch8` (the old fixed names)
+  and checks that they survive a full rehearsal and the self-test.
 
 ## The deploy script's rehearsal parameters
 
