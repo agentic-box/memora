@@ -20,6 +20,13 @@ from tests.test_l5_restore import SELECT, _cli, _halted_store, replica, sc  # no
 REPO = Path(__file__).resolve().parent.parent
 
 
+def _routes(store, db=DB):
+    """memora-all's MEMORA_DATABASES as lp_container.sh passes it."""
+    import json
+
+    return {"MEMORA_DATABASES": json.dumps({db: str(store)})}
+
+
 class Holder:
     """Another process holding the store's primary lock (as memora-all does)."""
 
@@ -128,6 +135,7 @@ def test_a_held_lock_refuses_before_any_d1_call(sc, cmd):
     calls = sc.tmp / f"d1-calls-{cmd}"
     env, docker_marker = _no_docker(sc.tmp)
     env["L5_TEST_D1_CALLS"] = str(calls)
+    env.update(_routes(store))
     base = [DB, "--account", "acct", "--database-id", "replica-db", "--lock-barrier"]
     common = [*base, "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports")]
     args = {
@@ -159,7 +167,8 @@ def test_restore_apply_runs_under_the_lock_barrier_without_docker(sc):
             str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports"), "--from-r2", sc.key,
             "--receipt", str(sc.receipt), "--conflicts", c, "--approve", str(sc.approve(c, SELECT)),
             "--out", str(sc.store), "--credential-file", str(cred)]
-    code, out, err = _cli(sc.replica, "restore", *args, env_extra={**env, "L5_TEST_D1_WRITES": "apply"})
+    code, out, err = _cli(sc.replica, "restore", *args,
+                          env_extra={**env, **_routes(sc.store), "L5_TEST_D1_WRITES": "apply"})
     assert code == 0 and out["applied"] == ["memory:2", "memory:3", "meta:other"], err
     assert not docker_marker.exists(), "the lock barrier never calls docker"
     assert _can_take(sc.store), "released when the run ended"
@@ -168,7 +177,8 @@ def test_restore_apply_runs_under_the_lock_barrier_without_docker(sc):
 def test_resume_runs_under_the_lock_barrier(replica, tmp_path):
     store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
     code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
-                          "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier")
+                          "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier",
+                          env_extra=_routes(store))
     assert code == 0 and out["cleared"].startswith("delete_guard") and out["lock_barrier"] is True, err
     assert _can_take(store)
 
@@ -251,6 +261,8 @@ def test_main_releases_the_lock_barrier_when_it_returns(tmp_path, monkeypatch):
     spec.loader.exec_module(cli)
     monkeypatch.setenv("MEMORA_D1_READ_TOKEN", "read-token")
     store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
+    for k, v in _routes(store).items():
+        monkeypatch.setenv(k, v)
     args = ["resume", DB, "--store", str(store), "--account", "acct", "--database-id", "replica-db",
             "--lock-barrier"]
     assert cli.main([*args, "--allow-deletes", "abc123"]) == 0
@@ -258,3 +270,54 @@ def test_main_releases_the_lock_barrier_when_it_returns(tmp_path, monkeypatch):
     assert cli.main([*args, "--allow-deletes", "wrong"]) == 2
     assert backends.primary_lock_problem(store) is not None, "released after a refusal"
     assert _can_take(store)
+
+
+
+# ------------------------------------------------------------------ review 7778 P1-1: memora-all's routing
+
+@pytest.mark.parametrize("routes, needle", [
+    (None, "needs memora-all's MEMORA_DATABASES"),
+    ({DB: "d1://acct/replica-db"}, "serves 'l5' from d1://"),
+    ({DB: "s3://bucket/x.db"}, "from s3://"),
+    ({DB: "/data/elsewhere.db"}, "routes 'l5' to /data/elsewhere.db"),
+    ({"another": "/x.db"}, "does not route 'l5'"),
+    ("{not json", "MEMORA_DATABASES is unusable"),
+])
+def test_a_stopped_required_run_refuses_unless_memora_all_routes_the_store_to_that_file(
+        replica, tmp_path, routes, needle):
+    import json
+
+    store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
+    calls = tmp_path / "d1-calls"
+    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": ""}
+    if routes is not None:
+        env["MEMORA_DATABASES"] = routes if isinstance(routes, str) else json.dumps(routes)
+    code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
+                          "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier",
+                          env_extra=env)
+    assert code == 2 and needle.replace("'l5'", repr(DB)) in out["refused"], (out, err)
+    assert not calls.exists() or calls.read_text() == ""
+    assert _can_take(store), "the lock was never taken"
+
+
+def test_a_file_uri_route_to_the_same_file_is_accepted(replica, tmp_path):
+    import json
+
+    store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
+    code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
+                          "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier",
+                          env_extra={"MEMORA_DATABASES": json.dumps({DB: f"file://{store}"})})
+    assert code == 0, (out, err)
+
+
+def test_rollback_finish_needs_no_local_route(sc):
+    """finish runs with memora-all up and serving D1 (its routing is d1:// by
+    then); it proves the D1 identity through /admin/data-volume instead."""
+    import json
+
+    args = ["rollback", DB, "--account", "acct", "--database-id", "replica-db", "--lock-barrier",
+            "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports"), "--phase", "finish",
+            "--store", str(sc.store), "--admin-token-file", str(sc.tmp / "no-admin"),
+            "--health-token-file", str(sc.tmp / "no-health")]
+    code, out, err = _cli(sc.replica, *args, env_extra={"MEMORA_DATABASES": json.dumps({DB: "d1://acct/replica-db"})})
+    assert code == 2 and "MEMORA_DATABASES" not in out["refused"] and "memora-all serves" not in out["refused"], out

@@ -1,6 +1,8 @@
 """X3: scripts/lp_container.sh runs the operator tool in a one-off
-container of memora-all's CURRENT image, without the host's docker, and
-removes only its own named container (never --rm, never a volume)."""
+container of memora-all's CURRENT image, without the host's docker. It is
+authoritative for memora-all's service state (checked before and after
+the run) and removes only the container it created, by its captured ID
+after rechecking the label (never --rm, never a volume)."""
 from __future__ import annotations
 
 import json
@@ -12,30 +14,49 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "lp_container.sh"
+ROUTES = {"re": "/data/re.db", "other": "d1://acct/db"}
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
-log = os.environ["CALL_LOG"]
-with open(log, "a") as fh:
+with open(os.environ["CALL_LOG"], "a") as fh:
     fh.write(json.dumps(args) + "\n")
 state = os.environ["STATE"]
-if args[:2] == ["inspect", "-f"] and args[3:] == [os.environ.get("SERVICE", "memora-all")]:
+st = json.load(open(state)) if os.path.exists(state) else {"running_calls": 0}
+def save():
+    json.dump(st, open(state, "w"))
+service = os.environ.get("SERVICE", "memora-all")
+if args[:2] == ["inspect", "-f"] and args[3:] == [service]:
+    fmt = args[2]
     if os.environ.get("INSPECT_RC"):
         sys.exit(int(os.environ["INSPECT_RC"]))
-    print({"{{.Image}}": "sha256:1mage", "{{.Config.User}}": os.environ.get("RUN_USER", "")}[args[2]])
+    if fmt == "{{.State.Running}}":
+        st["running_calls"] += 1
+        save()
+        key = "RUNNING_BEFORE" if st["running_calls"] == 1 else "RUNNING_AFTER"
+        print(os.environ.get(key, os.environ.get("RUNNING_BEFORE", "false")))
+    elif fmt == "{{.Image}}":
+        print("sha256:1mage")
+    elif fmt == "{{.Config.User}}":
+        print(os.environ.get("RUN_USER", ""))
+    elif "Config.Env" in fmt:
+        for line in json.loads(os.environ.get("SERVICE_ENV", "[]")):
+            print(line)
     sys.exit(0)
-if args[:2] == ["inspect", "-f"] and "memora.lp.run" in args[2]:
-    if not os.path.exists(state):
-        sys.exit(1)
-    label = os.environ.get("FOREIGN_LABEL") or json.load(open(state))["label"]
-    print(label)
+if args and args[0] == "create":
+    st["name"] = args[args.index("--name") + 1]
+    st["label"] = args[args.index("--label") + 1].split("=", 1)[1]
+    save()  # on a failed create: the EXISTING container has this same name and label
+    if os.environ.get("CREATE_RC"):
+        print("Error: name already in use", file=sys.stderr)
+        sys.exit(int(os.environ["CREATE_RC"]))
+    print("cid-0123456789")
     sys.exit(0)
-if args and args[0] == "run":
-    name = args[args.index("--name") + 1]
-    label = args[args.index("--label") + 1].split("=", 1)[1]
-    json.dump({"name": name, "label": label}, open(state, "w"))
+if args[:2] == ["start", "-a"]:
     sys.exit(int(os.environ.get("RUN_RC", "0")))
+if args[:2] == ["inspect", "-f"] and "memora.lp.run" in args[2]:
+    print(os.environ.get("FOREIGN_LABEL") or st.get("label", ""))
+    sys.exit(0)
 if args[:2] == ["rm", "-f"]:
     sys.exit(0)
 sys.exit(97)
@@ -50,58 +71,101 @@ def rt(tmp_path):
     tok = tmp_path / "secrets"
     tok.mkdir()
     env = {**os.environ, "LP_RUNTIME": str(fake), "LP_TOKEN_DIR": str(tok), "CALL_LOG": str(tmp_path / "calls"),
-           "STATE": str(tmp_path / "state.json")}
+           "STATE": str(tmp_path / "state.json"),
+           "SERVICE_ENV": json.dumps(["PATH=/usr/bin", f"MEMORA_DATABASES={json.dumps(ROUTES)}", "OTHER=1"])}
 
     def run(*args, **extra):
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, timeout=60,
                            env={**env, **{k: str(v) for k, v in extra.items()}})
         log = tmp_path / "calls"
         calls = [json.loads(ln) for ln in log.read_text().splitlines()] if log.exists() else []
+        for f in ("calls", "state.json"):
+            (tmp_path / f).unlink(missing_ok=True)
         return r.returncode, calls, r.stderr
 
     run.tok = tok
     return run
 
 
-TOOL = ["rollback", "re", "--phase", "verify", "--store", "/data/re.db", "--lock-barrier"]
+VERIFY = ["rollback", "re", "--phase", "verify", "--store", "/data/re.db", "--lock-barrier"]
+FINISH = ["rollback", "re", "--phase", "finish", "--store", "/data/re.db", "--lock-barrier"]
 
 
-def _run_call(calls):
-    runs = [c for c in calls if c[0] == "run"]
-    assert len(runs) == 1
-    return runs[0]
+def _create(calls):
+    creates = [c for c in calls if c[0] == "create"]
+    assert len(creates) == 1
+    return creates[0]
 
 
 def test_it_runs_the_tool_in_memora_alls_current_image_without_docker_or_rm(rt):
-    code, calls, err = rt(*TOOL, RUN_USER="1000:1000")
+    code, calls, err = rt(*VERIFY, RUN_USER="1000:1000")
     assert code == 0, err
-    run = _run_call(calls)
-    assert "--rm" not in run
-    joined = " ".join(run)
+    create = _create(calls)
+    assert not [c for c in calls if c[0] == "run"], "create + start, never run"
+    assert "--rm" not in create
+    joined = " ".join(create)
     assert "docker.sock" not in joined and "/var/run/docker" not in joined
-    vols = [run[i + 1] for i, a in enumerate(run) if a == "-v"]
+    vols = [create[i + 1] for i, a in enumerate(create) if a == "-v"]
     assert vols == ["memora-all-data:/data", f"{rt.tok}:/run/secrets/memora:ro"]
-    image_at = run.index("sha256:1mage")  # the image ID memora-all runs, not a tag
-    assert run[image_at + 1:image_at + 3][0] == "-c" and run[image_at + 3] == "lp"
-    assert run[image_at + 4:] == TOOL, "the tool's arguments pass through unchanged"
-    assert run[run.index("--user") + 1] == "1000:1000"
-    assert run[run.index("--entrypoint") + 1] == "sh"
-    name = run[run.index("--name") + 1]
-    assert name.startswith("memora-lp-") and run[run.index("--label") + 1] == f"memora.lp.run={name}"
+    envs = [create[i + 1] for i, a in enumerate(create) if a == "-e"]
+    assert envs == ["MEMORA_DATA_DIR=/data", f"MEMORA_DATABASES={json.dumps(ROUTES)}"], "memora-all's routing, nothing else"
+    image_at = create.index("sha256:1mage")  # the image ID memora-all runs, not a tag
+    assert create[image_at + 1] == "-c" and create[image_at + 3] == "lp"
+    assert create[image_at + 4:] == VERIFY, "the tool's arguments pass through unchanged"
+    assert create[create.index("--user") + 1] == "1000:1000"
+    name = create[create.index("--name") + 1]
+    assert name.startswith("memora-lp-") and create[create.index("--label") + 1] == f"memora.lp.run={name}"
+    assert ["start", "-a", "cid-0123456789"] in calls
     rms = [c for c in calls if c[:2] == ["rm", "-f"]]
-    assert rms == [["rm", "-f", name]], "removes exactly its own container, by name"
+    assert rms == [["rm", "-f", "cid-0123456789"]], "removes exactly the created container, by its ID"
     assert not any(c[0] in ("volume", "rmi", "system") for c in calls)
 
 
+@pytest.mark.parametrize("args, required", [
+    (["restore", "re", "--out", "/data/re.db", "--lock-barrier"], "false"),
+    (["resume", "re", "--store", "/data/re.db", "--lock-barrier"], "false"),
+    (["sequence-highwater", "re", "--local", "/data/re.db", "--lock-barrier"], "false"),
+    (VERIFY, "false"),
+    (FINISH, "true"),
+    (["rollback", "re", "--phase", "drain", "--store", "/data/re.db"], "true"),
+])
+def test_the_service_state_is_checked_before_anything_runs(rt, args, required):
+    wrong = "true" if required == "false" else "false"
+    code, calls, err = rt(*args, RUNNING_BEFORE=wrong)
+    assert code == 67 and "nothing was run" in err
+    assert not [c for c in calls if c[0] in ("create", "start", "rm")]
+    code, calls, err = rt(*args, RUNNING_BEFORE=required)
+    assert code == 0, err
+
+
+def test_a_state_change_during_the_run_fails_loudly(rt):
+    code, calls, err = rt(*VERIFY, RUNNING_BEFORE="false", RUNNING_AFTER="true")
+    assert code == 68 and "changed during the run (false -> true)" in err
+    assert ["rm", "-f", "cid-0123456789"] in calls, "still cleaned up"
+
+
+def test_other_commands_do_not_require_a_state(rt):
+    for running in ("true", "false"):
+        code, _, err = rt("fk-audit", "re", "--store", "/data/re.db", RUNNING_BEFORE=running)
+        assert code == 0, err
+
+
+def test_a_failed_create_removes_nothing(rt):
+    """A name collision with an existing container carrying the SAME name and
+    label (review 7778 P1-2): no ID was captured, so nothing is removed --
+    not by name, not by label."""
+    code, calls, err = rt(*VERIFY, CREATE_RC=125)
+    assert code == 69 and "nothing to clean up" in err
+    assert not [c for c in calls if c[0] in ("rm", "start")]
+
+
 def test_the_tools_exit_status_is_kept_and_the_container_still_removed(rt):
-    code, calls, _ = rt(*TOOL, RUN_RC=3)
-    assert code == 3
-    name = _run_call(calls)[_run_call(calls).index("--name") + 1]
-    assert ["rm", "-f", name] in calls
+    code, calls, _ = rt(*VERIFY, RUN_RC=3)
+    assert code == 3 and ["rm", "-f", "cid-0123456789"] in calls
 
 
 def test_a_container_that_does_not_carry_this_runs_label_is_left_alone(rt):
-    code, calls, err = rt(*TOOL, FOREIGN_LABEL="someone-else")
+    code, calls, err = rt(*VERIFY, FOREIGN_LABEL="someone-else")
     assert code == 0 and not [c for c in calls if c[:2] == ["rm", "-f"]]
     assert "left in place" in err
 
@@ -111,19 +175,31 @@ def test_service_stopped_is_refused_inside_the_container(rt):
     assert code == 65 and "--lock-barrier" in err and calls == []
 
 
-def test_a_missing_token_dir_is_a_usage_error(rt, tmp_path):
-    code, calls, _ = rt(*TOOL, LP_TOKEN_DIR=str(tmp_path / "nope"))
+def test_rollback_without_a_phase_is_a_usage_error(rt):
+    code, calls, _ = rt("rollback", "re", "--store", "/data/re.db")
     assert code == 65 and calls == []
 
 
-def test_an_unreadable_service_image_stops_before_any_run(rt):
-    code, calls, err = rt(*TOOL, INSPECT_RC=1)
-    assert code == 66 and not [c for c in calls if c[0] == "run"] and "cannot read the image" in err
+def test_a_missing_token_dir_is_a_usage_error(rt, tmp_path):
+    code, calls, _ = rt(*VERIFY, LP_TOKEN_DIR=str(tmp_path / "nope"))
+    assert code == 65 and calls == []
+
+
+def test_an_uninspectable_service_stops_before_any_create(rt):
+    code, calls, err = rt(*VERIFY, INSPECT_RC=1)
+    assert code == 66 and not [c for c in calls if c[0] == "create"] and "cannot inspect" in err
 
 
 def test_no_user_flag_when_memora_all_runs_as_the_image_default(rt):
-    code, calls, _ = rt(*TOOL)
-    assert code == 0 and "--user" not in _run_call(calls)
+    code, calls, _ = rt(*VERIFY)
+    assert code == 0 and "--user" not in _create(calls)
+
+
+def test_no_routing_passed_when_memora_all_has_none(rt):
+    code, calls, _ = rt(*VERIFY, SERVICE_ENV=json.dumps(["PATH=/usr/bin"]))
+    assert code == 0
+    envs = [c for c in _create(calls)]
+    assert not any(a.startswith("MEMORA_DATABASES=") for a in envs)
 
 
 def test_the_in_container_program_refuses_an_image_without_the_tool(tmp_path):

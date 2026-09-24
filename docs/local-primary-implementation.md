@@ -1315,8 +1315,21 @@ the image memora-all runs now: `LP_TOKEN_DIR=<dir> scripts/lp_container.sh
 <local_primary.py arguments>`. It mounts `memora-all-data` at `/data` and
 the token directory read-only at `/run/secrets/memora`, and never mounts the
 host's docker socket. The container is named `memora-lp-<ts>-<pid>` and
-labelled with that name; it is not run with `--rm`, and the script removes
-only that container, by name and only while it carries the label. With no
+labelled with that name; it is not run with `--rm`. It is created with
+`create` (the ID captured only from a successful create) and started
+attached, and the script removes only that ID, after re-checking its label;
+a failed create (a name collision) removes nothing.
+
+The host wrapper is authoritative for memora-all's service state (review
+7778). It classifies the command:
+- stopped-required: `restore`, `resume`, `sequence-highwater`,
+  `rollback --phase verify`;
+- running-required: `rollback --phase finish|drain`.
+
+It checks `inspect .State.Running` before the run (wrong state: exit 67,
+nothing run) and again after the tool exits. If the state changed during
+the run it exits 68, loudly, whatever the tool returned. It passes
+memora-all's own `MEMORA_DATABASES` into the container. With no
 docker inside, the barrier is `--lock-barrier`, not `--service-stopped`:
 the run acquires the store's primary lock (flock on `<db>.db.primary-lock`,
 the L2 canonical path) before any D1 call and holds it for the whole run.
@@ -1326,6 +1339,15 @@ path now. memora-all holds the lock while it serves the store, so holding
 it proves memora-all is not serving it.
 - It is accepted by `rollback --phase verify|finish`, `restore` (including
   the `--from-r2` apply), `resume` and `sequence-highwater`.
+- The lock proves only that no process serves that local FILE. For every
+  stopped-required step, the tool first reads memora-all's routing
+  (`MEMORA_DATABASES` as passed in) and refuses unless it routes `<db>` to
+  exactly that file (`file://` or a plain path, compared by realpath). It
+  refuses when the variable is unset or unusable, when `<db>` is not
+  routed, and when it is routed to `d1://`, `s3://` or another path: memora-all serving
+  it from there never takes this lock. `finish` has no such check: by then
+  `<db>` is routed to D1, and the step proves that identity through
+  `/admin/data-volume`.
 - In `finish` (memora-all up, serving D1) it also shows that memora-all no
   longer serves the local store.
 - It is refused for `drain` (memora-all serves the store then), for other

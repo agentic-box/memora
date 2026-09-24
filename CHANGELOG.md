@@ -17,6 +17,10 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ### Local-primary X3: a maintenance venue on nuc8, and the primary lock as a barrier
 - `scripts/lp_container.sh <local_primary.py arguments>`: runs the operator tool in a one-off container of memora-all's current image (its image ID). It mounts `memora-all-data` at `/data` and `$LP_TOKEN_DIR` read-only at `/run/secrets/memora`, uses no docker socket and no `--rm`, and removes only its own container `memora-lp-<ts>-<pid>`, by name and while it carries this run's label. Exit 64 when the image predates the tool, 65 on a usage error (including `--service-stopped`), 66 when memora-all's image cannot be read.
 - The image now carries `scripts/local_primary.py` (Dockerfile).
+- Round 2 (review 7778):
+  - The wrapper is authoritative for memora-all's service state. Stopped-required commands (restore, resume, sequence-highwater, rollback verify) and running-required ones (rollback finish/drain) are checked through `inspect .State.Running` before the run (exit 67) and after it (exit 68 if it changed).
+  - memora-all's `MEMORA_DATABASES` is passed in, and `--lock-barrier` refuses a stopped-required run unless memora-all routes the store to exactly that local file (`local_primary.check_service_route`).
+  - The container is created with `create` and its ID captured, then started attached; only that ID is removed, after a label recheck. A failed create removes nothing (exit 69).
 - `--lock-barrier` (rollback `--phase verify|finish`, `restore` including the `--from-r2` apply, `resume`, `sequence-highwater`): the store's primary lock, taken before any D1 call and held for the whole run. Nested steps' releases are no-ops while it is pinned (`backends.pin_primary_lock`). Every boundary re-verifies that the lock is ours on the lock file at the canonical path (`backends.primary_lock_problem`). Refused for `rollback --phase drain`, other commands, and with `--service-stopped`.
 
 ### Local-primary X2: a store that starts frozen serves reads

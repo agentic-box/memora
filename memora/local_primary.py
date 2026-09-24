@@ -473,6 +473,34 @@ class ServiceStopped:
         return None  # nothing to lift: memora-all is started by the operator
 
 
+def check_service_route(db: str, store: Path) -> str:
+    """X3 round 2 (review 7778 P1-1): the primary lock proves only that no
+    process serves THIS local file. For a step that needs memora-all
+    stopped, its registry must route <db> to exactly this file: memora-all
+    serving <db> from d1:// (or another path) never takes this lock. The
+    registry is memora-all's own MEMORA_DATABASES, which
+    scripts/lp_container.sh passes into the container. Returns the route."""
+    from .storage import DatabaseRegistryError, database_registry
+
+    if not os.getenv("MEMORA_DATABASES", "").strip():
+        raise L5Refused("--lock-barrier needs memora-all's MEMORA_DATABASES (scripts/lp_container.sh passes "
+                        "it): without memora-all's routing the lock cannot prove the store is not served")
+    try:
+        routes = database_registry()
+    except DatabaseRegistryError as exc:
+        raise L5Refused(f"memora-all's MEMORA_DATABASES is unusable: {exc}")
+    spec = routes.get(db)
+    if spec is None:
+        raise L5Refused(f"memora-all does not route {db!r} (known: {sorted(routes)}); refusing --lock-barrier")
+    if "://" in spec and not spec.startswith("file://"):
+        raise L5Refused(f"memora-all serves {db!r} from {spec.split('://', 1)[0]}://, not the local file "
+                        f"{store}: its primary lock proves nothing about that service")
+    path = spec[len("file://"):] if spec.startswith("file://") else spec
+    if os.path.realpath(path) != os.path.realpath(str(store)):
+        raise L5Refused(f"memora-all routes {db!r} to {path}, not {store}: the lock on {store} proves nothing")
+    return spec
+
+
 class LockBarrier:
     """The barrier inside a one-off maintenance container, where docker is
     not available (X3, scripts/lp_container.sh): the store's primary lock
