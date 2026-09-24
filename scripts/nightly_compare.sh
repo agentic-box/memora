@@ -35,9 +35,10 @@
 # DEPLOY_CONTAINER (memora-all) name the runtime and the container. No host,
 # store or account is named in this script.
 #
-# Crontab on the deploy host (local time; the leader installs it):
-#   15 3 * * 1-6  $HOME/repos/agentic-box/memora/scripts/nightly_compare.sh --mode nightly >/dev/null 2>&1
-#   0  4 * * 0    $HOME/repos/agentic-box/memora/scripts/nightly_compare.sh --mode barrier >/dev/null 2>&1
+# Crontab on the deploy host (local time; the leader installs it; <checkout>
+# is the deploy host's memora checkout, DEPLOY_REPO in instances/deploy.env):
+#   15 3 * * 1-6  <checkout>/scripts/nightly_compare.sh --mode nightly >/dev/null 2>&1
+#   0  4 * * 0    <checkout>/scripts/nightly_compare.sh --mode barrier >/dev/null 2>&1
 # (cron's own output is discarded; the summary is in the log. A failing run
 # exits 1 for whatever wraps it.)
 set -euo pipefail

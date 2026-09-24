@@ -210,7 +210,11 @@ class TestRun:
         proc, calls = nc("--mode", "nightly", env={"RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-x"})
         assert proc.returncode == 0 and all(c[1] == "memora-x" for c in calls if c[0] == "exec")
 
-    def test_no_infra_identifier_in_the_script(self):
+    def test_the_script_names_no_host_of_its_own(self):
+        """Where it runs comes from the environment (CFG1's
+        tests/test_no_infra_identifiers.py scans the tree for identifiers)."""
         text = SCRIPT.read_text()
-        for word in ("nuc8", "100.104", "bestation", "ob1", "cloudflare-strategic"):
-            assert word not in text, word
+        assert 'HOST="${DEPLOY_HOST:-localhost}"' in text
+        assert 'CONTAINER="${DEPLOY_CONTAINER:-memora-all}"' in text
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        assert "ssh " not in code.replace('ssh "$HOST"', ""), "the only ssh target is DEPLOY_HOST"
