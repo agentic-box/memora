@@ -178,17 +178,17 @@ live cutover.
 **After the thaw (the store takes writes and replicates them).** Use the L6
 runbook: `docs/local-primary-implementation.md` §5.3,
 `local_primary.py rollback <db> --phase drain|verify|finish --store /data/<db>.db`.
-- **Where `rollback --phase verify` runs on nuc8: decided (leader 7760),
-  built separately as X3.**
-  - The phase needs memora-all stopped, the root-owned `/data`, and the
-    `docker` CLI; the image has no `docker`, and a stopped container
-    cannot `exec`.
-  - X3: the operator tool runs in a one-off container of the current
-    memora image, with `memora-all-data` mounted and the token directory
-    `:ro`. Its "service stopped" barrier is the store's primary lock (a
-    flock on the shared volume, which memora-all holds for its lifetime),
-    held for the whole run, instead of `docker inspect`. A small host
-    wrapper runs the container.
-  - **No store is thawed (step h) until X3 lands.** Until then, a store
-    that has been cut over stays frozen, and the rollback before the thaw
-    (above) is available.
+- **Where the stopped-required phases run: X3's venue, `scripts/lp_container.sh`.**
+  `rollback --phase verify` (like `restore`, `resume` and
+  `sequence-highwater`) needs memora-all stopped and the store file on the
+  root-owned volume. `lp_container.sh` runs the operator tool in a one-off
+  container of memora-all's current image, with `memora-all-data` at
+  `/data` and `LP_TOKEN_DIR` read-only at `/run/secrets/memora`.
+  `--lock-barrier` makes the data volume's service lock
+  (`/data/.service.lock`, which memora-all holds for its lifetime; the
+  deploy pins `MEMORA_DATA_DIR=/data` so both sides lock the same file) the
+  proof that memora-all is stopped, held for the whole run. Usage and exit
+  codes: the script's header and `docs/local-primary-implementation.md`
+  §5.3 (X3).
+  - Rehearse the post-thaw rollback with it before the first store is
+    thawed (leader 7760: no store is thawed until X3 is in place).
