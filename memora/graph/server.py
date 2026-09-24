@@ -18,7 +18,7 @@ from importlib.resources import files as _pkg_files
 
 from sse_starlette.sse import EventSourceResponse
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..storage import (
     CURRENT_DB,
@@ -389,8 +389,11 @@ def build_graph_app(host: str):
     from starlette.applications import Starlette
     from starlette.routing import Route
 
-    def _load_spa_html(version: str) -> str:
-        html = _pkg_files("memora.graph").joinpath("index.html").read_text("utf-8")
+    def _load_spa_html(version: str, page: str = "index.html") -> str:
+        """A page shipped in memora.graph (the SAME file the Pages build
+        serves: memora-graph/public/<page> is a symlink to it), with this
+        server's MEMORA_CONFIG injected."""
+        html = _pkg_files("memora.graph").joinpath(page).read_text("utf-8")
         try:
             multi = bool(graph_databases()["databases"])
         except Exception:
@@ -408,6 +411,9 @@ def build_graph_app(host: str):
         )
 
     GRAPH_HTML = _load_spa_html(version=_get_memora_version())
+    # G2: the force-graph (2D/3D) view, at the same path as on Pages, so its
+    # relative module imports and the main viewer's link work on both.
+    FORCE_HTML = _load_spa_html(version=_get_memora_version(), page="force-graph.html")
 
     _check_origin = _origin_ok  # the exact-origin rule, module level (review 7922)
 
@@ -416,6 +422,24 @@ def build_graph_app(host: str):
         return HTMLResponse(GRAPH_HTML)
 
     GRAPH_LIMIT_JS = _pkg_files("memora.graph").joinpath("_graph_limit.mjs").read_bytes()
+    SELECTION_JS = _pkg_files("memora.graph").joinpath("_selection.mjs").read_bytes()
+
+    async def force_graph_handler(request: Request):
+        """The force-graph view (G2). Read-only by construction: it has no
+        edit calls; every read goes through the per-store /api routes."""
+        return HTMLResponse(FORCE_HTML)
+
+    async def force_graph_redirect(request: Request):
+        query = request.url.query
+        return RedirectResponse("/force-graph.html" + (f"?{query}" if query else ""), status_code=307)
+
+    async def selection_module(request: Request):
+        """The selection/detail helper the force-graph view imports."""
+        return Response(
+            SELECTION_JS,
+            media_type="application/javascript",
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def graph_limit_module(request: Request):
         """Serve the shared limit/banner helper the SPA imports from /graph."""
@@ -1016,6 +1040,9 @@ def build_graph_app(host: str):
             Route("/api/capabilities", api_capabilities),
             Route("/api/databases", api_databases),
             Route("/_graph_limit.mjs", graph_limit_module),
+            Route("/force-graph.html", force_graph_handler),
+            Route("/graph/force", force_graph_redirect),
+            Route("/_selection.mjs", selection_module),
             Route("/api/graph", api_graph),
             Route("/api/events", graph_events),
             Route("/api/chat", api_chat, methods=["POST"]),
@@ -1059,8 +1086,9 @@ class _GraphGuard:
             if path == "/login":
                 return await self._login(request, token)(scope, receive, send)
             if not _token_ok(request, token):
-                if path == "/graph" and request.method == "GET":
-                    nxt = "/graph" + (f"?{scope.get('query_string', b'').decode()}" if scope.get("query_string") else "")
+                page = _LOGIN_PAGES.get(path)
+                if page is not None and request.method == "GET":
+                    nxt = page + (f"?{scope.get('query_string', b'').decode()}" if scope.get("query_string") else "")
                     return await HTMLResponse(_LOGIN_HTML.replace("__NEXT__", _html_attr(nxt)),
                                               status_code=401)(scope, receive, send)
                 return await JSONResponse({"error": "unauthorized", "memora_graph": True},
@@ -1099,6 +1127,12 @@ class _GraphGuard:
             resp.set_cookie(GRAPH_COOKIE, token, httponly=True, samesite="strict", path="/")
             return await resp(scope, receive, send)
         return respond
+
+
+# Pages that answer an unauthenticated browser with the login form, and
+# where the login returns to (always under /graph: the login refuses any
+# other target). The force-graph view (G2) returns through /graph/force.
+_LOGIN_PAGES = {"/graph": "/graph", "/graph/force": "/graph/force", "/force-graph.html": "/graph/force"}
 
 
 def _html_attr(value: str) -> str:

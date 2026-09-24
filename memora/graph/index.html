@@ -339,6 +339,8 @@ div.vis-tooltip {
 #search-box input:focus { outline: none; border-color: #58a6ff; }
 
 /* Toolbar with database selector, version, and connection status */
+#force-graph-link { color: #58a6ff; text-decoration: none; font-size: 12px; white-space: nowrap; }
+#force-graph-link:hover { text-decoration: underline; }
 #toolbar { position: absolute; top: 10px; left: 440px; background: rgba(22,27,34,0.9); padding: 8px 12px; border-radius: 6px; display: flex; align-items: center; gap: 12px; z-index: 50; }
 #truncation-banner { display: none; align-items: center; gap: 8px; background: #2d1b4e; border: 1px solid #a855f7; border-radius: 6px; padding: 4px 10px; font-size: 12px; color: #e6edf3; }
 #truncation-banner .tb-text { color: #d8b4fe; }
@@ -685,6 +687,8 @@ div.vis-tooltip {
             <span class="tb-text" id="truncation-banner-text"></span>
             <button id="truncation-raise" type="button" onclick="raiseGraphLimit()">Show more</button>
         </div>
+        <a id="force-graph-link" href="/force-graph.html" title="Force-graph view (2D/3D) of the same store"
+           onclick="this.href='/force-graph.html' + getDbParam()">force graph</a>
         <div id="version"><span id="version-db">memora</span> | Cloudflare</div>
     </div>
     <div id="help">Click tag/section to filter | Click node to view | Scroll to zoom | Type to search (or #id) | Drag timeline</div>

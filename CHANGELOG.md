@@ -14,6 +14,14 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Force-graph view served by memora-all (G2)
+- memora-all's graph server also serves the force-graph (2D/3D) view at `/force-graph.html`, the same path as on Pages; `/graph/force` redirects to it, keeping the query.
+- It is behind the same graph token. An unauthenticated browser gets the login form and returns to the view with its `?db=`.
+- It reads each store through G1's per-store API (`/api/databases`, `/api/graph?db=`, `/api/memories?db=`), with the injected `MEMORA_CONFIG` (image proxy `/r2/`, store selector).
+- The page has no edit calls, so it is read-only on both builds.
+- One source of truth: `force-graph.html` and `_selection.mjs` move to `memora/graph/` (shipped as package data), and `memora-graph/public/` keeps symlinks to them, as it already did for `index.html` and `_graph_limit.mjs`.
+- The page takes the image-proxy prefix from `MEMORA_CONFIG.r2Prefix` (`/api/r2/` when none is injected) and prefers `?db=` over its stored choice. The main viewer links to it with its current store.
+
 ## 0.5.1
 
 Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
