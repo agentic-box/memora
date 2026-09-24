@@ -26,9 +26,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   only, plus a rule version: status, query, rows, row count and
   `served_by_primary`. `read_at` and a waiting intent's `eligible_in_s`
   are excluded.
-- Evidence is still gathered on every GET, so the accept is judged against
-  evidence read at accept time. An unchanged D1 matches; a real change
-  between show and accept is still refused.
+- Evidence is gathered on every GET, and the accept (`POST
+  /admin/reconcile/<db>/<id>`) reads D1 again itself. The decision is
+  judged against D1 as it is when accepted, even on a direct POST: an
+  unchanged D1 matches, while a real change between show and accept, or a
+  failed read, is refused.
 - Digests shown before this change do not match: show the intents again.
 
 ## 0.5.1

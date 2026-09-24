@@ -42,7 +42,7 @@ def test_accept_with_the_shown_digest_succeeds_after_another_get(registry, read_
     shown = admin.list_intents("remote", reader=reader)[1]["open_intents"][0]["evidence_sha256"]
     admin.list_intents("remote", reader=reader)  # the CLI's own GET right before its POST
     status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
-                                       decision="applied", evidence_digest=shown)
+                                       decision="applied", evidence_digest=shown, reader=reader)
     assert status == 200 and body["open_intents"] == []
 
 
@@ -50,10 +50,10 @@ def test_a_real_d1_change_between_show_and_accept_is_refused(registry, read_now,
     _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
     shown = admin.list_intents("remote", reader=_Reader([(ROWS, {"served_by_primary": True})]))[1]
     digest = shown["open_intents"][0]["evidence_sha256"]
-    changed = [{"key": "embedding_rebuild_lease", "value": "owner-2"}]
-    admin.list_intents("remote", reader=_Reader([(changed, {"served_by_primary": True})]))
+    changed = _Reader([([{"key": "embedding_rebuild_lease", "value": "owner-2"}], {"served_by_primary": True})])
+    admin.list_intents("remote", reader=changed)
     status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
-                                       decision="applied", evidence_digest=digest)
+                                       decision="applied", evidence_digest=digest, reader=changed)
     assert status == 409 and body["error"] == "evidence_changed"
     assert storage.backend_for("remote").journal().status()[0] == [1]
 
@@ -90,7 +90,7 @@ def test_the_cli_accept_path_matches_across_its_own_get(registry, read_now, tmp_
         def accept(self, iid, body):
             return admin.accept_intent("remote", iid, body["receipt"], operator=body["operator"],
                                        body_intent_id=body["intent_id"], decision=body["decision"],
-                                       evidence_digest=body["evidence_sha256"])
+                                       evidence_digest=body["evidence_sha256"], reader=reader)
 
     out = reconcile_accept("remote", Client(), intent_id=1, receipt_path=_receipt(tmp_path), operator="spok",
                            decision="applied", evidence_sha256=digest, account_id="acct", database_id="db1")
@@ -98,3 +98,41 @@ def test_the_cli_accept_path_matches_across_its_own_get(registry, read_now, tmp_
     with pytest.raises(L5Refused, match="not open"):
         reconcile_accept("remote", Client(), intent_id=1, receipt_path=_receipt(tmp_path), operator="spok",
                          decision="applied", evidence_sha256=digest, account_id="acct", database_id="db1")
+
+
+def test_a_direct_post_after_a_d1_change_is_refused_without_another_get(registry, read_now, tmp_path):
+    """Review 8067: the accept reads D1 itself; a stale cache from the last
+    GET cannot resolve an intent whose evidence has since changed."""
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    digest = admin.list_intents("remote", reader=_Reader([(ROWS, {"served_by_primary": True})]))[1][
+        "open_intents"][0]["evidence_sha256"]
+    now_d1 = _Reader([([{"key": "embedding_rebuild_lease", "value": "owner-2"}], {"served_by_primary": True})])
+    status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                       decision="applied", evidence_digest=digest, reader=now_d1)
+    assert status == 409 and body["error"] == "evidence_changed"
+    assert now_d1.calls, "the accept read D1"
+    assert storage.backend_for("remote").journal().status()[0] == [1]
+
+
+def test_a_failed_read_at_accept_time_is_refused(registry, read_now, tmp_path):
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    digest = admin.list_intents("remote", reader=_Reader([(ROWS, {"served_by_primary": True})]))[1][
+        "open_intents"][0]["evidence_sha256"]
+
+    class Broken:
+        def execute(self, sql, params=None):
+            raise ConnectionError("D1 unreachable")
+
+    status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                       decision="applied", evidence_digest=digest, reader=Broken())
+    assert status == 409 and body["error"] == "evidence_changed"
+    assert storage.backend_for("remote").journal().status()[0] == [1]
+
+
+def test_a_direct_post_with_d1_unchanged_is_accepted(registry, read_now, tmp_path):
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    reader = _Reader([(ROWS, {"served_by_primary": True})])
+    digest = admin.list_intents("remote", reader=reader)[1]["open_intents"][0]["evidence_sha256"]
+    status, _ = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                    decision="applied", evidence_digest=digest, reader=reader)
+    assert status == 200

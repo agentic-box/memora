@@ -158,8 +158,9 @@ DECISIONS = ("applied", "not-applied")
 # served_by_primary. read_at and a waiting intent's eligible_in_s change on
 # every gather -- including them made the digest change on every GET, so no
 # operator decision could ever match (bestation intent 53). Evidence is
-# still gathered on every GET: the accept is judged against evidence read
-# at accept time, so a real D1 change between show and accept is refused.
+# gathered on every GET, and accept_intent gathers it AGAIN (reads D1) at
+# POST time: the decision is judged against D1 as it is when accepted, so a
+# real change between show and accept is refused even on a direct POST.
 EVIDENCE_RULE = 1
 _EVIDENCE_TIMING_KEYS = ("read_at", "eligible_in_s")
 
@@ -175,7 +176,8 @@ def evidence_sha256(evidence: Any) -> str:
 
 
 def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = None,
-                  body_intent_id: Any = None, decision: Any = None, evidence_digest: Any = None) -> Result:
+                  body_intent_id: Any = None, decision: Any = None, evidence_digest: Any = None,
+                  reader=None) -> Result:
     """Operator acceptance of one open intent. Required (review 7584 P2): a
     verified export receipt for this database, the operator, the intent id
     (must match the path), the decision (applied | not-applied) and the
@@ -197,10 +199,15 @@ def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = No
     journal = backend.journal()
     if intent_id not in journal.status()[0]:
         return 404, {"error": "no_such_open_intent", "id": intent_id}
-    current = journal.evidence.get(intent_id)
-    if current is None:
+    if journal.evidence.get(intent_id) is None:
         return 409, {"error": "no_evidence_yet", "message": "GET /admin/intents first, and decide on its evidence"}
-    if evidence_digest != evidence_sha256(current):
+    # Re-read D1 NOW (review 8067): the quoted digest must match the evidence
+    # as it is at accept time, not the cache of the last GET. A failed read
+    # gives error evidence, whose digest cannot match: refused.
+    from .reconcile import gather_evidence
+
+    current = gather_evidence(backend, journal, reader=reader).get(intent_id)
+    if current is None or evidence_digest != evidence_sha256(current):
         return 409, {"error": "evidence_changed", "message": "the evidence is not the one this decision quotes"}
     extra = {**extra, "operator": operator.strip(), "decision": decision,
              "evidence_sha256": evidence_digest}
