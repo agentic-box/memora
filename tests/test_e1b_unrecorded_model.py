@@ -290,3 +290,38 @@ def test_a_blank_legacy_embedding_row_does_not_make_the_preflight_refuse_a_searc
     except (storage.SearchUnavailable, embeddings.EmbeddingIntegrityFault):
         searchable = False
     assert ep.run("tfidf", registry={"fine": reg["fine"]})["stores"]["fine"]["ok"] is searchable
+
+
+# ------------------------------------------------------------------ post-PASS mutation checks
+
+def test_the_note_clears_once_a_write_records_the_model(reg):
+    _search("old")
+    assert "model_unrecorded" in admin.gate_health("old")["embeddings"]
+    token = storage.CURRENT_DB.set("old")
+    try:
+        conn = storage.connect()
+        storage.add_memory(conn, content="a new apple", metadata={}, tags=[])  # the write path records it
+        conn.commit()
+        embeddings.verify_embedding_integrity(conn, stamp=True)  # an explicit audit: now no mismatch at all
+        conn.commit()
+        conn.close()
+    finally:
+        storage.CURRENT_DB.reset(token)
+    assert _vector_state(reg["old"])[2] == ("tfidf|tfidf|sparse",)
+    _search("old")
+    assert "embeddings" not in (admin.gate_health("old") or {})
+
+
+@pytest.mark.parametrize("reps, model, ok, dim", [
+    ({"sparse": 3}, "tfidf", True, None),
+    ({"sparse": 3, "empty": 1}, "tfidf", True, None),
+    ({"dense:8": 3}, "tfidf", False, None),
+    ({"dense:8": 3}, "openai", True, 8),
+    ({"dense:8": 2, "dense:16": 1}, "openai", False, None),
+    ({"dense": 3}, "openai", False, None),
+    ({"sparse": 3}, "openai", False, None),
+    ({}, "openai", True, None),
+])
+def test_unrecorded_compatibility(reps, model, ok, dim):
+    got_ok, got_dim, _why = embeddings.unrecorded_compatibility(reps, model)
+    assert (got_ok, got_dim) == (ok, dim)
