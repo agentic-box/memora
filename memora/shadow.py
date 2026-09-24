@@ -257,6 +257,9 @@ class ShadowApplier:
         self.name = name
         self.path = Path(path)
         self.backend = LocalSQLiteBackend(self.path)  # built from MEMORA_SHADOW_LOCAL: no registry gate
+        # D1 enforces foreign keys: the replay must cascade the same way
+        # (plan §9 x). An fk audit with orphans refuses the applier at start.
+        self.backend.enforce_foreign_keys = True
         self.reader = reader
         self.retries = retries
         self.retry_sleep = retry_sleep

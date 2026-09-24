@@ -911,6 +911,9 @@ Other rules:
 
 **SQLite settings:**
 - `connect()` sets WAL once and `busy_timeout=5000` on every writer.
+- X1 (§9 x): a live primary's writers also set `foreign_keys = ON`, after a
+  once-per-process audit (`PRAGMA foreign_key_check`) finds no orphan. An
+  orphan refuses the store; health says why.
 - `store_write(conn)` is a new context manager in backends.py. It takes a
   per-path process-wide `threading.Lock`, runs BEGIN IMMEDIATE, and commits
   or rolls back.
@@ -1800,4 +1803,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (u) `_absorb_link`'s fixed savepoint name assumes `add_link` never opens a same-named nested savepoint (L4 review 7614 P2) | L5 | **done in L5 piece a**: `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection, and `add_link`'s docstring records the constraint |
 | (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |
 | (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | **done in L6 piece b**: each memory group lists `inbound_refs` (the memories whose crossrefs point at it, per side, and whether they are conflict groups); the apply report and `--dry-run` list `dangling_references` for the chosen sides (a warning) |
-| (x) local writers run with `PRAGMA foreign_keys` off while D1 enforces them, so D1's `ON DELETE CASCADE` on `memories_embeddings`, `memories_crossrefs` and `memories_events` does not run locally. The app's `delete_memory` deletes those children itself, so app traffic matches D1, but a raw parent DELETE leaves orphan children locally that D1 would not have (L9a review 7721 P2) | L9 | before the first local-primary cutover (L9 write mode): enforce `PRAGMA foreign_keys=ON` on local writers or emulate the cascades, after an orphan audit of the existing data |
+| (x) local writers run with `PRAGMA foreign_keys` off while D1 enforces them, so D1's `ON DELETE CASCADE` on `memories_embeddings`, `memories_crossrefs` and `memories_events` does not run locally. The app's `delete_memory` deletes those children itself, so app traffic matches D1, but a raw parent DELETE leaves orphan children locally that D1 would not have (L9a review 7721 P2) | L9 | **done in X1**: `local_primary.py fk-audit <db> --store P` reports orphans read-only (`PRAGMA foreign_key_check` over every table that declares a foreign key; counts and parent ids; exit 5 when any). A live primary, and the L9a shadow file (opt-in `enforce_foreign_keys`), audits its data once per process before its first writer. Orphans refuse the store: every open raises, startup reports it, health shows `refused`, a refused default store stops startup (exit 2), and nothing is repaired. A clean audit turns `PRAGMA foreign_keys = ON` on in `writer_setup_pragmas`. Plain local stores keep them off |

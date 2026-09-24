@@ -14,6 +14,12 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary X1: local foreign-key parity (plan §9 x)
+- `local_primary.py fk-audit <db> --store P`: read-only audit (`PRAGMA foreign_key_check` over every table that declares a foreign key, which today is `memories_embeddings`, `memories_crossrefs` and `memories_events`). Reports each child table's orphan count and the missing `memories.id` values; exit 5 when there are orphans, 2 when the store cannot be read.
+- A live primary enforces foreign keys like D1: `PRAGMA foreign_keys = ON` in `writer_setup_pragmas`, so a raw parent DELETE cascades locally as it does on D1. Before the first writer in a process, the store's data is audited once. Orphans refuse the store (every open raises, `fence_live_primaries` reports it, health shows `refused`, a refused default store stops startup with exit 2). Nothing is repaired automatically.
+- The L9a shadow file opts in (`LocalSQLiteBackend.enforce_foreign_keys`), so its replay of a raw parent DELETE cascades like D1. A shadow file with orphans refuses its applier at start.
+- Plain local stores are unchanged (foreign keys off, like WAL in L4).
+
 ### Local-primary L9a round 4 / L6 (review 7733)
 - `replicator.is_added_parent(key, records, columns)` now checks against the REAL schema. Each record's column list must equal the table's `PRAGMA table_info` columns (`replicator.added_parent_columns`), read from the shadow backup in `shadow-night` and from the snapshot in `compare.log_compare`, before the rebuild. A partial UPSERT (for example `id, content` only) is an unexpected log key.
 

@@ -67,11 +67,12 @@ def test_connect_runs_exactly_the_setup_statements(tmp_path, traced, monkeypatch
     if live_primary:
         backend.store_name = "p"
         monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"p": "d1://a/b"}))
+        backend.fk_gate()  # the once-per-process audit (its own connection; test below)
     conn, statements = _open(backend, traced)
     try:
         pragmas = [s for s in statements if s.lstrip().upper().startswith("PRAGMA")]
         others = [s for s in statements if s not in pragmas]
-        expected = ["busy_timeout"] + (["journal_mode=WAL"] if live_primary else [])
+        expected = ["busy_timeout"] + (["journal_mode=WAL", "foreign_keys"] if live_primary else [])
         assert sorted(_normalise_pragma(p) for p in pragmas) == sorted(expected), pragmas
         assert [_normalise_pragma(p) for p in backends.writer_setup_pragmas(live_primary)] \
             == [_normalise_pragma(p) for p in pragmas], "connect() ran PRAGMAs outside writer_setup_pragmas()"
@@ -82,8 +83,37 @@ def test_connect_runs_exactly_the_setup_statements(tmp_path, traced, monkeypatch
             backends.release_primary_lock(backend.db_path)
 
 
+def test_the_fk_audit_runs_once_per_process_on_its_own_closed_connection(tmp_path, traced, monkeypatch):
+    """Plan §9 (x): before the first writer of an enforcing store, one audit
+    -- reads only (sqlite_master, foreign_key_list, foreign_key_check) --
+    on a separate writer connection that is closed again; later opens run
+    only the setup statements."""
+    path = tmp_path / "store.db"
+    seed = sqlite3.connect(path)
+    seed.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)")
+    seed.execute("CREATE TABLE c (pid INTEGER REFERENCES p(id) ON DELETE CASCADE)")
+    seed.commit()
+    seed.close()
+    backend = backends.LocalSQLiteBackend(path)
+    backend.store_name = "p"
+    monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"p": "d1://a/b"}))
+    try:
+        conn, statements = _open(backend, traced)
+        conn.close()
+        audit = [s for s in statements if "foreign_key_check" in s or "foreign_key_list" in s
+                 or s.startswith("SELECT name FROM sqlite_master")]
+        assert audit and all(not re.match(r"\s*(INSERT|UPDATE|DELETE|CREATE|DROP|ALTER|REPLACE)", s, re.I)
+                             for s in statements), statements
+        assert backends._store_lock(path).open_writers == 0, "the audit connection was closed"
+        conn, again = _open(backend, traced)
+        conn.close()
+        assert not any("foreign_key" in s and "foreign_keys" not in s for s in again), "audited once"
+    finally:
+        backends.release_primary_lock(path)
+
+
 def test_the_normaliser_does_not_fold_other_pragmas_into_allowed_ones():
-    allowed = {"busy_timeout", "journal_mode=WAL"}
+    allowed = {"busy_timeout", "journal_mode=WAL", "foreign_keys"}
     for sql in ("PRAGMA journal_mode=DELETE", "PRAGMA wal_checkpoint(TRUNCATE)",
                 "PRAGMA query_only=1", "PRAGMA synchronous=OFF", "PRAGMA optimize"):
         try:

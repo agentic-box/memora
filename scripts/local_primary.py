@@ -25,6 +25,7 @@ this file only parses arguments and builds the dependencies.
                             6 when deferred (the applier in memora-all did not drain and stay stable)
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
+  fk-audit <db> --store /data/<db>.db          §9 x: foreign-key orphans (read-only; exit 5 when any)
   check-endpoint            F4a: authenticated round trip to memora-all through a
                             SCRATCH local store, before a client is repointed (L8)
 
@@ -33,7 +34,7 @@ on it (seed, sequence-highwater) run under one freeze, lifted by `thaw`
 when the procedure is done.
 
 Exit codes: 0 done, 2 refused (nothing changed), 3 halted (see the message),
-4 volume alert, 5 shadow night not clean or compare diff, 6 shadow night deferred or compare skipped.
+4 volume alert, 5 shadow night not clean, compare diff or fk-audit orphans, 6 shadow night deferred or compare skipped.
 Every run prints one JSON line on stdout with the outcome.
 """
 
@@ -192,6 +193,9 @@ def _parser() -> argparse.ArgumentParser:
     vc = sub.add_parser("volume-check", help="§4 volume alert")
     vc.add_argument("--store", action="append", required=True)
     vc.add_argument("--min-free-pct", type=float, default=10.0)
+    fa = sub.add_parser("fk-audit", help="§9 x read-only audit: child rows whose foreign-key parent is missing")
+    fa.add_argument("db")
+    fa.add_argument("--store", required=True, help="the local store file (a live primary may be running)")
     return p
 
 
@@ -433,6 +437,20 @@ def main(argv=None) -> int:
                 raise lp.L5Refused(str(exc))
             print(json.dumps({"ok": True, "shadow": args.shadow, "shadow_state": state}))
             return 0
+        if args.cmd == "fk-audit":
+            from memora.backends import LocalSQLiteBackend, StoreLockedError, StoreMissingError
+            from memora.fk_audit import fk_orphans
+
+            try:
+                conn = LocalSQLiteBackend(Path(args.store)).connect_read_only()  # never creates or writes
+            except (StoreMissingError, StoreLockedError) as exc:
+                raise lp.L5Refused(f"cannot read {args.store}: {exc}")
+            try:
+                out = fk_orphans(conn)
+            finally:
+                conn.close()
+            print(json.dumps({"ok": out["clean"], "db": args.db, "store": args.store, **out}, default=str))
+            return 0 if out["clean"] else 5
         if args.cmd == "volume-check":
             out = lp.volume_check([Path(s) for s in args.store], min_free_pct=args.min_free_pct)
             print(json.dumps(out))

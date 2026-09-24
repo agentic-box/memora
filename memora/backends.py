@@ -565,11 +565,31 @@ class StoreWriteAborted(RuntimeError):
 WRITER_BUSY_TIMEOUT_MS = 5000
 
 
-def writer_setup_pragmas(live_primary: bool) -> tuple:
+def writer_setup_pragmas(live_primary: bool, foreign_keys: Optional[bool] = None) -> tuple:
     """The ONLY statements connect() runs on a writer before arming its gate
-    (plan §9 item b). Both are idempotent and change no row."""
+    (plan §9 item b). All are idempotent and change no row. foreign_keys
+    (plan §9 x) defaults to live_primary: D1 enforces foreign keys, so a
+    live primary -- and the L9a shadow file, which opts in -- does too, once
+    its fk audit is clean (LocalSQLiteBackend.fk_gate)."""
     base = (f"PRAGMA busy_timeout = {WRITER_BUSY_TIMEOUT_MS}",)
-    return base + (("PRAGMA journal_mode = WAL",) if live_primary else ())
+    fk = live_primary if foreign_keys is None else foreign_keys
+    return (base + (("PRAGMA journal_mode = WAL",) if live_primary else ())
+            + (("PRAGMA foreign_keys = ON",) if fk else ()))
+
+
+# The fk audit of each enforcing store, once per process (plan §9 x):
+# realpath -> None (clean) or the refusal reason. The RLock is held for the
+# whole audit, so another thread waits for the result; the audit's own
+# writer open re-enters and sees _FK_PENDING.
+_FK_AUDITS: Dict[str, Optional[str]] = {}
+_FK_AUDITS_GUARD = threading.RLock()
+_FK_PENDING = "pending"
+
+
+def reset_fk_audits() -> None:
+    """Forget the cached audits (tests; a repaired store needs a restart)."""
+    with _FK_AUDITS_GUARD:
+        _FK_AUDITS.clear()
 
 
 _STORE_WRITE_LOCKS: Dict[str, threading.Lock] = {}
@@ -924,8 +944,13 @@ class LocalSQLiteBackend(StorageBackend):
         # backend was built directly.
         self.store_name: Optional[str] = None
         # Set when this process may not serve the store at all (a live
-        # primary whose lock another process holds): every open raises.
+        # primary whose lock another process holds, or whose fk audit found
+        # orphans): every open raises.
         self.refused_reason: Optional[str] = None
+        # Foreign keys on for a store that is not a live primary (the L9a
+        # shadow file: its replay must cascade like D1). Plain local stores
+        # keep them off (dark, like WAL).
+        self.enforce_foreign_keys = False
 
     def write_gate(self) -> _WriteGate:
         """This store's write gate (plan §1), shared by every backend object
@@ -946,6 +971,45 @@ class LocalSQLiteBackend(StorageBackend):
         except ValueError:
             return False
         return isinstance(replicas, dict) and self.store_name in replicas
+
+    @property
+    def foreign_keys_on(self) -> bool:
+        return self.live_primary or self.enforce_foreign_keys
+
+    def fk_gate(self) -> None:
+        """Plan §9 (x): before foreign keys are enforced on this store, audit
+        the existing data once per process (memora.fk_audit). Orphans refuse
+        the store here -- every open raises and health says why -- because
+        the store would diverge from D1 at the next cascade. Nothing is
+        repaired automatically."""
+        if not self.foreign_keys_on:
+            return
+        key = os.path.realpath(str(self.db_path))
+        with _FK_AUDITS_GUARD:
+            if key in _FK_AUDITS:
+                state = _FK_AUDITS[key]
+                if state is None or state == _FK_PENDING:
+                    return  # our own audit open re-entering, or clean
+                self.refused_reason = state
+                raise StoreLockedError(state)
+            _FK_AUDITS[key] = _FK_PENDING
+            try:
+                from .fk_audit import fk_orphans, refusal_reason
+
+                conn = self._open_writer(True, _LockedWriterConnection, gated=False)
+                try:
+                    result = fk_orphans(conn)
+                finally:
+                    conn.close()
+                reason = None if result["clean"] else refusal_reason(result)
+            except BaseException:
+                _FK_AUDITS.pop(key, None)  # not audited: the next open tries again
+                raise
+            _FK_AUDITS[key] = reason
+        if reason is not None:
+            logger.error("store %s refused: %s", self.store_name or self.db_path, reason)
+            self.refused_reason = reason
+            raise StoreLockedError(reason)
 
     def _ensure_parent_dir(self) -> None:
         """Ensure parent directory exists."""
@@ -980,6 +1044,7 @@ class LocalSQLiteBackend(StorageBackend):
         except StoreLockedError as exc:
             self.refused_reason = str(exc)
             raise
+        self.fk_gate()  # at startup too (fence_live_primaries): health shows a refusal at once
 
     def _open_writer(self, check_same_thread: bool, factory, *, gated: bool) -> sqlite3.Connection:
         if self.refused_reason is not None:
@@ -991,6 +1056,7 @@ class LocalSQLiteBackend(StorageBackend):
         # start the lock would otherwise fail with FileNotFoundError (§9 k).
         self._ensure_parent_dir()
         self.fence()
+        self.fk_gate()
         lock = _store_lock(self.db_path)
         with lock.exclusive():
             conn = sqlite3.connect(self.db_path, check_same_thread=False, factory=factory)
@@ -1008,7 +1074,7 @@ class LocalSQLiteBackend(StorageBackend):
         # nothing else. busy_timeout on every writer; WAL only for a live
         # primary (readers must not wait for a phase-3 transaction), so every
         # other local store keeps its journal mode.
-        for pragma in writer_setup_pragmas(self.live_primary):
+        for pragma in writer_setup_pragmas(self.live_primary, self.foreign_keys_on):
             conn.execute(pragma).fetchall()
         # Armed last: the setup above is not gated.
         if gated:

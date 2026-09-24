@@ -3461,8 +3461,9 @@ def _fence_live_primaries_or_exit() -> None:
         logger.error("store %s refused: %s", name, reason)
         print(f"Warning: store {name!r} refused: {reason}", file=sys.stderr)
     if default is not None and default in refused:
-        print(f"Error: the default store {default!r} is a live primary served by another process: "
-              f"{refused[default]}", file=sys.stderr)
+        print(f"Error: the default store {default!r} is a live primary this process may not serve "
+              f"(its primary lock is held elsewhere, or its fk audit found orphans): {refused[default]}",
+              file=sys.stderr)
         sys.exit(2)
 
 

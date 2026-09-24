@@ -135,7 +135,9 @@ def test_store_write_refuses_a_non_transactional_connection(tmp_path):
 
 def test_writer_setup_pragmas_are_exactly_busy_timeout_and_wal_for_a_live_primary(tmp_path, monkeypatch):
     assert backends.writer_setup_pragmas(False) == ("PRAGMA busy_timeout = 5000",)
-    assert backends.writer_setup_pragmas(True) == ("PRAGMA busy_timeout = 5000", "PRAGMA journal_mode = WAL")
+    assert backends.writer_setup_pragmas(True) == ("PRAGMA busy_timeout = 5000", "PRAGMA journal_mode = WAL",
+                                                   "PRAGMA foreign_keys = ON")  # plan §9 x
+    assert backends.writer_setup_pragmas(False, True) == ("PRAGMA busy_timeout = 5000", "PRAGMA foreign_keys = ON")
     plain = LocalSQLiteBackend(tmp_path / "plain.db")
     with plain.connect() as c:
         assert c.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
