@@ -18,6 +18,18 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
 
+### Deploy preflight reads a live local primary read-only (hotfix)
+
+- The deploy's `import_attempt` preflight opened every store with a writer
+  connection. That refused a live local primary, whose writer lock
+  (`/data/<db>.db.primary-lock`) the running memora-all holds, so the
+  v0.5.1 deploy stopped there (safely, before any change).
+- It now opens each store read-only (`connect_read_only`). That takes no
+  writer or primary lock and reads a WAL primary through the server's
+  own `-wal`/`-shm`. A d1:// store keeps its read path.
+- A real `import_attempt` row still refuses the deploy. The other
+  preflights open no store.
+
 ### E1: no implicit embedding rebuild; the fingerprint no longer includes the endpoint host
 - Production finding (nuc8 v0.5.0). After the M1 moved hosts (same Ollama bge-m3), every store's stored fingerprint mismatched, because it carried the embedding endpoint's host (`backend|model|host|repr`).
   - The first search on the seeded local `re` rebuilt all 238 embeddings.

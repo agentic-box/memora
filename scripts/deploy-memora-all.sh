@@ -589,13 +589,19 @@ print("token files readable by the new image through the read-only mount")
 # per live store, rows whose metadata contains the string at all (a superset
 # of real markers), through the running (previous) container: a raw backend
 # connection, so no schema pass -- one SELECT per store. Any hit, or a
-# failed check, aborts before anything is stopped.
+# failed check, aborts before anything is stopped. READ-ONLY (v0.5.1): a
+# live local primary's writer lock (/data/<db>.db.primary-lock) is held by
+# the running memora-all, so a writer open here would be refused; the
+# read-only open takes no writer or primary lock and reads a WAL primary
+# through the server's own -wal/-shm. A d1:// store's read path is its
+# connect() (the base class's connect_read_only).
 "$RT" exec -i "$CONTAINER" python - <<'PY' || { echo "import_attempt preflight failed — aborting before touching the live container" >&2; exit 1; }
 import json, os, sys
 from memora import storage
 bad = {}
 for name in json.loads(os.environ["MEMORA_DATABASES"]):
-    conn = storage.backend_for(name).connect()
+    backend = storage.backend_for(name)
+    conn = getattr(backend, "connect_read_only", backend.connect)()
     try:
         rows = conn.execute(
             "SELECT id FROM memories WHERE instr(metadata, ?) > 0 LIMIT 20", ('"import_attempt"',)
