@@ -97,7 +97,7 @@ def test_sync_sh_remote_refused_before_anything(tmp_path, args):
     assert "/broadcast" not in (GRAPH / "scripts" / "sync.sh").read_text()
 
 
-@pytest.mark.parametrize("args", [[], ["--dry-run"], ["--bucket", "ob1", "--d1-id", "x"], ["--bucket", "ob1", "--d1-id", "x", "--dry-run"]])
+@pytest.mark.parametrize("args", [[], ["--dry-run"], ["--bucket", "alpha", "--d1-id", "x"], ["--bucket", "alpha", "--d1-id", "x", "--dry-run"]])
 def test_link_r2_images_always_refused(tmp_path, args):
     bindir, _ = _recorders(tmp_path, [])
     r = subprocess.run([sys.executable, "-X", "importtime", str(GRAPH / "scripts" / "link-r2-images.py"), *args],

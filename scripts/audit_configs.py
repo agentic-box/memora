@@ -4,8 +4,13 @@
 
   scripts/audit_configs.py                       # this host, $HOME
   scripts/audit_configs.py --local ~/repos/agentic-box
-  scripts/audit_configs.py --host nuc8 --host ob1 --host bestation --host re
-  scripts/audit_configs.py --local --host nuc8 --json
+  scripts/audit_configs.py --host deploy-host --host alpha-host --host beta-host
+  scripts/audit_configs.py --local --host deploy-host --json
+
+memora-all's own host (whose memora-all files and container are reported but
+do not fail the audit) is DEPLOY_HOST from the operator's git-ignored
+instances/deploy.env (see instances/deploy.env.example), or --deploy-host.
+With neither, no host is memora-all's: its files count as blocking.
 
 Every audit also inspects EVERY persisted container of each host, running
 or stopped (docker/podman `ps -a`, Apple's `container list --all`): a
@@ -31,6 +36,7 @@ be audited, 2 usage error.
 from __future__ import annotations
 
 import argparse
+from typing import Optional
 import json
 import subprocess
 import sys
@@ -40,12 +46,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from memora import config_audit  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import deploy_config  # noqa: E402
+
+DEFAULT_DEPLOY_CONFIG = Path(__file__).resolve().parent.parent / "instances" / "deploy.env"
+
 AUDIT_SOURCE = Path(config_audit.__file__)
 
 
 def audit_remote(host: str, roots, memora_all, *, ssh: str = "ssh", timeout: int = 300,
-                 containers_only: bool = False) -> dict:
+                 containers_only: bool = False, deploy_host: Optional[str] = None) -> dict:
     cmd = [ssh, "-o", "BatchMode=yes", host, "python3", "-", "--json", "--host-label", host]
+    if deploy_host:
+        cmd += ["--deploy-host", deploy_host]
     if containers_only:
         cmd.append("--containers-only")
     for m in memora_all:
@@ -81,6 +94,9 @@ def main(argv=None) -> int:
     ap.add_argument("--remote-root", action="append", default=[],
                     help="roots on the remote hosts (default: their $HOME)")
     ap.add_argument("--memora-all", action="append", default=[], metavar="PATH")
+    ap.add_argument("--deploy-host", default=None, metavar="LABEL",
+                    help="memora-all's host (default: DEPLOY_HOST from instances/deploy.env)")
+    ap.add_argument("--deploy-config", default=str(DEFAULT_DEPLOY_CONFIG), help=argparse.SUPPRESS)
     ap.add_argument("--ssh", default="ssh", help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--containers-only", action="store_true",
@@ -88,6 +104,15 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if args.local is None and not args.host:
         args.local = []
+    deploy_host = args.deploy_host
+    if not deploy_host:
+        try:
+            deploy_host = deploy_config.load(Path(args.deploy_config)).get("DEPLOY_HOST") or None
+        except deploy_config.ConfigError:
+            deploy_host = None
+    if not deploy_host:
+        print("audit_configs: no DEPLOY_HOST (instances/deploy.env) or --deploy-host: "
+              "no host is treated as memora-all's", file=sys.stderr)
     results = []
     if args.local is not None:
         roots = [Path(r) for r in args.local] or [Path.home()]
@@ -97,10 +122,10 @@ def main(argv=None) -> int:
             return 2
         label = config_audit.os.uname().nodename.split(".")[0]
         results.append(config_audit.audit(roots, host=label, memora_all=args.memora_all,
-                                          files=not args.containers_only))
+                                          files=not args.containers_only, deploy_host=deploy_host))
     for host in args.host:
         results.append(audit_remote(host, args.remote_root, args.memora_all, ssh=args.ssh,
-                                    containers_only=args.containers_only))
+                                    containers_only=args.containers_only, deploy_host=deploy_host))
     clean = all(r["clean"] for r in results)
     if args.json:
         print(json.dumps({"clean": clean, "hosts": results}))

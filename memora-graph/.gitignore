@@ -5,6 +5,10 @@ node_modules/
 .wrangler/
 .dev.vars
 
+# The real Cloudflare configuration (D1 ids, account subdomain, store map)
+# is the operator's; the template is wrangler.toml.example (CFG1).
+/wrangler.toml
+
 # Build output
 dist/
 

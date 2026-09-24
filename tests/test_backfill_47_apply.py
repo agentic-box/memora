@@ -11,7 +11,7 @@ import memora.storage as storage
 from scripts import apply_backfill_47 as apply
 from scripts import preview_backfill_47 as preview_mod
 
-PROJECTS = ["memora", "clmux", "acebar", "pi"]
+PROJECTS = ["memora", "clmux", "project-a", "pi"]
 ISSUE = "**clmux: workspace rename does not work**  Attempting to rename a workspace does not take."
 NOTE = "Observability matters because clmux daemon logs are what the sidebar replays."
 

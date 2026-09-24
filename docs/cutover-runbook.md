@@ -1,10 +1,10 @@
 # Cutover runbook: one store to local primary (REL1)
 
-This runbook moves ONE store of memora-all (nuc8) from `d1://` to a seeded
+This runbook moves ONE store of memora-all (deploy-host) from `d1://` to a seeded
 local SQLite file on memora-all's `/data` volume. The file is replicated to
 the same D1 database in write mode. `scripts/cutover_store.sh <db>` runs it
 from the Mac, in the checkout whose `instances/all.env` the deploy reads.
-The first store is `re`. memora, ob1 and bestation stay on `d1://`.
+The first store is `gamma`. memora, alpha and beta stay on `d1://`.
 
 The script runs only the steps below and checks each boundary. With no
 flags it prints the plan and does nothing: it makes no ssh call and no edit
@@ -27,7 +27,7 @@ pointer (below).
 
     The owner is not checked, because a container maps the host uid to
     another uid. `FOO` and `FOO_FILE` both set stops the server.
-- **One-time, on nuc8, before the first v0.5.0 deploy**, write the
+- **One-time, on deploy-host, before the first v0.5.0 deploy**, write the
   Cloudflare token that `credentials.mcp.json` holds today into its file.
   The value is never printed:
 
@@ -44,7 +44,7 @@ pointer (below).
   - In this pilot, `d1-read.token` is both the read token and the
     replicator token (the user's decision). To split them later, add a
     file and set `DEPLOY_D1_REPLICATOR_TOKEN_FILE=<name>` for the deploy.
-- **A verified export of the store** exists on nuc8 under
+- **A verified export of the store** exists on deploy-host under
   `~/memora-lp/exports/<db>/` (`<stamp>.sql` and `<stamp>.receipt.json`),
   with copies off the host.
 - **Tool path.** The operator tool is in the image, at
@@ -58,7 +58,7 @@ pointer (below).
 | step | what | boundary check |
 |---|---|---|
 | a | `freeze <db>` through `POST /admin/freeze/<db>`. The freeze is persisted on `/data` | `/health/db/<db>`: frozen, 0 in flight, no open intent |
-| b | Copy the newest receipt and its `.sql` into `/data/exports/<db>/`, then `recheck` under the freeze. A fresh export (still frozen) is taken when D1 moved, or when the receipt is older than 24 h. A fresh export is copied out to nuc8 (`~/memora-lp/exports/<db>/`) and to this Mac (`~/memora-lp/exports/<db>/`, or `CUTOVER_OFFHOST_DIR`) | the tool returns a receipt; still frozen |
+| b | Copy the newest receipt and its `.sql` into `/data/exports/<db>/`, then `recheck` under the freeze. A fresh export (still frozen) is taken when D1 moved, or when the receipt is older than 24 h. A fresh export is copied out to deploy-host (`~/memora-lp/exports/<db>/`) and to this Mac (`~/memora-lp/exports/<db>/`, or `CUTOVER_OFFHOST_DIR`) | the tool returns a receipt; still frozen |
 | c | `seed <db> --receipt <b> --out /data/<db>.db`. It rechecks again, loads the export, raises the sequences, installs sync with `d1://<account>/<database-id>`, verifies against the receipt and links the file into place. Then `fk-audit` | seed exit 0; fk audit clean; still frozen |
 | d | Print the `all.env` edits; `--apply-env` makes them. A timestamped 0600 backup, `all.env.bak-cutover-<db>-<ts>`, is taken first | the file reads back with all three values |
 | e | `scripts/deploy-memora-all.sh` (production defaults). The store comes up frozen, from the persisted freeze | the deploy's own checks, every store included |
@@ -75,7 +75,7 @@ MEMORA_REPLICATION=write
 MEMORA_REPLICATION_INTERVAL_S=60                             (--interval)
 ```
 
-- `MEMORA_REPLICATION_INTERVAL_S` is `--interval` (default 60, the `re`
+- `MEMORA_REPLICATION_INTERVAL_S` is `--interval` (default 60, the `gamma`
   pilot's once a minute, leader 7763). It applies to every replicated
   store of memora-all.
 - **The replicator's timing** (leader 7762), from `all.env` through the
@@ -125,10 +125,10 @@ so, until it is thawed.
 ### Runs
 
 ```
-scripts/cutover_store.sh re                                   # the plan; nothing is done
-scripts/cutover_store.sh re --execute                         # a, b, c; prints d's edits and stops
-scripts/cutover_store.sh re --execute --from d --apply-env    # d, e, f, g; stops before the thaw
-scripts/cutover_store.sh re --execute --from h --thaw         # h
+scripts/cutover_store.sh gamma                                   # the plan; nothing is done
+scripts/cutover_store.sh gamma --execute                         # a, b, c; prints d's edits and stops
+scripts/cutover_store.sh gamma --execute --from d --apply-env    # d, e, f, g; stops before the thaw
+scripts/cutover_store.sh gamma --execute --from h --thaw         # h
 ```
 
 - `--from` takes `a`, `d`, `e`, `f`, `g` or `h`. Steps a to c are one
@@ -142,13 +142,13 @@ scripts/cutover_store.sh re --execute --from h --thaw         # h
   own shell writes them from its environment (`printf` is a shell
   builtin, so there is no process argv), and they are removed on exit.
   The D1 read token is the container's `MEMORA_D1_READ_TOKEN_FILE`. No
-  token is on a command line of the Mac or of nuc8.
+  token is on a command line of the Mac or of deploy-host.
 
 ### What is not exercised before the live run
 
 Write mode against real D1 runs for the first time at step e of the first
 live cutover.
-- The server2 rehearsal (`docs/deploy-rehearsal.md`) runs the v0.5.0 deploy
+- The build-host rehearsal (`docs/deploy-rehearsal.md`) runs the v0.5.0 deploy
   with a seeded local store as a replicated store in **log** mode: the
   passthrough, the replication block and the token mount.
 - There is no fake D1 HTTP endpoint the replicator can be pointed at: its

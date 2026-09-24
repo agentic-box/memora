@@ -3,7 +3,7 @@
 # replacement Ollama host. Same image/volume/mounts/ports/limits as the live
 # container — this changes exactly one env var, nothing else. Queue item 23.
 #
-# ALREADY RUN (2026-09-16, nuc8): the new host answered, the switch and the
+# ALREADY RUN (2026-09-16, deploy-host): the new host answered, the switch and the
 # 3-fact dry-run absorb smoke test both succeeded, and dev was pushed. This
 # script is kept for reference / re-run on a future host move, not because
 # there is anything left to do.
@@ -36,15 +36,15 @@
 # tools/call — a JSON-RPC error rides HTTP 200, which the prior
 # HTTP-status-only check would have printed and exited zero on.
 #
-# Old host: 100.85.27.63:11434 (decommissioned M1 — offline in clmux's own
-#   mesh peer registry too, ~/.clmux-mesh/network/peers.json on nuc8; that
+# Old host: EMBEDDING_OLD_URL (e.g. 100.64.0.12:11434, a decommissioned embedding host — offline in clmux's own
+#   mesh peer registry too, ~/.clmux-mesh/network/peers.json on deploy-host; that
 #   file is clmux's, not memora's, and was out of scope here, untouched).
-# New host: 100.118.64.23:11434 (Ollama 0.34.0, bge-m3, confirmed live).
+# New host: EMBEDDING_NEW_URL (e.g. 100.64.0.11:11434; Ollama 0.34.0, bge-m3, confirmed live).
 #
-# Verified nothing else on nuc8 or in this repo hardcodes the old IP:
+# Verified nothing else on deploy-host or in this repo hardcodes the old IP:
 #   - memora repo (incl. gitignored instances/*.env): no match.
-#   - nuc8's memora checkout: no match.
-#   - nuc8 home dir scripts/json/env/py/yaml/conf/service files: no match
+#   - deploy-host's memora checkout: no match.
+#   - deploy-host home dir scripts/json/env/py/yaml/conf/service files: no match
 #     except ~/.config/memora/credentials.mcp.json itself (the file this
 #     script edits) and ~/.clmux-mesh/network/peers.json (see above).
 #
@@ -53,29 +53,37 @@
 #
 # Rollback (restores the state from immediately before this script's most
 # recent run — check `docker ps -a --filter name=memora-all-embhost` on
-# nuc8 for the exact <ts>, there may be more than one from repeated runs):
-#   ssh nuc8 'docker rm -f memora-all && docker rename memora-all-embhost-<ts> memora-all && docker start memora-all'
+# deploy-host for the exact <ts>, there may be more than one from repeated runs):
+#   ssh deploy-host 'docker rm -f memora-all && docker rename memora-all-embhost-<ts> memora-all && docker start memora-all'
 #   restore ~/.config/memora/credentials.mcp.json.bak-embhost-<ts> if the credentials file itself needs reverting
 set -euo pipefail
 
-OLD_URL="http://100.85.27.63:11434/v1"
-NEW_URL="http://100.118.64.23:11434/v1"
+# The hosts come from the operator's git-ignored deploy configuration (CFG1,
+# instances/deploy.env.example): DEPLOY_HOST, EMBEDDING_OLD_URL and
+# EMBEDDING_NEW_URL. Without them the script refuses; it never guesses.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CFG=()
+while IFS= read -r -d '' v; do CFG+=("$v"); done \
+  < <(python3 "$ROOT/scripts/deploy_config.py" "$ROOT/instances/deploy.env" DEPLOY_HOST EMBEDDING_OLD_URL EMBEDDING_NEW_URL)
+[ "${#CFG[@]}" -eq 3 ] || { echo "refused: instances/deploy.env lacks DEPLOY_HOST / EMBEDDING_OLD_URL / EMBEDDING_NEW_URL — nothing was done" >&2; exit 1; }
+DEPLOY_HOST="${CFG[0]}"; OLD_URL="${CFG[1]}"; NEW_URL="${CFG[2]}"
+NEW_ROOT="${NEW_URL%/v1}/"   # the Ollama root the liveness probe asks
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than credentials.mcp.json, which does
 # NOT carry this key (see the post-mortem above).
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/instances/all.env"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — need MEMORA_DATABASES for memora-all" >&2; exit 1; }
 MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//")"
 [ -n "$MEMORA_DATABASES" ] || { echo "$ENV_FILE has no MEMORA_DATABASES" >&2; exit 1; }
 MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
 
-ssh nuc8 bash -s -- "$OLD_URL" "$NEW_URL" "$MEMORA_DATABASES_B64" <<'REMOTE'
+ssh "$DEPLOY_HOST" bash -s -- "$OLD_URL" "$NEW_URL" "$MEMORA_DATABASES_B64" "$NEW_ROOT" <<'REMOTE'
 set -euo pipefail
 OLD_URL="$1"
 NEW_URL="$2"
 MEMORA_DATABASES="$(printf '%s' "$3" | base64 -d)"
+NEW_ROOT="$4"
 TS=$(date +%s)
 
 CRED=~/.config/memora/credentials.mcp.json
@@ -85,8 +93,8 @@ cp -p "$CRED" "$CRED.bak-embhost-$TS"
 # Fail loudly rather than silently no-op if the base URL has already moved
 # (someone else changed it, or this script already ran) or the new host
 # still isn't reachable — this must not proceed on a stale assumption.
-if ! curl -sf -m 3 "http://100.118.64.23:11434/" >/dev/null 2>&1; then
-  echo "new embedding host 100.118.64.23:11434 is not answering — aborting, not touching credentials" >&2
+if ! curl -sf -m 3 "$NEW_ROOT" >/dev/null 2>&1; then
+  echo "new embedding host $NEW_ROOT is not answering — aborting, not touching credentials" >&2
   exit 1
 fi
 

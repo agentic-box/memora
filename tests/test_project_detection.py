@@ -1464,7 +1464,7 @@ def _legacy_issue(conn, tags=("memora/issues",), metadata=None):
 
 
 def test_a_typed_tag_is_not_project_evidence(db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     for kind in ("issues", "todos", "sections", "documents", "knowledge"):
         assert storage._resolve_project(None, [f"memora/{kind}"], {"type": "issue"}) is None
     # A non-typed project tag is evidence, and a typed tag never makes it ambiguous.
@@ -1474,7 +1474,7 @@ def test_a_typed_tag_is_not_project_evidence(db, projects):
 
 
 def test_a_legacy_typed_issue_no_longer_resolves_to_memora(db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         mid = _legacy_issue(conn)["id"]
         stored = storage.get_memory(conn, mid)
@@ -1483,7 +1483,7 @@ def test_a_legacy_typed_issue_no_longer_resolves_to_memora(db, projects):
 
 
 def test_the_typed_tag_follows_a_later_resolved_project(default_policy_db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         mid = _legacy_issue(conn)["id"]
         # Declaring the project re-prefixes the memory's own typed tag, under
@@ -1494,7 +1494,7 @@ def test_the_typed_tag_follows_a_later_resolved_project(default_policy_db, proje
 
 
 def test_the_typed_tag_follows_a_non_typed_project_tag_on_a_tag_update(db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         mid = _legacy_issue(conn)["id"]
         updated = storage.update_memory(conn, mid, tags=["memora/issues", "clmux/tui"])
@@ -1502,7 +1502,7 @@ def test_the_typed_tag_follows_a_non_typed_project_tag_on_a_tag_update(db, proje
 
 
 def test_an_update_without_a_project_keeps_the_legacy_typed_tag(default_policy_db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         mid = _legacy_issue(conn)["id"]
         updated = storage.update_memory(conn, mid, content=LEGACY_CLMUX_ISSUE + " Still open.")
@@ -1519,7 +1519,7 @@ def test_another_kinds_typed_tag_is_not_exempt(default_policy_db, projects):
 
 
 def test_export_import_round_trip_of_a_legacy_typed_issue(db, projects):
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         _legacy_issue(conn)
         exported = storage.export_memories(conn)
@@ -1540,7 +1540,7 @@ def test_export_import_round_trip_of_a_legacy_typed_issue(db, projects):
 def test_an_import_with_a_forged_typed_tag_prefix_is_refused(db, projects, strategy):
     """Only the OLD DEFAULT memora/<kind> is a legacy exception; any other
     prefix on a no-project memory is a forged system tag."""
-    projects(["memora", "clmux", "acebar", "pi"])
+    projects(["memora", "clmux", "project-a", "pi"])
     with storage.connect() as conn:
         _legacy_issue(conn)  # the store already holds one memory
         before = [m["id"] for m in storage.list_memories(conn, limit=-1)]

@@ -90,7 +90,7 @@ else:
 # plumbing ONLY -- nothing selects a database yet, and with MEMORA_DATABASES
 # unset the behaviour is byte-for-byte what it was.
 #
-# MEMORA_DATABASES='{"memora":"d1://acct/id","ob1":"d1://acct/id2","scratch":"/data/s.db"}'
+# MEMORA_DATABASES='{"memora":"d1://acct/id","alpha":"d1://acct/id2","scratch":"/data/s.db"}'
 # MEMORA_DEFAULT_DB=memora
 #
 # Backend-agnostic by construction: parse_backend_uri dispatches on the URI
@@ -300,7 +300,7 @@ def bound_database() -> dict:
     `database` is the name the caller is ACTUALLY bound to, which is the whole
     point: a workspace pointed at the wrong-but-valid name gets that name back,
     so the mismatch with what it expected becomes visible. `database_source`
-    says HOW it was chosen, because "I asked for ob1" and "I said nothing and
+    says HOW it was chosen, because "I asked for alpha" and "I said nothing and
     got the default" are different facts and only the first is an assertion the
     caller can make.
 

@@ -23,7 +23,7 @@ top-level README):
 ```sh
 mkdir -p ~/.local/libexec/memora ~/.local/var/log     # the proxy + its logs live here
 cp scripts/memora_proxy.py ~/.local/libexec/memora/   # the generated plist's $MEMORA_PROXY_BIN
-./scripts/memora-instance.sh proxy ob1                # render + print the install commands
+./scripts/memora-instance.sh proxy alpha                # render + print the install commands
 ```
 
 Then run what it prints. It ends with an `lsof` check so you see the listener
@@ -43,11 +43,11 @@ appear, and gives you the `.mcp.json` line for the workspace.
 
 ```sh
 ./scripts/memora-instance.sh status                 # containers + proxy health
-launchctl print gui/$(id -u)/com.memora.proxy.memora-ob1 | grep state
-tail -f ~/.local/var/log/memora-proxy-ob1.log       # per-connection resolve/connect log
+launchctl print gui/$(id -u)/com.memora.proxy.memora-alpha | grep state
+tail -f ~/.local/var/log/memora-proxy-alpha.log       # per-connection resolve/connect log
 
-launchctl bootout gui/$(id -u)/com.memora.proxy.memora-ob1   # stop supervising
-rm ~/Library/LaunchAgents/com.memora.proxy.memora-ob1.plist
+launchctl bootout gui/$(id -u)/com.memora.proxy.memora-alpha   # stop supervising
+rm ~/Library/LaunchAgents/com.memora.proxy.memora-alpha.plist
 ```
 
 Stopping a container without unloading its proxy leaves a listener with nothing

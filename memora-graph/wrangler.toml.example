@@ -1,0 +1,47 @@
+# memora-graph's Cloudflare configuration -- TEMPLATE (CFG1).
+# Copy to wrangler.toml (git-ignored) and fill in your own values: the D1
+# database ids and names, R2 bucket names, the sync worker's URL and the
+# store map are deployment configuration and never live in this repository.
+# As shipped (placeholder ids) it runs locally (`wrangler pages dev --local`,
+# the CI's graph-ui job) with two stores, "memora" and "alpha".
+name = "memora-graph"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Pages configuration - serve from public directory
+pages_build_output_dir = "public"
+
+# D1 Databases - one binding per store, selected via ?db= (see DB_CONFIG)
+[[d1_databases]]
+binding = "DB_MEMORA"
+database_name = "memora-graph"
+database_id = "00000000-0000-0000-0000-000000000001"
+
+[[d1_databases]]
+binding = "DB_ALPHA"
+database_name = "alpha-graph"
+database_id = "00000000-0000-0000-0000-000000000002"
+
+# R2 Buckets - one per store that has images
+[[r2_buckets]]
+binding = "R2_MEMORA"
+bucket_name = "memora"
+
+[[r2_buckets]]
+binding = "R2_ALPHA"
+bucket_name = "alpha"
+
+[vars]
+# Graph settings
+MIN_EDGE_SCORE = "0.40"
+# WebSocket worker URL for real-time updates (served to the SPA at /api/config);
+# empty = no realtime. e.g. "https://memora-graph-sync.<your-subdomain>.workers.dev"
+WS_WORKER_URL = ""
+# Default database
+DEFAULT_DB = "memora"
+# Database config (JSON) - maps db name to binding suffix
+DB_CONFIG = '{"memora": "MEMORA", "alpha": "ALPHA"}'
+# Chat LLM model (via OpenRouter). Set OPENROUTER_API_KEY as a secret.
+CHAT_MODEL = "x-ai/grok-4.20-beta"
+# Model for query rewriting (fast, cheap). Falls back to CHAT_MODEL if unset.
+REWRITE_MODEL = "x-ai/grok-4.20-beta"

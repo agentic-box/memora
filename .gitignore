@@ -37,3 +37,5 @@ launchd/generated/
 # The example file is committed; the real ones are not.
 instances/*.env
 !instances/example.env
+# CFG1: the operator's own identifier list for tests/test_no_infra_identifiers.py
+instances/*.local

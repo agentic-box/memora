@@ -70,6 +70,11 @@ jobs:
       - name: Install Chromium for Playwright
         run: npx playwright install --with-deps chromium
 
+      - name: Use the template Cloudflare configuration
+        # wrangler.toml is the operator's and git-ignored (CFG1); the template
+        # runs locally with placeholder ids.
+        run: test -f wrangler.toml || cp wrangler.toml.example wrangler.toml
+
       - name: Seed local D1 from the fixture
         # Supersession chain, non-lineage typed edges, and a mirror-only drift row.
         #

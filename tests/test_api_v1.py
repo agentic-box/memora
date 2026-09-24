@@ -19,7 +19,7 @@ from memora import api_v1, health
 from tests.conftest import FakeD1Backend
 
 TOKEN = "memora-api-v1-test-token"
-OTHER_TOKEN = "a-token-for-ob1-only"
+OTHER_TOKEN = "a-token-for-alpha-only"
 
 
 def _clear_health():
@@ -52,7 +52,7 @@ def _digest(token):
 @pytest.fixture(params=["sqlite", "fake_d1"])
 def api(request, tmp_path, monkeypatch):
     """A server with stores memora (the backend under test) and broken (a
-    probe that always fails), tokens for memora+nostore and for ob1 only."""
+    probe that always fails), tokens for memora+nostore and for alpha only."""
     monkeypatch.setenv("HOME", str(tmp_path))
     blocker = tmp_path / "not-a-directory"
     blocker.write_text("x")
@@ -71,7 +71,7 @@ def api(request, tmp_path, monkeypatch):
         monkeypatch.setattr(storage, "backend_for", lambda name: fake if name == "memora" else real(name))
     tokens = _write_tokens(tmp_path, {
         _digest(TOKEN): ["memora", "nostore"],
-        _digest(OTHER_TOKEN): ["ob1"],
+        _digest(OTHER_TOKEN): ["alpha"],
     })
     _connect_store().close()  # the store exists (created by a writing path)
     mcp = FastMCP("api-test")
@@ -272,7 +272,7 @@ def test_canonical_request_sha256_is_order_independent():
     ({}, "/api/v1/memora/health", 401, "bad_token"),
     ({"Authorization": "Bearer wrong"}, "/api/v1/memora/health", 401, "bad_token"),
     ({"Authorization": f"Basic {TOKEN}"}, "/api/v1/memora/health", 401, "bad_token"),
-    (AUTH, "/api/v1/ob1/health", 403, "store_forbidden"),
+    (AUTH, "/api/v1/alpha/health", 403, "store_forbidden"),
     ({"Authorization": f"Bearer {OTHER_TOKEN}"}, "/api/v1/memora/health", 403, "store_forbidden"),
     (AUTH, "/api/v1/nostore/health", 404, "unknown_store"),
     (AUTH, "/api/v1/Bad.Name/health", 404, "unknown_store"),

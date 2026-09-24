@@ -676,7 +676,6 @@ div.vis-tooltip {
             <label for="db-select">Database:</label>
             <select id="db-select" onchange="switchDatabase(this.value)">
                 <option value="memora">memora</option>
-                <option value="ob1">ob1</option>
             </select>
         </div>
         <div class="lineage-pill" title="Default: show lineage (superseded dimmed). Uncheck for current-state only when lineage is available.">
@@ -735,7 +734,9 @@ div.vis-tooltip {
             version: '',
             r2Prefix: '/api/r2/',
             dbSelector: true,
-            wsUrl: 'wss://memora-graph-sync.cloudflare-strategic612.workers.dev/ws',
+            // No realtime URL in this (public) file (CFG1): the Pages app
+            // serves it from its WS_WORKER_URL var at /api/config.
+            wsUrl: undefined,
             sseUrl: null
         };
 
@@ -3471,6 +3472,16 @@ div.vis-tooltip {
         function connectRealtime() {
             if (MEMORA_CONFIG.sseUrl) connectSSE();
             else if (MEMORA_CONFIG.wsUrl) connectWebSocket();
+            else if (MEMORA_CONFIG.wsUrl === undefined) {
+                // Not injected: ask the deployment once (null = no realtime).
+                fetch('/api/config')
+                    .then(function (r) { return r.ok ? r.json() : null; })
+                    .catch(function () { return null; })
+                    .then(function (c) {
+                        MEMORA_CONFIG.wsUrl = (c && typeof c.wsUrl === 'string' && c.wsUrl) ? c.wsUrl : null;
+                        if (MEMORA_CONFIG.wsUrl) connectWebSocket();
+                    });
+            }
         }
 
         var sseSource = null;

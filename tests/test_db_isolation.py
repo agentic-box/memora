@@ -2,7 +2,7 @@
 
 THE LOAD-BEARING PHASE. Separation is currently GUARANTEED by four separate
 processes with four separate configs — nothing in the code has to be correct for
-ob1 to stay out of bestation. A single routed server trades that for separation
+alpha to stay out of beta. A single routed server trades that for separation
 guaranteed only by CODE, so a leak here is worse than the limitation it
 replaces.
 

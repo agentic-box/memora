@@ -7,7 +7,7 @@
 # boundary:
 #
 #   a  freeze <db> (POST /admin/freeze/<db>, persisted on /data)
-#   b  recheck the latest export receipt on nuc8 under that freeze; a fresh
+#   b  recheck the latest export receipt on deploy-host under that freeze; a fresh
 #      export (still frozen) if D1 moved or the receipt is older than 24 h
 #   c  seed /data/<db>.db INSIDE memora-all (the named volume is root-owned
 #      on the host), then the fk audit (clean required)
@@ -15,7 +15,7 @@
 #        MEMORA_DATABASES[<db>] = /data/<db>.db
 #        MEMORA_REPLICAS[<db>]  = d1://<account>/<database-id>
 #        MEMORA_REPLICATION     = write
-#        MEMORA_REPLICATION_INTERVAL_S = --interval (default 60: the re pilot,
+#        MEMORA_REPLICATION_INTERVAL_S = --interval (default 60: the gamma pilot,
 #                                 leader 7763; one send per minute at most)
 #   e  redeploy (scripts/deploy-memora-all.sh); the store comes up frozen
 #   f  health: served locally, replication block present, write mode, the
@@ -37,14 +37,18 @@
 # Tokens: the operator tool runs inside memora-all and gets the admin and
 # health tokens as 0600 files under /dev/shm/memora-cutover (tmpfs), written
 # there from the container's own environment by the container's shell and
-# removed on exit. No token value is on a command line of the Mac or nuc8,
+# removed on exit. No token value is on a command line of the Mac or the deploy host,
 # or printed. The D1 read token is the container's MEMORA_D1_READ_TOKEN_FILE.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/instances/all.env"
 DEPLOY="$ROOT/scripts/deploy-memora-all.sh"
-HOST=nuc8
+# The memora-all host comes from the operator's git-ignored deploy
+# configuration (CFG1, instances/deploy.env.example); no host is guessed.
+CONFIG_FILE="$ROOT/instances/deploy.env"
+HOST="$(python3 "$ROOT/scripts/deploy_config.py" "$CONFIG_FILE" DEPLOY_HOST | tr -d '\0')" || HOST=""
+[ -n "$HOST" ] || { echo "refused: DEPLOY_HOST is not set in $CONFIG_FILE (see instances/deploy.env.example) — nothing was done" >&2; exit 2; }
 RT=docker
 CONTAINER=memora-all
 TOOL=(python /app/scripts/local_primary.py)

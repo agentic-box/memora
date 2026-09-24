@@ -121,10 +121,10 @@ setup_d1_database() {
         print_success "D1 database 'memora-graph' already exists"
     fi
 
-    # Remote D1 migrations are RETIRED: memora-all on nuc8 is the only D1
+    # Remote D1 migrations are RETIRED: memora-all on deploy-host is the only D1
     # writer (docs/local-primary-implementation.md §0 P6, §6 F3). The setup
     # stops here rather than write D1.
-    print_error "Remote D1 migrations are retired: memora-all on nuc8 is the only D1 writer. See docs/local-primary-implementation.md §0 P6 and §6 F3."
+    print_error "Remote D1 migrations are retired: memora-all on deploy-host is the only D1 writer. See docs/local-primary-implementation.md §0 P6 and §6 F3."
     exit 1
 }
 
@@ -283,6 +283,11 @@ main() {
     echo "================================="
 
     check_prerequisites
+    # wrangler.toml is the operator's and git-ignored (CFG1): start from the template.
+    if [ ! -f "$PROJECT_DIR/wrangler.toml" ]; then
+        cp "$PROJECT_DIR/wrangler.toml.example" "$PROJECT_DIR/wrangler.toml"
+        print_success "Created wrangler.toml from wrangler.toml.example (fill in your ids)"
+    fi
     install_dependencies
     check_cloudflare_login
     setup_d1_database

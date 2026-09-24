@@ -8,13 +8,13 @@ restart.
 | workspace | restore from |
 |---|---|
 | `~/repos/agentic-box` | `~/.config/memora/credentials.mcp.json` |
-| `~/repos/SAIL/ob1` | `~/.config/memora/ob1.credentials.mcp.json` |
-| `~/repos/tarmacs/terminator` | `~/.config/memora/ob1.credentials.mcp.json` |
-| `~/repos/bestation` | `~/.config/memora/bestation.credentials.mcp.json` |
-| `~/repos/re` | `~/.config/memora/re.credentials.mcp.json` |
+| `~/repos/alpha-app` | `~/.config/memora/alpha.credentials.mcp.json` |
+| `~/repos/alpha-tool` | `~/.config/memora/alpha.credentials.mcp.json` |
+| `~/repos/beta-app` | `~/.config/memora/beta.credentials.mcp.json` |
+| `~/repos/gamma-app` | `~/.config/memora/gamma.credentials.mcp.json` |
 
 ```sh
-cp ~/.config/memora/ob1.credentials.mcp.json ~/repos/SAIL/ob1/.mcp.json
+cp ~/.config/memora/alpha.credentials.mcp.json ~/repos/alpha-app/.mcp.json
 ```
 
 **One catch.** Those stashed files contain ONLY the `memora` server. Every
@@ -25,8 +25,8 @@ memora entry instead:
 ```sh
 python3 - <<'PY'
 import json
-live = "/Users/spok/repos/SAIL/ob1/.mcp.json"
-stash = "/Users/spok/.config/memora/ob1.credentials.mcp.json"
+live = "~/repos/alpha-app/.mcp.json"
+stash = "~/.config/memora/alpha.credentials.mcp.json"
 d = json.load(open(live))
 d["mcpServers"]["memora"] = json.load(open(stash))["mcpServers"]["memora"]
 json.dump(d, open(live, "w"), indent=2); open(live, "a").write("\n")
@@ -39,6 +39,6 @@ After restoring, the container and its proxy can be left running (harmless) or
 stopped:
 
 ```sh
-./scripts/memora-instance.sh down ob1
-launchctl bootout gui/$(id -u)/com.memora.proxy.memora-ob1
+./scripts/memora-instance.sh down alpha
+launchctl bootout gui/$(id -u)/com.memora.proxy.memora-alpha
 ```

@@ -2,7 +2,7 @@
 """Find every memora client configuration that can reach Cloudflare D1
 directly (docs/local-primary-implementation.md §6 F4-F6, §6.1, slice L8).
 
-After the writer freeze, memora-all on nuc8 is the only process allowed to
+After the writer freeze, memora-all on its deploy host is the only process allowed to
 talk to D1. Every other client must go through memora-all's HTTP endpoint.
 This scan finds what still does not:
 
@@ -46,10 +46,13 @@ carry the command name and exit status only (review 7680 P1-2b).
 
 memora-all's own configuration is reported but does not fail the audit:
 instances/all.env (the deploy's registry source, on any host) and, when the
-host label is "nuc8", ~/.config/memora/credentials.mcp.json and
-~/.config/memora/all.* (memora-all's credential source on nuc8), and the
-running container named memora-all on nuc8. More paths can be marked with
---memora-all PATH.
+host label equals --deploy-host (memora-all's host, DEPLOY_HOST in the
+operator's git-ignored instances/deploy.env; never hard-coded here),
+~/.config/memora/credentials.mcp.json and ~/.config/memora/all.*
+(memora-all's credential source there), and the running container named
+memora-all there. Without --deploy-host no host is memora-all's, so those
+files and that container count as ordinary direct-D1 clients (fail-safe).
+More paths can be marked with --memora-all PATH.
 
 Standard library only: scripts/audit_configs.py pipes this file to
 `ssh HOST python3 -` to audit other hosts.
@@ -139,11 +142,11 @@ def candidate_files(root: Path, *, max_depth: int = MAX_DEPTH) -> Iterator[Path]
                 yield p
 
 
-def _memora_all(path: Path, host: str, extra: List[str]) -> bool:
+def _memora_all(path: Path, host: str, extra: List[str], deploy_host: Optional[str] = None) -> bool:
     s = path.as_posix()
     if s.endswith("/instances/all.env"):
         return True
-    if host == "nuc8":
+    if deploy_host and host == deploy_host:
         home = str(Path.home())
         if s == f"{home}/.config/memora/credentials.mcp.json" or fnmatch.fnmatch(s, f"{home}/.config/memora/all.*"):
             return True
@@ -256,7 +259,7 @@ def container_env(runtime: str, name: str) -> List[str]:
     return env
 
 
-def audit_containers(host: str) -> Dict[str, List]:
+def audit_containers(host: str, deploy_host: Optional[str] = None) -> Dict[str, List]:
     findings: List[Dict[str, object]] = []
     errors: List[str] = []
     runtimes = _runtimes()
@@ -281,7 +284,7 @@ def audit_containers(host: str) -> Dict[str, List]:
             except RuntimeQueryFailed as exc:
                 errors.append(f"runtime {runtime}: {exc}")
                 continue
-            owner_is_all = host == "nuc8" and name == "memora-all"
+            owner_is_all = bool(deploy_host) and host == deploy_host and name == "memora-all"
             for f in scan_text("\n".join(env)):
                 entry = {"host": host, "file": f"{runtime}:{name}", "line": 0, "kind": "runtime_env",
                          "detail": f["kind"], "container": name, "state": state, "value": f["value"],
@@ -305,7 +308,8 @@ def coverage(roots: List[Path], files: bool, runtimes: List[str]) -> str:
 
 
 def audit(roots: List[Path], *, host: str = "local", memora_all: Optional[List[str]] = None,
-          max_depth: int = MAX_DEPTH, files: bool = True, containers: bool = True) -> Dict[str, object]:
+          max_depth: int = MAX_DEPTH, files: bool = True, containers: bool = True,
+          deploy_host: Optional[str] = None) -> Dict[str, object]:
     findings: List[Dict[str, object]] = []
     errors: List[str] = []
     seen = set()
@@ -323,12 +327,12 @@ def audit(roots: List[Path], *, host: str = "local", memora_all: Optional[List[s
             except OSError as exc:
                 errors.append(f"{path}: {exc.strerror or exc}")
                 continue
-            owner_is_all = _memora_all(path, host, memora_all or [])
+            owner_is_all = _memora_all(path, host, memora_all or [], deploy_host)
             for f in scan_text(text):
                 findings.append({"host": host, "file": str(path), **f, "memora_all": owner_is_all})
     runtimes: List[str] = []
     if containers:
-        c = audit_containers(host)
+        c = audit_containers(host, deploy_host)
         findings += c["findings"]
         errors += c["errors"]
         runtimes = c["runtimes"]
@@ -350,6 +354,8 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("roots", nargs="*", help="directories or files to scan (default: $HOME)")
     ap.add_argument("--host-label", default=os.uname().nodename.split(".")[0])
+    ap.add_argument("--deploy-host", default=None, metavar="LABEL",
+                    help="the host label that runs memora-all (DEPLOY_HOST)")
     ap.add_argument("--memora-all", action="append", default=[], metavar="PATH",
                     help="a file (glob) that belongs to memora-all itself")
     ap.add_argument("--max-depth", type=int, default=MAX_DEPTH)
@@ -362,7 +368,7 @@ def main(argv=None) -> int:
         print(f"config_audit: no such path: {', '.join(missing)}", file=sys.stderr)
         return 2
     result = audit(roots, host=args.host_label, memora_all=args.memora_all, max_depth=args.max_depth,
-                   files=not args.containers_only)
+                   files=not args.containers_only, deploy_host=args.deploy_host)
     if args.json:
         print(json.dumps(result))
     else:

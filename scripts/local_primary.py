@@ -85,7 +85,7 @@ def _parser() -> argparse.ArgumentParser:
         fz.add_argument("--admin-token-file", required=True)
         fz.add_argument("--health-token-file", required=True)
     ce = sub.add_parser("check-endpoint", help="F4a: prove the memora-all endpoint before repointing a client")
-    ce.add_argument("--memora-url", required=True, help="memora-all's base URL, e.g. http://nuc8:8920")
+    ce.add_argument("--memora-url", required=True, help="memora-all's base URL, e.g. http://deploy-host:8920")
     ce.add_argument("--health-token-file", required=True, help="0600 file with MEMORA_HEALTH_TOKEN")
     ce.add_argument("--admin-token-file", required=True, help="0600 file with MEMORA_ADMIN_TOKEN")
     ce.add_argument("--store", default="scratch", help="a LOCAL SQLite store in the registry (default: scratch)")

@@ -313,7 +313,7 @@ def test_fork_supersedes_only_the_leaf_that_passes(fake_d1_backend, monkeypatch)
 def test_fork_where_every_leaf_fails_links_related_instead(fake_d1_backend, monkeypatch):
     with storage.connect() as conn:
         orig = _mem(conn, "ORIG cache size is 1GB")
-        a = _mem(conn, "FAIL-1 cache size is 2GB on nuc8")
+        a = _mem(conn, "FAIL-1 cache size is 2GB on deploy-host")
         b = _mem(conn, "FAIL-2 cache size is 4GB on the mac")
         storage.add_link(conn, a["id"], orig["id"], edge_type="supersedes")
         storage.add_link(conn, b["id"], orig["id"], edge_type="supersedes")
@@ -430,7 +430,7 @@ def test_concurrent_unrelated_siblings_both_stay_live(fake_d1_backend, monkeypat
     leaf, first, second, active, llm = _race_two_absorbs(
         monkeypatch, fake_d1_backend,
         "FIRST proxy now re-resolves the container IP per connection",
-        "SECOND proxy deploy moved to the nuc8 compose file",
+        "SECOND proxy deploy moved to the deploy-host compose file",
         verify,
     )
     assert second["action"] == "superseded"

@@ -17,7 +17,7 @@ REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "repoint_mcp_config.py"
 D1 = "d1" + "://"
 TOKEN = "cfut_" + "RepointSecret0123456789"
-URL = "http://nuc8:8920/mcp/memora"
+URL = "http://deploy-host:8920/mcp/memora"
 
 CREDENTIALS = {"mcpServers": {"memora": {
     "command": "/Users/x/.local/bin/memora-server", "args": ["--no-graph"],
@@ -118,8 +118,8 @@ def test_server_selects_one_entry(tmp_path):
 
 
 @pytest.mark.parametrize("args,content", [
-    (["--url", "ftp://nuc8/mcp"], CREDENTIALS),
-    (["--url", "http://nuc8:8920/other"], CREDENTIALS),
+    (["--url", "ftp://deploy-host/mcp"], CREDENTIALS),
+    (["--url", "http://deploy-host:8920/other"], CREDENTIALS),
     (["--url", URL], {"servers": {}}),
     (["--url", URL, "--server", "missing"], CREDENTIALS),
     (["--url", URL, "--check-health-token-file", "/x"], CREDENTIALS),
@@ -180,7 +180,7 @@ def test_no_value_is_ever_printed(tmp_path):
             assert value not in out, (extra, value)
         for key in SECRETS:
             assert key in out, "keys are shown so the operator sees what is kept"
-        assert "<redacted:" in out and "--no-graph" in out and "http://nuc8:8920/<redacted path:2 segments>" in out
+        assert "<redacted:" in out and "--no-graph" in out and "http://deploy-host:8920/<redacted path:2 segments>" in out
         if extra:
             break
         p.write_text(json.dumps(doc))
@@ -227,7 +227,7 @@ def test_a_url_with_userinfo_or_query_is_never_printed(tmp_path):
     p = _write(tmp_path, ".mcp.json", doc)
     doc["mcpServers"]["third"] = {"type": "http", "url": "https://h.example/api/pathsecret-" + "Leak5/mcp#frag-" + "Leak6"}
     p.write_text(json.dumps(doc))
-    for url, extra in ((URL, ["--apply"]), ("http://user:pw-" + "Leak7@nuc8:8920/mcp/memora", []),
+    for url, extra in ((URL, ["--apply"]), ("http://user:pw-" + "Leak7@deploy-host:8920/mcp/memora", []),
                        ("ftp://x/path-" + "Leak8", [])):
         before = p.read_text()
         r = _run(str(p), "--url", url, *extra)
@@ -240,6 +240,6 @@ def test_a_url_with_userinfo_or_query_is_never_printed(tmp_path):
     from scripts.repoint_mcp_config import safe_url
     assert safe_url("https://a:b@h.example:8443/p/q?x=1#f") == \
         "https://h.example:8443/<redacted path:2 segments> (userinfo/query/fragment withheld)"
-    assert safe_url("http://nuc8:8920/mcp") == "http://nuc8:8920/<redacted path:1 segment>"
-    assert safe_url("http://nuc8:8920") == "http://nuc8:8920"
+    assert safe_url("http://deploy-host:8920/mcp") == "http://deploy-host:8920/<redacted path:1 segment>"
+    assert safe_url("http://deploy-host:8920") == "http://deploy-host:8920"
     assert safe_url("not a url").startswith("<redacted:")

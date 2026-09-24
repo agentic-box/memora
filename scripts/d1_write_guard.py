@@ -32,7 +32,8 @@ Rules (tools):
   joined with the next, so a flag on a continuation line is seen.
 Rules (handlers), in files under memora-graph/functions/ or
 memora-graph/worker/; findings name the D1 binding names the file uses
-(DB_MEMORA/DB_OB1/DB_BESTATION/DB_RE, or the dynamic `DB_${…}` lookup):
+(any DB_<NAME> binding, e.g. DB_MEMORA, except the DB_CONFIG var; or the
+dynamic `DB_${…}` lookup -- the store set is configuration, CFG1):
   H1  a string literal that starts with write SQL (INSERT … INTO, REPLACE
       INTO, UPDATE … SET, DELETE FROM, CREATE/DROP/ALTER …), including a
       template literal whose table is interpolated
@@ -90,7 +91,7 @@ H1 = re.compile(
 )
 # Case-SENSITIVE on purpose: the head of concatenated write SQL.
 H2 = re.compile(r"([\"'`]|\})\s*(INSERT|REPLACE|UPDATE|DELETE|CREATE|DROP|ALTER)(?=\s|[\"'`]|\$\{)")
-BINDINGS = re.compile(r"\bDB_(MEMORA|OB1|BESTATION|RE)\b|DB_\$\{")
+BINDINGS = re.compile(r"\bDB_(?!CONFIG\b)[A-Z][A-Z0-9_]*\b|DB_\$\{")
 
 
 def _line(text: str, pos: int) -> int:

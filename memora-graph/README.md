@@ -26,7 +26,7 @@ Cloud-hosted knowledge graph visualization for Memora, deployed on Cloudflare Pa
 ## Read-only viewer
 
 The deployed viewer never writes D1 (`docs/local-primary-implementation.md`
-§6 F1, slice L7). memora-all on nuc8 is the only D1 writer; memories are
+§6 F1, slice L7). memora-all on deploy-host is the only D1 writer; memories are
 created and edited through memora itself.
 
 - `PATCH`, `PUT`, `POST` and `DELETE` on `/api/memories/:id` answer `405`
@@ -84,11 +84,13 @@ npx wrangler login
 npx wrangler d1 create memora-graph
 ```
 
-Update `wrangler.toml` with the database ID from the output.
+Copy `wrangler.toml.example` to `wrangler.toml` (git-ignored: it holds your
+D1 ids, buckets, worker URL and store map) and fill in the database ID from
+the output.
 
 ### 4. Run migrations
 
-Retired: memora-all on nuc8 is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). Remote D1 migrations are disabled; `npm run d1:migrate` exits 1. `npm run d1:migrate-local` still works for local development.
+Retired: memora-all on deploy-host is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). Remote D1 migrations are disabled; `npm run d1:migrate` exits 1. `npm run d1:migrate-local` still works for local development.
 
 ### 5. Deploy WebSocket Worker
 
@@ -130,7 +132,7 @@ npm run deploy
 
 ### 10. Initial sync
 
-Retired: memora-all on nuc8 is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). `npm run sync-remote` (`sync.sh --remote`) exits 1; `npm run sync` still syncs to a local D1.
+Retired: memora-all on deploy-host is the only D1 writer (see `docs/local-primary-implementation.md` §0 P6, §6 F3). `npm run sync-remote` (`sync.sh --remote`) exits 1; `npm run sync` still syncs to a local D1.
 
 ## Enable Auto-Sync
 
@@ -191,7 +193,7 @@ memora-graph/
 │       └── index.ts           # Durable Object for WebSocket
 ├── migrations/
 │   └── 0001_init.sql          # D1 schema
-├── wrangler.toml
+├── wrangler.toml.example      # template; your wrangler.toml is git-ignored
 ├── package.json
 └── tsconfig.json
 ```

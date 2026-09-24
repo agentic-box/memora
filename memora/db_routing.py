@@ -1,6 +1,6 @@
 """Route an MCP request to a named database by URL path (memora #965 phase 2).
 
-    http://host:8910/mcp/ob1  ->  CURRENT_DB = "ob1"
+    http://host:8910/mcp/alpha  ->  CURRENT_DB = "alpha"
     http://host:8910/mcp      ->  the registry default
 
 WHY THE PATH AND NOT A TOOL ARGUMENT. Every workspace already owns a URL in its

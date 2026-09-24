@@ -10,6 +10,24 @@ entry in an existing registry, or a new file — not a fork of the deploy script
 unset (one process, one store). With the registry set, one process serves
 every named store.
 
+## Operator configuration (not in git)
+
+This repository is public, so nothing in it names the operator's
+infrastructure: no host names, Tailscale addresses, Cloudflare account,
+D1 database ids or real store names. Those live in git-ignored files:
+
+- `instances/*.env` (except `example.env`): the container registries.
+- `instances/deploy.env`: the deploy host, the graph's publish address, the
+  checkout on that host, `MEMORA_PROJECTS` and the embedding hosts. Copy
+  `instances/deploy.env.example`. `scripts/deploy-memora-all.sh`,
+  `cutover_store.sh`, `switch-embedding-host.sh` and `audit_configs.py`
+  read it through `scripts/deploy_config.py`, and refuse to run without the
+  keys they need.
+- `instances/identifiers.local` (optional): one extra identifier per line
+  for `tests/test_no_infra_identifiers.py`, which fails if any identifier
+  from these files appears in a tracked file.
+- `memora-graph/wrangler.toml`: see `memora-graph/wrangler.toml.example`.
+
 ## Fields
 
 | field | meaning |
@@ -61,9 +79,9 @@ whose log paths are uncreatable. Set `MEMORA_PROXY_BIN` in the environment if
 you keep the proxy somewhere else.
 
 ```sh
-./scripts/memora-instance.sh build   ob1   # build that instance's image tag
-./scripts/memora-instance.sh up      ob1   # start the container
-./scripts/memora-instance.sh proxy   ob1   # render the plist + print install cmds
+./scripts/memora-instance.sh build   alpha   # build that instance's image tag
+./scripts/memora-instance.sh up      alpha   # start the container
+./scripts/memora-instance.sh proxy   alpha   # render the plist + print install cmds
 ./scripts/memora-instance.sh status        # all instances at a glance
 ```
 
@@ -94,15 +112,15 @@ Per-store files (one D1 database each):
 | file | `PORT` | used by (from the file's own comment) |
 |---|---|---|
 | `memora.env` | 8910 | agentic-box |
-| `ob1.env` | 8911 | SAIL/ob1 + tarmacs/terminator |
-| `bestation.env` | 8912 | bestation |
-| `re.env` | 8913 | re |
+| `alpha.env` | 8911 | alpha-app + alpha-tool |
+| `beta.env` | 8912 | beta |
+| `gamma.env` | 8913 | gamma |
 
 Registry file (one container, every store by path):
 
 | file | `PORT` | names in `MEMORA_DATABASES` |
 |---|---|---|
-| `all.env` | 8920 | `memora`, `ob1`, `bestation`, `re` (`MEMORA_DEFAULT_DB=memora`) |
+| `all.env` | 8920 | `memora`, `alpha`, `beta`, `gamma` (`MEMORA_DEFAULT_DB=memora`) |
 
 Which of those is running on a given host is an operational fact, not
 something these files can assert. `./scripts/memora-instance.sh status`

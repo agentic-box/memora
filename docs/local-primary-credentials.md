@@ -12,22 +12,22 @@ purpose**, not by database.
 
 | credential | Cloudflare permission | held by | delivered as |
 |---|---|---|---|
-| (a) `MEMORA_D1_EDIT_TOKEN` | Account → D1 → **Edit** | memora-all, for every store still served from `d1://` (all stores until their cutover, including each shadow week) | `CLOUDFLARE_API_TOKEN` in memora-all's env (the name `D1Backend` reads), from `~/.config/memora/credentials.mcp.json` on nuc8. No code change |
+| (a) `MEMORA_D1_EDIT_TOKEN` | Account → D1 → **Edit** | memora-all, for every store still served from `d1://` (all stores until their cutover, including each shadow week) | `CLOUDFLARE_API_TOKEN` in memora-all's env (the name `D1Backend` reads), from `~/.config/memora/credentials.mcp.json` on deploy-host. No code change |
 | (b) `MEMORA_D1_REPLICATOR_TOKEN` | Account → D1 → **Edit** | memora-all's replicator, write mode only | `MEMORA_D1_REPLICATOR_TOKEN`, read only by `memora/replicator.py` |
 | (c) `MEMORA_D1_READ_TOKEN` | Account → D1 → **Read** | the shadow applier's reader; `local_primary.py` export, recheck and compare | `MEMORA_D1_READ_TOKEN`, or `--read-token-file`; given to wrangler only as the subprocess's `CLOUDFLARE_API_TOKEN` |
 | operator | D1 Edit: token (b), used by a person | whoever runs `local_primary.py` restore apply, the sequence step or `restamp` | a 0600 file passed with `--credential-file`; never a service env. Each use also needs a receipt |
 | Pages deploy | Pages (no D1) | the user only; on no agent host | a `wrangler login` session or a Pages-only token on the user's machine |
-| memora-all health token | — | operators, probes | `~/.config/memora/all.health-token` (0600) on nuc8 |
-| memora-all admin token | — | operators, `local_primary.py` | `~/.config/memora/all.admin-token` (0600) on nuc8; never equal to the health token |
+| memora-all health token | — | operators, probes | `~/.config/memora/all.health-token` (0600) on deploy-host |
+| memora-all admin token | — | operators, `local_primary.py` | `~/.config/memora/all.admin-token` (0600) on deploy-host; never equal to the health token |
 
 Tokens (a), (b) and (c) carry **no Pages permission**.
 
 By phase:
 
-| phase | memora-all | scripts on nuc8 | other hosts |
+| phase | memora-all | scripts on deploy-host | other hosts |
 |---|---|---|---|
 | before F6 (L1b–L8) | the OLD token | none | the OLD token (Mac MCP etc.) |
-| after F6, before any shadow | (a) | (c) for exports | nothing: repointed to nuc8 (F4, F5) |
+| after F6, before any shadow | (a) | (c) for exports | nothing: repointed to deploy-host (F4, F5) |
 | store X in its shadow week | (a) plus (c) (shadow reader) | (c) | nothing |
 | store X cut over, others not | (a) for the uncut stores; (b) for X's replicator; (c) while any store is in shadow | (c); operator (b) for restore, sequence or restamp | nothing |
 | after L12, rollback window open (14 days after L12's clean write week) | (a) still held, so a rollback remains possible; (b); (c) for nightly compares | (c); operator | nothing |
@@ -42,15 +42,15 @@ For each of (a), (b), (c):
    R2 (R2 uses its own S3 keys).
 2. **Account resources**: `Include` · the one account that holds the memora D1
    databases.
-3. **Client IP filtering** (recommended): nuc8's egress address for (a) and
-   (b); nuc8 plus any operator host for (c).
+3. **Client IP filtering** (recommended): deploy-host's egress address for (a) and
+   (b); deploy-host plus any operator host for (c).
 4. **TTL**: none for (a)–(c); they are revoked by the rotation below.
 5. Name them `memora-d1-edit`, `memora-d1-replicator` and `memora-d1-read`,
    so the dashboard shows what each one is.
 6. Verify each one: `curl -H "Authorization: Bearer <token>"
    https://api.cloudflare.com/client/v4/user/tokens/verify` must answer
    `"status": "active"`.
-7. Store each in a 0600 file on nuc8 only (for example
+7. Store each in a 0600 file on deploy-host only (for example
    `~/.config/memora/d1-edit.token`); never in a repo, an instance `.env` or a
    workspace `.mcp.json`.
 
@@ -65,9 +65,9 @@ last, only after nothing but memora-all uses D1.
    from the Mac:
 
    ```sh
-   scripts/local_primary.py check-endpoint --memora-url http://nuc8:8920 \
-     --health-token-file ~/.config/memora/nuc8.health-token \
-     --admin-token-file ~/.config/memora/nuc8.admin-token --store scratch
+   scripts/local_primary.py check-endpoint --memora-url http://deploy-host:8920 \
+     --health-token-file ~/.config/memora/deploy-host.health-token \
+     --admin-token-file ~/.config/memora/deploy-host.admin-token --store scratch
    ```
 
    It proves liveness, that the admin token is enforced (no token and the
@@ -78,10 +78,10 @@ last, only after nothing but memora-all uses D1.
 3. **Repoint every client (F4, F5)**, one file at a time, dry run first:
 
    ```sh
-   scripts/repoint_mcp_config.py ~/.claude.json --url http://nuc8:8920/mcp/memora
-   scripts/repoint_mcp_config.py ~/.claude.json --url http://nuc8:8920/mcp/memora --apply \
-     --check-health-token-file ~/.config/memora/nuc8.health-token \
-     --check-admin-token-file ~/.config/memora/nuc8.admin-token
+   scripts/repoint_mcp_config.py ~/.claude.json --url http://deploy-host:8920/mcp/memora
+   scripts/repoint_mcp_config.py ~/.claude.json --url http://deploy-host:8920/mcp/memora --apply \
+     --check-health-token-file ~/.config/memora/deploy-host.health-token \
+     --check-admin-token-file ~/.config/memora/deploy-host.admin-token
    ```
 
    Only the routing of each direct-D1 entry changes: `command`/`args`
@@ -103,7 +103,7 @@ last, only after nothing but memora-all uses D1.
    through the scratch store (`--check-store`, default `scratch`), and a
    failure refuses the repoint. Repeat for every file the audit (step 5) lists: workspace
    `.mcp.json` files, `~/.claude.json`, `~/.config/memora/*credentials*.mcp.json`
-   on the Mac, ob1, bestation and re.
+   on the Mac, alpha, beta and gamma.
    Then **verify a real client connection through the new entry**: start
    the client (for example Claude Code in that workspace) and call
    `memory_stats` through the repointed server entry; it must answer with
@@ -120,13 +120,13 @@ last, only after nothing but memora-all uses D1.
    ```
 
    An instance whose registry is still `d1://` must first be repointed in
-   its `instances/<name>.env` (or retired: its workspaces now use nuc8).
+   its `instances/<name>.env` (or retired: its workspaces now use deploy-host).
 5. **Audit files AND running containers on every host (F4/F5 done when
    clean)**:
 
    ```sh
-   scripts/audit_configs.py --local --host nuc8 --host ob1 --host bestation --host re
-   scripts/audit_configs.py --local --host nuc8 --host ob1 --host bestation --host re --containers-only   # quick re-check
+   scripts/audit_configs.py --local --host deploy-host --host alpha --host beta --host gamma
+   scripts/audit_configs.py --local --host deploy-host --host alpha --host beta --host gamma --containers-only   # quick re-check
    ```
 
    Every run scans the configuration files and inspects the environment of
@@ -146,15 +146,15 @@ last, only after nothing but memora-all uses D1.
    a runtime prints is copied into a report (only command names and exit
    status).
    Exit 0 only when no host has a direct-D1 client except memora-all itself
-   (`instances/all.env`; on nuc8, `~/.config/memora/credentials.mcp.json`,
+   (`instances/all.env`; on deploy-host, `~/.config/memora/credentials.mcp.json`,
    `all.*` and the running `memora-all` container). A host that cannot be
    audited, or whose runtime cannot list or inspect its containers, counts
    as not clean.
 6. **check-endpoint from each client host**: run step 2's command on every
-   host that was repointed (the Mac, ob1, bestation, re); each must print
+   host that was repointed (the Mac, alpha, beta, gamma); each must print
    `"ok": true`.
 7. **Move memora-all to (a) (F6)**: put (a) as `CLOUDFLARE_API_TOKEN` in
-   nuc8's `~/.config/memora/credentials.mcp.json` (a backup is kept by the
+   deploy-host's `~/.config/memora/credentials.mcp.json` (a backup is kept by the
    deploy), redeploy, and check `/health/db/<store>` for every store.
 8. **Revoke the OLD token** in the dashboard, only when ALL of these hold
    (the revoke gate):

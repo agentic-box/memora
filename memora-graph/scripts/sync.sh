@@ -4,14 +4,14 @@
 # Usage:
 #   ./scripts/sync.sh           # Local D1 (development) only
 #
-# RETIRED for remote D1: memora-all on nuc8 is the only D1 writer
+# RETIRED for remote D1: memora-all on deploy-host is the only D1 writer
 # (docs/local-primary-implementation.md §0 P6, §6 F3). Any remote run exits 1
 # before it reads .mcp.json, runs python or calls the broadcast endpoint.
 
 for arg in "$@"; do
     case "$arg" in
         --remote|--remote=*)  # abbreviations are rejected by sync-to-d1.py (allow_abbrev=False)
-            echo "sync.sh: remote D1 sync is retired. memora-all on nuc8 is the only D1 writer; see docs/local-primary-implementation.md §0 P6 and §6 F3." >&2
+            echo "sync.sh: remote D1 sync is retired. memora-all on deploy-host is the only D1 writer; see docs/local-primary-implementation.md §0 P6 and §6 F3." >&2
             exit 1
             ;;
     esac

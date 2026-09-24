@@ -2,8 +2,8 @@
 # Run the local-primary operator tool (scripts/local_primary.py) in a
 # one-off container of the image memora-all runs NOW (X3; plan §5.3 and §4).
 #
-#   LP_TOKEN_DIR=/etc/memora/lp-secrets scripts/lp_container.sh rollback re --phase verify \
-#       --store /data/re.db --lock-barrier --admin-token-file /run/secrets/memora/admin \
+#   LP_TOKEN_DIR=/etc/memora/lp-secrets scripts/lp_container.sh rollback gamma --phase verify \
+#       --store /data/gamma.db --lock-barrier --admin-token-file /run/secrets/memora/admin \
 #       --health-token-file /run/secrets/memora/health --read-token-file /run/secrets/memora/d1-read ...
 #
 # - The image is memora-all's own image ID (`inspect .Image`), not a tag that

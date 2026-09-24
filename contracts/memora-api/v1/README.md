@@ -12,6 +12,12 @@ minor version; anything that breaks an existing client is `/api/v2`.
 Versioning starts at the first landed (tagged) memora release that carries
 this directory: 1.0.0 is that first version, and changes made before it
 landed are part of 1.0.0, not versions of their own.
+A change to the README or to fixture data only, with no change to any
+schema, route or behaviour, bumps the patch version.
+
+- 1.0.1: docs and fixture data only. The example store names are neutral
+  (`alpha`); no schema, route or behaviour changed. A 1.0.0 client needs no
+  change.
 
 ## Routes
 
@@ -72,7 +78,7 @@ created, used or held.
 
 - `MEMORA_API_TOKENS_FILE` (absolute path) holds a JSON object mapping the
   lowercase hex `sha256(token)` to a non-empty list of store names, for
-  example `{"ad1e…7823": ["memora", "ob1"]}`. The file never holds a token.
+  example `{"ad1e…7823": ["memora", "alpha"]}`. The file never holds a token.
 - The API **always** needs a tokens file. Without `MEMORA_API_TOKENS_FILE`
   the routes are not registered on any bind address, loopback included, and
   startup logs an error. Every request needs a token that lists the store,
@@ -224,7 +230,7 @@ On a transactional store (Phase L; §3.2 of the design):
 
 - The test token is `memora-api-v1-test-token`, and its sha256 is
   `ad1e1c54d5de91f836f918da0c800e77a08b0bcddae8f953b139c05db53d7823`. In the
-  fixtures it may use the stores `memora` and `nostore`, and not `ob1`.
+  fixtures it may use the stores `memora` and `nostore`, and not `alpha`.
 - `live` says whether a real Phase 0 server on a scratch store produces the
   fixture: `exact` (the body matches, apart from `volatile`), `schema` (the
   status and schema match; the data differs), or `null` (not producible

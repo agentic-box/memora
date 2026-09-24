@@ -1,4 +1,4 @@
-"""E1 (production, nuc8 v0.5.0): the embedding fingerprint identifies the
+"""E1 (production, deploy-host v0.5.0): the embedding fingerprint identifies the
 MODEL and REPRESENTATION only -- backend|model|repr, never the endpoint host
 -- and old host-bearing stamps compare equal when those match; a search
 never rebuilds embeddings on any backend (a repairable mismatch is logged
@@ -16,7 +16,7 @@ import pytest
 import memora
 from memora import admin, embeddings, storage
 
-OLD_HOST_TFIDF = "tfidf|tfidf|100.85.27.63:11434|sparse"  # the pre-E1 format, the old M1's host
+OLD_HOST_TFIDF = "tfidf|tfidf|100.64.0.12:11434|sparse"  # the pre-E1 format, the old M1's host
 
 
 def _stamp_value(fingerprint, audit):
@@ -25,13 +25,13 @@ def _stamp_value(fingerprint, audit):
 
 @pytest.fixture
 def store(tmp_path, monkeypatch):
-    path = tmp_path / "re.db"
-    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"re": str(path)}))
+    path = tmp_path / "gamma.db"
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"gamma": str(path)}))
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     storage._EMBEDDING_REPAIR_NEEDED.clear()
     embeddings._MODEL_RECORDED.clear()
-    token = storage.CURRENT_DB.set("re")
+    token = storage.CURRENT_DB.set("gamma")
     conn = storage.connect()
     for i in range(3):
         storage.add_memory(conn, content=f"apples and pears number {i}", metadata={}, tags=[])
@@ -83,7 +83,7 @@ def _audit(path):
 # ------------------------------------------------------------------ the fingerprint
 
 @pytest.mark.parametrize("fp, expected", [
-    ("openai|bge-m3|100.85.27.63:11434|dense:1024", "openai|bge-m3|dense:1024"),
+    ("openai|bge-m3|100.64.0.12:11434|dense:1024", "openai|bge-m3|dense:1024"),
     ("openai|bge-m3|dense:1024", "openai|bge-m3|dense:1024"),
     ("tfidf|tfidf|default-host|sparse", "tfidf|tfidf|sparse"),
     ("tfidf", "tfidf"),
@@ -95,7 +95,7 @@ def test_normalize_fingerprint_drops_only_the_host(fp, expected):
 
 def test_the_current_fingerprint_carries_no_host(monkeypatch):
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "bge-m3")
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://100.118.64.23:11434/v1")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://100.64.0.11:11434/v1")
     assert embeddings.current_embedding_fingerprint("openai", observed_dim=1024) == "openai|bge-m3|dense:1024"
     assert embeddings.current_embedding_fingerprint("tfidf") == "tfidf|tfidf|sparse"
 
@@ -106,18 +106,18 @@ def test_a_host_move_alone_is_not_a_mismatch_for_dense_vectors(tmp_path, monkeyp
 
     monkeypatch.setenv("OPENAI_EMBEDDING_MODEL", "bge-m3")
     monkeypatch.setenv("OPENAI_API_KEY", "k")
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://100.118.64.23:11434/v1")
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://100.64.0.11:11434/v1")
     db = sqlite3.connect(tmp_path / "m.db")
     db.row_factory = sqlite3.Row
     schema.ensure_schema(db)
     for i in (1, 2):
         db.execute("INSERT INTO memories (id, content) VALUES (?, 'x')", (i,))
         embeddings.upsert_embedding(db, i, {str(j): 0.1 for j in range(8)})
-    embeddings.set_stored_embedding_model(db, "openai|bge-m3|100.85.27.63:11434|dense:8")
+    embeddings.set_stored_embedding_model(db, "openai|bge-m3|100.64.0.12:11434|dense:8")
     embeddings.verify_embedding_integrity(db)
     db.commit()
     assert embeddings.check_embedding_model_mismatch(db, "openai") is False
-    embeddings.set_stored_embedding_model(db, "openai|text-embedding-3-small|100.118.64.23:11434|dense:8")
+    embeddings.set_stored_embedding_model(db, "openai|text-embedding-3-small|100.64.0.11:11434|dense:8")
     embeddings.verify_embedding_integrity(db)
     db.commit()
     assert embeddings.check_embedding_model_mismatch(db, "openai") is True, "a MODEL change still is one"
@@ -126,17 +126,17 @@ def test_a_host_move_alone_is_not_a_mismatch_for_dense_vectors(tmp_path, monkeyp
 # ------------------------------------------------------------------ symptom 1: the seeded local store
 
 def test_a_seeded_store_with_old_host_stamps_neither_warns_nor_rebuilds(store, monkeypatch, caplog):
-    """`re` after the cutover: embedding_model from the new host, D1's
+    """`gamma` after the cutover: embedding_model from the new host, D1's
     integrity stamp still from the old one -- as the seed copied them."""
-    _meta(store, "embedding_model", "tfidf|tfidf|100.118.64.23:11434|sparse")
+    _meta(store, "embedding_model", "tfidf|tfidf|100.64.0.11:11434|sparse")
     _meta(store, "embedding_integrity", _stamp_value(OLD_HOST_TFIDF, _audit(store)))
-    monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"re": "d1://acct/db"}))
+    monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"gamma": "d1://acct/db"}))
     calls = _rebuild_spy(monkeypatch)
     with caplog.at_level(logging.WARNING, logger="memora.storage"):
         results = _search(3)
     assert calls == [] and all(len(r) == 2 for r in results)
     assert not [r for r in caplog.records if "embedding integrity" in r.getMessage()]
-    assert "embeddings" not in (admin.gate_health("re") or {})
+    assert "embeddings" not in (admin.gate_health("gamma") or {})
 
 
 # ------------------------------------------------------------------ no implicit rebuild, anywhere
@@ -148,7 +148,7 @@ def test_a_real_model_mismatch_is_reported_once_and_never_rebuilt_from_a_search(
     _meta(store, "embedding_model", real_mismatch)
     _meta(store, "embedding_integrity", _stamp_value(real_mismatch, _audit(store)))
     if replicated:
-        monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"re": "d1://acct/db"}))
+        monkeypatch.setenv("MEMORA_REPLICAS", json.dumps({"gamma": "d1://acct/db"}))
     calls = _rebuild_spy(monkeypatch)
     with caplog.at_level(logging.WARNING, logger="memora.storage"):
         for _ in range(3):
@@ -157,7 +157,7 @@ def test_a_real_model_mismatch_is_reported_once_and_never_rebuilt_from_a_search(
     assert calls == [], "never from a search"
     notes = [r.getMessage() for r in caplog.records if "NOT rebuilt from a search" in r.getMessage()]
     assert len(notes) == 1 and "memory_rebuild_embeddings" in notes[0] and "replicates to D1" in notes[0]
-    health = admin.gate_health("re")["embeddings"]["repair_needed"]
+    health = admin.gate_health("gamma")["embeddings"]["repair_needed"]
     assert health["reason"] == "model_or_representation_mismatch" and "memory_rebuild_embeddings" in health["action"]
 
 
@@ -165,13 +165,13 @@ def test_the_explicit_rebuild_repairs_and_clears_the_health_note(store, monkeypa
     _meta(store, "embedding_model", "openai|text-embedding-3-small|dense:1536")
     with pytest.raises(storage.SearchUnavailable):
         _search()
-    assert "embeddings" in admin.gate_health("re")
+    assert "embeddings" in admin.gate_health("gamma")
     conn = storage.connect()
     try:
         assert storage.rebuild_embeddings(conn) == 3  # what memory_rebuild_embeddings runs
     finally:
         conn.close()
-    assert "embeddings" not in admin.gate_health("re")
+    assert "embeddings" not in admin.gate_health("gamma")
     assert all(len(r) == 2 for r in _search(2))
 
 
@@ -184,7 +184,7 @@ def test_a_store_never_audited_searches_its_comparable_vectors_without_a_rebuild
     with caplog.at_level(logging.WARNING, logger="memora.storage"):
         assert all(len(r) == 2 for r in _search(2)) and calls == []
     assert not [r for r in caplog.records if "embedding integrity" in r.getMessage()]
-    assert "embeddings" not in (admin.gate_health("re") or {})
+    assert "embeddings" not in (admin.gate_health("gamma") or {})
 
 
 # ------------------------------------------------------------------ symptom 2: the D1 stores
@@ -199,12 +199,12 @@ def d1(tmp_path, monkeypatch):
     send = D1Send(replica)
     monkeypatch.setattr(backends.D1Connection, "_send", lambda self, sql, params=None: send(self, sql, params))
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "edit-token")
-    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"bestation": "d1://acct/db1"}))
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"beta": "d1://acct/db1"}))
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     storage._EMBEDDING_REPAIR_NEEDED.clear()
     embeddings._MODEL_RECORDED.clear()  # one key per D1 database id; each test has its own fake
-    token = storage.CURRENT_DB.set("bestation")
+    token = storage.CURRENT_DB.set("beta")
     conn = storage.connect()
     for i in range(3):
         storage.add_memory(conn, content=f"apples and pears number {i}", metadata={}, tags=[])
@@ -231,8 +231,8 @@ def _d1_meta_get(replica, key):
         db.close()
 
 
-def test_bestation_old_host_stamp_and_a_leftover_lease_compare_equal_no_rebuild(d1, monkeypatch, caplog):
-    """bestation after the M1 move: embedding_model and the stamp from the old
+def test_beta_old_host_stamp_and_a_leftover_lease_compare_equal_no_rebuild(d1, monkeypatch, caplog):
+    """beta after the M1 move: embedding_model and the stamp from the old
     host, a rebuild lease left by the 13:17 search. It must simply compare
     equal: searches work, nothing is written, nothing is logged."""
     _d1_meta(d1, "embedding_model", OLD_HOST_TFIDF)
@@ -249,7 +249,7 @@ def test_bestation_old_host_stamp_and_a_leftover_lease_compare_equal_no_rebuild(
 
 
 def test_a_d1_store_with_a_real_mismatch_is_not_rebuilt_on_d1_by_a_search(d1, monkeypatch, caplog):
-    """ob1's 13:21 rebuild of 615 embeddings ON D1 from one search: never again."""
+    """alpha's 13:21 rebuild of 615 embeddings ON D1 from one search: never again."""
     real_mismatch = "openai|text-embedding-3-small|dense:1536"
     _d1_meta(d1, "embedding_model", real_mismatch)
     _d1_meta(d1, "embedding_integrity", _stamp_value(real_mismatch, _audit(d1.path)))
@@ -260,7 +260,7 @@ def test_a_d1_store_with_a_real_mismatch_is_not_rebuilt_on_d1_by_a_search(d1, mo
                 _search()
     assert calls == []
     assert len([r for r in caplog.records if "NOT rebuilt from a search" in r.getMessage()]) == 1
-    assert admin.gate_health("bestation")["embeddings"]["repair_needed"]["reason"] == \
+    assert admin.gate_health("beta")["embeddings"]["repair_needed"]["reason"] == \
         "model_or_representation_mismatch"
 
 

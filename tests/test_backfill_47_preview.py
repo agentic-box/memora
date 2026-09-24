@@ -10,7 +10,7 @@ import memora
 import memora.storage as storage
 from scripts import preview_backfill_47 as preview
 
-PROJECTS = ["memora", "clmux", "acebar", "pi"]
+PROJECTS = ["memora", "clmux", "project-a", "pi"]
 CLMUX_TEXT = "clmux TUI sidebar tmux pane workspace switching in the clmux daemon clmuxd"
 NEUTRAL_TEXT = "A neutral note about scheduling that names no project at all."
 

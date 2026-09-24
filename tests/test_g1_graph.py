@@ -292,16 +292,16 @@ def test_the_exact_origin_is_accepted(stores):
 def test_origin_ok_compares_scheme_host_and_port():
     from starlette.requests import Request as R
 
-    def req(origin, host="100.104.19.74:8766"):
+    def req(origin, host="100.64.0.10:8766"):
         headers = [(b"host", host.encode())] + ([(b"origin", origin.encode())] if origin is not None else [])
         return R({"type": "http", "scheme": "http", "path": "/", "headers": headers, "query_string": b"",
-                  "server": ("100.104.19.74", 8766)})
+                  "server": ("100.64.0.10", 8766)})
 
     assert gs._origin_ok(req(None))
-    assert gs._origin_ok(req("http://100.104.19.74:8766"))
-    assert not gs._origin_ok(req("http://100.104.19.74:8765"))
-    assert not gs._origin_ok(req("http://100.104.19.74"))
-    assert not gs._origin_ok(req("https://100.104.19.74:8766"))
+    assert gs._origin_ok(req("http://100.64.0.10:8766"))
+    assert not gs._origin_ok(req("http://100.64.0.10:8765"))
+    assert not gs._origin_ok(req("http://100.64.0.10"))
+    assert not gs._origin_ok(req("https://100.64.0.10:8766"))
     assert not gs._origin_ok(req("http://127.0.0.1:8766"))
     assert gs._origin_ok(req("http://localhost:8765", host="localhost:8765"))
     assert not gs._origin_ok(req("http://localhost:3000", host="localhost:8765"))
@@ -313,3 +313,48 @@ def test_a_refused_single_store_is_503(local_db, monkeypatch):
     monkeypatch.setattr(storage, "_store_refusals", {None: "data volume unfit"})
     r = _client().get("/api/memories")
     assert r.status_code == 503 and r.json()["error"] == "store_refused"
+
+
+# ---------------------------------------------------------------- CFG1: store names are configuration
+
+class _FakeImages:
+    bucket = "b"
+
+    def __init__(self):
+        self.keys = []
+        outer = self
+
+        class _S3:
+            def get_object(self, Bucket, Key):
+                outer.keys.append(Key)
+                import io
+                return {"Body": io.BytesIO(b"png"), "ContentType": "image/png"}
+        self.s3_client = _S3()
+
+
+@pytest.mark.parametrize("path, key", [
+    ("/r2/images/1/0.png", "images/1/0.png"),
+    ("/r2/memora/images/1/0.png", "images/1/0.png"),
+    ("/r2/beta/images/1/0.png", "images/1/0.png"),     # a configured store's prefix
+    ("/r2/alpha/images/1/0.png", "images/1/0.png"),
+    ("/r2/other/images/1/0.png", None),                # not a configured store: not stripped, 404
+])
+def test_the_image_proxy_strips_only_configured_store_prefixes(stores, monkeypatch, path, key):
+    fake = _FakeImages()
+    import memora.image_storage as image_storage
+    monkeypatch.setattr(image_storage, "get_image_storage_instance", lambda: fake)
+    r = _client().get(path)
+    if key is None:
+        assert r.status_code == 404 and fake.keys == []
+    else:
+        assert r.status_code == 200 and fake.keys == [key]
+
+
+def test_the_page_names_no_store_or_worker_url_of_its_own(stores):
+    """The selector's options come from /api/databases (the configured
+    registry); the shipped markup holds only the default store, and there is
+    no realtime URL in the page."""
+    html = _client().get("/graph").text
+    assert '<option value="memora">memora</option>' in html
+    assert "workers.dev" not in html
+    assert '<option value="alpha">' not in html and '<option value="beta">' not in html

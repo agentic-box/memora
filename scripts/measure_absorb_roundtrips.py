@@ -30,7 +30,7 @@ The run ASSERTS the expected actions for the scenario, and with
 
 Default latencies: D1 0.2 s/request (memora #973 measured ~20 s for ~100
 requests on the live store), embeddings 0.1 s/request (bge-m3 on the M1 from
-nuc8, measured 2026-09-23), LLM 2.0 s/call (assumed for gpt-4o-mini via
+deploy-host, measured 2026-09-23), LLM 2.0 s/call (assumed for gpt-4o-mini via
 OpenRouter; pass the real figure when known).
 
 Usage:

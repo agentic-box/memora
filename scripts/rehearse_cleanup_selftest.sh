@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Self-test of the teardown rules in scripts/rehearse_objects.sh against a
-# real runtime (server2):  scripts/rehearse_cleanup_selftest.sh IMAGE
+# real runtime (build-host):  scripts/rehearse_cleanup_selftest.sh IMAGE
 # Every object it creates has a name unique to this test run and a captured
 # ID. Its decoys are put on the run's own object list on purpose and must
 # survive the teardown; the test then removes them by their captured IDs

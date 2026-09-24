@@ -391,19 +391,19 @@ class TestUpgradeFromAnAnonymousVolume:
     staged, verified, while stopped -- keep the old container for rollback,
     and abort before run if the copy fails."""
 
-    REG = ["""MEMORA_DATABASES='{"re": "/data/re.db", "memora": "d1://acct/db"}'""", "MEMORA_DEFAULT_DB=re"]
+    REG = ["""MEMORA_DATABASES='{"gamma": "/data/gamma.db", "memora": "d1://acct/db"}'""", "MEMORA_DEFAULT_DB=gamma"]
     ANON = "5e" * 32
 
     def _old_volume(self, tmp_path):
         import sqlite3
         old = tmp_path / "volumes" / self.ANON
         (old / "intent").mkdir(parents=True)
-        db = sqlite3.connect(old / "re.db")
+        db = sqlite3.connect(old / "gamma.db")
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)")
         db.execute("INSERT INTO memories (content) VALUES ('must survive')")
         db.commit()
-        keep = sqlite3.connect(old / "re.db")  # sidecars stay while copied
+        keep = sqlite3.connect(old / "gamma.db")  # sidecars stay while copied
         keep.execute("SELECT 1").fetchone()
         (old / "intent" / "memora.jsonl").write_text('{"type":"intent","id":7,"sql":"INSERT INTO memories"}\n')
         return old, (db, keep)
@@ -418,7 +418,7 @@ class TestUpgradeFromAnAnonymousVolume:
 
     def test_upgrade_copies_everything_byte_identical_and_keeps_the_old_container(self, tmp_path):
         old, conns = self._old_volume(tmp_path)
-        assert (old / "re.db-wal").exists() and (old / "re.db-shm").exists()
+        assert (old / "gamma.db-wal").exists() and (old / "gamma.db-shm").exists()
         proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
                                 runtime_env={"CURRENT_MOUNT": self.ANON})
         assert proc.returncode == 0, proc.stderr
@@ -427,7 +427,7 @@ class TestUpgradeFromAnAnonymousVolume:
         assert self._files(new) == self._files(old)
         for c in conns:
             c.close()
-        assert {"re.db", "re.db-wal", "re.db-shm", "intent/memora.jsonl"} <= set(self._files(new))
+        assert {"gamma.db", "gamma.db-wal", "gamma.db-shm", "intent/memora.jsonl"} <= set(self._files(new))
         assert f"source={self.ANON}" in (new / ".memora-volume-source").read_text()
         verbs = [c[0] for c in calls]
         stop, copy = verbs.index("stop"), next(i for i, c in enumerate(calls)
@@ -466,7 +466,7 @@ class TestUpgradeFromAnAnonymousVolume:
         verbs = [c[0] for c in calls]
         assert not _removals(calls) and "rename" not in verbs and argv == []
         assert any(c[0] == "rm" and "-migrate-" in c[1] for c in calls), "the failed migrator is cleaned up"
-        assert (old / "re.db").exists(), "the old volume is untouched"
+        assert (old / "gamma.db").exists(), "the old volume is untouched"
 
     def test_a_still_running_container_is_not_copied(self, tmp_path):
         self._old_volume(tmp_path)
@@ -483,7 +483,7 @@ class TestUpgradeFromAnAnonymousVolume:
             c.close()
         assert proc.returncode == 0, proc.stderr
         assert "old volume" in proc.stdout and "rm" in [c[0] for c in calls]
-        assert (old / "re.db").exists()
+        assert (old / "gamma.db").exists()
 
 
 @pytest.mark.skipif(not os.path.exists(SCRIPT), reason="deploy script not present")
@@ -552,7 +552,7 @@ def test_default_memory_is_the_measured_gate():
 
 
 class TestRealPodmanInspectShape:
-    """R1: the parser reads `podman inspect` output recorded on server2 (token
+    """R1: the parser reads `podman inspect` output recorded on build-host (token
     values redacted, paths anonymised): the production-shaped old container
     (an anonymous /data volume) and the deployed one (the named volume)."""
 

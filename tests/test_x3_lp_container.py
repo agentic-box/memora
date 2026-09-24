@@ -14,7 +14,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "lp_container.sh"
-ROUTES = {"re": "/data/re.db", "other": "d1://acct/db"}
+ROUTES = {"gamma": "/data/gamma.db", "other": "d1://acct/db"}
 
 FAKE = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -90,8 +90,8 @@ def rt(tmp_path):
     return run
 
 
-VERIFY = ["rollback", "re", "--phase", "verify", "--store", "/data/re.db", "--lock-barrier"]
-FINISH = ["rollback", "re", "--phase", "finish", "--store", "/data/re.db", "--lock-barrier"]
+VERIFY = ["rollback", "gamma", "--phase", "verify", "--store", "/data/gamma.db", "--lock-barrier"]
+FINISH = ["rollback", "gamma", "--phase", "finish", "--store", "/data/gamma.db", "--lock-barrier"]
 
 
 def _create(calls):
@@ -126,12 +126,12 @@ def test_it_runs_the_tool_in_memora_alls_current_image_without_docker_or_rm(rt):
 
 
 @pytest.mark.parametrize("args, required", [
-    (["restore", "re", "--out", "/data/re.db", "--lock-barrier"], "false"),
-    (["resume", "re", "--store", "/data/re.db", "--lock-barrier"], "false"),
-    (["sequence-highwater", "re", "--local", "/data/re.db", "--lock-barrier"], "false"),
+    (["restore", "gamma", "--out", "/data/gamma.db", "--lock-barrier"], "false"),
+    (["resume", "gamma", "--store", "/data/gamma.db", "--lock-barrier"], "false"),
+    (["sequence-highwater", "gamma", "--local", "/data/gamma.db", "--lock-barrier"], "false"),
     (VERIFY, "false"),
     (FINISH, "true"),
-    (["rollback", "re", "--phase", "drain", "--store", "/data/re.db"], "true"),
+    (["rollback", "gamma", "--phase", "drain", "--store", "/data/gamma.db"], "true"),
 ])
 def test_the_service_state_is_checked_before_anything_runs(rt, args, required):
     wrong = "true" if required == "false" else "false"
@@ -150,7 +150,7 @@ def test_a_state_change_during_the_run_fails_loudly(rt):
 
 def test_other_commands_do_not_require_a_state(rt):
     for running in ("true", "false"):
-        code, _, err = rt("fk-audit", "re", "--store", "/data/re.db", RUNNING_BEFORE=running)
+        code, _, err = rt("fk-audit", "gamma", "--store", "/data/gamma.db", RUNNING_BEFORE=running)
         assert code == 0, err
 
 
@@ -175,12 +175,12 @@ def test_a_container_that_does_not_carry_this_runs_label_is_left_alone(rt):
 
 
 def test_service_stopped_is_refused_inside_the_container(rt):
-    code, calls, err = rt("restore", "re", "--service-stopped")
+    code, calls, err = rt("restore", "gamma", "--service-stopped")
     assert code == 65 and "--lock-barrier" in err and calls == []
 
 
 def test_rollback_without_a_phase_is_a_usage_error(rt):
-    code, calls, _ = rt("rollback", "re", "--store", "/data/re.db")
+    code, calls, _ = rt("rollback", "gamma", "--store", "/data/gamma.db")
     assert code == 65 and calls == []
 
 

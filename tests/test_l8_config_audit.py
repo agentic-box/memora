@@ -45,11 +45,11 @@ def _tree(root: Path):
     (root / ".config" / "memora" / "credentials.mcp.json").write_text(json.dumps(stdio, indent=2))
     (root / "work" / "proj").mkdir(parents=True)
     (root / "work" / "proj" / ".mcp.json").write_text(json.dumps(
-        {"mcpServers": {"memora": {"type": "http", "url": "http://nuc8:8920/mcp/memora"}}}))
+        {"mcpServers": {"memora": {"type": "http", "url": "http://deploy-host:8920/mcp/memora"}}}))
     (root / "repo" / "instances").mkdir(parents=True)
     (root / "repo" / "instances" / "all.env").write_text(
         f"MEMORA_DATABASES='{{\"memora\":\"{D1}{ACCT}/{DB}\"}}'\n")
-    (root / "repo" / "instances" / "re.env").write_text(f'STORAGE_URI="{D1}{ACCT}/{DB}"\n')
+    (root / "repo" / "instances" / "gamma.env").write_text(f'STORAGE_URI="{D1}{ACCT}/{DB}"\n')
     (root / ".zshrc").write_text(f"export CF_API_TOKEN={TOKEN}\nexport CLOUDFLARE_API_TOKEN=\n")
     (root / "Library" / "LaunchAgents").mkdir(parents=True)
     (root / "Library" / "LaunchAgents" / "com.x.plist").write_text(
@@ -70,7 +70,7 @@ def test_finds_every_kind_and_masks_every_value(tmp_path):
     assert ("credentials.mcp.json", "storage_uri") in kinds
     assert ("credentials.mcp.json", "cloudflare_token") in kinds
     assert ("all.env", "memora_databases") in kinds
-    assert ("re.env", "d1_uri") in kinds
+    assert ("gamma.env", "d1_uri") in kinds
     assert (".zshrc", "cloudflare_token") in kinds
     assert ("com.x.plist", "cloudflare_token") in kinds
     files = {Path(f["file"]).name for f in result["findings"]}
@@ -103,16 +103,18 @@ def test_memora_all_is_reported_but_does_not_fail(tmp_path):
     assert result["clean"] and result["blocking"] == 0
 
 
-def test_nuc8_credentials_are_memora_alls_only_on_nuc8(tmp_path, monkeypatch):
+def test_deploy_host_credentials_are_memora_alls_only_on_the_deploy_host(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     _tree(tmp_path)
-    for f in (tmp_path / ".zshrc", tmp_path / "repo" / "instances" / "re.env",
+    for f in (tmp_path / ".zshrc", tmp_path / "repo" / "instances" / "gamma.env",
               tmp_path / "Library" / "LaunchAgents" / "com.x.plist"):
         f.unlink()
     on_mac = config_audit.audit([tmp_path], host="mac", containers=False)
-    on_nuc8 = config_audit.audit([tmp_path], host="nuc8", containers=False)
+    on_deploy_host = config_audit.audit([tmp_path], host="deploy-host", containers=False, deploy_host="deploy-host")
+    unconfigured = config_audit.audit([tmp_path], host="deploy-host", containers=False)
     assert not on_mac["clean"], "on the Mac the credential file is a direct-D1 client (F4)"
-    assert on_nuc8["clean"], "on nuc8 it is memora-all's own credential source"
+    assert on_deploy_host["clean"], "on deploy-host it is memora-all's own credential source"
+    assert not unconfigured["clean"], "without a configured deploy host (CFG1) no host is memora-all's"
 
 
 def test_extra_memora_all_paths(tmp_path):
@@ -154,7 +156,7 @@ def test_cli_exit_codes_and_no_secret_on_stdout(tmp_path):
     assert TOKEN not in r.stdout + r.stderr and ACCT not in r.stdout
     clean = tmp_path / "clean"
     clean.mkdir()
-    (clean / ".mcp.json").write_text(json.dumps({"mcpServers": {"m": {"type": "http", "url": "http://nuc8:8920/mcp"}}}))
+    (clean / ".mcp.json").write_text(json.dumps({"mcpServers": {"m": {"type": "http", "url": "http://deploy-host:8920/mcp"}}}))
     r = _cli("--local", str(clean))
     assert r.returncode == 0 and "ALL CLEAN" in r.stdout
     assert _cli("--local", str(tmp_path / "missing")).returncode == 2
@@ -174,12 +176,12 @@ def test_remote_hosts_run_the_module_over_ssh(tmp_path):
     # Drops "-o X" pairs, the host and the remote "python3"; runs the rest.
     ssh = _fake_ssh(tmp_path, f'while [ "$1" = -o ]; do shift 2; done\nshift 2\ncd /\nexec {sys.executable} "$@" '
                               f'"{remote_home}"\n')
-    r = _cli("--host", "ob1", "--ssh", ssh, "--json")
+    r = _cli("--host", "alpha", "--ssh", ssh, "--json")
     out = json.loads(r.stdout)
     assert r.returncode == 1 and not out["clean"]
     host = out["hosts"][0]
-    assert host["host"] == "ob1" and host["blocking"] > 0
-    assert all(f["host"] == "ob1" for f in host["findings"])
+    assert host["host"] == "alpha" and host["blocking"] > 0
+    assert all(f["host"] == "alpha" for f in host["findings"])
     assert TOKEN not in r.stdout
 
 
@@ -188,12 +190,12 @@ def test_remote_hosts_run_the_module_over_ssh(tmp_path):
     ("echo not json\nexit 0\n", "garbage output"),
     ('echo \'{"host": "someone-else", "clean": true, "findings": [], "blocking": 0, "errors": []}\'\nexit 0\n',
      "answer from the wrong host"),
-    ('echo \'{"host": "ob1", "clean": true, "findings": [], "blocking": 0, "errors": []}\'\nexit 1\n',
+    ('echo \'{"host": "alpha", "clean": true, "findings": [], "blocking": 0, "errors": []}\'\nexit 1\n',
      "exit status contradicts the report"),
 ])
 def test_a_host_that_cannot_be_audited_is_not_clean(tmp_path, body, why):
     ssh = _fake_ssh(tmp_path, "cat >/dev/null\n" + body)
-    r = _cli("--host", "ob1", "--ssh", ssh, "--json")
+    r = _cli("--host", "alpha", "--ssh", ssh, "--json")
     out = json.loads(r.stdout)
     assert r.returncode == 1 and not out["clean"], why
     assert out["hosts"][0]["errors"], why
@@ -202,11 +204,11 @@ def test_a_host_that_cannot_be_audited_is_not_clean(tmp_path, body, why):
 def test_the_module_runs_standalone_from_stdin(tmp_path):
     """What ssh HOST python3 - does: no memora package on the remote."""
     root = _tree(tmp_path / "h")
-    r = subprocess.run([sys.executable, "-", "--json", "--host-label", "bestation", str(root)],
+    r = subprocess.run([sys.executable, "-", "--json", "--host-label", "beta", str(root)],
                        input=MODULE.read_text(), capture_output=True, text=True, cwd="/", timeout=60,
                        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
     assert r.returncode == 1, r.stderr
-    assert json.loads(r.stdout)["host"] == "bestation"
+    assert json.loads(r.stdout)["host"] == "beta"
 
 
 # ---------------------------------------------------------------- running containers
@@ -284,17 +286,18 @@ def test_a_running_container_with_the_old_token_blocks(tmp_path, runtimes):
     assert TOKEN not in dump and ACCT not in dump and "sk-live-not-d1" not in dump
 
 
-def test_memora_all_on_nuc8_is_the_exception(tmp_path, runtimes):
+def test_memora_all_on_deploy_host_is_the_exception(tmp_path, runtimes):
     env = BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}", f"MEMORA_DATABASES={{\"m\":\"{D1}{ACCT}/{DB}\"}}"]
     runtimes(docker={"memora-all": env})
     empty = tmp_path / "home"
     empty.mkdir()
-    assert config_audit.audit([empty], host="nuc8")["clean"]
-    assert not config_audit.audit([empty], host="ob1")["clean"], "memora-all is only the exception on nuc8"
+    assert config_audit.audit([empty], host="deploy-host", deploy_host="deploy-host")["clean"]
+    assert not config_audit.audit([empty], host="alpha", deploy_host="deploy-host")["clean"], "memora-all is only the exception on deploy-host"
+    assert not config_audit.audit([empty], host="deploy-host")["clean"], "without a configured deploy host nothing is exempt"
 
 
 def test_a_clean_container_is_clean(tmp_path, runtimes):
-    runtimes(docker={"web": BASE_ENV + ["MEMORA_URL=http://nuc8:8920/mcp"]})
+    runtimes(docker={"web": BASE_ENV + ["MEMORA_URL=http://deploy-host:8920/mcp"]})
     empty = tmp_path / "home"
     empty.mkdir()
     assert config_audit.audit([empty], host="mac")["clean"]
@@ -328,16 +331,16 @@ def test_containers_only_skips_files(tmp_path, runtimes):
 
 def test_containers_are_audited_on_remote_hosts_too(tmp_path, runtimes):
     """The remote run inherits the host's runtimes: here the fake ones."""
-    runtimes(podman={"memora-ob1": BASE_ENV + [f"CF_API_TOKEN={TOKEN}"]})
+    runtimes(podman={"memora-alpha": BASE_ENV + [f"CF_API_TOKEN={TOKEN}"]})
     remote_home = tmp_path / "remote"
     remote_home.mkdir()
     ssh = _fake_ssh(tmp_path, f'while [ "$1" = -o ]; do shift 2; done\nshift 2\ncd /\nexec {sys.executable} "$@" '
                               f'"{remote_home}"\n')
-    r = _cli("--host", "ob1", "--ssh", ssh, "--json", "--containers-only")
+    r = _cli("--host", "alpha", "--ssh", ssh, "--json", "--containers-only")
     out = json.loads(r.stdout)
     assert r.returncode == 1
     f = out["hosts"][0]["findings"][0]
-    assert f["kind"] == "runtime_env" and f["container"] == "memora-ob1" and f["host"] == "ob1"
+    assert f["kind"] == "runtime_env" and f["container"] == "memora-alpha" and f["host"] == "alpha"
     assert TOKEN not in r.stdout
 
 
@@ -356,11 +359,11 @@ def test_a_stopped_container_with_the_old_token_blocks(tmp_path, runtimes):
     assert r.returncode == 1 and "exited" in r.stdout and "stopped" in r.stdout
 
 
-def test_a_stopped_memora_all_on_nuc8_is_still_the_exception(tmp_path, runtimes):
+def test_a_stopped_memora_all_on_deploy_host_is_still_the_exception(tmp_path, runtimes):
     runtimes(docker={"memora-all": (BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}"], "exited")})
     empty = tmp_path / "home"
     empty.mkdir()
-    assert config_audit.audit([empty], host="nuc8")["clean"]
+    assert config_audit.audit([empty], host="deploy-host", deploy_host="deploy-host")["clean"]
 
 
 @pytest.mark.parametrize("fail", ["list", "inspect"])
@@ -379,7 +382,7 @@ def test_runtime_output_is_never_echoed(tmp_path, runtimes, fail):
 def test_invalid_remote_output_is_never_echoed(tmp_path):
     ssh = _fake_ssh(tmp_path, f"cat >/dev/null\necho 'CLOUDFLARE_API_TOKEN={TOKEN} not json'\n"
                               f"echo 'stderr {TOKEN}' >&2\nexit 3\n")
-    r = _cli("--host", "ob1", "--ssh", ssh, "--json")
+    r = _cli("--host", "alpha", "--ssh", ssh, "--json")
     assert r.returncode == 1 and TOKEN not in r.stdout + r.stderr
     assert "ssh exit 3" in r.stdout
 
@@ -401,13 +404,13 @@ def test_the_module_report_states_its_coverage(tmp_path):
     """The module itself (what runs on a remote host) prints coverage too."""
     empty = tmp_path / "home"
     empty.mkdir()
-    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "ob1", str(empty)],
+    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "alpha", str(empty)],
                        capture_output=True, text=True, timeout=60, env=dict(os.environ))
     assert r.returncode == 0, r.stdout
-    assert r.stdout.startswith("coverage ob1: ") and "docker" in r.stdout
-    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "ob1", str(empty)],
+    assert r.stdout.startswith("coverage alpha: ") and "docker" in r.stdout
+    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "alpha", str(empty)],
                        capture_output=True, text=True, timeout=60, env={**os.environ, "MEMORA_AUDIT_RUNTIMES": ""})
-    assert r.returncode == 1 and r.stdout.startswith("coverage ob1: ") and "no container runtime audited" in r.stdout
+    assert r.returncode == 1 and r.stdout.startswith("coverage alpha: ") and "no container runtime audited" in r.stdout
 
 
 
@@ -440,3 +443,22 @@ def test_an_empty_override_is_not_clean_even_with_no_runtime_installed(tmp_path,
     assert result["errors"] == ["no container runtime audited: MEMORA_AUDIT_RUNTIMES is set and empty"]
     monkeypatch.delenv("MEMORA_AUDIT_RUNTIMES")
     assert config_audit.audit([empty], host="mac")["clean"], "no runtime installed and no override: clean"
+
+
+def test_the_cli_passes_the_configured_deploy_host_to_remote_audits(tmp_path):
+    """CFG1: memora-all's host is DEPLOY_HOST from the (git-ignored) deploy
+    configuration, handed to each remote audit as --deploy-host."""
+    argv = tmp_path / "argv.txt"
+    ssh = _fake_ssh(tmp_path, f'cat >/dev/null\nprintf "%s\\n" "$@" > "{argv}"\nexit 255\n')
+    cfg = tmp_path / "deploy.env"
+    cfg.write_text("DEPLOY_HOST=alpha\n")
+    _cli("--host", "alpha", "--ssh", ssh, "--json", "--deploy-config", str(cfg))
+    args = argv.read_text().split("\n")
+    assert args[args.index("--deploy-host") + 1] == "alpha"
+    cfg.unlink()
+    r = _cli("--host", "alpha", "--ssh", ssh, "--json", "--deploy-config", str(cfg))
+    assert "--deploy-host" not in argv.read_text().split("\n")
+    assert "no host is treated as memora-all's" in r.stderr
+    _cli("--host", "alpha", "--ssh", ssh, "--json", "--deploy-config", str(cfg), "--deploy-host", "beta")
+    args = argv.read_text().split("\n")
+    assert args[args.index("--deploy-host") + 1] == "beta"

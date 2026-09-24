@@ -62,7 +62,7 @@ TARGET_PORT="${MEMORA_TARGET_PORT:-8000}"      # port memora listens on INSIDE t
 # (docs/local-primary-implementation.md §8 L2a): max(768M, 1.5 x the peak RSS
 # of one server holding four local stores with FTS and the 384 MB corpus
 # cache), rounded up to 64 MiB. scripts/measure_memory_gate.py, run in the
-# Linux image (python 3.12.14) on server2: worst peak 629.7 MB (4 x 1500 rows,
+# Linux image (python 3.12.14) on build-host: worst peak 629.7 MB (4 x 1500 rows,
 # 1536-dim) -> 945 MB -> 960M. The old 512M (measured 116-230 MB on D1-only
 # stores, which hold no corpus locally) is too small once stores are local.
 DEFAULT_MEMORY="${MEMORA_MEMORY:-960M}"
@@ -87,7 +87,7 @@ load() {  # load instances/<name>.env into INSTANCE/PORT/STORAGE_URI/VOLUME
   local f="$INSTANCE_DIR/$name.env"
   [ -f "$f" ] || die "no config at $f"
   # CRED_SOURCE is per-instance: workspaces do NOT all define the same env.
-  # bestation and re omit the AWS/R2 backup vars that agentic-box sets, so
+  # beta and gamma omit the AWS/R2 backup vars that agentic-box sets, so
   # sharing one credential file would silently switch cloud backup ON for
   # stores that never had it. Reset it every load so one instance cannot
   # inherit the previous one's source during `status all`.

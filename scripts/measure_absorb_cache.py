@@ -24,7 +24,7 @@ CORPUS_PREFIX = (
 
 FACT_POOL = [
     "the build pipeline now uses cache warming on deploy",
-    "database connection pool raised to 40 for the ob1 store",
+    "database connection pool raised to 40 for the alpha store",
     "rollback procedure documented in the operations runbook",
     "the proxy re-resolves the container address per connection",
     "memory absorb writes a durable inflight row before the first insert",

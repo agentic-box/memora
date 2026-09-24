@@ -2,7 +2,7 @@
 
 The script runs for real with ssh, scp and docker replaced by fakes
 (tests/fake_cutover_docker.py stands in for memora-all and the operator tool
-inside it) and the deploy replaced by a logging stub. Nothing touches nuc8,
+inside it) and the deploy replaced by a logging stub. Nothing touches deploy-host,
 D1 or a runtime.
 """
 import json
@@ -16,9 +16,9 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "cutover_store.sh")
 FAKE_DOCKER = os.path.join(REPO, "tests", "fake_cutover_docker.py")
-REGISTRY = {"memora": "d1://acct/db1", "ob1": "d1://acct/db2", "re": "d1://acct/db3"}
+REGISTRY = {"memora": "d1://acct/db1", "alpha": "d1://acct/db2", "gamma": "d1://acct/db3"}
 ENV_TEXT = f"# instance config\nMEMORA_DATABASES='{json.dumps(REGISTRY)}'\nOTHER=kept\n"
-EDITED = {**REGISTRY, "re": "/data/re.db"}
+EDITED = {**REGISTRY, "gamma": "/data/gamma.db"}
 ROLLBACK = "rollback: docs/cutover-runbook.md"
 
 
@@ -33,6 +33,9 @@ def cut(tmp_path):
     (repo / "scripts").mkdir(parents=True)
     (repo / "instances").mkdir()
     shutil.copy(SCRIPT, repo / "scripts" / "cutover_store.sh")
+    shutil.copy(os.path.join(REPO, "scripts", "deploy_config.py"), repo / "scripts")
+    # CFG1: the memora-all host is the operator's git-ignored configuration.
+    (repo / "instances" / "deploy.env").write_text("DEPLOY_HOST=deploy-host\n")
     env_file = repo / "instances" / "all.env"
     env_file.write_text(ENV_TEXT)
     os.chmod(env_file, 0o600)
@@ -41,7 +44,7 @@ def cut(tmp_path):
          f'#!/bin/bash\necho "deploy $*" >> "{tools}"\nexit "${{DEPLOY_RC:-0}}"\n')
 
     home = tmp_path / "home"
-    exports = home / "memora-lp" / "exports" / "re"
+    exports = home / "memora-lp" / "exports" / "gamma"
     exports.mkdir(parents=True)
     for stamp in ("20260920T000000Z", "20260923T000000Z"):  # the newest one is used
         (exports / f"{stamp}.sql").write_text("-- sql\n")
@@ -86,7 +89,7 @@ def _deployed(cut):
 
 def _edit_env(cut):
     cut.env_file.write_text(f"MEMORA_DATABASES='{json.dumps(EDITED)}'\n"
-                            f"MEMORA_REPLICAS='{json.dumps({'re': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n"
+                            f"MEMORA_REPLICAS='{json.dumps({'gamma': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n"
                             "MEMORA_REPLICATION_INTERVAL_S=60\n")
 
 
@@ -98,37 +101,37 @@ def _frozen(cut):
 
 class TestPlan:
     def test_default_is_a_dry_run_that_touches_nothing(self, cut):
-        proc, calls = cut("re")
+        proc, calls = cut("gamma")
         assert proc.returncode == 0, proc.stderr
         assert "dry run: nothing was done" in proc.stdout
         assert calls == [] and not cut.tools.exists(), "no ssh, docker or deploy"
         assert cut.env_file.read_text() == ENV_TEXT
 
     def test_the_plan_names_every_step_and_the_exact_edits(self, cut):
-        proc, _ = cut("re", "--dry-run")
+        proc, _ = cut("gamma", "--dry-run")
         out = proc.stdout
         for step in "abcdefgh":
             assert f"\n  {step}  " in out, step
-        assert "cutover plan for store re (D1 d1://acct/db3) on nuc8:memora-all, from step a" in out
+        assert "cutover plan for store gamma (D1 d1://acct/db3) on deploy-host:memora-all, from step a" in out
         assert f"    MEMORA_DATABASES='{json.dumps(EDITED)}'" in out
-        assert """    MEMORA_REPLICAS='{"re": "d1://acct/db3"}'""" in out
+        assert """    MEMORA_REPLICAS='{"gamma": "d1://acct/db3"}'""" in out
         assert "    MEMORA_REPLICATION=write" in out
-        assert "    MEMORA_REPLICATION_INTERVAL_S=60" in out  # the re pilot (leader 7763)
+        assert "    MEMORA_REPLICATION_INTERVAL_S=60" in out  # the gamma pilot (leader 7763)
         assert "interval_s 60" in out and "within 150 s" in out and "--drain-timeout 600" in out
         assert "sqlite:" not in out  # the registry takes a path, not a sqlite:// URI
-        assert "python /app/scripts/local_primary.py seed re" in out
+        assert "python /app/scripts/local_primary.py seed gamma" in out
         assert "the tool runs INSIDE memora-all" in out
-        assert "--out /data/re.db" in out and "--mode barrier" in out
+        assert "--out /data/gamma.db" in out and "--mode barrier" in out
         assert "only with --apply-env" in out and "only with --thaw" in out
 
     def test_the_replicas_map_is_merged(self, cut):
         cut.env_file.write_text(ENV_TEXT.replace("OTHER=kept", "MEMORA_REPLICAS='{\"x\": \"d1://a/b\"}'"))
-        proc, _ = cut("re")
-        assert """MEMORA_REPLICAS='{"x": "d1://a/b", "re": "d1://acct/db3"}'""" in proc.stdout
+        proc, _ = cut("gamma")
+        assert """MEMORA_REPLICAS='{"x": "d1://a/b", "gamma": "d1://acct/db3"}'""" in proc.stdout
 
     def test_from_e_plans_only_the_later_steps(self, cut):
         _edit_env(cut)
-        proc, _ = cut("re", "--from", "e")
+        proc, _ = cut("gamma", "--from", "e")
         assert proc.returncode == 0, proc.stderr
         assert "\n  a  " not in proc.stdout and "\n  d  " not in proc.stdout and "\n  e  " in proc.stdout
 
@@ -138,10 +141,10 @@ class TestRefusals:
         (["nope"], "'nope' is not a store of MEMORA_DATABASES"),
         (["Re;rm"], "usage:"),
         ([], "usage:"),
-        (["re", "--from", "b"], "--from takes a, d, e, f, g or h"),
-        (["re", "--from", "c"], "--from takes a, d, e, f, g or h"),
-        (["re", "--from", "e"], "--from e needs the env edits (step d) made"),
-        (["re", "--from", "h", "--thaw", "--execute"], "--from h needs the env edits"),
+        (["gamma", "--from", "b"], "--from takes a, d, e, f, g or h"),
+        (["gamma", "--from", "c"], "--from takes a, d, e, f, g or h"),
+        (["gamma", "--from", "e"], "--from e needs the env edits (step d) made"),
+        (["gamma", "--from", "h", "--thaw", "--execute"], "--from h needs the env edits"),
     ])
     def test_refused_before_anything(self, cut, args, match):
         proc, calls = cut(*args)
@@ -151,19 +154,19 @@ class TestRefusals:
 
     def test_a_store_already_local_is_not_cut_again(self, cut):
         _edit_env(cut)
-        proc, calls = cut("re", "--execute")
+        proc, calls = cut("gamma", "--execute")
         assert proc.returncode == 2 and "not d1://<account>/<database-id>" in proc.stderr
         assert calls == []
 
     def test_a_store_already_replicated_is_refused(self, cut):
-        cut.env_file.write_text(ENV_TEXT + "MEMORA_REPLICAS='{\"re\": \"d1://acct/db3\"}'\n")
-        proc, calls = cut("re", "--execute")
-        assert proc.returncode == 2 and "MEMORA_REPLICAS already names 're'" in proc.stderr
+        cut.env_file.write_text(ENV_TEXT + "MEMORA_REPLICAS='{\"gamma\": \"d1://acct/db3\"}'\n")
+        proc, calls = cut("gamma", "--execute")
+        assert proc.returncode == 2 and "MEMORA_REPLICAS already names 'gamma'" in proc.stderr
 
     def test_from_e_without_write_mode_is_refused(self, cut):
         _edit_env(cut)
         cut.env_file.write_text(cut.env_file.read_text().replace("MEMORA_REPLICATION=write", "MEMORA_REPLICATION=log"))
-        proc, calls = cut("re", "--execute", "--from", "e")
+        proc, calls = cut("gamma", "--execute", "--from", "e")
         assert proc.returncode == 2 and "needs MEMORA_REPLICATION=write" in proc.stderr and calls == []
 
 
@@ -171,23 +174,23 @@ class TestRefusals:
 
 class TestFreezeSeed:
     def test_a_to_c_then_stops_before_the_env_edits(self, cut):
-        proc, calls = cut("re", "--execute")
+        proc, calls = cut("gamma", "--execute")
         assert proc.returncode == 0, proc.stderr
         assert _tool_cmds(calls) == ["freeze", "recheck", "seed", "fk-audit"]
         recheck = next(c for c in calls if c[4:5] == ["recheck"])
-        assert recheck[recheck.index("--receipt") + 1] == "/data/exports/re/20260923T000000Z.receipt.json"
+        assert recheck[recheck.index("--receipt") + 1] == "/data/exports/gamma/20260923T000000Z.receipt.json"
         cps = [c for c in calls if c[0] == "cp"]
         assert [os.path.basename(c[1]) for c in cps] == ["20260923T000000Z.receipt.json", "20260923T000000Z.sql"]
-        assert all(c[2] == "memora-all:/data/exports/re/" for c in cps)
+        assert all(c[2] == "memora-all:/data/exports/gamma/" for c in cps)
         seed = next(c for c in calls if c[4:5] == ["seed"])
-        assert seed[seed.index("--out") + 1] == "/data/re.db"
-        assert seed[seed.index("--receipt") + 1] == "/data/exports/re/20260923T000000Z.receipt.json"
+        assert seed[seed.index("--out") + 1] == "/data/gamma.db"
+        assert seed[seed.index("--receipt") + 1] == "/data/exports/gamma/20260923T000000Z.receipt.json"
         assert "next: " in proc.stdout and "--from d --apply-env" in proc.stdout
         assert cut.env_file.read_text() == ENV_TEXT and not _deployed(cut)
         assert "thaw" not in _tool_cmds(calls)
 
     def test_the_tool_gets_token_files_written_inside_the_container(self, cut):
-        proc, calls = cut("re", "--execute")
+        proc, calls = cut("gamma", "--execute")
         setup = [c for c in calls if c[2:4] == ["sh", "-c"]]
         assert len(setup) == 1
         prog = setup[0][4]
@@ -198,18 +201,18 @@ class TestFreezeSeed:
         assert ["exec", "memora-all", "rm", "-rf", "/dev/shm/memora-cutover"] in calls
 
     def test_an_old_receipt_takes_a_fresh_export_copied_off_host(self, cut):
-        proc, calls = cut("re", "--execute", env={
+        proc, calls = cut("gamma", "--execute", env={
             "TOOL_RC_RECHECK": "2",
             "TOOL_OUT_RECHECK": json.dumps({"ok": False, "refused": "receipt x is older than 24 h (90000 s)"})})
         assert proc.returncode == 0, proc.stderr
         assert _tool_cmds(calls) == ["freeze", "recheck", "export", "seed", "fk-audit"]
         seed = next(c for c in calls if c[4:5] == ["seed"])
-        assert seed[seed.index("--receipt") + 1] == "/data/exports/re/20990101T000000Z.receipt.json"
+        assert seed[seed.index("--receipt") + 1] == "/data/exports/gamma/20990101T000000Z.receipt.json"
         out = [c for c in calls if c[0] == "cp" and c[1].startswith("memora-all:")]
-        assert [c[1] for c in out] == ["memora-all:/data/exports/re/20990101T000000Z.receipt.json",
-                                       "memora-all:/data/exports/re/20990101T000000Z.sql"]
+        assert [c[1] for c in out] == ["memora-all:/data/exports/gamma/20990101T000000Z.receipt.json",
+                                       "memora-all:/data/exports/gamma/20990101T000000Z.sql"]
         assert "scp" in cut.tools.read_text()
-        assert sorted(p.name for p in (cut.offhost / "re").iterdir()) == [
+        assert sorted(p.name for p in (cut.offhost / "gamma").iterdir()) == [
             "20990101T000000Z.receipt.json", "20990101T000000Z.sql"]
         assert (cut.exports / "20990101T000000Z.sql").exists()
 
@@ -218,13 +221,13 @@ class TestFreezeSeed:
         ({"FREEZE_STAYS_OPEN": "1"}, "a", "not frozen with 0 in flight", ["freeze"]),
         ({"TOOL_RC_RECHECK": "2"}, "b", "no usable receipt", ["freeze", "recheck"]),
         ({"TOOL_RC_SEED": "2"}, "c", "the seed failed", ["freeze", "recheck", "seed"]),
-        ({"TOOL_RC_FK_AUDIT": "5"}, "c", "fk audit of /data/re.db is not clean", ["freeze", "recheck", "seed", "fk-audit"]),
+        ({"TOOL_RC_FK_AUDIT": "5"}, "c", "fk audit of /data/gamma.db is not clean", ["freeze", "recheck", "seed", "fk-audit"]),
     ])
     def test_a_failed_boundary_stops_with_the_rollback_pointer(self, cut, knobs, step, match, done):
-        proc, calls = cut("re", "--execute", env=knobs)
+        proc, calls = cut("gamma", "--execute", env=knobs)
         assert proc.returncode == 1
-        assert f"cutover re STOPPED at step {step}: " in proc.stderr and match in proc.stderr, proc.stderr
-        assert ROLLBACK in proc.stderr and "local_primary.py rollback re --phase drain|verify|finish" in proc.stderr
+        assert f"cutover gamma STOPPED at step {step}: " in proc.stderr and match in proc.stderr, proc.stderr
+        assert ROLLBACK in proc.stderr and "local_primary.py rollback gamma --phase drain|verify|finish" in proc.stderr
         assert _tool_cmds(calls) == done
         assert ["exec", "memora-all", "rm", "-rf", "/dev/shm/memora-cutover"] in calls  # removed on failure too
         assert cut.env_file.read_text() == ENV_TEXT and not _deployed(cut)
@@ -232,7 +235,7 @@ class TestFreezeSeed:
     def test_no_receipt_on_the_host_stops_at_b(self, cut):
         shutil.rmtree(cut.exports)
         cut.exports.mkdir()
-        proc, calls = cut("re", "--execute")
+        proc, calls = cut("gamma", "--execute")
         assert proc.returncode == 1 and "STOPPED at step b: no receipt" in proc.stderr
         assert _tool_cmds(calls) == ["freeze"]
 
@@ -240,34 +243,34 @@ class TestFreezeSeed:
 class TestEnvEdits:
     def test_apply_env_backs_up_edits_and_redeploys(self, cut):
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "d", "--apply-env")
+        proc, calls = cut("gamma", "--execute", "--from", "d", "--apply-env")
         assert proc.returncode == 0, proc.stderr
-        backups = list(cut.env_file.parent.glob("all.env.bak-cutover-re-*"))
+        backups = list(cut.env_file.parent.glob("all.env.bak-cutover-gamma-*"))
         assert len(backups) == 1 and backups[0].read_text() == ENV_TEXT
         assert stat.S_IMODE(os.stat(backups[0]).st_mode) == 0o600
         assert stat.S_IMODE(os.stat(cut.env_file).st_mode) == 0o600
         text = cut.env_file.read_text()
         assert f"MEMORA_DATABASES='{json.dumps(EDITED)}'" in text
-        assert """MEMORA_REPLICAS='{"re": "d1://acct/db3"}'""" in text
+        assert """MEMORA_REPLICAS='{"gamma": "d1://acct/db3"}'""" in text
         assert "MEMORA_REPLICATION=write" in text and "OTHER=kept" in text and "# instance config" in text
         assert "MEMORA_REPLICATION_INTERVAL_S=60" in text
         assert _deployed(cut)
         assert _tool_cmds(calls) == ["compare"]
         cmp = next(c for c in calls if c[4:5] == ["compare"])
-        assert cmp[cmp.index("--mode") + 1] == "barrier" and cmp[cmp.index("--store") + 1] == "/data/re.db"
+        assert cmp[cmp.index("--mode") + 1] == "barrier" and cmp[cmp.index("--store") + 1] == "/data/gamma.db"
         assert cmp[cmp.index("--drain-timeout") + 1] == "600"
         assert "stopped before the thaw" in proc.stdout and "--from h --thaw" in proc.stdout
 
     def test_without_apply_env_nothing_is_edited(self, cut):
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "d")
+        proc, calls = cut("gamma", "--execute", "--from", "d")
         assert proc.returncode == 0 and "--from d --apply-env" in proc.stdout
         assert cut.env_file.read_text() == ENV_TEXT and not _deployed(cut)
         assert not list(cut.env_file.parent.glob("all.env.bak-*"))
 
     def test_a_failed_redeploy_stops_at_e(self, cut):
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "d", "--apply-env", env={"DEPLOY_RC": "1"})
+        proc, calls = cut("gamma", "--execute", "--from", "d", "--apply-env", env={"DEPLOY_RC": "1"})
         assert proc.returncode == 1 and "STOPPED at step e" in proc.stderr and ROLLBACK in proc.stderr
         assert "compare" not in _tool_cmds(calls)
 
@@ -286,40 +289,40 @@ class TestAfterRedeploy:
         ({"REPL": json.dumps({"mode": "write", "status": "backoff", "last_error": "D1 403", "interval_s": 60.0,
                               "lag_rows": 0, "last_acked_seq": 0, "head_seq": 0})},
          "replication status 'backoff', not running (last_error 'D1 403')"),
-        ({"REG_ENTRY": "d1://acct/db3"}, "not the local /data/re.db"),
+        ({"REG_ENTRY": "d1://acct/db3"}, "not the local /data/gamma.db"),
         ({"ENV_REPLICATION": "log"}, "lacks MEMORA_REPLICATION=write"),
     ])
     def test_health_must_show_a_live_write_mode_store(self, cut, knobs, match):
         _edit_env(cut)
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "f", env=knobs)
+        proc, calls = cut("gamma", "--execute", "--from", "f", env=knobs)
         assert proc.returncode == 1 and "STOPPED at step f" in proc.stderr and match in proc.stderr, proc.stderr
         assert _tool_cmds(calls) == [] and ROLLBACK in proc.stderr
 
     def test_health_must_still_be_frozen(self, cut):
         _edit_env(cut)
-        proc, calls = cut("re", "--execute", "--from", "f")
+        proc, calls = cut("gamma", "--execute", "--from", "f")
         assert proc.returncode == 1 and "not frozen" in proc.stderr
 
     @pytest.mark.parametrize("rc, match", [("5", "found differences"), ("6", "was skipped"), ("2", "failed")])
     def test_an_unclean_compare_stops_and_never_thaws(self, cut, rc, match):
         _edit_env(cut)
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "g", "--thaw", env={"TOOL_RC_COMPARE": rc})
+        proc, calls = cut("gamma", "--execute", "--from", "g", "--thaw", env={"TOOL_RC_COMPARE": rc})
         assert proc.returncode == 1 and "STOPPED at step g" in proc.stderr and match in proc.stderr
         assert _tool_cmds(calls) == ["compare"]
 
     def test_the_thaw_needs_the_flag(self, cut):
         _edit_env(cut)
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "g")
+        proc, calls = cut("gamma", "--execute", "--from", "g")
         assert proc.returncode == 0 and _tool_cmds(calls) == ["compare"]
         assert json.loads(cut.state.read_text())["freeze"] == "frozen"
 
     def test_the_thaw_needs_a_recorded_clean_barrier_compare(self, cut):
         _edit_env(cut)
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "h", "--thaw")  # no compare recorded
+        proc, calls = cut("gamma", "--execute", "--from", "h", "--thaw")  # no compare recorded
         assert proc.returncode == 1 and "STOPPED at step h" in proc.stderr
         assert "not a clean barrier compare" in proc.stderr and "thaw" not in _tool_cmds(calls)
 
@@ -329,22 +332,22 @@ class TestAfterRedeploy:
         repl = {"mode": "write", "status": "running", "lag_rows": 0, "head_seq": 9, "last_acked_seq": 9,
                 "interval_s": 60.0, "compare_consumed_seq": 4,
                 "last_compare_mode": "barrier", "last_compare_clean": True}
-        proc, calls = cut("re", "--execute", "--from", "h", "--thaw", env={"REPL": json.dumps(repl)})
+        proc, calls = cut("gamma", "--execute", "--from", "h", "--thaw", env={"REPL": json.dumps(repl)})
         assert proc.returncode == 1 and "rows were written after the compare" in proc.stderr
         assert "thaw" not in _tool_cmds(calls)
 
     def test_compare_then_thaw(self, cut):
         _edit_env(cut)
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "g", "--thaw")
+        proc, calls = cut("gamma", "--execute", "--from", "g", "--thaw")
         assert proc.returncode == 0, proc.stderr
         assert _tool_cmds(calls) == ["compare", "thaw"]
-        assert "cutover of re done" in proc.stdout
+        assert "cutover of gamma done" in proc.stdout
         assert json.loads(cut.state.read_text())["freeze"] == "open"
 
     def test_the_whole_run_from_d(self, cut):
         _frozen(cut)
-        proc, calls = cut("re", "--execute", "--from", "d", "--apply-env", "--thaw")
+        proc, calls = cut("gamma", "--execute", "--from", "d", "--apply-env", "--thaw")
         assert proc.returncode == 0, proc.stderr
         assert _deployed(cut) and _tool_cmds(calls) == ["compare", "thaw"]
 
@@ -364,7 +367,7 @@ class TestReceiptBesideItsExport:
         d.mkdir()
         (d / "s.sql").write_text(sql_text)
         sha = hashlib.sha256(b"-- rows\n").hexdigest()
-        r = {"version": 1, "db": "re", "account_id": "acct", "database_id": "db3", "d1_uri": "d1://acct/db3",
+        r = {"version": 1, "db": "gamma", "account_id": "acct", "database_id": "db3", "d1_uri": "d1://acct/db3",
              "verified_at": "now", "verified_at_epoch": time.time(), "sql_path": "/home/elsewhere/s.sql",
              "sql_sha256": sha, "r2_sha256": sha, "epoch": 1, "tables": {}}
         (d / "s.receipt.json").write_text(json.dumps(r))
@@ -374,7 +377,7 @@ class TestReceiptBesideItsExport:
         from memora.local_primary import load_receipt
 
         d = self._receipt(tmp_path)
-        r = load_receipt(str(d / "s.receipt.json"), "re", account_id="acct", database_id="db3")
+        r = load_receipt(str(d / "s.receipt.json"), "gamma", account_id="acct", database_id="db3")
         assert r["sql_path"] == str(d / "s.sql")
 
     def test_a_changed_copy_is_still_refused(self, tmp_path):
@@ -382,7 +385,7 @@ class TestReceiptBesideItsExport:
 
         d = self._receipt(tmp_path, sql_text="-- other rows\n")
         with pytest.raises(L5Refused, match="missing or changed"):
-            load_receipt(str(d / "s.receipt.json"), "re", account_id="acct", database_id="db3")
+            load_receipt(str(d / "s.receipt.json"), "gamma", account_id="acct", database_id="db3")
 
     def test_the_recorded_path_wins_when_it_exists(self, tmp_path):
         from memora.local_primary import load_receipt
@@ -393,34 +396,54 @@ class TestReceiptBesideItsExport:
         r = json.loads((d / "s.receipt.json").read_text())
         r["sql_path"] = str(real)
         (d / "s.receipt.json").write_text(json.dumps(r))
-        assert load_receipt(str(d / "s.receipt.json"), "re", account_id="acct", database_id="db3")["sql_path"] == str(real)
+        assert load_receipt(str(d / "s.receipt.json"), "gamma", account_id="acct", database_id="db3")["sql_path"] == str(real)
 
 
 class TestInterval:
     def test_a_custom_interval_sets_the_edit_and_the_allowances(self, cut):
-        proc, _ = cut("re", "--interval", "400")
+        proc, _ = cut("gamma", "--interval", "400")
         assert proc.returncode == 0, proc.stderr
         assert "    MEMORA_REPLICATION_INTERVAL_S=400" in proc.stdout
         assert "within 830 s" in proc.stdout and "--drain-timeout 830" in proc.stdout
 
     def test_zero_interval_sends_on_commit(self, cut):
-        proc, _ = cut("re", "--interval", "0")
+        proc, _ = cut("gamma", "--interval", "0")
         assert "    MEMORA_REPLICATION_INTERVAL_S=0" in proc.stdout and "--drain-timeout 600" in proc.stdout
 
     @pytest.mark.parametrize("bad", ["-5", "soon", "", "1e3"])
     def test_a_bad_interval_is_refused(self, cut, bad):
-        proc, calls = cut("re", "--interval", bad)
+        proc, calls = cut("gamma", "--interval", bad)
         assert proc.returncode == 2 and "--interval takes seconds" in proc.stderr and calls == []
 
     def test_after_the_edits_the_interval_comes_from_all_env(self, cut):
         _edit_env(cut)
         cut.env_file.write_text(cut.env_file.read_text().replace("INTERVAL_S=60", "INTERVAL_S=5"))
-        proc, _ = cut("re", "--from", "f", "--interval", "999")
+        proc, _ = cut("gamma", "--from", "f", "--interval", "999")
         assert "interval_s 5," in proc.stdout and "within 40 s" in proc.stdout
 
     def test_the_applied_interval_is_read_back(self, cut):
         _frozen(cut)
-        proc, _ = cut("re", "--execute", "--from", "d", "--apply-env", "--interval", "30",
+        proc, _ = cut("gamma", "--execute", "--from", "d", "--apply-env", "--interval", "30",
                       env={"FAKE_INTERVAL_S": "30"})
         assert proc.returncode == 0, proc.stderr
         assert "MEMORA_REPLICATION_INTERVAL_S=30" in cut.env_file.read_text()
+
+
+def test_the_host_comes_from_the_deploy_configuration(cut):
+    """CFG1: the ssh target is DEPLOY_HOST from instances/deploy.env."""
+    (cut.repo / "instances" / "deploy.env").write_text("DEPLOY_HOST=other-host\n")
+    proc, calls = cut("gamma")
+    assert proc.returncode == 0, proc.stderr
+    assert "on other-host:memora-all" in proc.stdout
+
+
+@pytest.mark.parametrize("text", [None, "", "DEPLOY_HOST=\n", "NOT A LINE\n"])
+def test_the_cutover_refuses_without_a_configured_host(cut, text):
+    f = cut.repo / "instances" / "deploy.env"
+    if text is None:
+        f.unlink()
+    else:
+        f.write_text(text)
+    proc, calls = cut("gamma")
+    assert proc.returncode == 2 and "DEPLOY_HOST is not set" in proc.stderr, proc.stderr
+    assert calls == []

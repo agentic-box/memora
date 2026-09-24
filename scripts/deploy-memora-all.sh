@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.5.2: fetch +
+# Full deploy of the live memora-all container (on DEPLOY_HOST) to v0.5.2: fetch +
 # build the tagged image and recreate the container from it, then verify it.
+#
+# CONFIGURATION (CFG1): the deploy host, the graph's publish address, the
+# checkout path on that host and MEMORA_PROJECTS come from the operator's
+# git-ignored instances/deploy.env (keys and placeholders in
+# instances/deploy.env.example); the store registry from instances/all.env.
+# The script refuses to run without them. "deploy-host" below stands for
+# DEPLOY_HOST, and 100.64.0.10 for DEPLOY_GRAPH_BIND.
 #
 # v0.5.0 (CHANGELOG.md "0.5.0") is the local-primary release. What THIS
 # deploy changes on memora-all:
 #  - CLOUDFLARE TOKENS AS MOUNTED FILES (REL1, review 7758). The token
-#    directory ~/.config/memora-lp on nuc8 (DEPLOY_SECRETS_DIR) is mounted
+#    directory ~/.config/memora-lp on deploy-host (DEPLOY_SECRETS_DIR) is mounted
 #    READ-ONLY at /run/secrets/memora, and the container gets only the paths:
 #      CLOUDFLARE_API_TOKEN_FILE       <- cloudflare-api.token  (DEPLOY_CLOUDFLARE_TOKEN_FILE)
 #      MEMORA_D1_READ_TOKEN_FILE       <- d1-read.token         (DEPLOY_D1_READ_TOKEN_FILE)
@@ -20,18 +27,18 @@
 #    again by the NEW image through the read-only mount (memora/secret_files.py)
 #    before the old container is stopped. After the start, the container's
 #    env is checked to carry no token value and the mount to be read-only.
-#    ONE-TIME, before the first v0.5.0 deploy (the user runs it on nuc8; the
+#    ONE-TIME, before the first v0.5.0 deploy (the user runs it on deploy-host; the
 #    value is never printed):
 #      ( umask 077; python3 -c 'import json,os; e=json.load(open(os.path.expanduser("~/.config/memora/credentials.mcp.json")))["mcpServers"]["memora"]["env"]; print(e.get("CLOUDFLARE_API_TOKEN") or e["CF_API_TOKEN"])' > ~/.config/memora-lp/cloudflare-api.token )
 #    Everything in ~/.config/memora-lp is visible (read-only) to the
 #    container: keep only token files there. The deploy lists its entries.
 #  - THE GRAPH UI (G1): memora-all's graph server (container port 8765) is
-#    published ONLY on nuc8's Tailscale address, DEPLOY_GRAPH_BIND
-#    (100.104.19.74) : DEPLOY_GRAPH_PORT (8766), never on 0.0.0.0 -- it can
+#    published ONLY on deploy-host's Tailscale address, DEPLOY_GRAPH_BIND
+#    (100.64.0.10) : DEPLOY_GRAPH_PORT (8766), never on 0.0.0.0 -- it can
 #    edit memories. Every graph route needs the graph token
 #    (~/.config/memora-lp/graph.token, minted here on first use, 0600,
 #    distinct from the health and admin tokens; the container gets
-#    MEMORA_GRAPH_TOKEN_FILE). Open http://100.104.19.74:8766/graph, enter
+#    MEMORA_GRAPH_TOKEN_FILE). Open http://100.64.0.10:8766/graph, enter
 #    the token once (an HttpOnly cookie), pick the store in the selector.
 #    The smoke check verifies it refuses without the token and lists the
 #    stores with it.
@@ -67,8 +74,8 @@
 # openai/gpt-4o-mini (step 2 re-writes the same value, a confirming no-op);
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
-# Steps, all on nuc8:
-#  1. git fetch + checkout the v0.5.2 tag in the nuc8 checkout, docker build.
+# Steps, all on deploy-host:
+#  1. git fetch + checkout the v0.5.2 tag in the deploy-host checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
@@ -126,7 +133,7 @@
 #
 # ADMIN TOKEN (local-primary §9 (a)): /admin/* routes take MEMORA_ADMIN_TOKEN,
 # never the health token. It is read from ~/.config/memora/all.admin-token on
-# nuc8 (minted there on first use, 48 alphanumerics, 0600) and must differ
+# deploy-host (minted there on first use, 48 alphanumerics, 0600) and must differ
 # from the health token.
 #
 # HARDENED (queue item 23 follow-up, sealed review msg 5698/5699): the
@@ -145,30 +152,48 @@
 #
 # Rollback (for a store already cut over to local primary, follow the L6
 # runbook in docs/local-primary-implementation.md instead):
-#   ssh nuc8 'docker rm -f memora-all && docker rename memora-all-grok-<ts> memora-all && docker start memora-all'
-#   ssh nuc8 'docker tag memora:rollback-<ts> memora:latest'   # only if the image itself needs reverting too
+#   ssh deploy-host 'docker rm -f memora-all && docker rename memora-all-grok-<ts> memora-all && docker start memora-all'
+#   ssh deploy-host 'docker tag memora:rollback-<ts> memora:latest'   # only if the image itself needs reverting too
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
 TAG="${DEPLOY_TAG:-v0.5.2}"
-# Rehearsal parameters (R1): every default is the production value, so an
-# unparameterised run is exactly the nuc8 deploy. scripts/rehearse_deploy.sh
-# sets them to run the same steps against a local podman on server2.
-DEPLOY_HOST="${DEPLOY_HOST:-nuc8}"            # "localhost": run here, no ssh
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The production values that identify real infrastructure (CFG1) are NOT in
+# this public script: they come from the operator's git-ignored
+# instances/deploy.env (see instances/deploy.env.example). Without it, or
+# with a key missing, the deploy refuses -- it never guesses a host.
+DEPLOY_CONFIG_FILE_DEFAULT="$ROOT/instances/deploy.env"
+CONFIG_FILE="${DEPLOY_CONFIG_FILE:-$DEPLOY_CONFIG_FILE_DEFAULT}"
+CFG=()
+while IFS= read -r -d '' v; do CFG+=("$v"); done \
+  < <(python3 "$ROOT/scripts/deploy_config.py" "$CONFIG_FILE" DEPLOY_HOST DEPLOY_GRAPH_BIND DEPLOY_REPO MEMORA_PROJECTS)
+[ "${#CFG[@]}" -eq 4 ] || { echo "refused: the deploy configuration $CONFIG_FILE is missing or incomplete" \
+  "(copy instances/deploy.env.example to instances/deploy.env and fill it in) — nothing was done" >&2; exit 1; }
+CFG_DEPLOY_HOST="${CFG[0]}"; CFG_DEPLOY_GRAPH_BIND="${CFG[1]}"; CFG_DEPLOY_REPO="${CFG[2]}"
+MEMORA_PROJECTS="${CFG[3]}"
+python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert isinstance(d, dict) and all(isinstance(v, list) for v in d.values())' \
+  "$MEMORA_PROJECTS" 2>/dev/null \
+  || { echo "refused: MEMORA_PROJECTS in $CONFIG_FILE is not a JSON object of lists — nothing was done" >&2; exit 1; }
+# Rehearsal parameters (R1): every default is the production value (from the
+# deploy configuration), so an unparameterised run is exactly the production
+# deploy. scripts/rehearse_deploy.sh sets them to run the same steps against
+# a local podman on a rehearsal host.
+DEPLOY_HOST="${DEPLOY_HOST:-$CFG_DEPLOY_HOST}"            # "localhost": run here, no ssh
 RUNTIME="${RUNTIME:-docker}"                  # the container runtime binary
 DEPLOY_CONTAINER="${DEPLOY_CONTAINER:-memora-all}"
 DEPLOY_DATA_VOLUME="${DEPLOY_DATA_VOLUME:-memora-all-data}"
 DEPLOY_IMAGE="${DEPLOY_IMAGE:-memora:latest}"
 DEPLOY_PORT="${DEPLOY_PORT:-8920}"
 DEPLOY_CONFIG_DIR="${DEPLOY_CONFIG_DIR:-~/.config/memora}"   # expanded on the target host
-DEPLOY_REPO="${DEPLOY_REPO:-~/repos/agentic-box/memora}"     # expanded on the target host
+DEPLOY_REPO="${DEPLOY_REPO:-$CFG_DEPLOY_REPO}"               # expanded on the target host
 DEPLOY_SKIP_CHECKOUT="${DEPLOY_SKIP_CHECKOUT:-0}"            # 1: build DEPLOY_REPO as it is
 DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed absorb in the smoke check
 DEPLOY_LABELS="${DEPLOY_LABELS:-}"                          # rehearsal only: k=v labels on what it creates
 DEPLOY_SECRETS_DIR="${DEPLOY_SECRETS_DIR:-~/.config/memora-lp}"  # token dir, mounted :ro (expanded on the target host)
 DEPLOY_STORE_WAIT_S="${DEPLOY_STORE_WAIT_S:-90}"            # per-store readiness wait after the start (s)
-# The graph UI (G1): published ONLY on nuc8's Tailscale address, never 0.0.0.0.
-DEPLOY_GRAPH_BIND="${DEPLOY_GRAPH_BIND:-100.104.19.74}"      # the host address the graph port is published on
+# The graph UI (G1): published ONLY on the deploy host's Tailscale address, never 0.0.0.0.
+DEPLOY_GRAPH_BIND="${DEPLOY_GRAPH_BIND:-$CFG_DEPLOY_GRAPH_BIND}"   # the host address the graph port is published on
 DEPLOY_GRAPH_PORT="${DEPLOY_GRAPH_PORT:-8766}"               # the host port (the container's graph is 8765)
 # Production overrides (documented, no sentinel): token file NAMES inside
 # DEPLOY_SECRETS_DIR. The same file may serve both D1 roles (the pilot does).
@@ -183,7 +208,6 @@ done
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${DEPLOY_ENV_FILE:-$ROOT/instances/all.env}"
 
 # Guard (review 7725): an override of ANY of the above needs the explicit
@@ -191,26 +215,28 @@ ENV_FILE="${DEPLOY_ENV_FILE:-$ROOT/instances/all.env}"
 # variable in an operator's shell can never re-target the production deploy.
 # (bash 3.2 on macOS runs this: no associative arrays.)
 DEPLOY_ENV_FILE_EFFECTIVE="$ENV_FILE"
+DEPLOY_CONFIG_FILE_EFFECTIVE="$CONFIG_FILE"
 OVERRIDDEN=()
 while IFS='|' read -r var label default; do
   [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
 done <<DEFAULTS
 TAG|DEPLOY_TAG|v0.5.2
-DEPLOY_HOST|DEPLOY_HOST|nuc8
+DEPLOY_HOST|DEPLOY_HOST|$CFG_DEPLOY_HOST
 RUNTIME|RUNTIME|docker
 DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
 DEPLOY_DATA_VOLUME|DEPLOY_DATA_VOLUME|memora-all-data
 DEPLOY_IMAGE|DEPLOY_IMAGE|memora:latest
 DEPLOY_PORT|DEPLOY_PORT|8920
 DEPLOY_CONFIG_DIR|DEPLOY_CONFIG_DIR|~/.config/memora
-DEPLOY_REPO|DEPLOY_REPO|~/repos/agentic-box/memora
+DEPLOY_REPO|DEPLOY_REPO|$CFG_DEPLOY_REPO
 DEPLOY_SKIP_CHECKOUT|DEPLOY_SKIP_CHECKOUT|0
 DEPLOY_SMOKE_ABSORB|DEPLOY_SMOKE_ABSORB|1
 DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
+DEPLOY_CONFIG_FILE_EFFECTIVE|DEPLOY_CONFIG_FILE|$DEPLOY_CONFIG_FILE_DEFAULT
 DEPLOY_LABELS|DEPLOY_LABELS|
 DEPLOY_SECRETS_DIR|DEPLOY_SECRETS_DIR|~/.config/memora-lp
 DEPLOY_STORE_WAIT_S|DEPLOY_STORE_WAIT_S|90
-DEPLOY_GRAPH_BIND|DEPLOY_GRAPH_BIND|100.104.19.74
+DEPLOY_GRAPH_BIND|DEPLOY_GRAPH_BIND|$CFG_DEPLOY_GRAPH_BIND
 DEPLOY_GRAPH_PORT|DEPLOY_GRAPH_PORT|8766
 DEFAULTS
 if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
@@ -226,6 +252,7 @@ if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   under() { python3 -c 'import os, sys; r, p = map(os.path.realpath, sys.argv[1:]); sys.exit(0 if os.path.commonpath([r, p]) == r else 1)' "$1" "$2"; }
   under "$RH_ROOT" "$DEPLOY_CONFIG_DIR" || refuse "DEPLOY_CONFIG_DIR is not under $RH_ROOT"
   under "$RH_ROOT" "$ENV_FILE" || refuse "DEPLOY_ENV_FILE is not under $RH_ROOT"
+  under "$RH_ROOT" "$CONFIG_FILE" || refuse "DEPLOY_CONFIG_FILE is not under $RH_ROOT"
   under "$RH_ROOT" "$DEPLOY_SECRETS_DIR" || refuse "DEPLOY_SECRETS_DIR is not under $RH_ROOT"
   case "$DEPLOY_LABELS" in *memora.rehearsal=?*) ;; *) refuse "DEPLOY_LABELS must carry memora.rehearsal=<run-id>" ;; esac
 elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
@@ -234,7 +261,7 @@ elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
   exit 1
 fi
 # The graph can edit memories: it is published on ONE specific address
-# (nuc8's Tailscale IP), never on all interfaces, rehearsals included.
+# (the deploy host's Tailscale IP), never on all interfaces, rehearsals included.
 python3 - "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" <<'PY' || { echo "refused: DEPLOY_GRAPH_BIND / DEPLOY_GRAPH_PORT — nothing was done" >&2; exit 1; }
 import ipaddress, sys
 bind, port = sys.argv[1:]
@@ -255,6 +282,7 @@ MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d=
 # base64 over the wire: the JSON has embedded quotes that ssh's remote
 # command re-join would otherwise mangle.
 MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
+MEMORA_PROJECTS_B64="$(printf '%s' "$MEMORA_PROJECTS" | base64 | tr -d '\n')"
 # The local-primary switches (absent = dark). Checked here, before anything
 # runs: MEMORA_REPLICATION is log|write; MEMORA_REPLICAS maps stores of
 # MEMORA_DATABASES whose registry entry is LOCAL to d1://account/database.
@@ -314,7 +342,7 @@ else:
 PY
 MEMORA_REPLICAS_B64="$(printf '%s' "$MEMORA_REPLICAS" | base64 | tr -d '\n')"
 # The /data migration program (shared with memora-instance.sh), sent from
-# THIS checkout: the nuc8 checkout is at $TAG and may predate it.
+# THIS checkout: the deploy-host checkout is at $TAG and may predate it.
 MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 
 # The remote script's parameters (REL2): ssh JOINS its arguments into one
@@ -326,7 +354,7 @@ MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 # preceded by the blob's sha256 as a second word (review 7889: a changed
 # character that keeps the field count must refuse too). The remote script
 # checks the digest, decodes (a decoder error refuses), requires exactly
-# the 24 parameters it reads, and only then restores $1..$24. A localhost
+# the 25 parameters it reads, and only then restores $1..$25. A localhost
 # rehearsal sends the SAME command line through `sh -c`, i.e. the same
 # re-parsing a remote shell does.
 REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
@@ -334,10 +362,10 @@ REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_C
   "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR"
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
   "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S"
-  "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE")
+  "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE" "$MEMORA_PROJECTS_B64")
 PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
 PARAMS_SHA="$(printf '%s' "$PARAMS_B64" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-[ "${#REMOTE_ARGS[@]}" -eq 24 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 24" >&2; exit 1; }
+[ "${#REMOTE_ARGS[@]}" -eq 25 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 25" >&2; exit 1; }
 REMOTE_CMD="bash -s -- $PARAMS_SHA $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
   TARGET=(sh -c "$REMOTE_CMD")
@@ -357,7 +385,7 @@ printf '%s' "$2" | base64 -d > "$DECODED" 2>/dev/null || { rm -f "$DECODED"; bro
 P=()
 while IFS= read -r -d '' v; do P+=("$v"); done < "$DECODED"
 rm -f "$DECODED"
-[ "${#P[@]}" -eq 24 ] || broken "${#P[@]} parameters arrived, not 24"
+[ "${#P[@]}" -eq 25 ] || broken "${#P[@]} parameters arrived, not 25"
 set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -371,6 +399,7 @@ SECRETS_DIR="${14/#\~/$HOME}"
 CF_TOKEN_NAME="${15}"; READ_TOKEN_NAME="${16}"; REPL_TOKEN_NAME="${17}"
 MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
 GRAPH_BIND="${22}"; GRAPH_PORT="${23}"; GRAPH_TOKEN_NAME="${24}"
+MEMORA_PROJECTS="$(printf '%s' "${25}" | base64 -d)"
 SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
 
@@ -421,7 +450,7 @@ PY
 # label is unreadable from a container, so the mount relabels the token
 # directory SHARED (:z) -- still read-only, and still readable by the old
 # container kept for rollback (a private :Z would cut it off). Elsewhere
-# (nuc8) the options are plain ro.
+# (deploy-host) the options are plain ro.
 SECRETS_OPTS=ro
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
   SECRETS_OPTS=ro,z
@@ -436,7 +465,8 @@ LP_ARGS=()   # the local-primary switches, only when all.env sets them (absent =
 [ -z "$MEMORA_REPLICATION" ] || LP_ARGS+=(-e "MEMORA_REPLICATION=$MEMORA_REPLICATION")
 for kv in ${20:-}; do LP_ARGS+=(-e "$kv"); done   # MEMORA_REPLICATION_{INTERVAL_S,POLL_S,BATCH_ROWS}, validated above
 # Keyed by registry store name (MEMORA_DATABASES); see the header for why.
-MEMORA_PROJECTS='{"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],"bestation":["bestation"],"re":["re"]}'
+# From the operator's deploy configuration (parameter 25), not this script.
+[ -n "$MEMORA_PROJECTS" ] || { echo "empty MEMORA_PROJECTS" >&2; exit 1; }
 
 REPO="$REPO_DIR"
 [ -d "$REPO" ] || { echo "missing $REPO checkout on $(hostname)" >&2; exit 1; }
@@ -679,7 +709,7 @@ if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
   fi
   # NOT `run --rm`: podman's --rm deletes an ANONYMOUS volume mounted with -v
   # once no container references it -- the old data (found by the R1
-  # rehearsal on server2). A plain `rm` never removes volumes, on either runtime;
+  # rehearsal on build-host). A plain `rm` never removes volumes, on either runtime;
   # --tmpfs /data keeps the image's VOLUME /data from leaving an anonymous one.
   MIGRATOR="$CONTAINER-migrate-$TS"
   if ! "$RT" run --name "$MIGRATOR" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} --tmpfs /data -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" "$IMAGE" \

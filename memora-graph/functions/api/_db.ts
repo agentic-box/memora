@@ -13,9 +13,10 @@ export type BindingSelection<T> =
   | { ok: true; name: string; binding: T }
   | { ok: false; status: 400 | 500; error: "unknown_database" | "database_binding_missing"; name: string };
 
+// Without DB_CONFIG only the default store exists: the real store set is
+// deployment configuration (the git-ignored wrangler.toml), never code.
 const FALLBACK_CONFIG: Readonly<Record<string, string>> = {
   memora: "MEMORA",
-  ob1: "OB1",
 };
 
 const BINDING_SUFFIX = /^[A-Z][A-Z0-9_]*$/;

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deployment REHEARSAL (R1): the L2a deploy and migration, and the L2-L6
-# startup, against a REAL container runtime on a rehearsal host (server2,
-# podman). No Cloudflare, no nuc8, no tokens that exist anywhere else: every
+# startup, against a REAL container runtime on a rehearsal host (build-host,
+# podman). No Cloudflare, no deploy-host, no tokens that exist anywhere else: every
 # store is a local SQLite file, the port is 18920, and all state lives under
 # $RH_ROOT. Every runtime object it creates goes through
 # scripts/rehearse_objects.sh: a name unique to this run (memora-rh-<epoch>-<pid>…),
@@ -35,7 +35,7 @@
 #      D1-dependent compare is only shown to refuse (no D1 here);
 #   4b. (REL1) the cutover mechanics inside the container: the operator
 #      tool at /app/scripts/local_primary.py with 0600 token files on its
-#      tmpfs, freeze / fk-audit; sync installed on the local "re" store
+#      tmpfs, freeze / fk-audit; sync installed on the local "gamma" store
 #      (standing in for the seed, which needs D1); a deploy with
 #      MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env: the store comes
 #      up frozen, replicating in LOG mode (log mode sends nothing to D1;
@@ -60,9 +60,12 @@ PY="${PYTHON:-python3}"
 CFG="$RH_ROOT/config"
 SECRETS="$RH_ROOT/secrets"
 ENVF="$RH_ROOT/all.env"
+# The rehearsal's own deploy configuration (CFG1): rehearsal-scoped, under
+# RH_ROOT, so the production instances/deploy.env is never read here.
+DEPLOY_CFGF="$RH_ROOT/deploy.env"
 RESULTS="$RH_ROOT/results.txt"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")"
-REG='{"memora": "/data/memora.db", "ob1": "/data/ob1.db", "bestation": "/data/bestation.db", "re": "/data/re.db"}'
+REG='{"memora": "/data/memora.db", "alpha": "/data/alpha.db", "beta": "/data/beta.db", "gamma": "/data/gamma.db"}'
 
 OBJECTS="$RH_ROOT/run-$RUN_ID.objects"
 mkdir -p "$RH_ROOT" "$CFG" "$SECRETS" "$RH_ROOT/fixtures"
@@ -122,6 +125,7 @@ deploy() {
   DEPLOY_IMAGE="$IMAGE" DEPLOY_PORT="$PORT" DEPLOY_CONFIG_DIR="$CFG" DEPLOY_REPO="$ROOT" \
   DEPLOY_GRAPH_BIND=127.0.0.1 DEPLOY_GRAPH_PORT=18766 \
   DEPLOY_SKIP_CHECKOUT=1 DEPLOY_SMOKE_ABSORB=0 DEPLOY_ENV_FILE="$ENVF" DEPLOY_TAG="v$VERSION" DEPLOY_SECRETS_DIR="$SECRETS" \
+  DEPLOY_CONFIG_FILE="$DEPLOY_CFGF" \
     bash "$ROOT/scripts/deploy-memora-all.sh"
 }
 
@@ -135,6 +139,8 @@ cat > "$CFG/credentials.mcp.json" <<JSON
 {"mcpServers": {"memora": {"env": {"MEMORA_EMBEDDING_MODEL": "tfidf", "MEMORA_LLM_MODEL": "none"}}}}
 JSON
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
+printf '%s\n' "DEPLOY_HOST=localhost" "DEPLOY_GRAPH_BIND=127.0.0.1" "DEPLOY_REPO=$ROOT" \
+  "MEMORA_PROJECTS='{\"memora\":[\"memora\"],\"alpha\":[\"alpha\"],\"beta\":[\"beta\"],\"gamma\":[\"gamma\"]}'" > "$DEPLOY_CFGF"
 # Throwaway Cloudflare-shaped tokens (REL1): never valid anywhere, no store
 # is on d1://, so nothing uses them; the checks are about where they go.
 chmod 700 "$SECRETS"
@@ -229,7 +235,7 @@ cp "$RH_ROOT/last-body.json" "$RH_ROOT/data-volume.json"
 import json, sys
 d = json.load(open(sys.argv[1]))
 assert d["volume"] == sys.argv[2], d
-assert set(d["stores"]) == {"memora", "ob1", "bestation", "re"}, d
+assert set(d["stores"]) == {"memora", "alpha", "beta", "gamma"}, d
 for name, s in d["stores"].items():
     assert s["kind"] == "sqlite" and s["needs_data_volume"] is True and s["refused"] is None, (name, s)
 PY
@@ -302,7 +308,7 @@ check "rollback: start it" "$RT" start "$OLD_ID"
 check "the rolled-back container answers /health" wait_health
 check "write to the rolled-back (old) container" "$RT" exec -i "$OLD_ID" python - <<'PY'
 from memora import storage
-conn = storage.backend_for("ob1").connect()
+conn = storage.backend_for("alpha").connect()
 storage.add_memory(conn, content="written after the rollback", tags=["rehearsal"]); conn.commit(); conn.close()
 PY
 remove_one container "$NEW1_ID" >> "$RH_ROOT/commands.log"   # the second deploy's leftover ($GROK2), by ID
@@ -368,30 +374,30 @@ IN_TOK=(--admin-token-file "$SHM/admin.token" --health-token-file "$SHM/health.t
 tokens_in() {  # exactly scripts/cutover_store.sh's form: the container's shell writes its own env
   "$RT" exec "$NAME" sh -c "umask 077 && mkdir -p $SHM && printf %s \"\$MEMORA_ADMIN_TOKEN\" > $SHM/admin.token && printf %s \"\$MEMORA_HEALTH_TOKEN\" > $SHM/health.token"
 }
-health_re() { curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/re"; }
+health_gamma() { curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/gamma"; }
 check "place the tool's token files on the container's tmpfs (0600)" tokens_in
 check "they are 0600 and on tmpfs" "$RT" exec "$NAME" sh -c \
   "test \"\$(stat -c %a $SHM/admin.token)\" = 600 && test \"\$(stat -f -c %T $SHM)\" = tmpfs"
-check "the image carries the operator tool: freeze re from inside the container" "${IN_TOOL[@]}" freeze re "${IN_TOK[@]}"
-check "fk-audit re from inside the container (clean)" "${IN_TOOL[@]}" fk-audit re --store /data/re.db
-check "install sync on /data/re.db (standing in for the seed, which needs D1)" "$RT" exec "$NAME" python -c '
+check "the image carries the operator tool: freeze gamma from inside the container" "${IN_TOOL[@]}" freeze gamma "${IN_TOK[@]}"
+check "fk-audit gamma from inside the container (clean)" "${IN_TOOL[@]}" fk-audit gamma --store /data/gamma.db
+check "install sync on /data/gamma.db (standing in for the seed, which needs D1)" "$RT" exec "$NAME" python -c '
 import sqlite3
 from memora.schema import install_sync
-c = sqlite3.connect("/data/re.db"); install_sync(c, "d1://rh-acct/rh-db", 1); c.close()'
+c = sqlite3.connect("/data/gamma.db"); install_sync(c, "d1://rh-acct/rh-db", 1); c.close()'
 printf "MEMORA_DATABASES='%s'\nMEMORA_REPLICAS='%s'\nMEMORA_REPLICATION=log\nMEMORA_REPLICATION_INTERVAL_S=2\nMEMORA_REPLICATION_BATCH_ROWS=50\n" \
-  "$REG" '{"re": "d1://rh-acct/rh-db"}' > "$ENVF"
+  "$REG" '{"gamma": "d1://rh-acct/rh-db"}' > "$ENVF"
 if deploy > "$RH_ROOT/deploy-4.log" 2>&1; then pass "deploy with MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env"; \
   else fail "deploy 4 (exit $?; see deploy-4.log)"; tail -30 "$RH_ROOT/deploy-4.log"; fi
 adopt NEW4_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
-grep -q "store re: replicating (log) to d1://rh-acct/rh-db" "$RH_ROOT/deploy-4.log" \
-  && grep -q "store re: /health/db 200 ok, FROZEN .*memory_stats" "$RH_ROOT/deploy-4.log" \
-  && pass "the deploy checked re's replication and ran memory_stats on it while frozen (X2: frozen stores serve reads)" \
-  || fail "deploy 4 did not check re as a frozen replicated store"
+grep -q "store gamma: replicating (log) to d1://rh-acct/rh-db" "$RH_ROOT/deploy-4.log" \
+  && grep -q "store gamma: /health/db 200 ok, FROZEN .*memory_stats" "$RH_ROOT/deploy-4.log" \
+  && pass "the deploy checked gamma's replication and ran memory_stats on it while frozen (X2: frozen stores serve reads)" \
+  || fail "deploy 4 did not check gamma as a frozen replicated store"
 check "wait for /health after deploy 4" wait_health
 "$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q 'MEMORA_REPLICATION=log' \
   && pass "the container env carries the local-primary switches from all.env" || fail "MEMORA_REPLICATION not passed through"
 sleep 5
-health_re > "$RH_ROOT/health-re.json"
+health_gamma > "$RH_ROOT/health-gamma.json"
 "$PY" -c '
 import json, sys
 h = json.load(open(sys.argv[1]))
@@ -399,13 +405,13 @@ assert h["freeze"]["state"] == "frozen", h["freeze"]
 r = h["replication"]
 assert r["mode"] == "log" and r["status"] == "running" and not r.get("halted_reason"), r
 assert (r["interval_s"], r["poll_s"], r["batch_rows"]) == (2.0, 5.0, 50), r
-' "$RH_ROOT/health-re.json" && pass "re came up frozen (persisted freeze), replicating in log mode, not halted; timing 2 s / 5 s / 50 rows from all.env" \
-  || fail "/health/db/re after deploy 4: $(cat "$RH_ROOT/health-re.json")"
+' "$RH_ROOT/health-gamma.json" && pass "gamma came up frozen (persisted freeze), replicating in log mode, not halted; timing 2 s / 5 s / 50 rows from all.env" \
+  || fail "/health/db/gamma after deploy 4: $(cat "$RH_ROOT/health-gamma.json")"
 check "token files again in the new container" tokens_in
-check "thaw re from inside the container" "${IN_TOOL[@]}" thaw re "${IN_TOK[@]}"
-"$PY" - "$PORT" <<'PY' >> "$RH_ROOT/commands.log" 2>&1 && pass "a write to re through /mcp/re" || fail "write to re (see commands.log)"
+check "thaw gamma from inside the container" "${IN_TOOL[@]}" thaw gamma "${IN_TOK[@]}"
+"$PY" - "$PORT" <<'PY' >> "$RH_ROOT/commands.log" 2>&1 && pass "a write to gamma through /mcp/gamma" || fail "write to gamma (see commands.log)"
 import json, sys, urllib.request
-base = f"http://127.0.0.1:{sys.argv[1]}/mcp/re"
+base = f"http://127.0.0.1:{sys.argv[1]}/mcp/gamma"
 H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 def post(body, sid=None):
     h = dict(H, **({"mcp-session-id": sid} if sid else {}))
@@ -421,7 +427,7 @@ print(raw[:300])
 PY
 LOGGED=0
 for _ in $(seq 1 20); do
-  health_re > "$RH_ROOT/health-re2.json"
+  health_gamma > "$RH_ROOT/health-re2.json"
   "$PY" -c 'import json,sys; r=json.load(open(sys.argv[1]))["replication"]; sys.exit(0 if r["lag_rows"] == 0 and r["log_cursor_seq"] > 0 else 1)' \
     "$RH_ROOT/health-re2.json" && { LOGGED=1; break; }
   sleep 2

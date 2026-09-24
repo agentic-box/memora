@@ -4,7 +4,7 @@ the admin token (local-primary plan §8 L2a, §9 (a); review 7626).
 The script is run for real with ssh, git and curl replaced by fakes and
 docker by tests/fake_container_runtime.py: ssh runs the remote heredoc
 locally, docker records every call and keeps volumes as directories, and the
-/data migration program really runs against them. Nothing touches nuc8 or a
+/data migration program really runs against them. Nothing touches deploy-host or a
 real runtime. The script's final smoke check talks HTTP to 127.0.0.1:8920
 and fails here (no server); every assertion is about what happened before.
 """
@@ -22,7 +22,16 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "deploy-memora-all.sh")
 FAKE_RUNTIME = os.path.join(REPO, "tests", "fake_container_runtime.py")
 ANON = "3f" * 32
-REGISTRY = {"memora": "d1://acct/db1", "ob1": "d1://acct/db2"}
+REGISTRY = {"memora": "d1://acct/db1", "alpha": "d1://acct/db2"}
+# The operator's deploy configuration (CFG1), as the fixture writes it into
+# the copied repo's git-ignored instances/deploy.env.
+PROJECTS = {"memora": ["memora", "project-a"], "alpha": ["alpha"]}
+DEPLOY_CFG = {"DEPLOY_HOST": "deploy-host", "DEPLOY_GRAPH_BIND": "100.64.0.10",
+              "DEPLOY_REPO": "~/repos/agentic-box/memora", "MEMORA_PROJECTS": json.dumps(PROJECTS)}
+
+
+def _deploy_env_text(cfg):
+    return "".join(f"{k}='{v}'\n" for k, v in cfg.items())
 MARKER = ".memora-volume-source"
 # Distinctive token values (REL1): a leak anywhere is found by substring.
 CF_TOKEN = "cfTOKEN" + "x9" * 20
@@ -49,6 +58,8 @@ def deploy(tmp_path):
     (repo / "instances").mkdir()
     shutil.copy(SCRIPT, repo / "scripts" / "deploy-memora-all.sh")
     shutil.copy(os.path.join(REPO, "scripts", "migrate_data_volume.sh"), repo / "scripts")
+    shutil.copy(os.path.join(REPO, "scripts", "deploy_config.py"), repo / "scripts")
+    (repo / "instances" / "deploy.env").write_text(_deploy_env_text(DEPLOY_CFG))
     (repo / "instances" / "all.env").write_text(f"MEMORA_DATABASES='{json.dumps(REGISTRY)}'\n")
 
     home = tmp_path / "home"
@@ -68,7 +79,7 @@ def deploy(tmp_path):
     (old / "intent").mkdir(parents=True)
     (old / "intent" / "memora.jsonl").write_text('{"type":"intent","id":3}\n')
     (old / "freeze").mkdir()
-    (old / "freeze" / "ob1").write_text("")
+    (old / "freeze" / "alpha").write_text("")
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -112,6 +123,7 @@ def deploy(tmp_path):
     run.bin = bin_dir
     run.secrets = secrets
     run.env_file = repo / "instances" / "all.env"
+    run.config_file = repo / "instances" / "deploy.env"
     return run
 
 
@@ -178,7 +190,7 @@ def test_rollback_then_writes_then_redeploy_recopies(deploy):
     again and accrues writes; the next deploy must bring them over."""
     deploy()
     (deploy.old / "intent" / "memora.jsonl").write_text('{"type":"intent","id":3}\n{"type":"intent","id":4}\n')
-    (deploy.old / "re.db").write_bytes(b"written during the rollback window")
+    (deploy.old / "gamma.db").write_bytes(b"written during the rollback window")
     proc, calls, _ = deploy()
     assert "copied " in proc.stdout
     assert _files(deploy.new) == _files(deploy.old)
@@ -334,14 +346,14 @@ def test_memory_limit_is_the_measured_gate(deploy):
 # ---------------------------------------------------------------- R1: rehearsal parameters
 
 def test_the_defaults_are_the_production_deploy(deploy):
-    """Unparameterised: ssh to nuc8, docker, the v0.5.2 checkout, memora-all
+    """Unparameterised: ssh to deploy-host, docker, the v0.5.2 checkout, memora-all
     on 8920 with memora-all-data and memora:latest, the tokens from
     ~/.config/memora-lp."""
     proc, calls, cfg = deploy()
     tools = deploy.tools.read_text().splitlines()
-    assert tools[0] == "ssh nuc8"
-    assert ("deploy target: host=nuc8 runtime=docker container=memora-all volume=memora-all-data "
-            "image=memora:latest port=8920 graph=100.104.19.74:8766 tag=v0.5.2 secrets=~/.config/memora-lp") in proc.stdout
+    assert tools[0] == "ssh deploy-host"
+    assert ("deploy target: host=deploy-host runtime=docker container=memora-all volume=memora-all-data "
+            "image=memora:latest port=8920 graph=100.64.0.10:8766 tag=v0.5.2 secrets=~/.config/memora-lp") in proc.stdout
     assert any(t.startswith("git ") and "checkout v0.5.2" in t for t in tools)
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
@@ -421,7 +433,7 @@ def test_an_override_without_the_rehearsal_sentinel_is_refused(deploy, override)
     ({"DEPLOY_DATA_VOLUME": "memora-all-data"}, "DEPLOY_DATA_VOLUME 'memora-all-data' is not rehearsal-scoped"),
     ({"DEPLOY_IMAGE": "memora:latest"}, "DEPLOY_IMAGE 'memora:latest' is not rehearsal-scoped"),
     ({"DEPLOY_PORT": "8920"}, "8920 is production's"),
-    ({"DEPLOY_HOST": "nuc8"}, "DEPLOY_HOST must be localhost"),
+    ({"DEPLOY_HOST": "deploy-host"}, "DEPLOY_HOST must be localhost"),
     ({"DEPLOY_CONFIG_DIR": "/etc"}, "DEPLOY_CONFIG_DIR is not under"),
     ({"DEPLOY_SECRETS_DIR": "/etc"}, "DEPLOY_SECRETS_DIR is not under"),
     ({"DEPLOY_REHEARSAL_ROOT": ""}, "DEPLOY_REHEARSAL_ROOT must name an existing directory"),
@@ -621,7 +633,7 @@ class TestTokenFiles:
 
 # ---------------------------------------------------------------- REL1: local-primary switches from all.env
 
-LOCAL_REGISTRY = {**REGISTRY, "re": "/data/re.db"}
+LOCAL_REGISTRY = {**REGISTRY, "gamma": "/data/gamma.db"}
 
 
 def _env_file(deploy, **extra):
@@ -639,17 +651,17 @@ class TestReplicationPassthrough:
         assert "MEMORA_REPLICAS / MEMORA_REPLICATION absent (dark)" in proc.stdout
 
     def test_present_is_passed_through(self, deploy):
-        replicas = json.dumps({"re": "d1://acct/db3"})
+        replicas = json.dumps({"gamma": "d1://acct/db3"})
         _env_file(deploy, MEMORA_REPLICAS=replicas, MEMORA_REPLICATION="write")
         proc, calls, _ = deploy()
         envs = _flag_values(_new_container_run(calls), "-e")
         assert f"MEMORA_REPLICAS={replicas}" in envs and "MEMORA_REPLICATION=write" in envs
-        assert "local-primary: MEMORA_REPLICAS=['re'] MEMORA_REPLICATION=write" in proc.stdout
+        assert "local-primary: MEMORA_REPLICAS=['gamma'] MEMORA_REPLICATION=write" in proc.stdout
 
     def test_file_uri_registry_entry_counts_as_local(self, deploy):
         deploy.env_file.write_text(
-            f"MEMORA_DATABASES='{json.dumps({**REGISTRY, 're': 'file:///data/re.db'})}'\n"
-            f"MEMORA_REPLICAS='{json.dumps({'re': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=log\n")
+            f"MEMORA_DATABASES='{json.dumps({**REGISTRY, 'gamma': 'file:///data/gamma.db'})}'\n"
+            f"MEMORA_REPLICAS='{json.dumps({'gamma': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=log\n")
         proc, calls, _ = deploy()
         assert "MEMORA_REPLICATION=log" in _flag_values(_new_container_run(calls), "-e")
 
@@ -657,10 +669,10 @@ class TestReplicationPassthrough:
         ({"MEMORA_REPLICATION": "on"}, "must be log or write"),
         ({"MEMORA_REPLICAS": '{"nope": "d1://a/b"}'}, "not a store of MEMORA_DATABASES"),
         ({"MEMORA_REPLICAS": '{"memora": "d1://acct/db1"}'}, "a replicated store must be a local path"),
-        ({"MEMORA_REPLICAS": '{"re": "re"}'}, "must be d1://account/database"),
-        ({"MEMORA_REPLICAS": '"re"'}, "must be a non-empty JSON object"),
+        ({"MEMORA_REPLICAS": '{"gamma": "gamma"}'}, "must be d1://account/database"),
+        ({"MEMORA_REPLICAS": '"gamma"'}, "must be a non-empty JSON object"),
         ({"MEMORA_REPLICAS": "{}"}, "must be a non-empty JSON object"),
-        ({"MEMORA_REPLICAS": "re"}, "Expecting value"),
+        ({"MEMORA_REPLICAS": "gamma"}, "Expecting value"),
     ])
     def test_a_bad_value_refuses_before_anything(self, deploy, extra, match):
         _env_file(deploy, **extra)
@@ -671,7 +683,7 @@ class TestReplicationPassthrough:
 
 class TestReplicationTimingPassthrough:
     def test_present_values_are_passed_through(self, deploy):
-        _env_file(deploy, MEMORA_REPLICAS=json.dumps({"re": "d1://acct/db3"}), MEMORA_REPLICATION="write",
+        _env_file(deploy, MEMORA_REPLICAS=json.dumps({"gamma": "d1://acct/db3"}), MEMORA_REPLICATION="write",
                   MEMORA_REPLICATION_INTERVAL_S="60", MEMORA_REPLICATION_POLL_S="2.5",
                   MEMORA_REPLICATION_BATCH_ROWS="250")
         proc, calls, _ = deploy()
@@ -775,7 +787,7 @@ FROZEN = {"freeze": {"state": "frozen", "in_flight": 0}}
 
 @pytest.fixture
 def poststart(deploy, tmp_path):
-    """A rehearsal-mode deploy against _FakeMemora: `re` replicated (write)."""
+    """A rehearsal-mode deploy against _FakeMemora: `gamma` replicated (write)."""
     rcfg = tmp_path / "rcfg"
     shutil.copytree(deploy.home / ".config" / "memora", rcfg)
     (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
@@ -785,7 +797,7 @@ def poststart(deploy, tmp_path):
     os.chmod(rsec / "graph.token", 0o600)
     envf = tmp_path / "rh.env"
     envf.write_text(f"MEMORA_DATABASES='{json.dumps(LOCAL_REGISTRY)}'\n"
-                    f"MEMORA_REPLICAS='{json.dumps({'re': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n")
+                    f"MEMORA_REPLICAS='{json.dumps({'gamma': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n")
     servers = []
 
     def run(health_db):
@@ -807,20 +819,20 @@ def poststart(deploy, tmp_path):
 
 class TestReplicatedStoreAfterStart:
     def test_a_frozen_replicating_store_passes(self, poststart):
-        proc, fake = poststart({"re": {**FROZEN, "replication": REPL_OK}})
-        assert "store re: replicating (write) to d1://acct/db3, status running, trigger version 2" in proc.stdout
-        assert "store re: /health/db 200 ok, FROZEN" in proc.stdout
+        proc, fake = poststart({"gamma": {**FROZEN, "replication": REPL_OK}})
+        assert "store gamma: replicating (write) to d1://acct/db3, status running, trigger version 2" in proc.stdout
+        assert "store gamma: /health/db 200 ok, FROZEN" in proc.stdout
         assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
-        assert ("re", "memory_stats") in fake.tool_calls  # X2: a frozen store serves reads
+        assert ("gamma", "memory_stats") in fake.tool_calls  # X2: a frozen store serves reads
 
     def test_a_thawed_replicating_store_is_checked_and_called(self, poststart):
-        proc, fake = poststart({"re": {"replication": REPL_OK}})
+        proc, fake = poststart({"gamma": {"replication": REPL_OK}})
         assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
-        assert ("re", "memory_stats") in fake.tool_calls
+        assert ("gamma", "memory_stats") in fake.tool_calls
 
     @pytest.mark.parametrize("body, reason", [
-        ({"replication": {"status": "refused", "error": "ReplicatorConfigError: re: no sync_state (install_sync has not run)"}},
-         "replication refused: ReplicatorConfigError: re: no sync_state"),
+        ({"replication": {"status": "refused", "error": "ReplicatorConfigError: gamma: no sync_state (install_sync has not run)"}},
+         "replication refused: ReplicatorConfigError: gamma: no sync_state"),
         ({"replication": {**REPL_OK, "status": "halted", "halted_reason": "foreign_writer"}}, "replication halted: foreign_writer"),
         ({"replication": {**REPL_OK, "mode": "log"}}, "replication mode 'log', configured 'write'"),
         ({"replication": {**REPL_OK, "replica_uri": "d1://acct/other"}}, "replica_uri 'd1://acct/other', configured 'd1://acct/db3'"),
@@ -828,9 +840,9 @@ class TestReplicatedStoreAfterStart:
         ({"refused": "the /data check refused it", "replication": REPL_OK}, "the store is refused"),
     ])
     def test_a_frozen_store_fails_on_its_replication(self, poststart, body, reason):
-        proc, fake = poststart({"re": {**FROZEN, **body}})
+        proc, fake = poststart({"gamma": {**FROZEN, **body}})
         assert proc.returncode != 0
-        assert "STORE CHECK FAILED — re: " + reason in proc.stderr, proc.stderr[-2000:]
+        assert "STORE CHECK FAILED — gamma: " + reason in proc.stderr, proc.stderr[-2000:]
         assert "L6 runbook" in proc.stderr and "all 3 stores verified" not in proc.stdout
 
     @pytest.mark.parametrize("body, reason", [
@@ -839,33 +851,33 @@ class TestReplicatedStoreAfterStart:
     ])
     def test_http_200_alone_is_not_enough_for_a_frozen_replicated_store(self, poststart, body, reason):
         # not terminal: waited for (DEPLOY_STORE_WAIT_S, 90 s in production), then failed
-        proc, _ = poststart({"re": {**FROZEN, **body}})
-        assert proc.returncode != 0 and f"STORE CHECK FAILED — re: {reason}" in proc.stderr, proc.stderr[-1500:]
+        proc, _ = poststart({"gamma": {**FROZEN, **body}})
+        assert proc.returncode != 0 and f"STORE CHECK FAILED — gamma: {reason}" in proc.stderr, proc.stderr[-1500:]
 
     def test_a_persistent_backoff_fails_after_the_bounded_wait(self, poststart):
         # review 7841 P1: D1 auth/network trouble after the sync state was read
         repl = {**REPL_OK, "status": "backoff", "last_error": "D1 403 Forbidden", "lag_rows": 1}
-        proc, _ = poststart({"re": {**FROZEN, "replication": repl}})
+        proc, _ = poststart({"gamma": {**FROZEN, "replication": repl}})
         assert proc.returncode != 0
-        assert ("STORE CHECK FAILED — re: replication status 'backoff', not running "
+        assert ("STORE CHECK FAILED — gamma: replication status 'backoff', not running "
                 "(last_error 'D1 403 Forbidden', lag_rows 1)") in proc.stderr, proc.stderr[-1500:]
         assert "all 3 stores verified" not in proc.stdout
 
     def test_a_backoff_that_recovers_within_the_wait_passes(self, poststart):
         repl = {**REPL_OK, "status": "backoff", "last_error": "D1 503", "lag_rows": 1}
-        proc, _ = poststart({"re": [{**FROZEN, "replication": repl}, {**FROZEN, "replication": REPL_OK}]})
+        proc, _ = poststart({"gamma": [{**FROZEN, "replication": repl}, {**FROZEN, "replication": REPL_OK}]})
         assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
 
     def test_a_store_not_replicated_keeps_the_plain_check(self, poststart):
-        proc, fake = poststart({"re": {"replication": REPL_OK}, "ob1": {**FROZEN}})
-        assert "store ob1: /health/db 200 ok, FROZEN" in proc.stdout
-        assert "store ob1: replicating" not in proc.stdout
+        proc, fake = poststart({"gamma": {"replication": REPL_OK}, "alpha": {**FROZEN}})
+        assert "store alpha: /health/db 200 ok, FROZEN" in proc.stdout
+        assert "store alpha: replicating" not in proc.stdout
         assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
 
 
 def test_a_frozen_unsafe_store_fails_the_deploy(poststart):
-    proc, _ = poststart({"re": {"replication": REPL_OK}, "ob1": {"freeze": {"state": "frozen-unsafe", "in_flight": 1}}})
-    assert proc.returncode != 0 and "STORE CHECK FAILED — ob1: frozen-unsafe after the restart" in proc.stderr
+    proc, _ = poststart({"gamma": {"replication": REPL_OK}, "alpha": {"freeze": {"state": "frozen-unsafe", "in_flight": 1}}})
+    assert proc.returncode != 0 and "STORE CHECK FAILED — alpha: frozen-unsafe after the restart" in proc.stderr
 
 
 class TestDataDirPinned:
@@ -903,7 +915,7 @@ class TestDataDirPinned:
 
 # ---------------------------------------------------------------- REL2: the remote arguments survive ssh
 
-N_REMOTE_ARGS = 24
+N_REMOTE_ARGS = 25
 
 
 def _decode_blob(line):
@@ -934,7 +946,9 @@ class TestRemoteArguments:
         assert params[17] == ""                      # MEMORA_REPLICAS_B64: empty (dark)
         assert params[18] == "" and params[19] == ""  # MEMORA_REPLICATION, the timing
         assert params[20] == "90"
-        assert params[21:] == ["100.104.19.74", "8766", "graph.token"]  # G1: the graph publish
+        assert params[21:24] == ["100.64.0.10", "8766", "graph.token"]  # G1: the graph publish
+        import base64
+        assert json.loads(base64.b64decode(params[24])) == PROJECTS    # CFG1: from deploy.env
 
     def test_spaces_survive_the_transport(self, deploy, tmp_path):
         root = tmp_path / "rh root"
@@ -945,10 +959,12 @@ class TestRemoteArguments:
         shutil.copytree(deploy.secrets, rsec)
         envf = root / "all env"
         envf.write_text(f"MEMORA_DATABASES='{json.dumps(REGISTRY)}'\n")
+        dcfg = root / "deploy env"
+        dcfg.write_text(deploy.config_file.read_text())
         proc, calls, _ = deploy(runtime_env={
             **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
             "DEPLOY_LABELS": "memora.rehearsal=rh-t extra=x", "DEPLOY_CONFIG_DIR": str(rcfg),
-            "DEPLOY_SECRETS_DIR": str(rsec), "DEPLOY_ENV_FILE": str(envf),
+            "DEPLOY_SECRETS_DIR": str(rsec), "DEPLOY_ENV_FILE": str(envf), "DEPLOY_CONFIG_FILE": str(dcfg),
             "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora")})
         run = _new_container_run(calls)
         assert f"{rsec}:{SECRETS_MOUNT}:ro" in _flag_values(run, "-v"), proc.stderr[-1500:]
@@ -1015,9 +1031,9 @@ class TestGraphPublish:
         proc, calls, _ = deploy()
         run = _new_container_run(calls)
         ports = _flag_values(run, "-p")
-        assert "100.104.19.74:8766:8765" in ports
-        assert not [p for p in ports if p.endswith(":8765") and not p.startswith("100.104.19.74:")]
-        assert "graph=100.104.19.74:8766" in proc.stdout
+        assert "100.64.0.10:8766:8765" in ports
+        assert not [p for p in ports if p.endswith(":8765") and not p.startswith("100.64.0.10:")]
+        assert "graph=100.64.0.10:8766" in proc.stdout
 
     def test_the_graph_token_is_minted_once_0600_and_passed_as_a_file(self, deploy):
         proc, calls, _ = deploy()
@@ -1053,7 +1069,7 @@ class TestGraphPublish:
         _nothing_done(deploy, proc, calls)
         assert "overrides are for rehearsals only" in proc.stderr
 
-    @pytest.mark.parametrize("bind, match", [("0.0.0.0", "every interface"), ("nuc8", "not an IPv4 address"),
+    @pytest.mark.parametrize("bind, match", [("0.0.0.0", "every interface"), ("deploy-host", "not an IPv4 address"),
                                              ("", "not an IPv4 address")])
     def test_the_graph_is_never_published_on_all_interfaces(self, deploy, tmp_path, bind, match):
         rcfg = tmp_path / "rcfg"
@@ -1128,3 +1144,73 @@ class TestEmbeddingPreflight:
         proc, calls, _ = deploy(runtime_env={"CREATE_RC": "125"})
         assert proc.returncode != 0 and "cannot create the embedding preflight container" in proc.stderr
         assert not any(c[0] in ("start", "stop") for c in calls)
+
+# ---------------------------------------------------------------- CFG1: infrastructure values come from deploy.env
+
+def test_the_production_values_come_from_the_deploy_configuration(deploy, tmp_path):
+    """The host, the graph address and the checkout are the configured ones,
+    and a different configured host is what ssh is called with."""
+    cfg = dict(DEPLOY_CFG, DEPLOY_HOST="other-host", DEPLOY_GRAPH_BIND="100.64.0.77")
+    deploy.config_file.write_text(_deploy_env_text(cfg))
+    proc, calls, _ = deploy()
+    assert "deploy target: host=other-host " in proc.stdout, proc.stderr[-800:]
+    assert "graph=100.64.0.77:8766" in proc.stdout
+    assert deploy.tools.read_text().splitlines()[0] == "ssh other-host"
+    params = _decode_blob((tmp_path / "ssh-command.txt").read_text().strip())
+    assert params[9] == "~/repos/agentic-box/memora" and params[21] == "100.64.0.77"
+
+
+@pytest.mark.parametrize("problem, match", [
+    ("missing", "is missing or incomplete"),
+    ("no-host", "is missing or incomplete"),
+    ("no-bind", "is missing or incomplete"),
+    ("no-repo", "is missing or incomplete"),
+    ("no-projects", "is missing or incomplete"),
+    ("empty-host", "is missing or incomplete"),
+    ("unknown-key", "is missing or incomplete"),
+    ("not-key-value", "is missing or incomplete"),
+    ("bad-projects", "MEMORA_PROJECTS in"),
+])
+def test_the_deploy_refuses_without_a_complete_configuration(deploy, problem, match):
+    """CFG1: no guessed default -- a missing file, a missing, empty or unknown
+    key, or a malformed line refuses before anything runs."""
+    cfg = dict(DEPLOY_CFG)
+    text = None
+    if problem == "missing":
+        deploy.config_file.unlink()
+    elif problem.startswith("no-"):
+        cfg.pop({"no-host": "DEPLOY_HOST", "no-bind": "DEPLOY_GRAPH_BIND", "no-repo": "DEPLOY_REPO",
+                 "no-projects": "MEMORA_PROJECTS"}[problem])
+    elif problem == "empty-host":
+        cfg["DEPLOY_HOST"] = ""
+    elif problem == "unknown-key":
+        text = _deploy_env_text(cfg) + "DEPLOY_HOTS=typo\n"
+    elif problem == "not-key-value":
+        text = _deploy_env_text(cfg) + "export DEPLOY_HOST\n"
+    elif problem == "bad-projects":
+        cfg["MEMORA_PROJECTS"] = '["memora"]'
+    if problem != "missing":
+        deploy.config_file.write_text(text if text is not None else _deploy_env_text(cfg))
+    proc, calls, _ = deploy()
+    _nothing_done(deploy, proc, calls)
+    assert match in proc.stderr and "nothing was done" in proc.stderr, proc.stderr[-800:]
+
+
+def test_a_config_file_override_needs_the_rehearsal_sentinel(deploy, tmp_path):
+    other = tmp_path / "elsewhere.env"
+    other.write_text(deploy.config_file.read_text())
+    proc, calls, _ = deploy(runtime_env={"DEPLOY_CONFIG_FILE": str(other)})
+    _nothing_done(deploy, proc, calls)
+    assert "overrides are for rehearsals only" in proc.stderr and "DEPLOY_CONFIG_FILE" in proc.stderr
+
+
+def test_a_rehearsal_config_file_outside_the_root_is_refused(deploy, tmp_path):
+    root = tmp_path / "rh"
+    (root / "cfg").mkdir(parents=True)
+    envf = root / "all.env"
+    envf.write_text(f"MEMORA_DATABASES='{json.dumps(REGISTRY)}'\n")
+    proc, calls, _ = deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
+                                         "DEPLOY_LABELS": "memora.rehearsal=r", "DEPLOY_CONFIG_DIR": str(root / "cfg"),
+                                         "DEPLOY_SECRETS_DIR": str(root / "sec"), "DEPLOY_ENV_FILE": str(envf)})
+    _nothing_done(deploy, proc, calls)
+    assert "DEPLOY_CONFIG_FILE is not under" in proc.stderr

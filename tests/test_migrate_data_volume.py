@@ -39,13 +39,13 @@ def old_volume(tmp_path):
     src = tmp_path / "old"
     (src / "intent").mkdir(parents=True)
     (src / "freeze").mkdir()
-    db = sqlite3.connect(src / "re.db")
+    db = sqlite3.connect(src / "gamma.db")
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)")
     db.execute("INSERT INTO memories (content) VALUES ('kept')")
     db.commit()
     # Copy while the sidecars exist, as a stopped container leaves them.
-    shadow = sqlite3.connect(src / "re.db")
+    shadow = sqlite3.connect(src / "gamma.db")
     shadow.execute("SELECT 1").fetchone()
     (src / "intent" / "memora.jsonl").write_text('{"type":"intent","id":1,"sql":"INSERT"}\n')
     (src / "freeze" / "memora").write_text("")
@@ -58,7 +58,7 @@ def old_volume(tmp_path):
 def test_first_copy_is_byte_identical_including_wal_sidecars_and_journal(tmp_path, old_volume):
     dst = tmp_path / "named"
     dst.mkdir()
-    assert (old_volume / "re.db-wal").exists() and (old_volume / "re.db-shm").exists()
+    assert (old_volume / "gamma.db-wal").exists() and (old_volume / "gamma.db-shm").exists()
     r = _run(old_volume, dst)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip().startswith("copied ")
@@ -107,7 +107,7 @@ def test_a_leftover_staging_area_is_reset_not_overlaid(tmp_path, old_volume):
     dst = tmp_path / "named"
     (dst / ".memora-staging").mkdir(parents=True)
     (dst / ".memora-staging" / "junk-from-a-failed-copy").write_text("x")
-    (dst / ".memora-staging" / "re.db").write_text("truncated")
+    (dst / ".memora-staging" / "gamma.db").write_text("truncated")
     r = _run(old_volume, dst)
     assert r.returncode == 0, r.stderr
     assert not (dst / "junk-from-a-failed-copy").exists()

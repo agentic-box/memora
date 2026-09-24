@@ -3,7 +3,7 @@
 HTTP endpoint (docs/local-primary-implementation.md §6 F4/F5, slice L8;
 procedure: docs/local-primary-credentials.md).
 
-  scripts/repoint_mcp_config.py FILE --url http://nuc8:8920/mcp/<store>            # dry run
+  scripts/repoint_mcp_config.py FILE --url http://deploy-host:8920/mcp/<store>            # dry run
   scripts/repoint_mcp_config.py FILE --url … --apply                                 # write it
   scripts/repoint_mcp_config.py FILE --url … --apply \\
       --check-health-token-file H --check-admin-token-file A                         # verify first
@@ -243,7 +243,7 @@ def apply(path: Path, new_doc: Dict[str, Any], *, now: float = None) -> Path:
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("file")
-    ap.add_argument("--url", required=True, help="memora-all's MCP URL, e.g. http://nuc8:8920/mcp/memora")
+    ap.add_argument("--url", required=True, help="memora-all's MCP URL, e.g. http://deploy-host:8920/mcp/memora")
     ap.add_argument("--server", help="only this mcpServers entry")
     ap.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
     ap.add_argument("--drop-env", action="store_true",

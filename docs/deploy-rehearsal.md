@@ -2,13 +2,13 @@
 
 `scripts/rehearse_deploy.sh` runs the real `scripts/deploy-memora-all.sh` —
 the L2a named-volume migration and the new container — against a real
-container runtime on a rehearsal host (server2, rootless podman 5.8). It uses
-no Cloudflare, no nuc8, and no token that exists anywhere else.
+container runtime on a rehearsal host (build-host, rootless podman 5.8). It uses
+no Cloudflare, no deploy-host, and no token that exists anywhere else.
 
 ```
-git archive v0.4.6 | ssh server2 'mkdir -p ~/verify/r1-old-src && tar -x -C ~/verify/r1-old-src'
-rsync -a --exclude .git ./ server2:verify/feat-r1-rehearsal/
-ssh server2 'cd ~/verify/feat-r1-rehearsal && PYTHON=~/verify/venv312/bin/python scripts/rehearse_deploy.sh ~/verify/r1-old-src'
+git archive v0.4.6 | ssh build-host 'mkdir -p ~/verify/r1-old-src && tar -x -C ~/verify/r1-old-src'
+rsync -a --exclude .git ./ build-host:verify/feat-r1-rehearsal/
+ssh build-host 'cd ~/verify/feat-r1-rehearsal && PYTHON=~/verify/venv312/bin/python scripts/rehearse_deploy.sh ~/verify/r1-old-src'
 ```
 
 Everything it creates is suffixed `-rh`: the container `memora-rh`, the
@@ -52,7 +52,7 @@ object is created and removed through `scripts/rehearse_objects.sh`:
 ## The deploy script's rehearsal parameters
 
 Every default is the production value, so an unparameterised run is exactly
-the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
+the deploy-host deploy; `tests/test_deploy_memora_all.py` pins both.
 
 **The guard (review 7725).**
 - Any value that differs from production is refused unless
@@ -60,7 +60,7 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
 - With the sentinel, a preflight refuses before anything runs unless all of
   these hold:
   - `DEPLOY_REHEARSAL_ROOT` is an existing directory;
-  - `DEPLOY_HOST=localhost` (nuc8 is refused);
+  - `DEPLOY_HOST=localhost` (deploy-host is refused);
   - the container, volume and image names contain `-rh`;
   - the port is not 8920;
   - the config dir and the env file are under the rehearsal root.
@@ -69,13 +69,13 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
 
 | variable | default | rehearsal |
 |---|---|---|
-| `DEPLOY_HOST` | `nuc8` | `localhost` (no ssh; the same remote command line runs through `sh -c`, re-parsed as ssh's remote shell would: REL2) |
+| `DEPLOY_HOST` | `deploy-host` | `localhost` (no ssh; the same remote command line runs through `sh -c`, re-parsed as ssh's remote shell would: REL2) |
 | `RUNTIME` | `docker` | `podman` (every runtime call goes through it) |
 | `DEPLOY_CONTAINER` / `DEPLOY_DATA_VOLUME` / `DEPLOY_IMAGE` | `memora-all` / `memora-all-data` / `memora:latest` | `memora-rh` / `memora-rh-data` / `memora-rh:latest` |
 | `DEPLOY_PORT` | `8920` | `18920` |
 | `DEPLOY_CONFIG_DIR` | `~/.config/memora` | `~/rehearsal-r1/config` (throwaway 0600 tokens) |
 | `DEPLOY_ENV_FILE` | `instances/all.env` | `~/rehearsal-r1/all.env` (four local SQLite stores) |
-| `DEPLOY_REPO` / `DEPLOY_SKIP_CHECKOUT` | the nuc8 checkout / `0` | this checkout / `1` (build it as it is) |
+| `DEPLOY_REPO` / `DEPLOY_SKIP_CHECKOUT` | the deploy-host checkout / `0` | this checkout / `1` (build it as it is) |
 | `DEPLOY_TAG` | `v0.5.0` | `v<pyproject version>` |
 | `DEPLOY_SECRETS_DIR` | `~/.config/memora-lp` | `~/rehearsal-r1/secrets` (throwaway 0600 token files, mounted read-only) |
 | `DEPLOY_SMOKE_ABSORB` | `1` | `0` (the dry-run absorb needs the LLM) |
@@ -132,14 +132,14 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
    - the operator tool at `/app/scripts/local_primary.py`;
    - the admin and health tokens as 0600 files on the container's tmpfs,
      written by the container's own shell;
-   - `freeze re` and `fk-audit re`.
+   - `freeze gamma` and `fk-audit gamma`.
 
-   Sync is then installed on `/data/re.db`, standing in for the seed,
-   which needs D1. A deploy follows, with `MEMORA_REPLICAS={"re": …}` and
+   Sync is then installed on `/data/gamma.db`, standing in for the seed,
+   which needs D1. A deploy follows, with `MEMORA_REPLICAS={"gamma": …}` and
    `MEMORA_REPLICATION=log` in `all.env`. Checked after it:
-   - `re` comes up frozen, from the persisted freeze;
+   - `gamma` comes up frozen, from the persisted freeze;
    - it replicates in **log** mode, not halted;
-   - after `thaw`, a write through `/mcp/re` is logged: `lag_rows` 0, and
+   - after `thaw`, a write through `/mcp/gamma` is logged: `lag_rows` 0, and
      the log cursor moved.
 
    Log mode sends nothing to D1. **Write mode is not rehearsed**: the

@@ -735,11 +735,17 @@ def build_graph_app(host: str):
             if ".." in key:
                 return JSONResponse({"error": "not_found"}, status_code=404)
 
-            # Strip db prefix (memora/, ob1/) if present, same as cloud proxy
-            if key.startswith("memora/"):
-                key = key[7:]
-            elif key.startswith("ob1/"):
-                key = key[4:]
+            # Strip a store-name prefix ("<store>/images/..") if present, same
+            # as the cloud proxy. The store names are the configured registry
+            # (CFG1: never a list in code); "memora" is the default store.
+            first, sep, rest = key.partition("/")
+            if sep and first != "images":
+                try:
+                    stores = set(graph_databases()["databases"]) | {"memora"}
+                except Exception:
+                    stores = {"memora"}
+                if first in stores:
+                    key = rest
 
             # Restrict to images/ prefix
             if not key.startswith("images/"):

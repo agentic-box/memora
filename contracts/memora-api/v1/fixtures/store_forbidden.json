@@ -3,7 +3,7 @@
   "description": "The token does not list the store.",
   "request": {
     "method": "GET",
-    "path": "/api/v1/ob1/health",
+    "path": "/api/v1/alpha/health",
     "headers": {
       "Authorization": "Bearer memora-api-v1-test-token"
     }

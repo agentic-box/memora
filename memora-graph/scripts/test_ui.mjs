@@ -64,8 +64,8 @@ check(
 
 // ------------------------------------------------- index.html truncation banner
 
-// Truncation probes use the default/seeded database. nonDefault (ob1) is a
-// catalog-only binding here and /api/graph?db=ob1 is not a fixture JSON graph.
+// Truncation probes use the default/seeded database. nonDefault (alpha) is a
+// catalog-only binding here and /api/graph?db=alpha is not a fixture JSON graph.
 const seededDb = configured.default || "memora";
 
 // Happy path (real fixture, truncated=false) must NOT sprout a banner.

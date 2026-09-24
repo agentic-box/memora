@@ -4,7 +4,7 @@
  *
  * Handles paths like:
  *   /api/r2/memora/images/123/0.jpg
- *   /api/r2/images/123/0.jpg?db=ob1
+ *   /api/r2/images/123/0.jpg?db=alpha
  */
 
 import {
@@ -37,7 +37,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, params, request })
   // Handle both bucket-prefixed and non-prefixed paths
   // R2 stores files like: images/123/0.jpg
   // URLs might come as: memora/images/123/0.jpg or images/123/0.jpg
-  // A configured db name may prefix the key (e.g. "bestation/images/..").
+  // A configured db name may prefix the key (e.g. "beta/images/..").
   // Strip it and pick that db's bucket; otherwise fall back to ?db=.
   const prefixDb = Object.keys(databaseConfig(env)).find((n) =>
     objectKey.startsWith(n + "/")

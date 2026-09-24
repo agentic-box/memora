@@ -381,7 +381,7 @@ an MCP `command` entry (that would spawn a stdio child that never speaks MCP
 on stdio). Credentials live on the server process.
 
 ```bash
-MEMORA_DATABASES='{"memora":"d1://<account-id>/<memora-db-id>","ob1":"d1://<account-id>/<ob1-db-id>"}' \
+MEMORA_DATABASES='{"memora":"d1://<account-id>/<memora-db-id>","alpha":"d1://<account-id>/<alpha-db-id>"}' \
 MEMORA_DEFAULT_DB=memora \
 CLOUDFLARE_API_TOKEN='<token>' \
 MEMORA_VECTOR_SCAN_PAGE_SIZE=100 \
@@ -393,7 +393,7 @@ memora-server --transport streamable-http --host 127.0.0.1 --port 8000 --no-grap
   "mcpServers": {
     "memora": {
       "type": "http",
-      "url": "http://127.0.0.1:8000/mcp/ob1"
+      "url": "http://127.0.0.1:8000/mcp/alpha"
     }
   }
 }
@@ -403,7 +403,7 @@ memora-server --transport streamable-http --host 127.0.0.1 --port 8000 --no-grap
 above): `scripts/memora-instance.sh up myinstance` starts the same HTTP server
 inside a container and puts `scripts/memora_proxy.py` on `127.0.0.1:<PORT>`
 (8910 for the `memora` instance). The workspace URL is then
-`http://127.0.0.1:8910/mcp/ob1`. See [Container Deployment](#container-deployment).
+`http://127.0.0.1:8910/mcp/alpha`. See [Container Deployment](#container-deployment).
 
 A registry may mix `d1://`, `s3://`, and local paths; `parse_backend_uri`
 dispatches on the scheme.
@@ -459,7 +459,7 @@ A registry instance needs the store in the path (`/mcp/<name>`); bare `/mcp` is
 the registry default:
 
 ```json
-{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp/ob1"}}}
+{"mcpServers": {"memora": {"type": "http", "url": "http://127.0.0.1:8910/mcp/alpha"}}}
 ```
 
 **Credentials never enter the image, the instance file, or the workspace's HTTP

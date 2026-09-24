@@ -8,7 +8,7 @@ and syncs them to D1 for the web graph visualization.
 Usage:
     python scripts/sync-to-d1.py           # Local D1 (development) only
 
-RETIRED for remote D1: memora-all on nuc8 is the only D1 writer
+RETIRED for remote D1: memora-all on deploy-host is the only D1 writer
 (docs/local-primary-implementation.md §0 P6, §6 F3). Any remote run
 (`--remote`, with or without `--replace`) exits 1 before it imports memora,
 reads a store or starts wrangler. Local-D1 development runs still work.
@@ -28,7 +28,7 @@ MEMORA_ROOT = SCRIPT_DIR.parent.parent
 sys.path.insert(0, str(MEMORA_ROOT))
 
 RETIRED_REMOTE = (
-    "sync-to-d1.py: remote D1 sync is retired. memora-all on nuc8 is the only D1 "
+    "sync-to-d1.py: remote D1 sync is retired. memora-all on deploy-host is the only D1 "
     "writer; see docs/local-primary-implementation.md §0 P6 and §6 F3."
 )
 

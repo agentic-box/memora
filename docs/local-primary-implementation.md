@@ -1,12 +1,12 @@
 # Local-primary: implementation plan
 
-This plan implements `plans/nuc8-local-primary-design.md`. It is based on dev
+This plan implements `plans/deploy-host-local-primary-design.md`. It is based on dev
 at 3d03123. Line numbers refer to that commit.
 
 The user's decisions (leader msgs 7507, 7520):
 - Replication is async for every store.
 - The memora-graph viewer becomes read-only.
-- nuc8 `memora-all` becomes the only D1 writer.
+- deploy-host `memora-all` becomes the only D1 writer.
 - **D1 is precious.** Today it is the only complete copy of every store, so
   §0 overrides every other section.
 - **D1 stays primary during the shadow period** (msg 7526; §2.9).
@@ -115,7 +115,7 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
     token with Pages permission) is held only by the user, on no agent
     host. Checked on the Mac on 2026-09-23: there is no wrangler config at
     `~/.wrangler`, `~/Library/Preferences/.wrangler` or `~/.config/.wrangler`.
-    nuc8, ob1, bestation and re are checked by `audit-configs` (L8).
+    deploy-host, alpha, beta and gamma are checked by `audit-configs` (L8).
   - The §6.1 tokens (a), (b) and (c) are minted with D1 permissions only,
     and no Pages permission.
   - The CI guard (F2) holds the scripted paths.
@@ -1326,7 +1326,7 @@ lines.
 
 ### 5.3 Rollback (H6)
 
-**Venue (X3).** On nuc8 the operator tool runs in a one-off container of
+**Venue (X3).** On deploy-host the operator tool runs in a one-off container of
 the image memora-all runs now: `LP_TOKEN_DIR=<dir> scripts/lp_container.sh
 <local_primary.py arguments>`. It mounts `memora-all-data` at `/data` and
 the token directory read-only at `/run/secrets/memora`, and never mounts the
@@ -1367,7 +1367,7 @@ a failed create (a name collision) removes nothing.
     - Every boundary also checks with `lstat` that the path is still not a
       link.
     - A link into a container-private `/tmp` would otherwise give each
-      container its own file; server2's two-container check showed both
+      container its own file; build-host's two-container check showed both
       "holding" it before the fix, and both refused after it.
   - The safety proof requires `scripts/lp_container.sh`: run by hand,
     `--lock-barrier` trusts `LP_SERVICE_DATA_DIR` as given.
@@ -1527,16 +1527,16 @@ Not writers: the GET-only functions (`actions`, `databases`, `duplicates`,
 | # | step | owner | done when | slice |
 |---|---|---|---|---|
 | F3 | `sync-to-d1.py`, `sync.sh`, `link-r2-images.py`, `setup-cloudflare.sh`'s remote migration and `package.json` `d1:migrate` exit 1 with a pointer here. `package.json` `deploy` and `setup-cloudflare.sh`'s Pages deploy first run the F2 guard, and refuse on any finding (P6) | worker | each exits 1, or refuses on 3d03123; a test runs each | L1b |
-| F2 | CI guard in `graph-ui.yml`. It fails on write SQL inside `.prepare(`/`.batch(`/`.exec(` under `memora-graph/functions/`, on `DB_MEMORA\|DB_OB1\|DB_BESTATION\|DB_RE` used with write SQL, on Python `requests.post` to `/d1/database/…/query`, and on `wrangler d1 execute --remote` / `migrations apply` without `--local`. An allow-list covers only `memora/backends.py` | worker | it fails on 3d03123 and passes after F1 and F3. **L7:** `--scope all` is clean; the handlers step and an `--scope all` step block in `graph-ui.yml` | L1b (tools), L7 (handlers) |
+| F2 | CI guard in `graph-ui.yml`. It fails on write SQL inside `.prepare(`/`.batch(`/`.exec(` under `memora-graph/functions/`, on `DB_MEMORA\|DB_ALPHA\|DB_BETA\|DB_GAMMA` used with write SQL, on Python `requests.post` to `/d1/database/…/query`, and on `wrangler d1 execute --remote` / `migrations apply` without `--local`. An allow-list covers only `memora/backends.py` | worker | it fails on 3d03123 and passes after F1 and F3. **L7:** `--scope all` is clean; the handlers step and an `--scope all` step block in `graph-ui.yml` | L1b (tools), L7 (handlers) |
 | F1 | viewer read-only: `chat.ts` keeps search and answers but drops the 3 write tools and `computeAndStoreEmbedding`; `[id].ts` PATCH returns 405; the edit controls in `index.html` and `force-graph.html` are hidden or disabled; `test_tag_writes.mjs` is replaced by 405 and no-tool tests | worker, deploy by leader | the deployed viewer returns 405; no edit controls. **L7 (code):** write methods on `[id].ts` answer 405 before any D1 call; `chat.ts` offers no tools and never executes one; `GET /api/capabilities` answers `read_only: true` and the shared `index.html` hides or disables its edit controls unless a server says `read_only: false` (only memora's own graph server does, which keeps editing through memora); `force-graph.html`'s favorite write is removed; `scripts/test_readonly.mjs` replaces `test_tag_writes.mjs`. The deploy is the leader's step | L7 |
-| F4a | from the Mac, over nuc8's endpoint: authenticate, and create and delete one memory in a `scratch` local store in the registry. D1 is never touched | user | receipt noted. **L8 tool:** `scripts/local_primary.py check-endpoint` (liveness; admin token enforced; `/admin/data-volume` shows the store is `kind: sqlite`, else it refuses before writing; authenticated `/health/db/<store>`; MCP stats, create, get, delete, gone) | L8 |
-| F4 | repoint the Mac `~/.config/memora/credentials.mcp.json` to nuc8: no `d1://`, no `CLOUDFLARE_API_TOKEN` | user | `audit-configs` is clean. **L8 tools:** `scripts/repoint_mcp_config.py` (dry run by default; 0600 backup; optional check-endpoint gate) and `scripts/audit_configs.py`; procedure in `docs/local-primary-credentials.md` | L8 |
-| F5 | the same for every `.mcp.json` / `credentials*.mcp.json` on ob1, bestation and re (REVERT.md lists 4) | user | audit output (`scripts/audit_configs.py --host ob1 --host bestation --host re`, exit 0) | L8 |
+| F4a | from the Mac, over deploy-host's endpoint: authenticate, and create and delete one memory in a `scratch` local store in the registry. D1 is never touched | user | receipt noted. **L8 tool:** `scripts/local_primary.py check-endpoint` (liveness; admin token enforced; `/admin/data-volume` shows the store is `kind: sqlite`, else it refuses before writing; authenticated `/health/db/<store>`; MCP stats, create, get, delete, gone) | L8 |
+| F4 | repoint the Mac `~/.config/memora/credentials.mcp.json` to deploy-host: no `d1://`, no `CLOUDFLARE_API_TOKEN` | user | `audit-configs` is clean. **L8 tools:** `scripts/repoint_mcp_config.py` (dry run by default; 0600 backup; optional check-endpoint gate) and `scripts/audit_configs.py`; procedure in `docs/local-primary-credentials.md` | L8 |
+| F5 | the same for every `.mcp.json` / `credentials*.mcp.json` on alpha, beta and gamma (REVERT.md lists 4) | user | audit output (`scripts/audit_configs.py --host alpha --host beta --host gamma`, exit 0) | L8 |
 | F6 | mint the three credentials in §6.1, move memora-all to (a), then revoke the OLD token (the one in the Mac MCP and on other hosts). The viewer keeps its Pages binding (read-only by F1/F2). (a) is revoked only after the last cutover and its rollback window | user | a stale client gets 401/403; memora-all is healthy on (a). Minting, rotation order and retention: `docs/local-primary-credentials.md` | L8, after F4a–F5 |
 | F7 | `cloud_sync.schedule_sync` stays, called after the ack | worker | — | L3 |
 
 F1 is swappable: if the viewer later needs edits, it becomes "route writes
-to nuc8", and nothing else changes.
+to deploy-host", and nothing else changes.
 
 ### 6.1 Credential inventory (P0-1)
 
@@ -1553,10 +1553,10 @@ database.
 
 Which process holds which token, by phase:
 
-| phase | memora-all | scripts on nuc8 | other hosts |
+| phase | memora-all | scripts on deploy-host | other hosts |
 |---|---|---|---|
 | before F6 (L1b–L8) | the OLD token | none | the OLD token (Mac MCP etc.) |
-| after F6, before any shadow | (a) | (c) for exports | nothing: repointed to nuc8 (F4, F5) |
+| after F6, before any shadow | (a) | (c) for exports | nothing: repointed to deploy-host (F4, F5) |
 | store X in shadow week | (a) plus (c) (shadow reader) | (c) | nothing |
 | store X cut over, others not | (a) for the uncut stores; (b) for X's replicator; (c) while any store is in shadow | (c); operator (b) for restore, sequence or restamp | nothing |
 | after L12, rollback window open (14 days after L12's clean write week) | (a) still held, so rollback remains possible; (b); (c) for nightly compares | (c); operator | nothing |
@@ -1781,9 +1781,9 @@ with flags off.
 | L6 | §5 compare, rollback, `restamp` | run by hand | full-table SELECTs of the 7 tables; epoch; `verify_embedding_integrity(stamp=False)` reads | rollback: only L5's sequence UPDATE. `restamp` (a separate operator step): one `memories_meta` `embedding_integrity` write | 0 |
 | L7 | F1, F2 for handlers; viewer deploy | viewer deploy | viewer GET handlers (unchanged) | none (removes writers) | 0 |
 | L8 | F4a–F6 including the §6.1 credentials, `audit-configs` | ops | none | none | 0 |
-| L9 | first store (`re` or `bestation`, the less critical), see below | per store | L3b, L5, L3 write-mode reads | the app's existing writes during shadow; after cutover, L3 write mode | whole store |
-| L10 | the other of `re`/`bestation`: same as L9, after L9 has had a clean week in write mode | per store | same | same | whole store |
-| L11 | `ob1`, same, after a clean week | per store | same | same | whole store |
+| L9 | first store (`gamma` or `beta`, the less critical), see below | per store | L3b, L5, L3 write-mode reads | the app's existing writes during shadow; after cutover, L3 write mode | whole store |
+| L10 | the other of `gamma`/`beta`: same as L9, after L9 has had a clean week in write mode | per store | same | same | whole store |
+| L11 | `alpha`, same, after a clean week | per store | same | same | whole store |
 | L12 | `memora`, same, last (P5) | per store | same | same | whole store |
 | L13 | remove the shadow wrapper (§2.9) | — | — | — | 0 |
 
@@ -1871,7 +1871,7 @@ Pre-existing D1 writes the plan leaves as they are:
   964+ rows), FTS and the 384 MB corpus cache, against the 768 MB limit.
   The launcher default becomes max(768m, 1.5 × peak RSS).
   **Measured in L2a** (`scripts/measure_memory_gate.py`, offline synthetic
-  stores): on server2 (Fedora, x86_64), inside the memora image built from
+  stores): on build-host (Fedora, x86_64), inside the memora image built from
   this tree with podman (python 3.12.14, the container's interpreter). One
   process imports `memora.server`, then runs 3 passes over the 4 stores:
   `semantic_search` (loads and caches the corpus snapshot), `hybrid_search`

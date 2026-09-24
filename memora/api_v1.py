@@ -46,7 +46,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 logger = logging.getLogger("memora.api_v1")
 
 API_VERSION = "v1"
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.0.1"
 SEARCH_MODE = "hybrid-v1"
 # Single-store deployments (no MEMORA_DATABASES) expose their one store as:
 DEFAULT_STORE = "default"

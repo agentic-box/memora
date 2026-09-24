@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A fake `docker` for tests/test_cutover_store.py: memora-all on nuc8.
+"""A fake `docker` for tests/test_cutover_store.py: memora-all on deploy-host.
 
 Every call is appended to $CALL_LOG (args joined by \\x1f, calls by \\x1e).
 `exec memora-all python /app/scripts/local_primary.py CMD ...` prints the
@@ -45,7 +45,7 @@ if args[:2] == ["exec", "memora-all"]:
         if cmd == "recheck":
             default["receipt"] = tail[tail.index("--receipt") + 1]
         if cmd == "export":
-            default["receipt"] = "/data/exports/re/20990101T000000Z.receipt.json"
+            default["receipt"] = "/data/exports/gamma/20990101T000000Z.receipt.json"
         if cmd in ("compare", "fk-audit"):
             default = {"clean": rc == 0}
         print(knob(f"TOOL_OUT_{key}") or json.dumps(default))
@@ -73,7 +73,7 @@ if args[:2] == ["exec", "memora-all"]:
             "env_replicas": {db: "d1://acct/db3"}, "env_replication": knob("ENV_REPLICATION", "write")}))
         sys.exit(0)
     if rest[:2] == ["python3", "-c"]:  # the sql path of a fresh receipt
-        print("/data/exports/re/20990101T000000Z.sql")
+        print("/data/exports/gamma/20990101T000000Z.sql")
         sys.exit(0)
     sys.exit(0)  # sh -c (token files), mkdir, rm
 if args[0] == "cp":

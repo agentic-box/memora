@@ -16,8 +16,8 @@ from memora.storage import CURRENT_DB
 
 class TestPathParsing:
     @pytest.mark.parametrize("path,expected", [
-        ("/mcp/ob1", "ob1"),
-        ("/mcp/ob1/", "ob1"),
+        ("/mcp/alpha", "alpha"),
+        ("/mcp/alpha/", "alpha"),
         ("/mcp", None),
         ("/mcp/", None),
     ])
@@ -28,7 +28,7 @@ class TestPathParsing:
         "/mcpbeta",       # prefix-matched to "beta" before the boundary fix
         "/mcp-other",     # prefix-matched to "-other"
         "/other",
-        "/mcp/ob1/extra",  # extra segments are NOT an alias for ob1
+        "/mcp/alpha/extra",  # extra segments are NOT an alias for alpha
     ])
     def test_non_route_paths_are_rejected(self, path):
         """A string prefix made any /mcp* URL an alternate database alias.
@@ -327,8 +327,8 @@ class TestRouteSafeNames:
         from memora.storage import database_registry
 
         monkeypatch.setenv("MEMORA_DATABASES", json.dumps({
-            "ob1": "/tmp/a.db", "my-db_2.x": "/tmp/b.db"}))
-        assert set(database_registry()) == {"ob1", "my-db_2.x"}
+            "alpha": "/tmp/a.db", "my-db_2.x": "/tmp/b.db"}))
+        assert set(database_registry()) == {"alpha", "my-db_2.x"}
 
     def test_bare_initialize_then_named_call_uses_the_default(self, monkeypatch, tmp_path):
         """codex: the most surprising disagreement, and it was unasserted.

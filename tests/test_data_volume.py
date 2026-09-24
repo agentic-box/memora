@@ -45,8 +45,8 @@ def data_dir(tmp_path):
 class TestNeedsDataVolume:
     @pytest.mark.parametrize("uri,needs", [
         ("/data/memora.db", True),
-        ("file:///data/re.db", True),
-        ("/data/shadow/ob1.db", True),
+        ("file:///data/gamma.db", True),
+        ("/data/shadow/alpha.db", True),
         ("/data", True),
         ("/database/x.db", False),        # prefix of the name, not the directory
         ("/tmp/x.db", False),
