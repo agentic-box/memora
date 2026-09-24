@@ -175,11 +175,16 @@ def test_the_explicit_rebuild_repairs_and_clears_the_health_note(store, monkeypa
     assert all(len(r) == 2 for r in _search(2))
 
 
-def test_a_store_never_audited_searches_its_comparable_vectors_without_a_rebuild(store, monkeypatch):
+def test_a_store_never_audited_searches_its_comparable_vectors_without_a_rebuild(store, monkeypatch, caplog):
+    """A repairable status whose vectors are comparable is not a repair: no
+    rebuild, no warning, no health entry (post-PASS mutation check)."""
     _meta(store, "embedding_integrity", None)
     _meta(store, "embedding_model", embeddings.current_embedding_fingerprint("tfidf"))
     calls = _rebuild_spy(monkeypatch)
-    assert all(len(r) == 2 for r in _search(2)) and calls == []
+    with caplog.at_level(logging.WARNING, logger="memora.storage"):
+        assert all(len(r) == 2 for r in _search(2)) and calls == []
+    assert not [r for r in caplog.records if "embedding integrity" in r.getMessage()]
+    assert "embeddings" not in (admin.gate_health("re") or {})
 
 
 # ------------------------------------------------------------------ symptom 2: the D1 stores
