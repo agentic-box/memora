@@ -444,6 +444,9 @@ def _foreign_ops(conn, cur, dest, made):
     }
 
 
+_HAS_BLOBOPEN = hasattr(sqlite3.Connection, "blobopen")
+
+
 def _outcomes(make_conn):
     conn = make_conn()
     conn.execute("CREATE TABLE IF NOT EXISTS t (x)")
@@ -458,7 +461,8 @@ def _outcomes(make_conn):
         "exec": conn.execute("SELECT x FROM t"),
         "many": conn.executemany("INSERT INTO t VALUES (?)", [(2,)]),
         "script": conn.executescript("SELECT 1;"),
-        "blob": conn.blobopen("b", "x", 1),
+        # Connection.blobopen is Python 3.11+; the 3.10 CI leg has no blobs.
+        "blob": conn.blobopen("b", "x", 1) if _HAS_BLOBOPEN else None,
         "dump": conn.iterdump(),
     }
     conn.commit()
@@ -469,6 +473,10 @@ def _outcomes(make_conn):
     def run():
         for name, op in ops.items():
             if not hasattr(sqlite3.Connection, "autocommit") and name == "conn.autocommit":
+                continue
+            if not _HAS_BLOBOPEN and "blob" in name:
+                continue
+            if not hasattr(sqlite3.Connection, "serialize") and name == "conn.serialize":
                 continue
             try:
                 op()
