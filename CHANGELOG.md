@@ -14,14 +14,6 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
-### Force-graph view served by memora-all (G2)
-- memora-all's graph server also serves the force-graph (2D/3D) view at `/force-graph.html`, the same path as on Pages; `/graph/force` redirects to it, keeping the query.
-- It is behind the same graph token. An unauthenticated browser gets the login form and returns to the view with its `?db=`.
-- It reads each store through G1's per-store API (`/api/databases`, `/api/graph?db=`, `/api/memories?db=`), with the injected `MEMORA_CONFIG` (image proxy `/r2/`, store selector).
-- The page has no edit calls, so it is read-only on both builds.
-- One source of truth: `force-graph.html` and `_selection.mjs` move to `memora/graph/` (shipped as package data), and `memora-graph/public/` keeps symlinks to them, as it already did for `index.html` and `_graph_limit.mjs`.
-- The page takes the image-proxy prefix from `MEMORA_CONFIG.r2Prefix` (`/api/r2/` when none is injected) and prefers `?db=` over its stored choice. The main viewer links to it with its current store.
-
 ## 0.5.1
 
 Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
@@ -63,6 +55,14 @@ Graph viewer with a store selector served by memora-all (G1): every graph route 
 - Vectors that do not match are a genuine mismatch: `SearchUnavailable` "embedding_model_unrecorded", repaired by the explicit `memory_rebuild_embeddings`.
 - `memory_verify_integrity(record_model=true)` is the explicit step that records the current model on such a store (one `memories_meta` row; refused when the vectors do not match).
 - Deploy preflight: `python -m memora.embedding_preflight`, run in the new image with memora-all's environment and data volume, reads each store's recorded model and vectors read-only (local stores via `connect_read_only()`, d1:// via the read token; no lock taken). A dense backend makes one probe embedding. Exit 2, naming the store and the fix, when any store would refuse searches under the new image; `deploy-memora-all.sh` runs it before the old container is stopped.
+
+### Force-graph view served by memora-all (G2)
+- memora-all's graph server also serves the force-graph (2D/3D) view at `/force-graph.html`, the same path as on Pages; `/graph/force` redirects to it, keeping the query.
+- It is behind the same graph token. An unauthenticated browser gets the login form and returns to the view with its `?db=`.
+- It reads each store through G1's per-store API (`/api/databases`, `/api/graph?db=`, `/api/memories?db=`), with the injected `MEMORA_CONFIG` (image proxy `/r2/`, store selector).
+- The page has no edit calls, so it is read-only on both builds.
+- One source of truth: `force-graph.html` and `_selection.mjs` move to `memora/graph/` (shipped as package data), and `memora-graph/public/` keeps symlinks to them, as it already did for `index.html` and `_graph_limit.mjs`.
+- The page takes the image-proxy prefix from `MEMORA_CONFIG.r2Prefix` (`/api/r2/` when none is injected) and prefers `?db=` over its stored choice. The main viewer links to it with its current store.
 
 ### Graph UI with a store selector, served by memora-all (G1)
 
