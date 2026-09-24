@@ -100,8 +100,10 @@ newest first, are the slices of the implementation plan
 - For every store in `MEMORA_REPLICAS`, frozen or not, the deploy also
   requires `/health/db`'s replication block to show the configured mode
   and `replica_uri`, a status neither refused nor halted, and the sync
-  schema at the current trigger version; otherwise it fails and names the
-  rollback. The replication block now carries `replica_uri`,
+  schema at the current trigger version, with status `running` (a
+  `backoff`, e.g. after a D1 auth error, is waited for, then fails with
+  the last error); otherwise it fails and names the rollback. The
+  cutover's health step requires `running` too. The replication block now carries `replica_uri`,
   `trigger_version` and `trigger_version_expected`.
 - The deploy pins `MEMORA_DATA_DIR=/data` in the container (X3's service
   lock, `/data/.service.lock`, must be the one memora-all holds). A

@@ -117,7 +117,9 @@ so, until it is thawed.
   `replica_uri`; a status neither `refused` nor `halted`; and the sync
   schema read from the store at the current trigger version.
   - A refused or halted replicator fails the deploy at once.
-  - A block that has not appeared is waited for (90 s), then fails.
+  - A block that has not appeared, or a status other than `running`
+    (such as `backoff` after a D1 error), is waited for (90 s), then
+    fails, naming the last error.
   - Each failure names the rollback.
 
 ### Runs

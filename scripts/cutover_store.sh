@@ -255,6 +255,8 @@ if kind in ("live", "compared"):
             bad.append(f"replication mode {rep.get('mode')!r}, not write")
         if rep.get("status") == "halted" or rep.get("halted_reason"):
             bad.append(f"replication halted: {rep.get('halted_reason')!r}")
+        elif rep.get("status") != "running":  # e.g. backoff on a D1 error (review 7841); polled
+            bad.append(f"replication status {rep.get('status')!r}, not running (last_error {rep.get('last_error')!r})")
         if rep.get("interval_s") != float(interval):
             bad.append(f"replication interval_s {rep.get('interval_s')!r}, not the configured {float(interval)}")
         if rep.get("last_acked_seq") != rep.get("head_seq") or rep.get("lag_rows") != 0:

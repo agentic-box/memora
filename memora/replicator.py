@@ -891,8 +891,8 @@ class StoreReplicator:
                 remaining = self._last_send_start + self.interval_s - time.monotonic()
                 if remaining > 0 and self._stop.wait(remaining):
                     break
+            started = time.monotonic()  # before the try: the handler uses it (review 7841 P2)
             try:
-                started = time.monotonic()
                 outcome = self.run_once()
                 if outcome not in ("idle", "halted"):
                     # a send, a reconcile read-back or resend: the next one waits

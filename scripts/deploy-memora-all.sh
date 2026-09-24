@@ -818,6 +818,11 @@ def _replication_problem(store, body):
     if rep.get("trigger_version") != rep.get("trigger_version_expected"):
         return True, (f"sync trigger version {rep.get('trigger_version')!r}, "
                       f"this build expects {rep.get('trigger_version_expected')!r}")
+    if rep.get("status") != "running":
+        # e.g. "backoff" after a D1 auth or network error (review 7841 P1):
+        # waited for (it may recover), then a failure naming the last error
+        return False, (f"replication status {rep.get('status')!r}, not running "
+                       f"(last_error {rep.get('last_error')!r}, lag_rows {rep.get('lag_rows')!r})")
     return None
 
 

@@ -726,7 +726,10 @@ class _FakeMemora:
                     return self._send(200, {"status": "ok", "version": "0.5.0"})
                 if self.path.startswith("/health/db/"):
                     store = self.path.rsplit("/", 1)[1]
-                    return self._send(200, {"status": "ok", "stale": False, **outer.health_db.get(store, {})})
+                    body = outer.health_db.get(store, {})
+                    if isinstance(body, list):  # a sequence of answers; the last one repeats
+                        body = body.pop(0) if len(body) > 1 else body[0]
+                    return self._send(200, {"status": "ok", "stale": False, **body})
                 return self._send(404, {})
 
             def do_POST(self):
@@ -821,6 +824,20 @@ class TestReplicatedStoreAfterStart:
         # not terminal: waited for (DEPLOY_STORE_WAIT_S, 90 s in production), then failed
         proc, _ = poststart({"re": {**FROZEN, **body}})
         assert proc.returncode != 0 and f"STORE CHECK FAILED — re: {reason}" in proc.stderr, proc.stderr[-1500:]
+
+    def test_a_persistent_backoff_fails_after_the_bounded_wait(self, poststart):
+        # review 7841 P1: D1 auth/network trouble after the sync state was read
+        repl = {**REPL_OK, "status": "backoff", "last_error": "D1 403 Forbidden", "lag_rows": 1}
+        proc, _ = poststart({"re": {**FROZEN, "replication": repl}})
+        assert proc.returncode != 0
+        assert ("STORE CHECK FAILED — re: replication status 'backoff', not running "
+                "(last_error 'D1 403 Forbidden', lag_rows 1)") in proc.stderr, proc.stderr[-1500:]
+        assert "all 3 stores verified" not in proc.stdout
+
+    def test_a_backoff_that_recovers_within_the_wait_passes(self, poststart):
+        repl = {**REPL_OK, "status": "backoff", "last_error": "D1 503", "lag_rows": 1}
+        proc, _ = poststart({"re": [{**FROZEN, "replication": repl}, {**FROZEN, "replication": REPL_OK}]})
+        assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
 
     def test_a_store_not_replicated_keeps_the_plain_check(self, poststart):
         proc, fake = poststart({"re": {"replication": REPL_OK}, "ob1": {**FROZEN}})

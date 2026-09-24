@@ -283,6 +283,9 @@ class TestAfterRedeploy:
         ({"REPL": json.dumps({"mode": "write", "status": "running", "interval_s": 60.0, "lag_rows": 3,
                               "last_acked_seq": 4, "head_seq": 7})}, "last_acked_seq 4 has not reached head 7"),
         ({"FAKE_INTERVAL_S": "0"}, "replication interval_s 0.0, not the configured 60.0"),
+        ({"REPL": json.dumps({"mode": "write", "status": "backoff", "last_error": "D1 403", "interval_s": 60.0,
+                              "lag_rows": 0, "last_acked_seq": 0, "head_seq": 0})},
+         "replication status 'backoff', not running (last_error 'D1 403')"),
         ({"REG_ENTRY": "d1://acct/db3"}, "not the local /data/re.db"),
         ({"ENV_REPLICATION": "log"}, "lacks MEMORA_REPLICATION=write"),
     ])
