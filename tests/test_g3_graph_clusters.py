@@ -201,7 +201,9 @@ def test_the_port_matches_the_literal_transcription_on_many_graphs():
 
 
 @pytest.mark.parametrize("related", ["not json", '{"id": 5}', '[{"id": 5, "score": 0.9}, "x"]',
-                                     '[{"score": 0.9}]', '[{"id": "5", "score": 0.9}]'])
+                                     '[{"score": 0.9}]', '[{"id": "5", "score": 0.9}]',
+                                     '[{"id": 5, "score": NaN}]', '[{"id": 5, "score": Infinity}]',
+                                     '[{"id": 5, "score": -Infinity}]'])
 def test_a_corrupt_row_makes_the_crossrefs_unavailable(related):
     conn = build_store(":memory:", "odd_entries")
     conn.execute("UPDATE memories_crossrefs SET related = ? WHERE memory_id = 3", (related,))

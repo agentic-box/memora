@@ -469,7 +469,7 @@ def _load_crossrefs_map(conn) -> Tuple[Dict[int, List[Dict[str, Any]]], bool]:
             out[row[0]] = []
             continue
         try:
-            parsed = json.loads(raw)
+            parsed = json.loads(raw, parse_constant=_reject_non_json_constant)
         except (TypeError, ValueError):
             available = False
             continue
@@ -497,6 +497,12 @@ def _load_crossrefs_map(conn) -> Tuple[Dict[int, List[Dict[str, Any]]], bool]:
         else:
             out[row[0]] = entries
     return out, available
+
+
+def _reject_non_json_constant(name: str) -> Any:
+    """NaN / Infinity / -Infinity are not JSON: JSON.parse rejects the row
+    (Pages: invalid_json, a corrupt row), where json.loads would accept it."""
+    raise ValueError(f"not JSON: {name}")
 
 
 def _is_js_number(value: Any) -> bool:
