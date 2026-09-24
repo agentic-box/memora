@@ -74,6 +74,13 @@ offline, using local SQLite and FakeD1 (`tests/conftest.py`).
     `halted_reason='delete_guard: <table> n/N'` and raises an alert.
   - `local_primary.py resume <db> --allow-deletes <attempt_id>` overrides it,
     for that one attempt only.
+  - Log mode does not halt (leader 7699): it sends nothing to D1, so a halt
+    would stop the shadow week without protecting anything. It records a
+    would-halt event instead -- a `sync_would_halt` row (table, deletes, row
+    count, threshold, attempt id; once per attempt), plus
+    `sync_state.would_halt_count` and `last_would_halt` -- logs a warning, and
+    keeps logging. The replication health block shows `would_halt_count` and
+    `last_would_halt`. Write mode halts as above.
   - Tables under 100 rows therefore halt on any delete; that is deliberate.
   - The same guard applies to restore replay (§4).
 - **P4. Shadow-local first; D1 stays primary** (P0-1, user decision
@@ -793,10 +800,12 @@ CREATE TABLE shadow_state (   -- in the shadow file only
 - **As built (L9a):** `local_primary.py shadow-night <db> --shadow S
   --seed-export SQL --account A --database-id D` (`memora/shadow_night.py`)
   runs both checks. (a) re-reads each diffed key once after a pause. (b)
-  also fails while the replicator's log is halted: L3's delete guard (P3)
-  halts log mode as well, and a table under 100 rows halts on any delete.
-  So a shadow night stays not-clean until `resume` is run. The shadow itself
-  is not marked dirty for that. A diff in (a) or (b) marks the shadow dirty.
+  also fails while the replicator's log is halted (any L3 halt cause), until
+  `resume` is run; the shadow itself is not marked dirty for that. The
+  delete guard (P3) does not halt log mode: the night reports the would-halt
+  events recorded since the previous night (`would_halt`, tracked by
+  `shadow_state.would_halt_reported_id`), and they do not fail the night.
+  A diff in (a) or (b) marks the shadow dirty.
   A clean night counts once per UTC day, and the command reports
   `ready_for_cutover` at 7. Exit 5 when the night is not clean.
 - `/health/db/<name>` carries the `shadow` block (`enabled`, `dirty`,
@@ -1420,6 +1429,7 @@ if it is in the dev deps.
 - **`test_statement_allow_list`**, plus a mutation that disables
   `_check_statement` (P2);
 - **`test_delete_guard_halts`**: 51 deletes, and 2% of a 100-row table (P3);
+  in log mode the same batches record a would-halt event and keep logging;
 - **`test_log_mode_sends_nothing`**: FakeD1 records zero requests (P4);
 - **`test_log_crash_between_append_and_cursor`**: a real subprocess killed
   after the fsync and before the cursor commit. Restart re-appends, and the
@@ -1752,7 +1762,7 @@ Pre-existing D1 writes the plan leaves as they are:
 | (k) `acquire_primary_lock` runs before `_ensure_parent_dir`, so a live primary whose parent directory does not exist yet raises FileNotFoundError on first start instead of creating it (L2 review 7592 P2). The seed creates the parent | L5 | **done in L5 piece b**: `_open_writer` creates the parent directory before `fence()`, and the seed creates it before taking the target's primary lock |
 | (l) watchdog alerts for replication (§2.5: `oldest_unacked_age_s > 300`, `status == halted`, `d1_missing_vectors > 0`). L3 exposes the metrics on `/health/db/<db>` (authorised); `scripts/memora_watchdog.py` is liveness-only by design, so the alert is a separate check | L9 | before the first cutover |
 | (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | **done in L6 piece a**: the compare computes it and `record_compare` stores it; the health block reports the last value. The §2.8 synchronous-commit flag stays unimplemented (optional) |
-| (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week) | L9 | after the log-only week |
+| (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week). Decided (leader 7699): log mode records would-halt events instead of halting, and each shadow night reports them; the week's would-halt count per table sets the per-table configuration before write mode | L9 | after the log-only week |
 | (o) `_WriteGate.enter(exempt=True)` relied on trusted in-process callers (L3 review 7603 P2) | L4 | **done in L4**: exempt entries are refused unless the caller module is `memora.replicator` (`test_exempt_gate_entries_are_for_the_replicator_only`) |
 | (p) a second `freeze()` on an already-frozen store returns without waiting for a newly entered exempt replicator token, so the scripts must re-check `/health/db/<db>` for `in_flight = 0` at every step boundary (already required by §1) (L3 review 7603 P2) | L5 | **done in L5 piece a** (kept through b/c): `FreezeClient.check` re-reads `/health/db/<db>` at every step boundary and continues only on `frozen`, `in_flight = 0` and no open intent |
 | (q) L4 decisions (§3): WAL is set only on live primaries, so every other local store keeps its journal mode, while `busy_timeout` is set on every writer. `list_absorb_inflight` keeps reading the table instead of returning `[]` on a transactional store: no new rows appear there, but rows left by an earlier version are still reported, not hidden. Inside `store_write`, inner commits are deferred and an inner rollback aborts the transaction (`StoreWriteAborted`), so no helper can split phase 3. `add_memory` refuses to compute an embedding under the lock, and R2 deletions run after the commit | L4 | done |

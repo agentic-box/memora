@@ -238,7 +238,15 @@ def _seed_rows(b, n):
     conn.close()
 
 
-@pytest.mark.parametrize("rows,deletes,halts", [
+def _would_halts(b):
+    conn = b.connect()
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM sync_would_halt ORDER BY id")]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("rows,deletes,trips", [
     (200, 51, True),    # both rules
     (6000, 51, True),   # the 50-row rule alone (1% of 6000 is 60)
     (6000, 50, False),
@@ -246,7 +254,11 @@ def _seed_rows(b, n):
     (99, 1, True),      # any delete from a table under 100 rows
     (200, 2, False),
 ])
-def test_delete_guard(tmp_path, rows, deletes, halts):
+def test_delete_guard_in_log_mode_records_a_would_halt_and_keeps_logging(tmp_path, rows, deletes, trips):
+    """Leader 7699 (§9 (n)): log mode sends nothing to D1, so the P3 guard
+    does not halt it; it records what write mode would have halted on
+    (table, count, threshold, attempt id) and logs the batch. Write mode
+    still halts: test_l3_write.test_delete_guard_halts_write_mode_before_sending."""
     b = local_store(tmp_path / "l.db")
     _seed_rows(b, rows)
     rep = _rep(b, batch_rows=10_000)
@@ -255,21 +267,74 @@ def test_delete_guard(tmp_path, rows, deletes, halts):
     conn.execute("DELETE FROM memories WHERE id <= ?", (deletes,))
     conn.commit()
     conn.close()
-    if not halts:
-        assert rep.run_once() == "logged"
+    assert rep.run_once() == "logged"
+    st = sync_state(b)
+    assert st["halted_reason"] is None
+    deleted = [r for r in R.iter_log("s1") if r["sql"].startswith("DELETE")]
+    assert len(deleted) == deletes  # the deletes are in the log
+    events = _would_halts(b)
+    if not trips:
+        assert events == [] and st["would_halt_count"] == 0 and st["last_would_halt"] is None
+        assert rep.status()["would_halt_count"] == 0
         return
-    assert rep.run_once() == "halted"
-    reason = sync_state(b)["halted_reason"]
-    assert reason.startswith(f"delete_guard: memories {deletes}/{rows}")
-    assert R._REPLICATORS == {} and rep.run_once() == "halted"  # persists
-    attempt = reason.rsplit("attempt=", 1)[1]
-    conn = b.connect_replicator()
-    with pytest.raises(ValueError):
-        R.resume(conn, allow_deletes="wrong")
-    R.resume(conn, allow_deletes=attempt)
+    assert len(events) == 1
+    ev = events[0]
+    assert (ev["tbl"], ev["deletes"], ev["total"]) == ("memories", deletes, rows)
+    assert ev["threshold"] == f"> 50 rows or > 1% of {rows}"
+    assert ev["attempt_id"] == deleted[0]["attempt_id"]
+    assert st["would_halt_count"] == 1
+    last = json.loads(st["last_would_halt"])
+    assert last["attempt_id"] == ev["attempt_id"] and last["tbl"] == "memories" and last["deletes"] == deletes
+    status = rep.status()  # the replication health block
+    assert status["would_halt_count"] == 1 and status["last_would_halt"]["attempt_id"] == ev["attempt_id"]
+    assert status["halted_reason"] is None
+
+
+def test_a_would_halt_is_recorded_once_per_attempt(tmp_path, monkeypatch):
+    """A crash between the record and the cursor move re-reads the same
+    batch (same attempt id): the event is not counted twice."""
+    b = local_store(tmp_path / "l.db")
+    _seed_rows(b, 99)
+    rep = _rep(b, batch_rows=10_000)
+    assert rep.run_once() == "logged"
+    conn = b.connect()
+    conn.execute("DELETE FROM memories WHERE id <= 3")
+    conn.commit()
+    conn.close()
+    real = R.append_log
+
+    def crash(*a, **kw):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(R, "append_log", crash)
+    with pytest.raises(OSError):
+        rep.run_once()
+    assert sync_state(b)["would_halt_count"] == 1
+    monkeypatch.setattr(R, "append_log", real)
+    assert rep.run_once() == "logged"
+    assert sync_state(b)["would_halt_count"] == 1 and len(_would_halts(b)) == 1
+    conn = b.connect()  # a second over-limit batch is a second event
+    conn.execute("DELETE FROM memories WHERE id <= 5")
+    conn.commit()
     conn.close()
     assert rep.run_once() == "logged"
-    assert sync_state(b)["allow_deletes_attempt"] is None  # one attempt only
+    assert sync_state(b)["would_halt_count"] == 2 and len(_would_halts(b)) == 2
+
+
+def test_an_allowed_attempt_in_log_mode_records_nothing(tmp_path):
+    b = local_store(tmp_path / "l.db")
+    _seed_rows(b, 99)
+    rep = _rep(b, batch_rows=10_000)
+    assert rep.run_once() == "logged"
+    conn = b.connect()
+    conn.execute("DELETE FROM memories WHERE id <= 3")
+    conn.commit()
+    batch = R.read_batch(conn, int(sync_state(b)["log_cursor_seq"]), 10_000)
+    conn.execute("UPDATE sync_state SET allow_deletes_attempt = ? WHERE id = 1", (batch.attempt_id,))
+    conn.commit()
+    conn.close()
+    assert rep.run_once() == "logged"
+    assert sync_state(b)["would_halt_count"] == 0 and _would_halts(b) == []
 
 
 def test_statement_outside_the_allow_list_halts(tmp_path, monkeypatch):

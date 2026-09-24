@@ -484,13 +484,31 @@ _SYNC_STATE_ADDED = (
     ("d1_missing_vectors", "INTEGER"),
     ("last_compare_report", "TEXT"),
     ("compare_runs", "TEXT"),  # {run_id: julianday start} of the compares in progress
+    # Log-mode delete-guard events (L9a, leader 7699): counted, never halting.
+    ("would_halt_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("last_would_halt", "TEXT"),
 )
+# One row per batch the P3 delete guard WOULD have halted in log mode (it
+# sends nothing to D1, so it records and keeps logging; write mode halts).
+# Local only: not a replicated table, no triggers.
+_SYNC_WOULD_HALT_DDL = """
+CREATE TABLE IF NOT EXISTS sync_would_halt (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  at TEXT NOT NULL,
+  tbl TEXT NOT NULL,
+  deletes INTEGER NOT NULL,
+  total INTEGER NOT NULL,
+  threshold TEXT NOT NULL,
+  attempt_id TEXT NOT NULL UNIQUE
+)
+"""
 _SHADOW_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS shadow_state (
   id INTEGER PRIMARY KEY CHECK (id = 1),
   dirty INTEGER NOT NULL DEFAULT 0, dirty_reason TEXT, dirty_at TEXT,
   clean_shutdown INTEGER NOT NULL DEFAULT 0,
-  clean_nights INTEGER NOT NULL DEFAULT 0, last_clean_night TEXT
+  clean_nights INTEGER NOT NULL DEFAULT 0, last_clean_night TEXT,
+  would_halt_reported_id INTEGER NOT NULL DEFAULT 0
 )
 """
 
@@ -552,6 +570,7 @@ def _ensure_sync_outbox(conn: sqlite3.Connection) -> None:
     for col, decl in _SYNC_STATE_ADDED:
         if col not in have:
             conn.execute(f"ALTER TABLE sync_state ADD COLUMN {col} {decl}")
+    conn.execute(_SYNC_WOULD_HALT_DDL)
     conn.commit()
     row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
     if row is None or int(row[0]) >= SYNC_TRIGGER_VERSION:
@@ -582,6 +601,10 @@ def install_sync(conn: sqlite3.Connection, replica_uri: str, d1_epoch) -> None:
     try:
         conn.execute(_SYNC_OUTBOX_DDL)
         conn.execute(_SYNC_STATE_DDL)
+        for col, decl in _SYNC_STATE_ADDED:
+            if col not in {r[1] for r in conn.execute("PRAGMA table_info(sync_state)")}:
+                conn.execute(f"ALTER TABLE sync_state ADD COLUMN {col} {decl}")
+        conn.execute(_SYNC_WOULD_HALT_DDL)
         conn.execute(
             "INSERT INTO sync_state (id, replica_uri, last_acked_seq, d1_epoch_expected, trigger_version) "
             "VALUES (1, ?, 0, ?, ?)",

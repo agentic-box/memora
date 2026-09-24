@@ -122,9 +122,21 @@ def _outbox_keys(db: sqlite3.Connection, lo: int, hi: Optional[int]) -> Dict[Key
     return out
 
 
+def _would_halt_events(db: sqlite3.Connection, after_id: int) -> List[Dict[str, Any]]:
+    """The log-mode delete-guard events (replicator._would_halt) after after_id."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sync_would_halt'").fetchone() is None:
+        return []
+    cur = db.execute("SELECT id, at, tbl, deletes, total, threshold, attempt_id FROM sync_would_halt "
+                     "WHERE id > ? ORDER BY id", (int(after_id),))
+    cols = [c[0] for c in cur.description]
+    return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 def builder_check(name: str, shadow_path: Path, seed_sql: Path, *,
-                  log_records: Optional[Iterable[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """(b): {"key_set": {...}, "diffs": {table: [...]}, "cursor": n}."""
+                  log_records: Optional[Iterable[Dict[str, Any]]] = None,
+                  would_halt_after: int = 0) -> Dict[str, Any]:
+    """(b): {"key_set": {...}, "diffs": {table: [...]}, "cursor": n,
+    "would_halt": [events after would_halt_after]}."""
     from . import replicator
     from .local_primary import load_sql
 
@@ -141,6 +153,7 @@ def builder_check(name: str, shadow_path: Path, seed_sql: Path, *,
     try:
         st = db.execute("SELECT log_cursor_seq, halted_reason FROM sync_state WHERE id = 1").fetchone()
         cursor, halted = int(st[0]), st[1]
+        would_halt = _would_halt_events(db, would_halt_after)
         logged_upto = _outbox_keys(db, 0, cursor)
         after = _outbox_keys(db, cursor, None)
         records = [r for r in (log_records if log_records is not None else replicator.iter_log(name))
@@ -168,15 +181,16 @@ def builder_check(name: str, shadow_path: Path, seed_sql: Path, *,
             rdb.close()
     finally:
         db.close()
-    return {"cursor": cursor, "log_records": len(records), "halted": halted,
+    return {"cursor": cursor, "log_records": len(records), "halted": halted, "would_halt": would_halt,
             "key_set": {"missing_in_log": [str(k) for k in missing_in_log][:50],
                         "extra_in_log": [str(k) for k in extra_in_log][:50]},
             "diffs": diffs, "work_dir": str(work)}
 
 
 def record_night(shadow_path: Path, clean: bool, reason: Optional[str], *,
-                 today: Optional[str] = None) -> Dict[str, Any]:
-    """Update shadow_state for one night; returns the new row."""
+                 today: Optional[str] = None, would_halt_upto: Optional[int] = None) -> Dict[str, Any]:
+    """Update shadow_state for one night; returns the new row. would_halt_upto
+    marks the would-halt events up to that id as reported."""
     from .backends import LocalSQLiteBackend, store_write
 
     day = today or time.strftime("%Y-%m-%d", time.gmtime())
@@ -185,6 +199,9 @@ def record_night(shadow_path: Path, clean: bool, reason: Optional[str], *,
         with store_write(db):
             st = dict(db.execute("SELECT * FROM shadow_state WHERE id = 1").fetchone())
             _record(db, st, clean, reason, day)
+            if would_halt_upto is not None:
+                db.execute("UPDATE shadow_state SET would_halt_reported_id = MAX(would_halt_reported_id, ?) "
+                           "WHERE id = 1", (int(would_halt_upto),))
         return dict(db.execute("SELECT * FROM shadow_state WHERE id = 1").fetchone())
     finally:
         db.close()
@@ -208,8 +225,16 @@ def run_night(name: str, shadow_path: Path, reader, seed_sql: Path, *, today: Op
               pause_s: float = 2.0, sleep: Callable[[float], None] = time.sleep,
               log_records: Optional[Iterable[Dict[str, Any]]] = None) -> Dict[str, Any]:
     shadow_path = Path(shadow_path)
+    db = _ro(shadow_path)
+    try:
+        reported = int(db.execute("SELECT would_halt_reported_id FROM shadow_state WHERE id = 1").fetchone()[0])
+    finally:
+        db.close()
     a = compare_with_d1(shadow_path, reader, pause_s=pause_s, sleep=sleep)
-    b = builder_check(name, shadow_path, Path(seed_sql), log_records=log_records)
+    # Would-halt events (log-mode delete guard, §9 (n)) are reported for the
+    # night, never a failure of it: the week's count sets the per-table
+    # limits before write mode.
+    b = builder_check(name, shadow_path, Path(seed_sql), log_records=log_records, would_halt_after=reported)
     b_bad = (bool(b["diffs"]) or bool(b["key_set"]["missing_in_log"]) or bool(b["key_set"]["extra_in_log"])
              or bool(b["halted"]))
     db = _ro(shadow_path)
@@ -230,7 +255,9 @@ def run_night(name: str, shadow_path: Path, reader, seed_sql: Path, *, today: Op
 
         shutil.rmtree(b["work_dir"], ignore_errors=True)  # kept only for diagnosing a failed night
         b = {k: v for k, v in b.items() if k != "work_dir"}
-    state = record_night(shadow_path, clean, reason, today=today)
-    return {"store": name, "clean": clean, "compare": a, "builder": b, "was_dirty": dirty,
+    wh = b["would_halt"]
+    state = record_night(shadow_path, clean, reason, today=today,
+                         would_halt_upto=wh[-1]["id"] if wh else None)
+    return {"store": name, "clean": clean, "compare": a, "builder": b, "was_dirty": dirty, "would_halt": wh,
             "shadow_state": state, "clean_nights": state["clean_nights"],
             "ready_for_cutover": bool(state["clean_nights"] >= REQUIRED_CLEAN_NIGHTS and not state["dirty"])}

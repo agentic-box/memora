@@ -14,6 +14,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L3/L9a: the delete guard records would-halt events in log mode
+- In log mode the P3 delete guard no longer halts the replicator (log mode sends nothing to D1; leader 7699, plan §9 (n)). A batch over the limit (> 50 net deletes, or > 1% of the table, so any delete from a table under 100 rows) adds a `sync_would_halt` row (table, deletes, row count, threshold, attempt id; once per attempt), increments `sync_state.would_halt_count`, sets `last_would_halt`, logs a warning, and is logged as usual. Write mode still halts before sending.
+- The replication health block (`/health/db/<name>`, `replication`) gets `would_halt_count` and `last_would_halt`.
+- `shadow-night` reports the would-halt events recorded since the previous night (`would_halt`; `shadow_state.would_halt_reported_id`). They do not fail the night. A halted log (any other halt cause) still does.
+
 ### Local-primary L9a (piece b): nightly shadow check, health block
 - `local_primary.py shadow-night <db> --shadow S --seed-export SQL --account A --database-id D [--read-token-file F]` (`memora/shadow_night.py`, §2.9), no barrier and no D1 write:
   - (a) compares the seven replicated tables of the shadow with D1, read through the READ token (the replicator's `memories_meta` exclusions apart). A diffed key is re-read once after a pause, so a write in flight during the read does not count.

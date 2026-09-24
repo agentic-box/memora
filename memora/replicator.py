@@ -255,16 +255,24 @@ def _add_parents(conn, batch: _Batch) -> None:
     batch.keys.extend(extra)
 
 
-def delete_guard(conn, batch: _Batch) -> Optional[str]:
+def delete_guard_detail(conn, batch: _Batch) -> Optional[Dict[str, Any]]:
     """P3: None when the batch's net deletes are within bounds, else the
-    halt reason. A table's deletes exceed the guard when they are more than
-    DELETE_GUARD_ROWS or more than DELETE_GUARD_FRACTION of its local rows
-    (so any delete from a table under 100 rows halts, deliberately)."""
+    first table over them: {tbl, deletes, total, threshold, attempt_id}. A
+    table's deletes exceed the guard when they are more than DELETE_GUARD_ROWS
+    or more than DELETE_GUARD_FRACTION of its local rows (so any delete from
+    a table under 100 rows trips it, deliberately)."""
     for tbl, n in sorted(batch.deletes.items()):
         total = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0] + n
         if n > DELETE_GUARD_ROWS or n > DELETE_GUARD_FRACTION * total:
-            return f"delete_guard: {tbl} {n}/{total} attempt={batch.attempt_id}"
+            return {"tbl": tbl, "deletes": n, "total": total, "attempt_id": batch.attempt_id,
+                    "threshold": f"> {DELETE_GUARD_ROWS} rows or > {DELETE_GUARD_FRACTION:.0%} of {total}"}
     return None
+
+
+def delete_guard(conn, batch: _Batch) -> Optional[str]:
+    """The halt reason for delete_guard_detail, or None."""
+    d = delete_guard_detail(conn, batch)
+    return None if d is None else f"delete_guard: {d['tbl']} {d['deletes']}/{d['total']} attempt={d['attempt_id']}"
 
 
 # ------------------------------------------------------------------ log mode (P4)
@@ -523,11 +531,35 @@ class StoreReplicator:
             return None, "halted"
         if batch is None:
             return None, "idle"
-        reason = delete_guard(self._conn, batch)
-        if reason and state.get("allow_deletes_attempt") != batch.attempt_id:
-            self._halt(reason)
+        detail = delete_guard_detail(self._conn, batch)
+        if detail and state.get("allow_deletes_attempt") != batch.attempt_id:
+            if self.mode == MODE_LOG:
+                # Log mode sends nothing to D1: halting would only stop the
+                # shadow week for no protection (leader 7699, §9 (n)). Record
+                # what write mode would have halted on, and keep logging; the
+                # week's events decide the per-table limits before write mode.
+                self._would_halt(detail)
+                return batch, None
+            self._halt(delete_guard(self._conn, batch))
             return None, "halted"
         return batch, None
+
+    def _would_halt(self, detail: Dict[str, Any]) -> None:
+        logger.warning("replicator %s: delete guard would halt write mode: %s %s/%s (attempt %s)",
+                       self.name, detail["tbl"], detail["deletes"], detail["total"], detail["attempt_id"])
+        event = dict(detail, at=_now_iso())
+        # Once per attempt: a crash before the cursor moves re-reads the same
+        # batch (same attempt id) and must not count it twice.
+        if self._conn.execute("SELECT 1 FROM sync_would_halt WHERE attempt_id = ?",
+                              (detail["attempt_id"],)).fetchone():
+            return
+        self._local_txn([
+            ("INSERT INTO sync_would_halt (at, tbl, deletes, total, threshold, attempt_id) VALUES (?, ?, ?, ?, ?, ?)",
+             (event["at"], detail["tbl"], detail["deletes"], detail["total"], detail["threshold"],
+              detail["attempt_id"])),
+            ("UPDATE sync_state SET would_halt_count = would_halt_count + 1, last_would_halt = ? WHERE id = 1",
+             (json.dumps(event, sort_keys=True),)),
+        ])
 
     def _log_cycle(self, state: Dict[str, Any]) -> str:
         batch, outcome = self._next_batch(int(state["log_cursor_seq"]), state)
@@ -703,6 +735,8 @@ class StoreReplicator:
                 "last_compare_clean": None if st.get("last_compare_clean") is None
                 else bool(st.get("last_compare_clean")),
                 "compare_consumed_seq": int(st.get("compare_consumed_seq") or 0),
+                "would_halt_count": int(st.get("would_halt_count") or 0),
+                "last_would_halt": json.loads(st["last_would_halt"]) if st.get("last_would_halt") else None,
             })
 
     def status(self) -> Dict[str, Any]:

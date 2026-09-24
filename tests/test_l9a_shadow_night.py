@@ -56,10 +56,9 @@ def _app_writes(w, n=3):
     ids = [conn.execute("INSERT INTO memories (content) VALUES (?)", (f"m{i}",)).lastrowid for i in range(n)]
     conn.execute("UPDATE memories SET tags = ? WHERE id = ?", ('["t"]', ids[0]))
     conn.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (?, ?)", (ids[1], "[]"))
-    # No DELETE: L3's delete guard (P3) halts the replicator -- log mode
-    # included -- on any delete in a table under 100 rows, and a halted log
-    # fails check (b) until an operator resumes it. That is L3 behaviour,
-    # covered by its own tests, not this check's.
+    # No DELETE here: any delete from a table under 100 rows trips L3's
+    # delete guard (P3), which log mode reports as a would-halt event; the
+    # tests below that want one make it themselves.
     conn.execute("UPDATE memories SET content = ? WHERE id = ?", ("m2!", ids[2]))
     conn.close()
     return ids
@@ -173,15 +172,55 @@ def test_cli_help_lists_the_commands():
     assert r.returncode == 0 and "--seed-export" in r.stdout
 
 
-def test_a_halted_replicator_log_fails_check_b(night):
-    """A delete in a small table halts the log (L3 P3); the night is then
-    not clean -- the log no longer covers the shadow's changes."""
-    _app_writes(night)
+def test_a_delete_guard_trip_in_log_mode_is_reported_for_the_night_and_the_night_stays_clean(night):
+    """Leader 7699 (§9 (n)): log mode does not halt on the P3 delete guard;
+    the night reports the would-halt events since the last night, and is
+    not failed by them."""
+    ids = _app_writes(night)
     conn = night.backend.connect()
     conn.execute("DELETE FROM memories WHERE id = ?", (1,))
     conn.close()
-    out = night.run()
-    assert not out["clean"]
+    out = night.run("2026-09-24")
+    assert out["clean"], out
+    assert out["builder"]["halted"] is None
+    [ev] = out["would_halt"]
+    assert out["builder"]["would_halt"] == out["would_halt"]
+    assert (ev["tbl"], ev["deletes"]) == ("memories", 1) and ev["attempt_id"]
+    assert out["clean_nights"] == 1
+    assert _state(night.shadow_path)["would_halt_reported_id"] == ev["id"]
+    out = night.run("2026-09-25")
+    assert out["clean"] and out["would_halt"] == [], "an event is reported for one night only"
+    assert out["clean_nights"] == 2
+    conn = night.backend.connect()
+    conn.execute("DELETE FROM memories WHERE id = ?", (ids[2],))  # ids[1] has an embedding row
+    conn.close()
+    out = night.run("2026-09-26")
+    assert out["clean"], out
+    assert [e["deletes"] for e in out["would_halt"]] == [1]
+    assert out["would_halt"][0]["id"] > ev["id"]
+
+
+def test_a_halted_replicator_log_fails_check_b(night):
+    """A halted log (any L3 halt cause) no longer covers the shadow's
+    changes: the night is not clean, and the shadow is not marked dirty --
+    it is not a shadow defect."""
+    _app_writes(night)
+    night.run("2026-09-24")
+    from memora.backends import LocalSQLiteBackend, store_write
+
+    shadow = LocalSQLiteBackend(night.shadow_path).connect()  # the shadow file's writer path
+    try:
+        with store_write(shadow):
+            shadow.execute("UPDATE sync_state SET halted_reason = 'statement_rejected: test', "
+                           "halted_at = 'now' WHERE id = 1")
+    finally:
+        shadow.close()
+    conn = night.backend.connect()
+    conn.execute("UPDATE memories SET content = 'after the halt' WHERE id = 1")
+    conn.close()
+    out = night.run("2026-09-25")
+    assert not out["clean"] and out["builder"]["halted"] == "statement_rejected: test"
+    assert out["clean_nights"] == 0 and not _state(night.shadow_path)["dirty"]
 
 
 def test_a_failed_night_resets_earlier_clean_nights(night):
