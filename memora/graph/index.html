@@ -3564,7 +3564,10 @@ div.vis-tooltip {
             } else {
                 wsStopped = false;
                 wsReconnectDelay = 1000;
-                connectWebSocket();
+                // Only a configured WebSocket reconnects here: SSE (the Python
+                // server) keeps its own stream, and a null or still-pending
+                // /api/config URL must not open WebSocket(null) (CFG1 review).
+                if (MEMORA_CONFIG.wsUrl && !ws) connectWebSocket();
             }
         });
 

@@ -147,6 +147,18 @@ def _hosts_in(value: str) -> List[str]:
     return [m.group(1)] if m else [value]
 
 
+def _workspace_paths(value: str) -> List[str]:
+    """The workspace part of a configured path: "~/repos/<ws>/memora" or
+    "$HOME/repos/<ws>/.mcp.json" -> "repos/<ws>". A path that names no
+    directory of its own under the home directory yields nothing."""
+    v = re.sub(r"^(~|\$HOME|\$\{HOME\}|/(?:Users|home)/[^/]+)/", "", value.strip())
+    parts = [p for p in v.split("/") if p]
+    while parts and parts[-1] in ("memora", ".mcp.json", "credentials.mcp.json"):
+        parts.pop()
+    # A dot-directory (~/.config/memora, the documented default) is generic.
+    return ["/".join(parts)] if len(parts) >= 2 and not parts[0].startswith(".") else []
+
+
 def operator_identifiers() -> List[Tuple[str, str]]:
     """(source key, identifier) pairs from the local configuration."""
     found: List[Tuple[str, str]] = []
@@ -156,6 +168,7 @@ def operator_identifiers() -> List[Tuple[str, str]]:
         for key in ("DEPLOY_HOST", "DEPLOY_GRAPH_BIND", "EMBEDDING_OLD_URL", "EMBEDDING_NEW_URL"):
             for h in _hosts_in(vals.get(key, "")):
                 found.append((f"deploy.env {key}", h))
+        found += [("deploy.env DEPLOY_REPO", p) for p in _workspace_paths(vals.get("DEPLOY_REPO", ""))]
         try:
             projects = json.loads(vals.get("MEMORA_PROJECTS", "{}"))
             # Store names identify D1 databases; project names are ordinary
@@ -166,7 +179,9 @@ def operator_identifiers() -> List[Tuple[str, str]]:
     for env in sorted((REPO / "instances").glob("*.env")):
         if env.name in ("example.env", "deploy.env"):
             continue
-        reg = _env_values(env).get("MEMORA_DATABASES")
+        env_vals = _env_values(env)
+        found += [(f"{env.name} CRED_SOURCE", p) for p in _workspace_paths(env_vals.get("CRED_SOURCE", ""))]
+        reg = env_vals.get("MEMORA_DATABASES")
         if not reg:
             continue
         try:
@@ -196,7 +211,8 @@ def operator_identifiers() -> List[Tuple[str, str]]:
 
 def identifier_pattern(value: str) -> re.Pattern:
     """Word-bounded; a short name (under 4 characters, e.g. a store called
-    "re") only in identifier contexts, so an English word never matches."""
+    "io") only in identifier contexts, so an ordinary word or a module
+    reference (io.open, io-bound) never matches."""
     v = re.escape(value)
     if len(value) >= 4:
         return re.compile(rf"(?<![A-Za-z0-9_]){v}(?![A-Za-z0-9_])", re.IGNORECASE)
@@ -223,8 +239,16 @@ def test_no_operator_identifier_is_tracked():
 def test_the_identifier_pattern_is_word_bounded_and_context_aware():
     long = identifier_pattern("hostname1")
     assert long.search("ssh hostname1 'ls'") and long.search("HOSTNAME1") and not long.search("hostname12")
-    short = identifier_pattern("re")
-    assert short.search('{"re": "/data/re.db"}') and short.search("store re: ok")
-    assert short.search("--host re") and not short.search("we re-run the rebuild, re:")
-    assert not short.search("x = re.compile(r'a')") and not short.search("import json, re, sys")
-    assert not short.search("insert/update/re-embed") and not short.search("a store re-runs it")
+    short = identifier_pattern("io")
+    assert short.search('{"io": "/data/io.db"}') and short.search("store io: ok")
+    assert short.search("--host io") and not short.search("an io-bound step, io:")
+    assert not short.search("x = io.open(p)") and not short.search("import json, io, sys")
+    assert not short.search("disk/cpu/io-wait") and not short.search("a store io-runs it")
+
+
+def test_workspace_paths_are_derived_from_configured_paths():
+    assert _workspace_paths("~/repos/ws-one/memora") == ["repos/ws-one"]
+    assert _workspace_paths("$HOME/repos/ws-one/.mcp.json") == ["repos/ws-one"]
+    assert _workspace_paths("/Users/someone/repos/ws-one/memora") == ["repos/ws-one"]
+    assert _workspace_paths("~/.config/memora/credentials.mcp.json") == []
+    assert _workspace_paths("~/memora") == [] and _workspace_paths("") == []

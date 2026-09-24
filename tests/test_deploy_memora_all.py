@@ -27,7 +27,7 @@ REGISTRY = {"memora": "d1://acct/db1", "alpha": "d1://acct/db2"}
 # the copied repo's git-ignored instances/deploy.env.
 PROJECTS = {"memora": ["memora", "project-a"], "alpha": ["alpha"]}
 DEPLOY_CFG = {"DEPLOY_HOST": "deploy-host", "DEPLOY_GRAPH_BIND": "100.64.0.10",
-              "DEPLOY_REPO": "~/repos/agentic-box/memora", "MEMORA_PROJECTS": json.dumps(PROJECTS)}
+              "DEPLOY_REPO": "~/repos/memora", "MEMORA_PROJECTS": json.dumps(PROJECTS)}
 
 
 def _deploy_env_text(cfg):
@@ -63,7 +63,7 @@ def deploy(tmp_path):
     (repo / "instances" / "all.env").write_text(f"MEMORA_DATABASES='{json.dumps(REGISTRY)}'\n")
 
     home = tmp_path / "home"
-    (home / "repos" / "agentic-box" / "memora").mkdir(parents=True)
+    (home / "repos" / "memora").mkdir(parents=True)
     cfg = home / ".config" / "memora"
     cfg.mkdir(parents=True)
     (cfg / "all.health-token").write_text("h" * 48)
@@ -379,7 +379,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
         "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "18766",
         "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
         "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
-        "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_TAG": "v9.9.9"})
+        "DEPLOY_REPO": str(deploy.home / "repos" / "memora"), "DEPLOY_TAG": "v9.9.9"})
     tools = deploy.tools.read_text().splitlines() if deploy.tools.exists() else []
     assert calls, proc.stderr[-2000:]
     assert not [t for t in tools if t.startswith(("ssh", "git", "docker"))], tools
@@ -809,7 +809,7 @@ def poststart(deploy, tmp_path):
             "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
             "DEPLOY_ENV_FILE": str(envf), "DEPLOY_PORT": str(fake.port), "DEPLOY_TAG": "v0.5.0",
             "DEPLOY_GRAPH_PORT": str(fake.port),
-            "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_STORE_WAIT_S": "2"})
+            "DEPLOY_REPO": str(deploy.home / "repos" / "memora"), "DEPLOY_STORE_WAIT_S": "2"})
         return proc, fake
 
     yield run
@@ -965,7 +965,7 @@ class TestRemoteArguments:
             **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
             "DEPLOY_LABELS": "memora.rehearsal=rh-t extra=x", "DEPLOY_CONFIG_DIR": str(rcfg),
             "DEPLOY_SECRETS_DIR": str(rsec), "DEPLOY_ENV_FILE": str(envf), "DEPLOY_CONFIG_FILE": str(dcfg),
-            "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora")})
+            "DEPLOY_REPO": str(deploy.home / "repos" / "memora")})
         run = _new_container_run(calls)
         assert f"{rsec}:{SECRETS_MOUNT}:ro" in _flag_values(run, "-v"), proc.stderr[-1500:]
         assert _flag_values(run, "--label") == ["memora.rehearsal=rh-t", "extra=x"]
@@ -1157,7 +1157,7 @@ def test_the_production_values_come_from_the_deploy_configuration(deploy, tmp_pa
     assert "graph=100.64.0.77:8766" in proc.stdout
     assert deploy.tools.read_text().splitlines()[0] == "ssh other-host"
     params = _decode_blob((tmp_path / "ssh-command.txt").read_text().strip())
-    assert params[9] == "~/repos/agentic-box/memora" and params[21] == "100.64.0.77"
+    assert params[9] == "~/repos/memora" and params[21] == "100.64.0.77"
 
 
 @pytest.mark.parametrize("problem, match", [

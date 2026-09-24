@@ -18,7 +18,7 @@
       "contract_version": "1.0.1",
       "writes": "transactional",
       "projects": [
-        "agentic-box",
+        "project-a",
         "clmux",
         "memora"
       ],

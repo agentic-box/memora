@@ -115,7 +115,7 @@ Default runtime is Apple's [`container`](https://github.com/apple/container) CLI
    cp instances/example.env instances/myinstance.env
    ```
 
-5. Create the credential file and install the proxy the LaunchAgent will run. `cred_args()` requires a `.mcp.json` whose `mcpServers.memora.env` holds `CLOUDFLARE_API_TOKEN` (D1 access) and the embedding/LLM keys — `up` dies if that file is missing. The script looks for `~/.config/memora/credentials.mcp.json` **if that file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Set `CRED_SOURCE` in the instance file to pick a path. Separately, `proxy` renders a plist whose executable is `$MEMORA_PROXY_BIN` (default `~/.local/libexec/memora/memora_proxy.py`) and whose logs live in `$MEMORA_LOG_DIR` (default `~/.local/var/log`) — nothing creates either on a fresh clone.
+5. Create the credential file and install the proxy the LaunchAgent will run. `cred_args()` requires a `.mcp.json` whose `mcpServers.memora.env` holds `CLOUDFLARE_API_TOKEN` (D1 access) and the embedding/LLM keys — `up` dies if that file is missing. The script looks for `~/.config/memora/credentials.mcp.json` unless the instance file sets `CRED_SOURCE` to another path; there is no other fallback. Separately, `proxy` renders a plist whose executable is `$MEMORA_PROXY_BIN` (default `~/.local/libexec/memora/memora_proxy.py`) and whose logs live in `$MEMORA_LOG_DIR` (default `~/.local/var/log`) — nothing creates either on a fresh clone.
 
    ```bash
    mkdir -p ~/.config/memora ~/.local/libexec/memora ~/.local/var/log
@@ -466,8 +466,8 @@ the registry default:
 config.** They are read at run time from a separate credential config
 (`$CRED_SOURCE` — itself a `.mcp.json` holding only the `mcpServers.memora.env`
 block) and injected with `-e`. If the instance file does not set
-`CRED_SOURCE`, the script uses `~/.config/memora/credentials.mcp.json` **when that
-file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Pass through *every*
+`CRED_SOURCE`, the script uses `~/.config/memora/credentials.mcp.json` (and `up`
+refuses when it is missing; there is no other fallback). Pass through *every*
 variable that file defines, not a hand-picked few: a container started with only
 the embedding keys silently loses `memory_absorb`'s LLM consolidation instead of
 failing loudly.

@@ -57,7 +57,7 @@ def app_factory(tmp_path, monkeypatch):
     tokens.chmod(0o600)
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"memora": str(tmp_path / "memora.db")}))
     monkeypatch.setenv("MEMORA_DEFAULT_DB", "memora")
-    monkeypatch.setenv("MEMORA_PROJECTS", json.dumps({"memora": ["agentic-box", "clmux", "memora"]}))
+    monkeypatch.setenv("MEMORA_PROJECTS", json.dumps({"memora": ["project-a", "clmux", "memora"]}))
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     token = storage.CURRENT_DB.set("memora")  # the store exists (a writing path created it)
     try:

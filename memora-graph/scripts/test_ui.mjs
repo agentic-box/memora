@@ -16,7 +16,7 @@ import { chromium } from "playwright";
 const BASE = process.argv[2] || "http://localhost:8788";
 const pass = [];
 const fail = [];
-const EXPECTED_CHECKS = 35;
+const EXPECTED_CHECKS = 38;
 const check = (name, ok, detail) =>
   (ok ? pass : fail).push(`${name}${detail ? ` — ${detail}` : ""}`);
 
@@ -507,6 +507,42 @@ check(
   await page.$eval("#truncation-banner", (n) => getComputedStyle(n).display === "none"),
 );
 await page.unroute("**/api/graph*");
+
+// ---------------------------------------------------------------- realtime config (CFG1)
+
+// The worker URL is no longer in index.html: the page asks /api/config, which
+// serves it from WS_WORKER_URL (null when unset). With no URL no WebSocket may
+// be opened -- not at load, not after the tab becomes visible again (the old
+// visibility handler opened WebSocket(null)). With a URL, exactly that one.
+{
+  const cfg = await (await fetch(`${BASE}/api/config`)).json();
+  const rt = await browser.newPage();
+  const asked = [];
+  const sockets = [];
+  rt.on("request", (r) => { if (new URL(r.url()).pathname === "/api/config") asked.push(r.url()); });
+  rt.on("websocket", (w) => sockets.push(w.url()));
+  await rt.goto(`${BASE}/`, { waitUntil: "networkidle" });
+  await rt.waitForTimeout(500);
+  await rt.evaluate(() => {
+    for (const hidden of [true, false]) {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+      document.dispatchEvent(new Event("visibilitychange"));
+    }
+  });
+  await rt.waitForTimeout(1500);
+  check("realtime: the page asks /api/config for its WebSocket URL", asked.length === 1, `requests=${asked.length}`);
+  if (cfg.wsUrl === null) {
+    check("realtime: /api/config without WS_WORKER_URL answers wsUrl null", true);
+    check("realtime: no URL -> no WebSocket, before or after a visibility change",
+      sockets.length === 0, sockets.join(","));
+  } else {
+    check("realtime: /api/config answers a wss://…/ws URL", /^wss:\/\/.+\/ws$/.test(cfg.wsUrl), cfg.wsUrl);
+    // Every socket (reconnect attempts included) goes to exactly the configured URL.
+    check("realtime: the page opens only the configured WebSocket",
+      sockets.length >= 1 && sockets.every((u) => u === cfg.wsUrl), sockets.join(","));
+  }
+  await rt.close();
+}
 
 check("no uncaught page errors", pageErrors.length === 0, pageErrors.slice(0, 2).join(" | "));
 

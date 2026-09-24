@@ -54,7 +54,9 @@ SECRET_DIR="${MEMORA_SECRET_DIR:-$HOME/.config/memora}"
 TOKEN_LEN=48                                   # exact health-token length
 # Overridable so a test can capture the argv cmd_up would run.
 CONTAINER_BIN="${MEMORA_CONTAINER_BIN:-container}"
-[ -f "$DEFAULT_CRED_SOURCE" ] || DEFAULT_CRED_SOURCE="$HOME/repos/agentic-box/.mcp.json"
+# No fallback to a workspace path (CFG1): without CRED_SOURCE the credential
+# source is ~/.config/memora/credentials.mcp.json, and `up` refuses when it
+# does not exist.
 PROXY_BIN="${MEMORA_PROXY_BIN:-$HOME/.local/libexec/memora/memora_proxy.py}"
 LOG_DIR="${MEMORA_LOG_DIR:-$HOME/.local/var/log}"
 TARGET_PORT="${MEMORA_TARGET_PORT:-8000}"      # port memora listens on INSIDE the container
@@ -87,7 +89,7 @@ load() {  # load instances/<name>.env into INSTANCE/PORT/STORAGE_URI/VOLUME
   local f="$INSTANCE_DIR/$name.env"
   [ -f "$f" ] || die "no config at $f"
   # CRED_SOURCE is per-instance: workspaces do NOT all define the same env.
-  # beta and gamma omit the AWS/R2 backup vars that agentic-box sets, so
+  # beta and gamma omit the AWS/R2 backup vars that the main workspace sets, so
   # sharing one credential file would silently switch cloud backup ON for
   # stores that never had it. Reset it every load so one instance cannot
   # inherit the previous one's source during `status all`.

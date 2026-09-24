@@ -186,8 +186,8 @@ def scratch_env(root: Path) -> Dict[str, str]:
         "MEMORA_DEFAULT_DB": "memora",
         "MEMORA_API_TOKENS_FILE": str(tokens),
         # "broken" stands in for the fixtures' "memora" store, so it declares the same projects.
-        "MEMORA_PROJECTS": json.dumps({"memora": ["agentic-box", "clmux", "memora"],
-                                       "broken": ["agentic-box", "clmux", "memora"]}),
+        "MEMORA_PROJECTS": json.dumps({"memora": ["project-a", "clmux", "memora"],
+                                       "broken": ["project-a", "clmux", "memora"]}),
         "MEMORA_EMBEDDING_MODEL": "tfidf",
         "MEMORA_LLM_ENABLED": "false",
         "MEMORA_ALLOW_ANY_TAG": "1",

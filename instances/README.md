@@ -56,8 +56,8 @@ file may not supply `MEMORA_DATABASES` / `MEMORA_DEFAULT_DB` /
 
 **No secrets live here.** API tokens and embedding keys are read at run time
 from `$CRED_SOURCE` and passed with `-e`. If the instance file does not set
-`CRED_SOURCE`, the script uses `~/.config/memora/credentials.mcp.json` **when
-that file exists**, otherwise `~/repos/agentic-box/.mcp.json`. Once a
+`CRED_SOURCE`, the script uses `~/.config/memora/credentials.mcp.json` (there is
+no other fallback; `up` refuses when it is missing). Once a
 workspace points at the container, its `.mcp.json` is a bare `{type, url}`
 HTTP entry — the env block has nowhere to live.
 
@@ -111,7 +111,7 @@ Per-store files (one D1 database each):
 
 | file | `PORT` | used by (from the file's own comment) |
 |---|---|---|
-| `memora.env` | 8910 | agentic-box |
+| `memora.env` | 8910 | main-app |
 | `alpha.env` | 8911 | alpha-app + alpha-tool |
 | `beta.env` | 8912 | beta |
 | `gamma.env` | 8913 | gamma |

@@ -3,7 +3,7 @@
 (docs/local-primary-implementation.md §6 F4-F6, slice L8).
 
   scripts/audit_configs.py                       # this host, $HOME
-  scripts/audit_configs.py --local ~/repos/agentic-box
+  scripts/audit_configs.py --local ~/repos/main-app
   scripts/audit_configs.py --host deploy-host --host alpha-host --host beta-host
   scripts/audit_configs.py --local --host deploy-host --json
 

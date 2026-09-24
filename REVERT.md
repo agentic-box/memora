@@ -7,7 +7,7 @@ restart.
 
 | workspace | restore from |
 |---|---|
-| `~/repos/agentic-box` | `~/.config/memora/credentials.mcp.json` |
+| `~/repos/main-app` | `~/.config/memora/credentials.mcp.json` |
 | `~/repos/alpha-app` | `~/.config/memora/alpha.credentials.mcp.json` |
 | `~/repos/alpha-tool` | `~/.config/memora/alpha.credentials.mcp.json` |
 | `~/repos/beta-app` | `~/.config/memora/beta.credentials.mcp.json` |
@@ -18,15 +18,15 @@ cp ~/.config/memora/alpha.credentials.mcp.json ~/repos/alpha-app/.mcp.json
 ```
 
 **One catch.** Those stashed files contain ONLY the `memora` server. Every
-workspace except `agentic-box` also defines a `clmux` server in the same file,
+workspace except `main-app` also defines a `clmux` server in the same file,
 which the repointing preserved. A blind copy would drop it. Restore just the
 memora entry instead:
 
 ```sh
 python3 - <<'PY'
-import json
-live = "~/repos/alpha-app/.mcp.json"
-stash = "~/.config/memora/alpha.credentials.mcp.json"
+import json, os
+live = os.path.expanduser("~/repos/alpha-app/.mcp.json")
+stash = os.path.expanduser("~/.config/memora/alpha.credentials.mcp.json")
 d = json.load(open(live))
 d["mcpServers"]["memora"] = json.load(open(stash))["mcpServers"]["memora"]
 json.dump(d, open(live, "w"), indent=2); open(live, "a").write("\n")
