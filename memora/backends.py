@@ -2351,7 +2351,7 @@ def acquire_primary_lock(db_path: Path) -> int:
         held = _PRIMARY_LOCKS.get(key)
         if held is not None:
             return held
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = _open_lock_file(path, "primary lock")  # never through a symlink (review 7845)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2480,7 +2480,7 @@ def primary_lock_problem(db_path: Path) -> Optional[str]:
     path = primary_lock_path(db_path)
     with _PRIMARY_LOCKS_GUARD:
         fd = _PRIMARY_LOCKS.get(str(path))
-    return _flock_problem(path, fd)
+    return _lock_symlink_problem(path) or _flock_problem(path, fd)
 
 
 # ------------------------------------------------------------------ the service lock (X3 round 3)
@@ -2495,8 +2495,48 @@ def service_lock_path(data_dir: Path) -> Path:
     holds it from startup for its lifetime, whatever its stores are routed
     to (D1 included); an operator run that needs memora-all stopped holds it
     for its whole run. The kernel keeps the two apart across containers on
-    the same volume -- continuously, not as a snapshot."""
-    return Path(os.path.realpath(str(Path(data_dir) / SERVICE_LOCK_NAME)))
+    the same volume -- continuously, not as a snapshot. Only the DIRECTORY
+    is resolved: the lock file itself must never be a symlink (review 7845:
+    a link into a container-private /tmp would give each side its own
+    file)."""
+    return Path(os.path.realpath(str(data_dir))) / SERVICE_LOCK_NAME
+
+
+def _open_lock_file(path: Path, what: str) -> int:
+    """Open a lock file (the service lock, a store's primary lock) without
+    following a symlink (O_NOFOLLOW), and require a regular file on the same
+    device as its directory. Anything else is refused (StoreLockedError),
+    before any lock (review 7845: a link into a container-private /tmp would
+    give each process its own file, and both would "hold" the lock)."""
+    import stat
+
+    try:
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError as exc:
+        raise StoreLockedError(f"{path} cannot be used as the {what} (a symlink?): {exc}")
+    try:
+        st = os.fstat(fd)
+        parent = os.stat(path.parent)
+        if not stat.S_ISREG(st.st_mode):
+            raise StoreLockedError(f"{path} is not a regular file: refusing it as the {what}")
+        if st.st_dev != parent.st_dev:
+            raise StoreLockedError(f"{path} is not on its directory's device (the data volume): refusing it as the "
+                                   f"{what}")
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _lock_symlink_problem(path: Path) -> Optional[str]:
+    import stat
+
+    try:
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return f"{path} is now a symlink"
+    except FileNotFoundError:
+        return f"{path} was removed"
+    return None
 
 
 def acquire_service_lock(data_dir: Path) -> int:
@@ -2509,7 +2549,7 @@ def acquire_service_lock(data_dir: Path) -> int:
         held = _SERVICE_LOCKS.get(str(path))
         if held is not None:
             return held
-        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        fd = _open_lock_file(path, "service lock")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2521,10 +2561,12 @@ def acquire_service_lock(data_dir: Path) -> int:
 
 
 def service_lock_problem(data_dir: Path) -> Optional[str]:
+    """As _flock_problem, but the file at the path must not be a symlink
+    now (lstat): a link swapped in later would point elsewhere."""
     path = service_lock_path(data_dir)
     with _PRIMARY_LOCKS_GUARD:
         fd = _SERVICE_LOCKS.get(str(path))
-    return _flock_problem(path, fd)
+    return _lock_symlink_problem(path) or _flock_problem(path, fd)
 
 
 def release_service_lock(data_dir: Path) -> None:

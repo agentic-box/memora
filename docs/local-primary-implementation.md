@@ -1344,6 +1344,17 @@ a failed create (a name collision) removes nothing.
     its data dir is not a mount point. REL1's deploy pins
     `-e MEMORA_DATA_DIR=/data` after the credentials env.
   - `memora-server migrate-images` (not `--dry-run`) takes the lock too.
+  - The lock FILE is never a symlink (review 7845). This applies to the
+    service lock and to every store's primary lock.
+    - The file is opened with `O_NOFOLLOW` and must be a regular file on
+      its directory's device (the volume). Only the directory is resolved.
+    - Every boundary also checks with `lstat` that the path is still not a
+      link.
+    - A link into a container-private `/tmp` would otherwise give each
+      container its own file; server2's two-container check showed both
+      "holding" it before the fix, and both refused after it.
+  - The safety proof requires `scripts/lp_container.sh`: run by hand,
+    `--lock-barrier` trusts `LP_SERVICE_DATA_DIR` as given.
 - The wrapper refuses (exit 70) unless memora-all mounts `LP_DATA_VOLUME` at
   `/data` and, for a stopped-required command, runs with
   `MEMORA_SERVICE_LOCK=1`.

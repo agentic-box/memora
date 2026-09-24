@@ -511,3 +511,84 @@ def test_migrate_images_takes_the_service_lock_unless_dry_run(tmp_path, dry_run,
         assert "ran True" in r.stdout
     else:
         assert "maintenance in progress (lock held)" in r.stderr and "ran" not in r.stdout
+
+
+# ------------------------------------------------------------------ review 7845: the lock file is never a symlink
+
+def test_a_symlinked_service_lock_is_refused_by_both_sides(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    private = tmp_path / "private"
+    private.mkdir()
+    (data / backends.SERVICE_LOCK_NAME).symlink_to(private / "lock")
+    with pytest.raises(backends.StoreLockedError, match="cannot be used as the service lock"):
+        backends.acquire_service_lock(data)
+    assert not (private / "lock").exists(), "the link target was not created"
+    b = lp.LockBarrier(tmp_path / "s.db", service_data_dir=data)
+    with pytest.raises(lp.L5Refused, match="maintenance lock: .*cannot be used as the service lock"):
+        b.check("at the start")
+    child = (f"import sys, os; sys.path.insert(0, {str(REPO)!r}); "
+             f"os.environ['MEMORA_DATA_DIR'] = {str(data)!r}; os.environ['MEMORA_SERVICE_LOCK'] = '1'; "
+             "from memora import server; server.os.path.ismount = lambda p: True; "
+             "server._take_service_lock_or_exit(); print('started')")
+    r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "cannot be used as the service lock" in r.stderr, (r.stdout, r.stderr)
+
+
+def test_a_lock_swapped_for_a_symlink_mid_run_is_caught(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    b = lp.LockBarrier(tmp_path / "s.db", service_data_dir=data)
+    (tmp_path / "s.db").write_bytes(b"")
+    b.check("at the start")
+    try:
+        lock = data / backends.SERVICE_LOCK_NAME
+        os.replace(lock, tmp_path / "moved")
+        lock.symlink_to(tmp_path / "moved")  # same inode through the link: only lstat sees it
+        with pytest.raises(lp.L5Refused, match="the service lock: .*now a symlink"):
+            b.check("before group 1")
+    finally:
+        b.release()
+
+
+def test_a_lock_on_another_device_is_refused(tmp_path, monkeypatch):
+    data = tmp_path / "data"
+    data.mkdir()
+    real_stat = os.stat
+
+    def fake_stat(p, *a, **kw):
+        st = real_stat(p, *a, **kw)
+        if str(p) == str(data.resolve()):
+            return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1) + tuple(st)[3:])
+        return st
+    monkeypatch.setattr(backends.os, "stat", fake_stat)
+    with pytest.raises(backends.StoreLockedError, match="not on its directory.s device"):
+        backends.acquire_service_lock(data)
+
+
+def test_a_symlinked_primary_lock_is_refused_too(tmp_path):
+    store = tmp_path / "s.db"
+    store.write_bytes(b"")
+    private = tmp_path / "private"
+    private.mkdir()
+    backends.primary_lock_path(store).symlink_to(private / "lock")
+    with pytest.raises(backends.StoreLockedError, match="cannot be used as the primary lock"):
+        backends.acquire_primary_lock(store)
+    assert not (private / "lock").exists()
+    with pytest.raises(lp.L5Refused, match="--lock-barrier at the start: .*primary lock"):
+        lp.LockBarrier(store).check("at the start")
+
+
+def test_a_primary_lock_swapped_for_a_symlink_mid_run_is_caught(tmp_path):
+    store = tmp_path / "s.db"
+    store.write_bytes(b"")
+    b = lp.LockBarrier(store)
+    b.check("at the start")
+    try:
+        lock = backends.primary_lock_path(store)
+        os.replace(lock, tmp_path / "moved")
+        lock.symlink_to(tmp_path / "moved")
+        with pytest.raises(lp.L5Refused, match="now a symlink"):
+            b.check("before group 1")
+    finally:
+        b.release()
