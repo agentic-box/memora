@@ -220,7 +220,9 @@ def builder_check(name: str, shadow_path: Path, seed_sql: Path, *,
                    if int(r["seq"]) <= cursor]
         log_keys = {(r["tbl"], tuple(_norm(v) for v in r["pk"])) for r in records}
         missing_in_log = sorted(set(logged_upto) - log_keys, key=str)
-        extra_in_log = sorted((k for k in log_keys - set(logged_upto) if not replicator.is_added_parent(k, records)), key=str)
+        parent_cols = replicator.added_parent_columns(db)  # the shadow backup's real schema (review 7733 P1)
+        extra_in_log = sorted((k for k in log_keys - set(logged_upto)
+                               if not replicator.is_added_parent(k, records, parent_cols)), key=str)
         scratch = work / "replayed.db"
         load_sql(seed_sql, scratch)
         rdb = _scratch(scratch)

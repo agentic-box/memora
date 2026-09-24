@@ -643,13 +643,20 @@ def test_the_added_parent_is_the_only_extra_memories_key_allowed(logged, tmp_pat
     local, replica, receipt = logged
     recs = list(R.iter_log(DB))
     parent, _child = _parent_and_child(recs)
-    assert R.is_added_parent(("memories", (1,)), recs)
+    conn = local.connect()
+    try:
+        cols = R.added_parent_columns(conn)
+    finally:
+        conn.close()
+    assert R.is_added_parent(("memories", (1,)), recs, cols)
+    assert not R.is_added_parent(("memories", (1,)), recs, {}), "no schema: nothing passes"
+    assert not R.is_added_parent(("memories", (1,)), recs, {**cols, "memories": cols["memories"][:2]})
     rep = _log_compare(tmp_path, local, replica, receipt)
     assert rep["clean"] and rep["unexpected_log_keys"] == []
 
 
 @pytest.mark.parametrize("variant", ["no-op delete of an absent id", "no-op update on the parent",
-                                     "parent without its child"])
+                                     "parent without its child", "partial upsert as the parent"])
 def test_an_extra_memories_key_that_is_not_an_added_parent_is_reported(logged, tmp_path, variant):
     local, replica, receipt = logged
     recs = list(R.iter_log(DB))
@@ -660,6 +667,12 @@ def test_an_extra_memories_key_that_is_not_an_added_parent_is_reported(logged, t
         extra = [{**parent, "index": 0, "pk": key, "sql": "DELETE FROM memories WHERE id = ?", "params": key}]
     elif variant == "no-op update on the parent":
         extra = [{**parent, "index": 7, "sql": "UPDATE memories SET content = content WHERE id = ?", "params": [1]}]
+    elif variant == "partial upsert as the parent":  # review 7733 P1: id + content only, in place of the real one
+        recs = [r for r in recs if r is not parent]
+        content = parent["params"][parent["sql"].split("(", 1)[1].split(")", 1)[0].split(", ").index("content")]
+        extra = [{**parent, "sql": "INSERT INTO memories (id, content) VALUES (?, ?) "
+                                   "ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+                  "params": [1, content]}]
     else:
         recs = [r for r in recs if r is not child]
         extra = []

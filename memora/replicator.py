@@ -255,12 +255,21 @@ def _add_parents(conn, batch: _Batch) -> None:
     batch.keys.extend(extra)
 
 
-def _builder_upsert_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def added_parent_columns(conn) -> Dict[str, List[str]]:
+    """The real column lists (PRAGMA table_info order, as read_batch builds
+    them from SELECT *) of the tables is_added_parent checks, read from a
+    store, snapshot or seed copy the caller has open (review 7733 P1)."""
+    return {t: _table_columns(conn, t) for t in (FK_PARENT, *FK_CHILDREN)}
+
+
+def _builder_upsert_row(record: Dict[str, Any], columns: Dict[str, List[str]]) -> Optional[Dict[str, Any]]:
     """The row a log record upserts, when the record is EXACTLY the
-    non-DELETE statement _build_statements emits for its own (table, key) --
-    rebuilt from the record's columns and params and compared as text and
-    values. None for anything else (a hand-written UPDATE, a DELETE, a
-    statement for another key, an unknown shape)."""
+    non-DELETE statement _build_statements emits for its own (table, key)
+    over the table's REAL columns: the record's column list must equal
+    columns[table] (a partial UPSERT that leaves columns out is refused,
+    review 7733 P1), and the statement rebuilt from its params must be the
+    same text and values. None for anything else (a hand-written UPDATE, a
+    DELETE, a statement for another key, an unknown shape)."""
     tbl, sql, params = record.get("tbl"), str(record.get("sql", "")), list(record.get("params") or [])
     if tbl not in SYNC_TABLES:
         return None
@@ -268,7 +277,7 @@ def _builder_upsert_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     if m is None or m.group("t") != tbl:
         return None
     cols = m.group("cols").split(", ")
-    if len(cols) != len(params) or len(set(cols)) != len(cols):
+    if not columns.get(tbl) or cols != list(columns[tbl]) or len(cols) != len(params):
         return None
     row = dict(zip(cols, params))
     pk = [row.get(c) for c in SYNC_TABLES[tbl]]
@@ -290,10 +299,12 @@ def _norm_log(v: Any) -> Any:
     return _norm(v)
 
 
-def is_added_parent(key: Tuple[str, Tuple[Any, ...]], records: List[Dict[str, Any]]) -> bool:
+def is_added_parent(key: Tuple[str, Tuple[Any, ...]], records: List[Dict[str, Any]],
+                    columns: Dict[str, List[str]]) -> bool:
     """A memories key that _add_parents added as the FK parent of a child
     upsert (review 7701 P1-1, 7721 P1). Every log record of the key must be
-    the replicator's own memories UPSERT for that id (_builder_upsert_row),
+    the replicator's own memories UPSERT for that id over the real columns
+    (_builder_upsert_row; `columns` from added_parent_columns),
     and each must share attempt and seq with a builder-shaped upsert of a
     memories_embeddings or memories_crossrefs row keyed by that id. Anything
     else -- a no-op UPDATE, a DELETE, a statement of another shape -- is an
@@ -307,9 +318,9 @@ def is_added_parent(key: Tuple[str, Tuple[Any, ...]], records: List[Dict[str, An
         return tuple(_norm_log(v) for v in r["pk"]) == pk
 
     children = {(r["attempt_id"], int(r["seq"])) for r in records
-                if r["tbl"] in FK_CHILDREN and same_key(r) and _builder_upsert_row(r) is not None}
+                if r["tbl"] in FK_CHILDREN and same_key(r) and _builder_upsert_row(r, columns) is not None}
     mine = [r for r in records if r["tbl"] == tbl and same_key(r)]
-    return bool(mine) and all(_builder_upsert_row(r) is not None and (r["attempt_id"], int(r["seq"])) in children
+    return bool(mine) and all(_builder_upsert_row(r, columns) is not None and (r["attempt_id"], int(r["seq"])) in children
                               for r in mine)
 
 

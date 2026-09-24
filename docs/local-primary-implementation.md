@@ -820,10 +820,12 @@ CREATE TABLE shadow_state (   -- in the shadow file only
   `shadow_state.would_halt_reported_id`), and they do not fail the night.
   In (b) a log key with no outbox row is a defect, except a `memories`
   parent the replicator adds to a child upsert (`replicator.is_added_parent`,
-  reviews 7701 P1-1 and 7721 P1). Every log record of the key must be
-  exactly the replicator's own memories UPSERT for that id: rebuilt with
-  `_build_statements` from the record's columns and params, it must give
-  the same SQL text and params. Each must also share attempt and seq with
+  reviews 7701 P1-1, 7721 P1 and 7733 P1). Every log record of the key must
+  be exactly the replicator's own memories UPSERT for that id. Its column
+  list must equal the table's real columns in `PRAGMA table_info` order,
+  read from the shadow backup, or from the snapshot in L6's log compare. A
+  partial UPSERT such as `id, content` is refused. Rebuilt with
+  `_build_statements`, it must give the same SQL text and params. Each must also share attempt and seq with
   an upsert of that id's `memories_embeddings`/`memories_crossrefs` row,
   checked the same way. A no-op UPDATE or a DELETE is a defect. Such a parent shares its
   child's seq, which is why the log reader deduplicates by (seq, table,

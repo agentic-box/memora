@@ -14,6 +14,9 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L9a round 4 / L6 (review 7733)
+- `replicator.is_added_parent(key, records, columns)` now checks against the REAL schema. Each record's column list must equal the table's `PRAGMA table_info` columns (`replicator.added_parent_columns`), read from the shadow backup in `shadow-night` and from the snapshot in `compare.log_compare`, before the rebuild. A partial UPSERT (for example `id, content` only) is an unexpected log key.
+
 ### Local-primary L9a round 3 / L6 (review 7721)
 - `replicator.is_added_parent` is strict. An extra `memories` log key passes only when every record of it is exactly the replicator's own memories UPSERT for that id (rebuilt with `_build_statements` from the record's columns and params, same SQL text and params). Each such record must share attempt and seq with an upsert of that id's `memories_embeddings`/`memories_crossrefs` row, checked the same way. A no-op UPDATE, a DELETE, another id or another shape is an unexpected log key.
 - L6's log-mode compare (`compare.log_compare`) used to exempt every `memories` key missing from the outbox. It now uses the same predicate.

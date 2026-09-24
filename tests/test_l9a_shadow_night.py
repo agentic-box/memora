@@ -295,7 +295,8 @@ def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(nigh
                                      "parent upsert at another seq", "parent upsert in another attempt",
                                      "upsert of another id at the child's seq", "parent upsert of another shape",
                                      "parent without its child", "parent upsert missing a column",
-                                     "parent with a no-op child", "labelled as the parent, writes another id"])
+                                     "parent with a no-op child", "labelled as the parent, writes another id",
+                                     "partial upsert as the parent"])
 def test_an_extra_memories_key_that_is_not_an_added_parent_is_a_defect(night, variant):
     """Review 7701 P1-1 / 7721 P1: only the replicator's own memories UPSERT
     for that id, in the same attempt and seq as a real child upsert, passes."""
@@ -327,6 +328,11 @@ def test_an_extra_memories_key_that_is_not_an_added_parent_is_a_defect(night, va
         assert add[0]["sql"] != parent["sql"]
     elif variant == "labelled as the parent, writes another id":  # the log key says 500, the row is 501
         add = [{**parent, "index": 6, "params": [501 if v == 500 else v for v in parent["params"]]}]
+    elif variant == "partial upsert as the parent":  # review 7733 P1: id + content only, in place of the real one
+        path.write_text("".join(ln + "\n" for ln, r in zip(lines, recs) if r is not parent))
+        add = [{**parent, "sql": "INSERT INTO memories (id, content) VALUES (?, ?) "
+                                 "ON CONFLICT(id) DO UPDATE SET content = excluded.content",
+                "params": [500, "seeded"]}]
     elif variant == "parent with a no-op child":
         path.write_text("".join(ln + "\n" for ln, r in zip(lines, recs) if r["tbl"] != "memories_embeddings"
                                 or r["pk"] != [500]))
