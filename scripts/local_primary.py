@@ -9,6 +9,11 @@ this file only parses arguments and builds the dependencies.
   recheck <db> --receipt R  under the SAME freeze: D1 unchanged since R? (else a fresh export)
   seed    <db> --receipt R --out /data/<db>.db   (rechecks R under the same freeze first)
   sequence-highwater <db> --receipt R --local /data/<db>.db --credential-file F [--dry-run]
+  restore <db> --receipt R --out /data/<db>.db              default: FULL re-seed (old store kept aside)
+  restore <db> --from-r2 KEY --receipt R                    prepare: write conflicts-<ts>.json
+  restore <db> --from-r2 KEY --receipt R --conflicts F --approve A --out P --credential-file C [--dry-run]
+  reconcile <db> [--accept ID --receipt R --operator NAME --decision applied|not-applied --evidence-sha256 X]
+  resume  <db> --store /data/<db>.db [--accept-d1-epoch N | --allow-deletes ATTEMPT]   (memora-all stopped)
   thaw    <db>              lift the freeze -- the only command that does
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
@@ -80,6 +85,39 @@ def _parser() -> argparse.ArgumentParser:
     sq.add_argument("--local", required=True, help="the local store file")
     sq.add_argument("--credential-file", help="0600 file with the operator's D1 edit token")
     sq.add_argument("--dry-run", action="store_true")
+    rs = sub.add_parser("restore", help="§4 restore: full re-seed, or --from-r2 with conflict groups")
+    common(rs)
+    rs.add_argument("--receipt", required=True)
+    rs.add_argument("--out", help="the store file (default restore, and --from-r2 apply)")
+    rs.add_argument("--replica-uri", help="optional; must equal d1://<account>/<database-id>")
+    rs.add_argument("--rehearse", action="store_true")
+    rs.add_argument("--from-r2", help="snapshot key in R2 (e.g. <db>/<ts>.db.gz)")
+    rs.add_argument("--conflicts", help="the conflicts file written by the prepare step")
+    rs.add_argument("--approve", help="the operator's selections: {conflicts_sha256, selections: {group: d1|snapshot}}")
+    rs.add_argument("--credential-file", help="0600 file with the operator's D1 edit token (snapshot selections)")
+    rs.add_argument("--dry-run", action="store_true", help="print the exact statements, write nothing")
+    rs.add_argument("--allow-deletes", help="the attempt id a delete-guard refusal names (that attempt only)")
+    rc2 = sub.add_parser("reconcile", help="§1 open D1 write intents: show, or --accept one")
+    rc2.add_argument("db")
+    rc2.add_argument("--account", required=True)
+    rc2.add_argument("--database-id", required=True)
+    rc2.add_argument("--memora-url", default="http://127.0.0.1:8000")
+    rc2.add_argument("--admin-token-file", required=True)
+    rc2.add_argument("--health-token-file", required=True)
+    rc2.add_argument("--accept", type=int, metavar="INTENT_ID")
+    rc2.add_argument("--receipt")
+    rc2.add_argument("--operator")
+    rc2.add_argument("--decision", choices=lp.RECONCILE_DECISIONS)
+    rc2.add_argument("--evidence-sha256")
+    rm = sub.add_parser("resume", help="§2.6/P3 clear a replicator halt (memora-all stopped)")
+    rm.add_argument("db")
+    rm.add_argument("--store", required=True)
+    rm.add_argument("--account", required=True)
+    rm.add_argument("--database-id", required=True)
+    rm.add_argument("--read-token-file")
+    g = rm.add_mutually_exclusive_group()
+    g.add_argument("--accept-d1-epoch", type=int)
+    g.add_argument("--allow-deletes")
     sn = sub.add_parser("snapshot", help="§4 nightly snapshot of a local store to R2")
     sn.add_argument("db")
     sn.add_argument("--store", required=True)
@@ -117,7 +155,7 @@ def _deps(args) -> lp.Deps:
     if getattr(args, "credential_file", None):
         lp.load_credential_file(args.credential_file)  # refuse a bad file before anything runs
         writer_factory = lambda: lp.OperatorD1Writer.from_credential_file(  # noqa: E731
-            args.account, args.database_id, args.credential_file)
+            args.account, args.database_id, args.credential_file, allow_restore=args.cmd == "restore")
     return lp.Deps(reader=reader, freeze=barrier, r2=_r2(args), account_id=args.account,
                    database_id=args.database_id, d1_name=args.d1_name, read_token=token,
                    native_export=args.native_export, writer_factory=writer_factory)
@@ -127,7 +165,7 @@ def _r2(args):
     return lp.FsR2(Path(args.r2_dir)) if args.r2_dir else lp.S3R2(args.r2_bucket)
 
 
-FROZEN_STEPS = ("export", "recheck", "seed", "sequence-highwater")
+FROZEN_STEPS = ("export", "recheck", "seed", "sequence-highwater", "restore")
 
 
 def _recovery(args) -> dict:
@@ -140,6 +178,24 @@ def _recovery(args) -> dict:
                         f"--memora-url {args.memora_url} --admin-token-file <file> --health-token-file <file>"}
 
 
+def _restore(args, deps) -> dict:
+    if not args.from_r2:
+        if not args.out:
+            raise lp.L5Refused("restore needs --out (the store file)")
+        return lp.restore(args.db, args.receipt, Path(args.out), deps, Path(args.out_dir),
+                          replica_uri=args.replica_uri, rehearse=args.rehearse)
+    if not args.conflicts and not args.approve:
+        return lp.restore_prepare(args.db, args.from_r2, args.receipt, deps, Path(args.out_dir))
+    if not (args.conflicts and args.approve and args.out):
+        raise lp.L5Refused("the apply step needs --conflicts, --approve and --out")
+    conflicts = json.loads(Path(args.conflicts).read_text())
+    if conflicts.get("snapshot_key") != args.from_r2:
+        raise lp.L5Refused(f"{args.conflicts} was prepared for {conflicts.get('snapshot_key')!r}, not {args.from_r2!r}")
+    return lp.restore_apply(args.db, args.conflicts, args.approve, args.receipt, deps, Path(args.out),
+                            Path(args.out_dir), replica_uri=args.replica_uri, dry_run=args.dry_run,
+                            allow_deletes=args.allow_deletes, rehearse=args.rehearse)
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -147,6 +203,30 @@ def main(argv=None) -> int:
             client = _freeze_client(args)
             client.freeze() if args.cmd == "freeze" else client.thaw()
             print(json.dumps({"ok": True, args.cmd: args.db}))
+            return 0
+        if args.cmd == "reconcile":
+            client = lp.AdminClient(args.memora_url, lp.load_credential_file(args.admin_token_file), args.db,
+                                    health_token=lp.load_credential_file(args.health_token_file))
+            if args.accept is None:
+                out = {"ok": True, **client.intents()}
+            else:
+                missing = [f for f in ("receipt", "operator", "decision", "evidence_sha256") if not getattr(args, f)]
+                if missing:
+                    raise lp.L5Refused(f"--accept needs {', '.join('--' + m.replace('_', '-') for m in missing)}")
+                out = {"ok": True, **lp.reconcile_accept(
+                    args.db, client, intent_id=args.accept, receipt_path=args.receipt, operator=args.operator,
+                    decision=args.decision, evidence_sha256=args.evidence_sha256,
+                    account_id=args.account, database_id=args.database_id)}
+            print(json.dumps(out))
+            return 0
+        if args.cmd == "resume":
+            from memora.backends import D1SelectOnlyConnection
+
+            reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id,
+                                                        lp.read_token(args.read_token_file)))
+            out = {"ok": True, **lp.resume_store(Path(args.store), reader, accept_d1_epoch=args.accept_d1_epoch,
+                                                 allow_deletes=args.allow_deletes)}
+            print(json.dumps(out))
             return 0
         if args.cmd == "volume-check":
             out = lp.volume_check([Path(s) for s in args.store], min_free_pct=args.min_free_pct)
@@ -167,6 +247,8 @@ def main(argv=None) -> int:
         elif args.cmd == "seed":
             out = {"ok": True, **lp.seed(args.db, args.receipt, Path(args.out), deps, Path(args.out_dir),
                                          replica_uri=args.replica_uri, rehearse=args.rehearse)}
+        elif args.cmd == "restore":
+            out = {"ok": True, **_restore(args, deps)}
         else:
             out = {"ok": True, **lp.sequence_highwater(args.db, args.receipt, Path(args.local), deps,
                                                        Path(args.out_dir), dry_run=args.dry_run)}

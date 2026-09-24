@@ -517,6 +517,9 @@ class FreezeServer:
     def __init__(self, db=DB, health=None, post_status=200, delete_status=200, already_frozen=False):
         self.db = db
         self.requests = []
+        self.intents = {"state": "frozen", "open_intents": []}  # GET /admin/intents/<db>
+        self.reconcile_bodies = []                              # POST /admin/reconcile/<db>/<id>
+        self.reconcile_status = 200
         self.health = list(health or [])
         self.post_status = post_status
         self.delete_status = delete_status
@@ -547,6 +550,13 @@ class FreezeServer:
                     if server.post_status == 200:
                         server.state = "frozen"
                     return self._reply(server.post_status, {"state": server.state})
+                if path == f"/admin/intents/{server.db}" and self.command == "GET":
+                    return self._reply(200, server.intents)
+                if path.startswith(f"/admin/reconcile/{server.db}/") and self.command == "POST":
+                    n = int(self.headers.get("Content-Length") or 0)
+                    server.reconcile_bodies.append((path.rsplit("/", 1)[1], json.loads(self.rfile.read(n) or b"{}")))
+                    return self._reply(server.reconcile_status, {"outcome": "operator-accepted"}
+                                       if server.reconcile_status == 200 else {"error": "evidence_changed"})
                 if path == f"/admin/freeze/{server.db}" and self.command == "DELETE":
                     if server.delete_status == 200:
                         server.state = "open"

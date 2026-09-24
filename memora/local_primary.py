@@ -696,7 +696,7 @@ def _fsync_dir(path: Path) -> None:
 
 
 def seed(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
-         replica_uri: Optional[str] = None, rehearse: bool = False) -> Dict[str, Any]:
+         replica_uri: Optional[str] = None, rehearse: bool = False, lock_held: bool = False) -> Dict[str, Any]:
     """§4 seed: a new local store from a verified export. Built beside the
     target and linked into place only when it verifies; an existing target
     is never touched. Holds the target's primary lock while it works, so a
@@ -723,10 +723,11 @@ def seed(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
     receipt = load_receipt(str(used), db, account_id=deps.account_id, database_id=deps.database_id)
     deps.freeze.check("before the seed")
     out.parent.mkdir(parents=True, exist_ok=True)  # §9 (k): before the primary lock
-    try:
-        acquire_primary_lock(out)
-    except StoreLockedError as exc:
-        raise L5Refused(f"cannot seed {out}: {exc}")
+    if not lock_held:  # restore holds it across its move-aside and this seed
+        try:
+            acquire_primary_lock(out)
+        except StoreLockedError as exc:
+            raise L5Refused(f"cannot seed {out}: {exc}")
     tmp = out.with_name(out.name + ".seed-partial")
     try:
         for p in _with_sidecars(tmp):
@@ -777,7 +778,8 @@ def seed(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
         for p in _with_sidecars(tmp):
             if p.exists():
                 p.unlink()
-        release_primary_lock(out)
+        if not lock_held:
+            release_primary_lock(out)
     return {"out": str(out), "receipt": str(used), "replica_uri": replica_uri, "epoch": receipt["epoch"],
             "tables": stats,
             "fts_rows": fts_rows, "sequences": sequences, "sync_state": state, "rehearse": rehearse}
@@ -795,19 +797,36 @@ class OperatorD1Writer:
     frozen while it runs, and each call is one statement the operator ran."""
 
     ALLOWED = frozenset({SEQ_UPDATE_SQL})
+    # R2 restore (§4): per-key statements built by the replicator's
+    # _build_statements and accepted by its P2 _check_statement, nothing else.
+    RESTORE_SHAPES = frozenset({"upsert", "insert", "delete"})
 
-    def __init__(self, conn):
+    def __init__(self, conn, *, allow_restore: bool = False):
         self.conn = conn  # backends.D1Connection (or a test double with _send)
+        self.allow_restore = allow_restore
         self.sent: List[Tuple[str, tuple]] = []
 
     @classmethod
-    def from_credential_file(cls, account_id: str, database_id: str, path: str) -> "OperatorD1Writer":
+    def from_credential_file(cls, account_id: str, database_id: str, path: str, *,
+                             allow_restore: bool = False) -> "OperatorD1Writer":
         from .backends import D1Connection
 
-        return cls(D1Connection(account_id, database_id, load_credential_file(path)))
+        return cls(D1Connection(account_id, database_id, load_credential_file(path)), allow_restore=allow_restore)
+
+    def _allowed(self, sql: str) -> bool:
+        if sql in self.ALLOWED:
+            return True
+        if not self.allow_restore:
+            return False
+        from .replicator import ReplicatorStatementError, _check_statement
+
+        try:
+            return _check_statement(sql) in self.RESTORE_SHAPES
+        except ReplicatorStatementError:
+            return False
 
     def send(self, sql: str, params: tuple) -> Dict[str, Any]:
-        if sql not in self.ALLOWED:
+        if not self._allowed(sql):
             raise L5Refused(f"statement not on the operator allow-list: {sql[:80]}")
         self.sent.append((sql, tuple(params)))
         return self.conn._send(sql, tuple(params))
@@ -945,3 +964,473 @@ def volume_check(stores: List[Path], *, min_free_pct: float = 10.0,
         if pct < min_free_pct:
             alerts.append(f"{store}: only {pct:.1f}% of the volume is free (minimum {min_free_pct}%)")
     return {"ok": not alerts, "alerts": alerts, "volumes": volumes}
+
+
+# ------------------------------------------------------------------ restore (§4, H5)
+
+def _move_aside(out: Path, clock: Callable[[], float]) -> Optional[str]:
+    """Move an existing store and its sidecars into <out>.pre-restore-<ts>/
+    (never deleted). The caller holds the primary lock."""
+    parts = [p for p in (out, Path(f"{out}-wal"), Path(f"{out}-shm"), Path(f"{out}-journal")) if p.exists()]
+    if not parts:
+        return None
+    base = f"{out.name}.pre-restore-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(clock()))}"
+    dest, n = out.with_name(base), 1
+    while dest.exists():
+        n += 1
+        dest = out.with_name(f"{base}-{n}")
+    dest.mkdir()
+    for p in parts:
+        os.replace(p, dest / p.name)
+    _fsync_dir(out.parent)
+    return str(dest)
+
+
+def _restore_into(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
+                  replica_uri: Optional[str], rehearse: bool) -> Dict[str, Any]:
+    """Move the old store aside (not on a rehearsal) and seed -- which
+    rechecks the receipt under the freeze -- holding the target's primary
+    lock across both. If the seed fails, the old store is put back."""
+    from .backends import StoreLockedError, acquire_primary_lock, release_primary_lock
+
+    if rehearse:
+        return {**seed(db, receipt_path, out, deps, out_dir, replica_uri=replica_uri, rehearse=True),
+                "moved_aside": None}
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        acquire_primary_lock(out)
+    except StoreLockedError as exc:
+        raise L5Refused(f"cannot restore {out}: {exc} (stop memora-all first)")
+    try:
+        deps.freeze.check("before moving the old store aside")
+        moved = _move_aside(out, deps.clock)
+        try:
+            rep = seed(db, receipt_path, out, deps, out_dir, replica_uri=replica_uri, lock_held=True)
+        except BaseException:
+            if moved and not out.exists():  # put the old store back: nothing was placed
+                for p in Path(moved).iterdir():
+                    os.replace(p, out.parent / p.name)
+                Path(moved).rmdir()
+                moved = None
+            raise
+        return {**rep, "moved_aside": moved}
+    finally:
+        release_primary_lock(out)
+
+
+def restore(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
+            replica_uri: Optional[str] = None, rehearse: bool = False) -> Dict[str, Any]:
+    """The default restore (H5): a FULL re-seed from a verified export. The
+    old store is moved aside (kept, never deleted) and a new one seeded; the
+    seed rechecks the receipt under the freeze already in place (a fresh
+    export if D1 changed). Unacked local writes are lost (accepted, 7507)."""
+    return _restore_into(db, receipt_path, Path(out), deps, out_dir, replica_uri=replica_uri, rehearse=rehearse)
+
+
+# ------------------------------------------------------------------ restore --from-r2: conflicts (§4)
+
+def _compare_tables() -> Dict[str, Tuple[str, ...]]:
+    from .schema import SYNC_TABLES
+
+    return dict(SYNC_TABLES)
+
+
+def _meta_excluded() -> Tuple[str, ...]:
+    from .schema import SYNC_META_EXCLUDED
+
+    return tuple(SYNC_META_EXCLUDED)
+
+
+def _group_of(table: str, row: Dict[str, Any]) -> str:
+    """Conflict groups (§4): per memory id (the memories row and its
+    embeddings, crossrefs, tombstones, tombstone_components and actions),
+    one per memories_meta key; an action with no memory is its own group."""
+    if table == "memories":
+        return f"memory:{row['id']}"
+    if table == "memories_meta":
+        return f"meta:{row['key']}"
+    if table == "memories_actions" and row.get("memory_id") is None:
+        return f"action:{row['id']}"
+    return f"memory:{row['memory_id']}"
+
+
+def _file_rows(db_path: Path, table: str, columns: List[str]) -> Dict[Tuple, Dict[str, Any]]:
+    pk = _compare_tables()[table]
+    db = _scratch_connect(db_path)
+    db.row_factory = sqlite3.Row
+    try:
+        have = {r[1] for r in db.execute(f'PRAGMA table_info("{table}")')}
+        if not have:
+            return {}
+        cols = [c for c in columns if c in have]
+        out = {}
+        for r in db.execute(f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM "{table}"'):
+            row = {c: r[c] for c in cols}
+            if table == "memories_meta" and row["key"] in _meta_excluded():
+                continue
+            out[tuple(row[c] for c in pk)] = row
+        return out
+    finally:
+        db.close()
+
+
+def _norm_row(row: Optional[Dict[str, Any]]) -> Any:
+    return None if row is None else {c: _norm(v) for c, v in sorted(row.items())}
+
+
+def _group_digest(rows: List[Dict[str, Any]]) -> str:
+    """sha256 of a group's rows as {table, pk, row}, sorted: the preimage
+    the apply step re-reads and compares."""
+    canon = sorted(json.dumps(r, sort_keys=True, default=str, separators=(",", ":")) for r in rows)
+    return hashlib.sha256("\n".join(canon).encode("utf-8")).hexdigest()
+
+
+def _group_rows(side: Dict[str, Dict[Tuple, Dict[str, Any]]], table_pk: Dict[str, Tuple[str, ...]],
+                keys: List[Tuple[str, Tuple]]) -> List[Dict[str, Any]]:
+    out = []
+    for table, pk in keys:
+        row = side[table].get(pk)
+        if row is not None:
+            out.append({"table": table, "pk": list(pk), "row": _norm_row(row)})
+    return out
+
+
+def build_conflicts(snapshot_db: Path, d1_db: Path, columns: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Every difference between the snapshot and D1 (a verified export of
+    it) over the §5.2 tables, keys on one side only included, grouped; each
+    group carries both versions of every row it holds and D1's preimage."""
+    tables = _compare_tables()
+    snap = {t: _file_rows(snapshot_db, t, columns[t]) for t in tables}
+    d1 = {t: _file_rows(d1_db, t, columns[t]) for t in tables}
+    members: Dict[str, List[Tuple[str, Tuple]]] = {}
+    for t in tables:
+        for side in (snap, d1):
+            for pk, row in side[t].items():
+                members.setdefault(_group_of(t, row), [])
+                if (t, pk) not in members[_group_of(t, row)]:
+                    members[_group_of(t, row)].append((t, pk))
+    groups = []
+    def order(gid: str):
+        kind, _, ident = gid.partition(":")
+        return (kind, int(ident) if ident.lstrip("-").isdigit() else 0, ident)
+
+    for gid in sorted(members, key=order):
+        keys = sorted(members[gid], key=lambda k: (list(tables).index(k[0]), [str(v) for v in k[1]]))
+        if all(_norm_row(snap[t].get(pk)) == _norm_row(d1[t].get(pk)) for t, pk in keys):
+            continue
+        d1_rows = _group_rows(d1, tables, keys)
+        groups.append({"group": gid, "keys": [{"table": t, "pk": list(pk)} for t, pk in keys],
+                       "snapshot_rows": _group_rows(snap, tables, keys), "d1_rows": d1_rows,
+                       "d1_preimage_sha256": _group_digest(d1_rows)})
+    return groups
+
+
+def _fetch_snapshot(r2, key: str, work: Path) -> Tuple[Path, str]:
+    raw = r2.get(key)
+    sha = hashlib.sha256(raw).hexdigest()
+    path = work / "snapshot.db"
+    try:
+        path.write_bytes(gzip.decompress(raw) if key.endswith(".gz") else raw)
+    except OSError as exc:
+        raise L5Refused(f"snapshot {key} is not a readable gzip: {exc}")
+    db = _scratch_connect(path)
+    try:
+        ok = db.execute("PRAGMA integrity_check").fetchone()[0]
+    except sqlite3.DatabaseError as exc:
+        ok = str(exc)
+    finally:
+        db.close()
+    if ok != "ok":
+        raise L5Refused(f"snapshot {key} fails integrity_check: {ok}")
+    return path, sha
+
+
+def restore_prepare(db: str, snapshot_key: str, receipt_path: str, deps: Deps, out_dir: Path) -> Dict[str, Any]:
+    """`restore --from-r2 KEY` step 1-3: under the freeze, recheck the
+    receipt, compare the snapshot with D1 (the verified export of it) and
+    write conflicts-<ts>.json for the operator. Writes nothing else."""
+    used = recheck(db, receipt_path, deps, out_dir)
+    receipt = load_receipt(str(used), db, account_id=deps.account_id, database_id=deps.database_id)
+    work = Path(tempfile.mkdtemp(prefix=f"restore-{db}-", dir=str(Path(out_dir))))
+    try:
+        # §4 step 1 loads the snapshot; its FTS is not needed here: the
+        # restored local store is re-seeded from D1 (FTS rebuilt there).
+        snap, snap_sha = _fetch_snapshot(deps.r2, snapshot_key, work)
+        d1 = work / "d1.db"
+        load_sql(Path(receipt["sql_path"]), d1)
+        columns = {t: [c for c, _ in deps.reader.columns(t)] for t in _compare_tables()}
+        groups = build_conflicts(snap, d1, columns)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    deps.freeze.check("before writing the conflicts file")
+    doc = {"version": 1, "db": db, "account_id": deps.account_id, "database_id": deps.database_id,
+           "receipt": str(used), "receipt_sha256": _sha256_file(Path(used)), "snapshot_key": snapshot_key,
+           "snapshot_sha256": snap_sha, "columns": columns, "created_at": _now_iso(), "groups": groups}
+    base = Path(out_dir) / db
+    base.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(deps.clock()))
+    path, n = base / f"conflicts-{stamp}.json", 1
+    while path.exists():
+        n += 1
+        path = base / f"conflicts-{stamp}-{n}.json"
+    path.write_text(json.dumps(doc, indent=2, sort_keys=True))
+    return {"conflicts": str(path), "conflicts_sha256": _sha256_file(path), "groups": len(groups),
+            "receipt": str(used)}
+
+
+# ------------------------------------------------------------------ restore --from-r2: apply (§4)
+
+RESTORE_CHOICES = ("d1", "snapshot")
+_FK_ORDER = ("memories", "memories_embeddings", "memories_crossrefs", "tombstones", "tombstone_components",
+             "memories_actions", "memories_meta")
+
+
+def load_approval(conflicts_path: str, approve_path: str, db: str, deps: Deps) -> Tuple[Dict[str, Any], Dict[str, str], str]:
+    """The conflicts file and the operator's --approve file, which must quote
+    the conflicts file's sha256 and choose d1|snapshot for EVERY group."""
+    try:
+        conflicts = json.loads(Path(conflicts_path).read_text())
+        approve = json.loads(Path(approve_path).read_text())
+    except (OSError, ValueError) as exc:
+        raise L5Refused(f"conflicts/approve file unreadable: {exc}")
+    if conflicts.get("version") != 1 or conflicts.get("db") != db:
+        raise L5Refused(f"{conflicts_path} is not a version-1 conflicts file for {db!r}")
+    if (conflicts.get("account_id"), conflicts.get("database_id")) != (deps.account_id, deps.database_id):
+        raise L5Refused(f"{conflicts_path} is for another D1 database")
+    sha = _sha256_file(Path(conflicts_path))
+    if not isinstance(approve, dict) or approve.get("conflicts_sha256") != sha:
+        raise L5Refused(f"{approve_path} does not quote this conflicts file (sha256 {sha})")
+    sel = approve.get("selections")
+    groups = [g["group"] for g in conflicts["groups"]]
+    if not isinstance(sel, dict):
+        raise L5Refused(f"{approve_path} has no selections")
+    missing = sorted(set(groups) - set(sel))
+    extra = sorted(set(sel) - set(groups))
+    bad = sorted(g for g, v in sel.items() if v not in RESTORE_CHOICES)
+    if missing or extra or bad:
+        raise L5Refused(f"{approve_path} must choose d1|snapshot for every group and nothing else: "
+                        f"missing={missing[:20]} unknown={extra[:20]} invalid={bad[:20]}")
+    return conflicts, sel, sha
+
+
+def _group_statements(group: Dict[str, Any], columns: Dict[str, List[str]]) -> List[Tuple[str, tuple]]:
+    """The per-key statements that make D1's rows of one group equal the
+    snapshot's: UPSERTs parents first, DELETEs children first; rows already
+    equal send nothing. Each one passes the replicator's P2 check."""
+    from .replicator import _build_statements, _check_statement
+
+    snap = {(r["table"], tuple(r["pk"])): r["row"] for r in group["snapshot_rows"]}
+    d1 = {(r["table"], tuple(r["pk"])): r["row"] for r in group["d1_rows"]}
+    ups, dels = [], []
+    for k in group["keys"]:
+        key = (k["table"], tuple(k["pk"]))
+        if snap.get(key) == d1.get(key):
+            continue
+        row = snap.get(key)
+        if row is not None:
+            row = {c: (bytes.fromhex(v["$hex"]) if isinstance(v, dict) and "$hex" in v else v) for c, v in row.items()}
+        stmts = _build_statements(k["table"], list(k["pk"]), row, columns[k["table"]])
+        (ups if row is not None else dels).append((k["table"], stmts))
+    ups.sort(key=lambda x: _FK_ORDER.index(x[0]))
+    dels.sort(key=lambda x: -_FK_ORDER.index(x[0]))
+    out = [st for _t, stmts in ups + dels for st in stmts]
+    for sql, _params in out:
+        _check_statement(sql)
+    return out
+
+
+def _d1_group_rows(reader: D1Reader, group: Dict[str, Any], columns: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """Re-read one group's rows from D1 (by key), normalised like the
+    conflicts file's."""
+    tables = _compare_tables()
+    out = []
+    for k in group["keys"]:
+        t, pk = k["table"], k["pk"]
+        cols = columns[t]
+        where = " AND ".join(f'"{c}" = ?' for c in tables[t])
+        rows = reader.rows(f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM "{t}" WHERE {where}',
+                           tuple(pk))
+        if rows:
+            out.append({"table": t, "pk": list(pk), "row": _norm_row({c: rows[0].get(c) for c in cols})})
+    return out
+
+
+def _delete_guard(plan: Dict[str, List[Tuple[str, tuple]]], receipt: Dict[str, Any], attempt: str,
+                  allow_deletes: Optional[str]) -> Optional[str]:
+    """P3 for restore replay: per-table DELETEs against D1's row counts."""
+    from .replicator import DELETE_GUARD_FRACTION, DELETE_GUARD_ROWS
+
+    n: Dict[str, int] = {}
+    for stmts in plan.values():
+        for sql, _p in stmts:
+            if sql.startswith("DELETE FROM "):
+                t = sql.split()[2]
+                # the embeddings DELETE+INSERT pair is an update, not a delete
+                if not any(s.startswith(f"INSERT INTO {t} ") for s, _ in stmts):
+                    n[t] = n.get(t, 0) + 1
+    for t, k in sorted(n.items()):
+        total = int((receipt["tables"].get(t) or {}).get("count", 0))
+        if (k > DELETE_GUARD_ROWS or k > DELETE_GUARD_FRACTION * total) and allow_deletes != attempt:
+            return f"delete_guard: {t} {k}/{total} attempt={attempt}"
+    return None
+
+
+def restore_apply(db: str, conflicts_path: str, approve_path: str, receipt_path: str, deps: Deps,
+                  out: Path, out_dir: Path, *, replica_uri: Optional[str] = None, dry_run: bool = False,
+                  allow_deletes: Optional[str] = None, rehearse: bool = False) -> Dict[str, Any]:
+    """`restore --from-r2` steps 4-7, under the freeze already in place:
+    - `d1` groups never write D1;
+    - `snapshot` groups send per-key UPSERT/DELETE (P2-checked, P3-guarded)
+      after re-reading the group on D1 and matching the recorded preimage
+      (a changed group is aborted and reported, the others continue), then
+      read the group back;
+    - when every group is resolved, D1 holds the chosen state everywhere, so
+      the local store is rebuilt from a fresh verified export of it (the
+      old store moved aside, kept).
+    A failed send HALTS: the group's outcome on D1 is unknown."""
+    conflicts, sel, csha = load_approval(conflicts_path, approve_path, db, deps)
+    used = recheck(db, receipt_path, deps, out_dir)
+    receipt = load_receipt(str(used), db, account_id=deps.account_id, database_id=deps.database_id)
+    columns = conflicts["columns"]
+    chosen = [g for g in conflicts["groups"] if sel[g["group"]] == "snapshot"]
+    from .replicator import ReplicatorStatementError
+
+    plan = {}
+    for g in chosen:
+        try:
+            plan[g["group"]] = _group_statements(g, columns)
+        except ReplicatorStatementError as exc:
+            raise L5Refused(f"group {g['group']}: no allowed statement can restore it: {exc}")
+    attempt = hashlib.sha256((csha + _sha256_file(Path(approve_path))).encode()).hexdigest()[:16]
+    report: Dict[str, Any] = {"conflicts_sha256": csha, "attempt": attempt, "receipt": str(used),
+                              "d1_groups": sorted(g for g, v in sel.items() if v == "d1"),
+                              "statements": {g: plan[g] for g in sorted(plan)}, "dry_run": dry_run}
+    halt = _delete_guard(plan, receipt, attempt, allow_deletes)
+    if halt:
+        raise L5Refused(f"{halt}: pass --allow-deletes {attempt} to allow this one attempt")
+    if dry_run:
+        return report
+    applied, aborted = [], []
+    writer = None
+    if any(plan.values()):
+        if deps.writer_factory is None:
+            raise L5Refused("no operator writer: pass --credential-file")
+        writer = deps.writer_factory()
+    for g in chosen:
+        gid = g["group"]
+        deps.freeze.check(f"before group {gid}")
+        if _group_digest(_d1_group_rows(deps.reader, g, columns)) != g["d1_preimage_sha256"]:
+            aborted.append(gid)  # D1 changed since the conflicts file: not written
+            continue
+        for sql, params in plan[gid]:
+            try:
+                res = writer.send(sql, params)
+            except L5Refused:
+                raise
+            except Exception as exc:
+                raise L5Halt(f"group {gid}: D1 send failed ({type(exc).__name__}: {exc}); its outcome is "
+                             f"unknown. Applied so far: {applied}. Re-run the prepare step.")
+            if isinstance(res, dict) and res.get("success") is False:
+                raise L5Halt(f"group {gid}: D1 rejected {sql[:80]!r}: {res}. Applied so far: {applied}")
+        if plan[gid] and _group_digest(_d1_group_rows(deps.reader, g, columns)) != _group_digest(g["snapshot_rows"]):
+            raise L5Halt(f"group {gid}: D1 does not read back as the snapshot. Applied so far: {applied}")
+        applied.append(gid)
+    report.update({"applied": applied, "aborted": aborted})
+    if aborted:
+        report["local"] = "not rebuilt: some groups were aborted; re-run the prepare step"
+        raise L5Refused(json.dumps(report, default=str))
+    deps.freeze.check("before the fresh export")
+    fresh = _export_frozen(db, deps, Path(out_dir) / db)
+    report["local"] = _restore_into(db, str(fresh), Path(out), deps, out_dir, replica_uri=replica_uri,
+                                    rehearse=rehearse)
+    return report
+
+
+# ------------------------------------------------------------------ reconcile (§1) and resume (§2.6, P3)
+
+class AdminClient(FreezeClient):
+    """GET /admin/intents/<db> and POST /admin/reconcile/<db>/<id>."""
+
+    def _post_json(self, path: str, body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
+        req = urllib.request.Request(self.base + path, method="POST", data=json.dumps(body).encode(),
+                                     headers={"Authorization": f"Bearer {self.admin_token}",
+                                              "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                return exc.code, json.loads(exc.read() or b"{}")
+            except ValueError:
+                return exc.code, {}
+        except (urllib.error.URLError, OSError) as exc:
+            raise L5Refused(f"memora-all is not reachable at {self.base}: {exc}")
+
+    def intents(self) -> Dict[str, Any]:
+        status, body = self._request("GET", f"/admin/intents/{self.db}")
+        if status != 200:
+            raise L5Refused(f"GET /admin/intents/{self.db} failed ({status}): {body}")
+        return body
+
+    def accept(self, intent_id: int, body: Dict[str, Any]) -> Dict[str, Any]:
+        status, out = self._post_json(f"/admin/reconcile/{self.db}/{intent_id}", body)
+        if status != 200:
+            raise L5Refused(f"reconcile of intent {intent_id} refused ({status}): {out}")
+        return out
+
+
+RECONCILE_DECISIONS = ("applied", "not-applied")
+
+
+def reconcile_accept(db: str, client: AdminClient, *, intent_id: int, receipt_path: str, operator: str,
+                     decision: str, evidence_sha256: str, account_id: str, database_id: str) -> Dict[str, Any]:
+    """`reconcile --accept` (§1, L2's accept body): the receipt must be a
+    usable one for this D1 database, and the evidence digest must be the one
+    GET /admin/intents shows now for this intent (the server re-checks)."""
+    load_receipt(receipt_path, db, account_id=account_id, database_id=database_id)
+    if decision not in RECONCILE_DECISIONS:
+        raise L5Refused(f"decision must be one of {RECONCILE_DECISIONS}")
+    if not operator.strip():
+        raise L5Refused("--operator is required")
+    shown = {int(i["id"]): i for i in client.intents().get("open_intents", [])}
+    if intent_id not in shown:
+        raise L5Refused(f"intent {intent_id} is not open on {db}")
+    if shown[intent_id].get("evidence_sha256") != evidence_sha256:
+        raise L5Refused(f"intent {intent_id}: the evidence changed since you read it "
+                        f"(now {shown[intent_id].get('evidence_sha256')}); show it again and decide on that")
+    body = {"receipt": str(receipt_path), "operator": operator.strip(), "intent_id": intent_id,
+            "decision": decision, "evidence_sha256": evidence_sha256}
+    return {"request": body, "response": client.accept(intent_id, body)}
+
+
+def resume_store(db_path: Path, reader: D1Reader, *, accept_d1_epoch: Optional[int] = None,
+                 allow_deletes: Optional[str] = None) -> Dict[str, Any]:
+    """`resume` (§2.6, P3): clear a replicator halt on a local store. Holds
+    the store's primary lock (memora-all must be stopped). An accepted D1
+    epoch must be D1's epoch now."""
+    from .backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock, release_primary_lock
+    from .replicator import resume
+
+    db_path = Path(db_path)
+    if not db_path.is_file():
+        raise L5Refused(f"no store at {db_path}")
+    if accept_d1_epoch is not None:
+        now = reader.epoch()
+        if int(accept_d1_epoch) != now:
+            raise L5Refused(f"--accept-d1-epoch {accept_d1_epoch} is not D1's epoch now ({now})")
+    try:
+        acquire_primary_lock(db_path)
+    except StoreLockedError as exc:
+        raise L5Refused(f"cannot resume {db_path}: {exc} (stop memora-all first)")
+    try:
+        conn = LocalSQLiteBackend(db_path).connect()
+        try:
+            cleared = resume(conn, accept_d1_epoch=accept_d1_epoch, allow_deletes=allow_deletes)
+        except ValueError as exc:
+            raise L5Refused(str(exc))
+        finally:
+            conn.close()
+    finally:
+        release_primary_lock(db_path)
+    return {"store": str(db_path), "cleared": cleared}

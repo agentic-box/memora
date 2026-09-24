@@ -14,6 +14,17 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L5 (piece c): restore, conflicts/approve, reconcile, resume
+- Per `docs/local-primary-implementation.md` §4, §1 "Reconciliation", §2.6, §0 P3/P7.
+- **`restore <db> --receipt R --out P`** (default): a full re-seed. The target's primary lock is held, and the old store and its sidecars are moved into `<name>.pre-restore-<ts>/`, never deleted. It then seeds (with a recheck); the old store is put back if the seed fails.
+- **`restore <db> --from-r2 KEY --receipt R`** writes `conflicts-<ts>.json`: every difference between the snapshot and D1's verified export over the §5.2 tables. Differences are grouped per memory id and per meta key, with both versions of every row and D1's preimage hash.
+- **`... --conflicts F --approve A --out P --credential-file C [--dry-run] [--allow-deletes ID]`**:
+  - The approve file quotes F's sha256 and chooses `d1|snapshot` for every group.
+  - `snapshot` groups send per-key UPSERT/DELETE statements (replicator-built, P2-checked, P3-guarded with a one-attempt override). The group's D1 preimage is revalidated first; a changed group is aborted and the others continue. Each group is read back, and a failed send or read-back HALTS.
+  - `d1` groups never write D1. The local store is then rebuilt from a fresh verified export of D1.
+- **`reconcile <db> [--accept ID --receipt R --operator O --decision applied|not-applied --evidence-sha256 X]`**: shows the open intents, or POSTs L2's accept body after checking the receipt's D1 identity and that the evidence is unchanged.
+- **`resume <db> --store P [--accept-d1-epoch N | --allow-deletes A]`**: clears a replicator halt while holding the store's primary lock (memora-all stopped). An accepted epoch must equal D1's current one.
+
 ### Local-primary L5 (piece b): seed, sequence high-water, snapshot, volume alert
 - Per `docs/local-primary-implementation.md` §4 and §9 k/v.
 - **`seed <db> --receipt R --out P`**: builds a new local store from a verified export, under the freeze already in place. It first rechecks R under that freeze and seeds from what the recheck returns (a fresh export if D1 changed). The replica URI is derived from the verified D1 identity; a `--replica-uri` that differs is refused. Steps:

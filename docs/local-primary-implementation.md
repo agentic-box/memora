@@ -972,6 +972,43 @@ Other rules:
      and reported; the other groups continue.
   6. Nothing is written to D1 for a group without a selection.
   7. `--dry-run` prints the exact statements.
+  - As built in L5 (piece c):
+    - **Prepare** (`restore <db> --from-r2 KEY --receipt R`), under the freeze
+      already in place:
+      - rechecks R;
+      - fetches the snapshot, which must gunzip and pass `integrity_check`;
+      - compares it with D1's verified export over the §5.2 tables, minus
+        the excluded meta keys;
+      - writes `conflicts-<ts>.json`. It carries both versions of every row
+        in each group, D1's preimage sha256 per group, the snapshot key and
+        sha256, the receipt and its sha256, and the D1 identity.
+      - An action with no memory is its own group.
+    - **Apply** (`... --conflicts F --approve A --out P --credential-file C`):
+      - The approve file must quote F's sha256 and choose `d1|snapshot` for
+        every group and nothing else. It then rechecks R.
+      - Each `snapshot` group gets per-key statements from the replicator's
+        `_build_statements`: UPSERTs parents first, DELETEs children first.
+        Rows that are already equal get none. Every statement passes
+        `_check_statement` and is sent through `OperatorD1Writer` with
+        `allow_restore`, which accepts only those P2 shapes.
+      - P3: DELETEs per table are counted against the receipt's row counts
+        with the replicator's thresholds. Over the limit the apply refuses
+        before any write, naming an attempt id derived from the conflicts
+        and approve hashes. `--allow-deletes <id>` allows that one attempt.
+      - Before each group, D1's rows for it are re-read and hashed. A group
+        whose hash is not the recorded preimage is aborted and reported; the
+        others continue. After the writes, the group must read back as the
+        snapshot, or the apply HALTS; a failed send also HALTS.
+      - When every group is resolved, D1 holds the chosen state everywhere.
+        The local store is then rebuilt by the default restore from a fresh
+        verified export, so a `d1` choice changes only the local store.
+        If a group was aborted, the local store is not rebuilt.
+    - **Default restore** (`restore <db> --receipt R --out P`):
+      - Holds the target's primary lock (memora-all stopped).
+      - Moves the old store and its sidecars into
+        `<name>.pre-restore-<ts>/`; they are never deleted.
+      - Seeds (which rechecks R).
+      - If the seed fails, the old store is put back.
 - **Sequence high-water, D1 side** (H7): run before rollback and before
   restore, with a receipt and a passing recheck.
   - It is one statement per table:
@@ -1008,6 +1045,19 @@ Other rules:
   volume has less free space than 2× the store, or less than
   `--min-free-pct` (default 10%).
 - **`resume <db> [--accept-d1-epoch | --allow-deletes <attempt>]`**.
+  - As built in L5:
+    - `resume <db> --store P` holds the store's primary lock, so memora-all
+      must be stopped. It calls the replicator's `resume()`.
+    - An accepted epoch must equal D1's epoch read now with the read token.
+      The §5.2 barrier compare that must precede it is L6's.
+    - A delete-guard halt is cleared only for the named attempt.
+- **`reconcile <db> [--accept ID ...]`** (§1): shows `GET /admin/intents/<db>`.
+  - `--accept` first checks the receipt: it must be usable, for this D1
+    database, and at a path memora-all can read.
+  - It also checks that the intent is open and that its evidence sha256 is
+    still the one shown.
+  - It then POSTs exactly L2's accept body, `{receipt, operator,
+    intent_id, decision, evidence_sha256}`; the server re-checks all of it.
 - **`--rehearse`** on seed and restore runs into a temp path.
 
 ## 5. Migration plumbing (L6)
@@ -1509,7 +1559,7 @@ Pre-existing D1 writes the plan leaves as they are:
 | (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | with L6 |
 | (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week) | L9 | after the log-only week |
 | (o) `_WriteGate.enter(exempt=True)` relied on trusted in-process callers (L3 review 7603 P2) | L4 | **done in L4**: exempt entries are refused unless the caller module is `memora.replicator` (`test_exempt_gate_entries_are_for_the_replicator_only`) |
-| (p) a second `freeze()` on an already-frozen store returns without waiting for a newly entered exempt replicator token, so the scripts must re-check `/health/db/<db>` for `in_flight = 0` at every step boundary (already required by §1) (L3 review 7603 P2) | L5 | with L5 |
+| (p) a second `freeze()` on an already-frozen store returns without waiting for a newly entered exempt replicator token, so the scripts must re-check `/health/db/<db>` for `in_flight = 0` at every step boundary (already required by §1) (L3 review 7603 P2) | L5 | **done in L5 piece a** (kept through b/c): `FreezeClient.check` re-reads `/health/db/<db>` at every step boundary and continues only on `frozen`, `in_flight = 0` and no open intent |
 | (q) L4 decisions (§3): WAL is set only on live primaries, so every other local store keeps its journal mode, while `busy_timeout` is set on every writer. `list_absorb_inflight` keeps reading the table instead of returning `[]` on a transactional store: no new rows appear there, but rows left by an earlier version are still reported, not hidden. Inside `store_write`, inner commits are deferred and an inner rollback aborts the transaction (`StoreWriteAborted`), so no helper can split phase 3. `add_memory` refuses to compute an embedding under the lock, and R2 deletions run after the commit | L4 | done |
 | (r) a caught `rollback()` inside `store_write` could still let the outer commit happen (L4 review 7610 P2) | L5 | **done in L4 round 2**: `StoreWriteAborted` poisons the transaction, so `store_write` rolls back and raises instead of committing |
 | (s) `sweep_pending_images` cannot apply while a store is persisted-frozen (L4 review 7610 P2) | L5 | **done in L4 round 2**: `DELETE /admin/freeze/<db>` (`thaw_store`) runs the sweep for a local store |
