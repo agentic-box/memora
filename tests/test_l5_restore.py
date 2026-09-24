@@ -170,10 +170,15 @@ def test_the_approve_file_is_bound_to_the_conflicts_file(sc):
 
 # ---------------------------------------------------------------- apply
 
-def _apply(sc, conflicts, approve, send, **kw):
+class StoppedBarrier(FakeBarrier):
+    """--service-stopped: memora-all is down (the R2 apply requires it)."""
+    stopped_service = True
+
+
+def _apply(sc, conflicts, approve, send, *, barrier=None, **kw):
     out = kw.pop("out", sc.store)
-    return lp.restore_apply(DB, conflicts, str(approve), str(sc.receipt), sc.deps(send=send), out,
-                            sc.tmp / "exports", **kw)
+    deps = sc.deps(send=send, barrier=barrier or StoppedBarrier(frozen=True))
+    return lp.restore_apply(DB, conflicts, str(approve), str(sc.receipt), deps, out, sc.tmp / "exports", **kw)
 
 
 def test_apply_writes_only_snapshot_groups_then_rebuilds_the_local_store_from_d1(sc):
@@ -213,6 +218,63 @@ class Recorder(ReplicaSend):
         return super()._send(sql, params)
 
 
+def test_apply_refuses_a_live_freeze_barrier_before_any_send(sc):
+    """7674 P1-1: with memora-all live (the freeze barrier) the apply would
+    write D1 and then fail to take the store's lock -- it refuses first."""
+    c = sc.prepare()["conflicts"]
+    send = Recorder(sc.replica)
+    before = d1_now(sc.replica)
+    with pytest.raises(lp.L5Refused, match="needs memora-all stopped"):
+        _apply(sc, c, sc.approve(c, SELECT), send, barrier=FakeBarrier(frozen=True))
+    assert send.sent == [] and d1_now(sc.replica) == before
+
+
+def test_apply_takes_the_store_lock_before_the_first_send(sc):
+    c = sc.prepare()["conflicts"]
+    send = Recorder(sc.replica)
+    before = d1_now(sc.replica)
+    holder = _hold_lock(sc.store)
+    try:
+        with pytest.raises(lp.L5Refused, match="stop memora-all first"):
+            _apply(sc, c, sc.approve(c, SELECT), send)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert send.sent == [] and d1_now(sc.replica) == before
+
+
+def test_a_child_row_added_after_prepare_aborts_its_group(sc):
+    """7674 P1-3: the group is enumerated on D1 (every child table by memory
+    id), not just the keys recorded at prepare."""
+    c = sc.prepare()["conflicts"]
+    replica_exec(sc.replica, "INSERT INTO memories_actions (memory_id, action, summary) VALUES (2, 'late', 's')")
+    sc.receipt = _export(sc.replica, sc.tmp)
+    send = Recorder(sc.replica)
+    with pytest.raises(lp.L5Refused) as exc:
+        _apply(sc, c, sc.approve(c, SELECT), send)
+    rep = json.loads(str(exc.value))
+    assert rep["aborted"] == ["memory:2"]
+    assert not [p for _s, p in send.sent if p and p[0] == 2]
+    assert _rows(sc.replica.path, "SELECT content FROM memories WHERE id = 2") == [("overwritten by mistake",)]
+
+
+def test_an_extra_row_after_the_writes_halts(sc, monkeypatch):
+    """After the writes the group's CURRENT rows must equal the snapshot's
+    exactly: a row that appears meanwhile is a failure, not 'applied'."""
+    c = sc.prepare()["conflicts"]
+
+    class Sneaky(Recorder):
+        def _send(self, sql, params):
+            out = super()._send(sql, params)
+            if "memories_meta" not in sql and params and params[0] == 2:
+                replica_exec(self.replica, "INSERT INTO memories_actions (memory_id, action, summary) "
+                                           "VALUES (2, 'raced', 's')")
+            return out
+
+    with pytest.raises(lp.L5Halt, match="group memory:2: D1's rows for it are not exactly the snapshot's"):
+        _apply(sc, c, sc.approve(c, SELECT), Sneaky(sc.replica))
+
+
 def test_apply_dry_run_prints_the_statements_and_writes_nothing(sc):
     c = sc.prepare()["conflicts"]
     before = d1_now(sc.replica)
@@ -222,6 +284,18 @@ def test_apply_dry_run_prints_the_statements_and_writes_nothing(sc):
     assert send.sent == [] and d1_now(sc.replica) == before and sc.store.read_bytes() == store_bytes
     assert set(rep["statements"]) == {"memory:2", "memory:3", "meta:other"}
     assert all(_check_statement(sql) for g in rep["statements"].values() for sql, _ in g)
+    assert rep["delete_guard"] == "within bounds" and "would be rebuilt" in rep["local"]
+
+
+def test_dry_run_reports_the_delete_guard_instead_of_refusing_and_writes_nothing(sc):
+    """7674 P1-2: the no-write plan includes the delete-guard result."""
+    c = sc.prepare()["conflicts"]
+    before = d1_now(sc.replica)
+    send = Recorder(sc.replica)
+    rep = _apply(sc, c, sc.approve(c, {**SELECT, "memory:4": "snapshot"}), send, dry_run=True,
+                 barrier=FakeBarrier(frozen=True))
+    assert rep["delete_guard"].startswith("delete_guard: memories 1/3 attempt=")
+    assert send.sent == [] and d1_now(sc.replica) == before
 
 
 def test_a_group_whose_d1_rows_changed_since_prepare_is_aborted_the_others_apply(sc):
@@ -263,7 +337,7 @@ def test_a_rejected_restore_statement_halts(sc):
 
 def test_a_restore_group_that_does_not_read_back_halts(sc):
     c = sc.prepare()["conflicts"]
-    with pytest.raises(lp.L5Halt, match="does not read back as the snapshot"):
+    with pytest.raises(lp.L5Halt, match="are not exactly the snapshot.s"):
         _apply(sc, c, sc.approve(c, SELECT), Recorder(sc.replica, "accept-only"))
 
 
@@ -301,15 +375,20 @@ def test_a_failed_default_restore_puts_the_old_store_back(sc):
     assert not list(sc.store.parent.glob("*.pre-restore-*"))
 
 
-def test_default_restore_refuses_while_memora_all_holds_the_store(sc):
+def _hold_lock(store):
     holder = subprocess.Popen(
         [sys.executable, "-c",
          "import fcntl, os, time\n"
-         f"fd = os.open({str(sc.store) + '.primary-lock'!r}, os.O_RDWR | os.O_CREAT, 0o644)\n"
+         f"fd = os.open({str(store) + '.primary-lock'!r}, os.O_RDWR | os.O_CREAT, 0o644)\n"
          "fcntl.flock(fd, fcntl.LOCK_EX)\nprint('held', flush=True)\ntime.sleep(60)\n"],
         stdout=subprocess.PIPE, text=True)
+    assert holder.stdout.readline().strip() == "held"
+    return holder
+
+
+def test_default_restore_refuses_while_memora_all_holds_the_store(sc):
+    holder = _hold_lock(sc.store)
     try:
-        assert holder.stdout.readline().strip() == "held"
         old = sc.store.read_bytes()
         with pytest.raises(lp.L5Refused, match="stop memora-all first"):
             lp.restore(DB, str(sc.receipt), sc.store, sc.deps(), sc.tmp / "exports")
@@ -439,27 +518,51 @@ def _cli(replica, *args, env_extra=None):
     return r.returncode, out, r.stderr
 
 
-def test_cli_restore_from_r2_prepare_then_apply(sc):
+def _docker(tmp_path, running):
+    bin_dir = tmp_path / f"bin-{running}"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "docker").write_text(f"#!/bin/sh\necho {running}\n")
+    (bin_dir / "docker").chmod(0o755)
+    return {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
+def test_cli_restore_from_r2_prepare_then_apply_with_the_service_stopped(sc):
+    stopped = _docker(sc.tmp, "false")
+    cred = sc.tmp / "operator.tok"
+    cred.write_text("operator-edit-token")
+    cred.chmod(0o600)
+    common = [DB, "--account", "acct", "--database-id", "replica-db", "--service-stopped",
+              "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports"),
+              "--from-r2", sc.key, "--receipt", str(sc.receipt)]
+    code, out, err = _cli(sc.replica, "restore", *common, env_extra=stopped)
+    assert code == 0 and out["groups"] == 4, err
+    approve = sc.approve(out["conflicts"], SELECT)
+    apply_args = [*common, "--conflicts", out["conflicts"], "--approve", str(approve), "--out", str(sc.store),
+                  "--credential-file", str(cred)]
+    code, dry, err = _cli(sc.replica, "restore", *apply_args, "--dry-run", env_extra=stopped)
+    assert code == 0 and dry["dry_run"] is True, err
+    code, out, _ = _cli(sc.replica, "restore", *apply_args, "--rehearse", env_extra=stopped)
+    assert code == 2 and "use --dry-run" in out["refused"]
+    code, out, err = _cli(sc.replica, "restore", *apply_args, env_extra={**stopped, "L5_TEST_D1_WRITES": "apply"})
+    assert code == 0 and out["applied"] == ["memory:2", "memory:3", "meta:other"], err
+    assert _rows(sc.replica.path, "SELECT content FROM memories WHERE id = 2") == [("memory 2 it's quoted",)]
+
+
+def test_cli_restore_apply_refuses_the_live_freeze_barrier(sc):
     srv = FreezeServer(already_frozen=True)
     try:
-        tokens = token_args(sc.tmp)
+        c = sc.prepare()["conflicts"]
         cred = sc.tmp / "operator.tok"
         cred.write_text("operator-edit-token")
         cred.chmod(0o600)
-        common = [DB, "--account", "acct", "--database-id", "replica-db", "--memora-url", srv.url, *tokens,
-                  "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports"),
-                  "--from-r2", sc.key, "--receipt", str(sc.receipt)]
-        code, out, err = _cli(sc.replica, "restore", *common)
-        assert code == 0 and out["groups"] == 4, err
-        approve = sc.approve(out["conflicts"], SELECT)
-        apply_args = [*common, "--conflicts", out["conflicts"], "--approve", str(approve), "--out", str(sc.store),
-                      "--credential-file", str(cred)]
-        code, dry, err = _cli(sc.replica, "restore", *apply_args, "--dry-run")
-        assert code == 0 and dry["dry_run"] is True, err
-        code, out, err = _cli(sc.replica, "restore", *apply_args, env_extra={"L5_TEST_D1_WRITES": "apply"})
-        assert code == 0 and out["applied"] == ["memory:2", "memory:3", "meta:other"], err
-        assert _rows(sc.replica.path, "SELECT content FROM memories WHERE id = 2") == [("memory 2 it's quoted",)]
-        assert srv.state == "frozen" and ("DELETE", f"/admin/freeze/{DB}") not in srv.methods()
+        before = d1_now(sc.replica)
+        code, out, _ = _cli(sc.replica, "restore", DB, "--account", "acct", "--database-id", "replica-db",
+                            "--memora-url", srv.url, *token_args(sc.tmp), "--r2-dir", str(sc.tmp / "r2"),
+                            "--out-dir", str(sc.tmp / "exports"), "--from-r2", sc.key, "--receipt", str(sc.receipt),
+                            "--conflicts", c, "--approve", str(sc.approve(c, SELECT)), "--out", str(sc.store),
+                            "--credential-file", str(cred), env_extra={"L5_TEST_D1_WRITES": "apply"})
+        assert code == 2 and "needs memora-all stopped" in out["refused"]
+        assert d1_now(sc.replica) == before
     finally:
         srv.close()
 
@@ -551,3 +654,20 @@ def test_cli_apply_refuses_a_conflicts_file_of_another_snapshot(sc):
         assert code == 2 and "was prepared for" in out["refused"]
     finally:
         srv.close()
+
+
+def test_the_rebuild_halts_when_the_fresh_export_does_not_hold_the_chosen_rows(sc):
+    """7674 P1-3 for the rebuild's expectations: D1 changes between the last
+    group and the fresh export -> the local store is not rebuilt."""
+    c = sc.prepare()["conflicts"]
+    store_bytes = sc.store.read_bytes()
+
+    class Racing(StoppedBarrier):
+        def check(self, where):
+            super().check(where)
+            if where == "before the fresh export":
+                replica_exec(sc.replica, "UPDATE memories SET content = 'raced' WHERE id = 2")
+
+    with pytest.raises(lp.L5Halt, match="group memory:2: the fresh export does not hold the chosen snapshot rows"):
+        _apply(sc, c, sc.approve(c, SELECT), Recorder(sc.replica), barrier=Racing(frozen=True))
+    assert sc.store.read_bytes() == store_bytes

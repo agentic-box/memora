@@ -446,6 +446,8 @@ class ServiceStopped:
     """The barrier when memora-all is stopped (rollback steps): the
     container must report State.Running=false at every step boundary."""
 
+    stopped_service = True  # steps that need the store's primary lock require this barrier
+
     def __init__(self, container: str = "memora-all", runner: Callable[..., Any] = subprocess.run):
         self.container = container
         self.runner = runner
@@ -987,10 +989,11 @@ def _move_aside(out: Path, clock: Callable[[], float]) -> Optional[str]:
 
 
 def _restore_into(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
-                  replica_uri: Optional[str], rehearse: bool) -> Dict[str, Any]:
+                  replica_uri: Optional[str], rehearse: bool, lock_held: bool = False) -> Dict[str, Any]:
     """Move the old store aside (not on a rehearsal) and seed -- which
     rechecks the receipt under the freeze -- holding the target's primary
-    lock across both. If the seed fails, the old store is put back."""
+    lock across both (taken here, or already held by the caller). If the
+    seed fails, the old store is put back."""
     from .backends import StoreLockedError, acquire_primary_lock, release_primary_lock
 
     if rehearse:
@@ -998,10 +1001,8 @@ def _restore_into(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Pa
                 "moved_aside": None}
     out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        acquire_primary_lock(out)
-    except StoreLockedError as exc:
-        raise L5Refused(f"cannot restore {out}: {exc} (stop memora-all first)")
+    if not lock_held:
+        _take_store_lock(out)
     try:
         deps.freeze.check("before moving the old store aside")
         moved = _move_aside(out, deps.clock)
@@ -1016,7 +1017,17 @@ def _restore_into(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Pa
             raise
         return {**rep, "moved_aside": moved}
     finally:
-        release_primary_lock(out)
+        if not lock_held:
+            release_primary_lock(out)
+
+
+def _take_store_lock(out: Path) -> None:
+    from .backends import StoreLockedError, acquire_primary_lock
+
+    try:
+        acquire_primary_lock(out)
+    except StoreLockedError as exc:
+        raise L5Refused(f"cannot restore {out}: {exc} (stop memora-all first)")
 
 
 def restore(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
@@ -1240,20 +1251,38 @@ def _group_statements(group: Dict[str, Any], columns: Dict[str, List[str]]) -> L
     return out
 
 
-def _d1_group_rows(reader: D1Reader, group: Dict[str, Any], columns: Dict[str, List[str]]) -> List[Dict[str, Any]]:
-    """Re-read one group's rows from D1 (by key), normalised like the
-    conflicts file's."""
+_BY_MEMORY = (("memories", "id"), ("memories_embeddings", "memory_id"), ("memories_crossrefs", "memory_id"),
+              ("tombstones", "memory_id"), ("tombstone_components", "memory_id"),
+              ("memories_actions", "memory_id"))
+
+
+def _enumerate_group(fetch: Callable[[str, tuple], List[Dict[str, Any]]], gid: str,
+                     columns: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    """EVERY current row of a group -- the memories row and all its child
+    rows by memory id, the meta key, or the memory-less action -- not just
+    the keys recorded at prepare, so a row added since is seen (review 7674
+    P1-3). Normalised like the conflicts file's rows."""
     tables = _compare_tables()
+    kind, _, ident = gid.partition(":")
+    if kind == "memory":
+        queries = [(t, f'"{col}" = ?', (int(ident),)) for t, col in _BY_MEMORY]
+    elif kind == "meta":
+        queries = [("memories_meta", '"key" = ?', (ident,))]
+    elif kind == "action":
+        queries = [("memories_actions", '"id" = ? AND "memory_id" IS NULL', (int(ident),))]
+    else:
+        raise L5Refused(f"unknown conflict group {gid!r}")
     out = []
-    for k in group["keys"]:
-        t, pk = k["table"], k["pk"]
+    for t, where, params in queries:
         cols = columns[t]
-        where = " AND ".join(f'"{c}" = ?' for c in tables[t])
-        rows = reader.rows(f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM "{t}" WHERE {where}',
-                           tuple(pk))
-        if rows:
-            out.append({"table": t, "pk": list(pk), "row": _norm_row({c: rows[0].get(c) for c in cols})})
+        for r in fetch(f'SELECT {", ".join(chr(34) + c + chr(34) for c in cols)} FROM "{t}" WHERE {where}', params):
+            row = {c: r.get(c) for c in cols}
+            out.append({"table": t, "pk": [row[c] for c in tables[t]], "row": _norm_row(row)})
     return out
+
+
+def _d1_group_rows(reader: D1Reader, group: Dict[str, Any], columns: Dict[str, List[str]]) -> List[Dict[str, Any]]:
+    return _enumerate_group(lambda sql, params: reader.rows(sql, params), group["group"], columns)
 
 
 def _delete_guard(plan: Dict[str, List[Tuple[str, tuple]]], receipt: Dict[str, Any], attempt: str,
@@ -1278,24 +1307,30 @@ def _delete_guard(plan: Dict[str, List[Tuple[str, tuple]]], receipt: Dict[str, A
 
 def restore_apply(db: str, conflicts_path: str, approve_path: str, receipt_path: str, deps: Deps,
                   out: Path, out_dir: Path, *, replica_uri: Optional[str] = None, dry_run: bool = False,
-                  allow_deletes: Optional[str] = None, rehearse: bool = False) -> Dict[str, Any]:
-    """`restore --from-r2` steps 4-7, under the freeze already in place:
+                  allow_deletes: Optional[str] = None) -> Dict[str, Any]:
+    """`restore --from-r2` steps 4-7:
     - `d1` groups never write D1;
     - `snapshot` groups send per-key UPSERT/DELETE (P2-checked, P3-guarded)
-      after re-reading the group on D1 and matching the recorded preimage
-      (a changed group is aborted and reported, the others continue), then
-      read the group back;
+      after the group's CURRENT rows on D1 (all of them, enumerated) hash to
+      the recorded preimage (a changed group is aborted and reported, the
+      others continue); afterwards the group's current rows must equal the
+      snapshot's exactly (an extra row HALTS);
     - when every group is resolved, D1 holds the chosen state everywhere, so
-      the local store is rebuilt from a fresh verified export of it (the
-      old store moved aside, kept).
-    A failed send HALTS: the group's outcome on D1 is unknown."""
+      the local store is rebuilt from a fresh verified export of it (the old
+      store moved aside, kept), after checking that export's groups.
+    It needs memora-all STOPPED (--service-stopped) and holds the target's
+    primary lock from before the first D1 send through the rebuild (review
+    7674 P1-1). --dry-run writes nothing: the statements per group, the
+    delete-guard result and the rebuild plan (7674 P1-2). A failed send
+    HALTS: the group's outcome on D1 is unknown."""
+    from .backends import release_primary_lock
+    from .replicator import ReplicatorStatementError
+
     conflicts, sel, csha = load_approval(conflicts_path, approve_path, db, deps)
     used = recheck(db, receipt_path, deps, out_dir)
     receipt = load_receipt(str(used), db, account_id=deps.account_id, database_id=deps.database_id)
     columns = conflicts["columns"]
     chosen = [g for g in conflicts["groups"] if sel[g["group"]] == "snapshot"]
-    from .replicator import ReplicatorStatementError
-
     plan = {}
     for g in chosen:
         try:
@@ -1303,48 +1338,90 @@ def restore_apply(db: str, conflicts_path: str, approve_path: str, receipt_path:
         except ReplicatorStatementError as exc:
             raise L5Refused(f"group {g['group']}: no allowed statement can restore it: {exc}")
     attempt = hashlib.sha256((csha + _sha256_file(Path(approve_path))).encode()).hexdigest()[:16]
+    halt = _delete_guard(plan, receipt, attempt, allow_deletes)
     report: Dict[str, Any] = {"conflicts_sha256": csha, "attempt": attempt, "receipt": str(used),
                               "d1_groups": sorted(g for g, v in sel.items() if v == "d1"),
-                              "statements": {g: plan[g] for g in sorted(plan)}, "dry_run": dry_run}
-    halt = _delete_guard(plan, receipt, attempt, allow_deletes)
+                              "statements": {g: plan[g] for g in sorted(plan)}, "dry_run": dry_run,
+                              "delete_guard": halt or "within bounds"}
+    if dry_run:
+        report["local"] = (f"would be rebuilt from a fresh verified export of D1 into {out} "
+                           f"(the old store moved aside)")
+        return report
     if halt:
         raise L5Refused(f"{halt}: pass --allow-deletes {attempt} to allow this one attempt")
-    if dry_run:
+    if not getattr(deps.freeze, "stopped_service", False):
+        raise L5Refused("restore --from-r2 writes D1 and then replaces the local store: it needs memora-all "
+                        "stopped (--service-stopped); nothing was sent")
+    out = Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _take_store_lock(out)  # before the first D1 send, through the rebuild
+    try:
+        applied, aborted = [], []
+        writer = None
+        if any(plan.values()):
+            if deps.writer_factory is None:
+                raise L5Refused("no operator writer: pass --credential-file")
+            writer = deps.writer_factory()
+        for g in chosen:
+            gid = g["group"]
+            deps.freeze.check(f"before group {gid}")
+            if _group_digest(_d1_group_rows(deps.reader, g, columns)) != g["d1_preimage_sha256"]:
+                aborted.append(gid)  # D1 changed since the conflicts file (a new row too): not written
+                continue
+            for sql, params in plan[gid]:
+                try:
+                    res = writer.send(sql, params)
+                except L5Refused:
+                    raise
+                except Exception as exc:
+                    raise L5Halt(f"group {gid}: D1 send failed ({type(exc).__name__}: {exc}); its outcome is "
+                                 f"unknown. Applied so far: {applied}. Re-run the prepare step.")
+                if isinstance(res, dict) and res.get("success") is False:
+                    raise L5Halt(f"group {gid}: D1 rejected {sql[:80]!r}: {res}. Applied so far: {applied}")
+            if _group_digest(_d1_group_rows(deps.reader, g, columns)) != _group_digest(g["snapshot_rows"]):
+                raise L5Halt(f"group {gid}: D1's rows for it are not exactly the snapshot's. "
+                             f"Applied so far: {applied}")
+            applied.append(gid)
+        report.update({"applied": applied, "aborted": aborted})
+        if aborted:
+            report["local"] = "not rebuilt: some groups were aborted; re-run the prepare step"
+            raise L5Refused(json.dumps(report, default=str))
+        deps.freeze.check("before the fresh export")
+        fresh = _export_frozen(db, deps, Path(out_dir) / db)
+        _check_rebuild_source(fresh, conflicts, sel, columns, deps)
+        report["local"] = _restore_into(db, str(fresh), out, deps, out_dir, replica_uri=replica_uri,
+                                        rehearse=False, lock_held=True)
         return report
-    applied, aborted = [], []
-    writer = None
-    if any(plan.values()):
-        if deps.writer_factory is None:
-            raise L5Refused("no operator writer: pass --credential-file")
-        writer = deps.writer_factory()
-    for g in chosen:
-        gid = g["group"]
-        deps.freeze.check(f"before group {gid}")
-        if _group_digest(_d1_group_rows(deps.reader, g, columns)) != g["d1_preimage_sha256"]:
-            aborted.append(gid)  # D1 changed since the conflicts file: not written
-            continue
-        for sql, params in plan[gid]:
-            try:
-                res = writer.send(sql, params)
-            except L5Refused:
-                raise
-            except Exception as exc:
-                raise L5Halt(f"group {gid}: D1 send failed ({type(exc).__name__}: {exc}); its outcome is "
-                             f"unknown. Applied so far: {applied}. Re-run the prepare step.")
-            if isinstance(res, dict) and res.get("success") is False:
-                raise L5Halt(f"group {gid}: D1 rejected {sql[:80]!r}: {res}. Applied so far: {applied}")
-        if plan[gid] and _group_digest(_d1_group_rows(deps.reader, g, columns)) != _group_digest(g["snapshot_rows"]):
-            raise L5Halt(f"group {gid}: D1 does not read back as the snapshot. Applied so far: {applied}")
-        applied.append(gid)
-    report.update({"applied": applied, "aborted": aborted})
-    if aborted:
-        report["local"] = "not rebuilt: some groups were aborted; re-run the prepare step"
-        raise L5Refused(json.dumps(report, default=str))
-    deps.freeze.check("before the fresh export")
-    fresh = _export_frozen(db, deps, Path(out_dir) / db)
-    report["local"] = _restore_into(db, str(fresh), Path(out), deps, out_dir, replica_uri=replica_uri,
-                                    rehearse=rehearse)
-    return report
+    finally:
+        release_primary_lock(out)
+
+
+def _check_rebuild_source(fresh_receipt: Path, conflicts: Dict[str, Any], sel: Dict[str, str],
+                          columns: Dict[str, List[str]], deps: Deps) -> None:
+    """Before the local rebuild: in the fresh export, every snapshot group
+    is exactly the snapshot's rows and every d1 group exactly its recorded
+    D1 rows (7674 P1-3, the rebuild's expectations)."""
+    r = load_receipt(str(fresh_receipt), conflicts["db"], account_id=deps.account_id,
+                     database_id=deps.database_id)
+    work = Path(tempfile.mkdtemp(prefix="rebuild-check-", dir=str(Path(fresh_receipt).parent)))
+    try:
+        scratch = work / "fresh.db"
+        load_sql(Path(r["sql_path"]), scratch)
+        db = _scratch_connect(scratch)
+        db.row_factory = sqlite3.Row
+        try:
+            def fetch(sql, params):
+                return [dict(x) for x in db.execute(sql, params)]
+
+            for g in conflicts["groups"]:
+                want = g["snapshot_rows"] if sel[g["group"]] == "snapshot" else g["d1_rows"]
+                if _group_digest(_enumerate_group(fetch, g["group"], columns)) != _group_digest(want):
+                    raise L5Halt(f"group {g['group']}: the fresh export does not hold the chosen "
+                                 f"{sel[g['group']]} rows; the local store was not rebuilt")
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 # ------------------------------------------------------------------ reconcile (§1) and resume (§2.6, P3)

@@ -983,7 +983,21 @@ Other rules:
         in each group, D1's preimage sha256 per group, the snapshot key and
         sha256, the receipt and its sha256, and the D1 identity.
       - An action with no memory is its own group.
-    - **Apply** (`... --conflicts F --approve A --out P --credential-file C`):
+    - **Apply** (`... --conflicts F --approve A --out P --credential-file C
+      --service-stopped`), after review 7674:
+      - It needs memora-all STOPPED. With the live freeze barrier it refuses
+        before any send.
+      - It holds the target's primary lock from before the first D1 send
+        through the fresh export and the rebuild.
+      - A group's preimage and read-back ENUMERATE the group's current rows
+        on D1: the memories row and every child table by memory id, the meta
+        key, or the memory-less action. So a row added since prepare aborts
+        the group, and an extra row after the writes HALTS.
+      - The fresh export is checked the same way before the rebuild: each
+        group holds exactly the chosen rows.
+      - `--dry-run` is the complete no-write plan: the statements per group,
+        the delete-guard result and the rebuild target. `--rehearse` is
+        refused for `--from-r2`.
       - The approve file must quote F's sha256 and choose `d1|snapshot` for
         every group and nothing else. It then rechecks R.
       - Each `snapshot` group gets per-key statements from the replicator's

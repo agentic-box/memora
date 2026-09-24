@@ -21,7 +21,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - **`... --conflicts F --approve A --out P --credential-file C [--dry-run] [--allow-deletes ID]`**:
   - The approve file quotes F's sha256 and chooses `d1|snapshot` for every group.
   - `snapshot` groups send per-key UPSERT/DELETE statements (replicator-built, P2-checked, P3-guarded with a one-attempt override). The group's D1 preimage is revalidated first; a changed group is aborted and the others continue. Each group is read back, and a failed send or read-back HALTS.
-  - `d1` groups never write D1. The local store is then rebuilt from a fresh verified export of D1.
+  - `d1` groups never write D1. The local store is then rebuilt from a fresh verified export of D1, after checking that every group in it holds the chosen rows.
+  - The apply needs memora-all stopped (`--service-stopped`, refused before any send otherwise). It holds the store's primary lock from before the first D1 send through the rebuild. Groups are compared by enumerating their current D1 rows (every child table by memory id), so a row added after prepare aborts the group. `--dry-run` is the whole no-write plan, delete-guard result included; `--rehearse` does not apply to `--from-r2`.
 - **`reconcile <db> [--accept ID --receipt R --operator O --decision applied|not-applied --evidence-sha256 X]`**: shows the open intents, or POSTs L2's accept body after checking the receipt's D1 identity and that the evidence is unchanged.
 - **`resume <db> --store P [--accept-d1-epoch N | --allow-deletes A]`**: clears a replicator halt while holding the store's primary lock (memora-all stopped). An accepted epoch must equal D1's current one.
 

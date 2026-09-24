@@ -11,7 +11,8 @@ this file only parses arguments and builds the dependencies.
   sequence-highwater <db> --receipt R --local /data/<db>.db --credential-file F [--dry-run]
   restore <db> --receipt R --out /data/<db>.db              default: FULL re-seed (old store kept aside)
   restore <db> --from-r2 KEY --receipt R                    prepare: write conflicts-<ts>.json
-  restore <db> --from-r2 KEY --receipt R --conflicts F --approve A --out P --credential-file C [--dry-run]
+  restore <db> --from-r2 KEY --receipt R --conflicts F --approve A --out P --credential-file C
+          --service-stopped [--dry-run]      (apply: memora-all stopped; --dry-run writes nothing)
   reconcile <db> [--accept ID --receipt R --operator NAME --decision applied|not-applied --evidence-sha256 X]
   resume  <db> --store /data/<db>.db [--accept-d1-epoch N | --allow-deletes ATTEMPT]   (memora-all stopped)
   thaw    <db>              lift the freeze -- the only command that does
@@ -184,6 +185,9 @@ def _restore(args, deps) -> dict:
             raise lp.L5Refused("restore needs --out (the store file)")
         return lp.restore(args.db, args.receipt, Path(args.out), deps, Path(args.out_dir),
                           replica_uri=args.replica_uri, rehearse=args.rehearse)
+    if args.rehearse:
+        raise lp.L5Refused("--rehearse does not apply to restore --from-r2: its apply writes D1; use --dry-run "
+                           "for the complete no-write plan")
     if not args.conflicts and not args.approve:
         return lp.restore_prepare(args.db, args.from_r2, args.receipt, deps, Path(args.out_dir))
     if not (args.conflicts and args.approve and args.out):
@@ -193,7 +197,7 @@ def _restore(args, deps) -> dict:
         raise lp.L5Refused(f"{args.conflicts} was prepared for {conflicts.get('snapshot_key')!r}, not {args.from_r2!r}")
     return lp.restore_apply(args.db, args.conflicts, args.approve, args.receipt, deps, Path(args.out),
                             Path(args.out_dir), replica_uri=args.replica_uri, dry_run=args.dry_run,
-                            allow_deletes=args.allow_deletes, rehearse=args.rehearse)
+                            allow_deletes=args.allow_deletes)
 
 
 def main(argv=None) -> int:
