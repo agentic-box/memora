@@ -24,6 +24,7 @@ import ipaddress
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -38,6 +39,11 @@ LOCAL_CONFIG = {
 # Words that are never identifiers: the project's own name and placeholders.
 NEUTRAL = {"memora", "localhost", "deploy-host", "build-host", "alpha", "beta", "gamma",
            "memora-graph", "memora-all", "127.0.0.1", "0.0.0.0"}
+# The FIXED placeholder values wrangler.toml.example ships (a copy of the
+# template is never a finding). Only these: a real value copied into the
+# template is still caught.
+TEMPLATE_PLACEHOLDERS = {"00000000-0000-0000-0000-000000000001", "00000000-0000-0000-0000-000000000002",
+                         "alpha-graph"}
 SKIP_SUFFIX = (".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".gz", ".db", ".sqlite", ".pdf")
 
 
@@ -206,11 +212,8 @@ def operator_identifiers() -> List[Tuple[str, str]]:
     if ids.exists():
         found += [("identifiers.local", line.strip()) for line in ids.read_text().splitlines()
                   if line.strip() and not line.startswith("#")]
-    # A value the tracked template itself carries (a copy of
-    # wrangler.toml.example, say) is public by definition.
-    template = (REPO / "memora-graph" / "wrangler.toml.example").read_text()
     return [(src, v) for src, v in found
-            if v and v.lower() not in NEUTRAL and not identifier_pattern(v).search(template)]
+            if v and v.lower() not in NEUTRAL and v not in TEMPLATE_PLACEHOLDERS]
 
 
 def identifier_pattern(value: str) -> re.Pattern:
@@ -256,3 +259,19 @@ def test_workspace_paths_are_derived_from_configured_paths():
     assert _workspace_paths("/Users/someone/repos/ws-one/memora") == ["repos/ws-one"]
     assert _workspace_paths("~/.config/memora/credentials.mcp.json") == []
     assert _workspace_paths("~/memora") == [] and _workspace_paths("") == []
+
+
+def test_template_placeholders_are_exempt_but_a_copied_real_value_is_not(tmp_path, monkeypatch):
+    """A copy of the template yields no identifiers; a real name that also
+    appears in the template (copied there by mistake) is still one."""
+    wr = tmp_path / "wrangler.toml"
+    wr.write_text((REPO / "memora-graph" / "wrangler.toml.example").read_text()
+                  + '\n[[r2_buckets]]\nbinding = "R2_X"\nbucket_name = "real-bucket-x"\n')
+    monkeypatch.setitem(LOCAL_CONFIG, "wrangler", wr)
+    monkeypatch.setitem(LOCAL_CONFIG, "deploy", tmp_path / "none.env")
+    monkeypatch.setitem(LOCAL_CONFIG, "identifiers", tmp_path / "none.local")
+    monkeypatch.setattr(sys.modules[__name__], "REPO", tmp_path)   # no instances/*.env here
+    (tmp_path / "instances").mkdir()
+    values = {v for _, v in operator_identifiers()}
+    assert values == {"real-bucket-x"}, values
+    assert identifier_pattern("real-bucket-x").search('bucket_name = "real-bucket-x"')
