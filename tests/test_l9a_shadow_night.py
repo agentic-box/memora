@@ -260,17 +260,26 @@ def test_an_extra_log_key_fails_the_key_set_check_alone(night):
 
 # ------------------------------------------------------------ review 7701 P1-1
 
+# FLK1: the seeded row is written to D1 and to the shadow separately, so it
+# must not take created_at from the clock (DEFAULT datetime('now'), one-second
+# resolution): two inserts on either side of a second boundary made the row
+# differ -- '[500] differs' in the nightly compare, about 1 run in 12 under
+# load. Both sides get the same explicit value.
+SEED_CREATED_AT = "2026-09-01 00:00:00"
+
+
 def _seeded_parent_child_update(night):
     """A memory in the seed (no outbox row ever) whose embedding alone is
     updated: the replicator sends the parent's current row with the child
     (replicator._add_parents)."""
+    seed_row = "INSERT INTO memories (id, content, created_at) VALUES (500, 'seeded', ?)"
     db = night.replica._db()
-    db.execute("INSERT INTO memories (id, content) VALUES (500, 'seeded')")
+    db.execute(seed_row, (SEED_CREATED_AT,))
     db.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (500, '[]')")
     db.commit()
     db.close()
     sh = sqlite3.connect(night.shadow_path)  # as `seed` would have copied them: no outbox rows
-    sh.execute("INSERT INTO memories (id, content) VALUES (500, 'seeded')")
+    sh.execute(seed_row, (SEED_CREATED_AT,))
     sh.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (500, '[]')")
     sh.execute("DELETE FROM sync_outbox")
     sh.commit()
@@ -284,6 +293,11 @@ def _seeded_parent_child_update(night):
 def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(night):
     """That parent log key is allowed; the night is clean."""
     _seeded_parent_child_update(night)
+    # FLK1: the seeded row is identical on both sides whatever the clock does
+    sh = sqlite3.connect(night.shadow_path)
+    local = sh.execute("SELECT created_at FROM memories WHERE id = 500").fetchone()[0]
+    sh.close()
+    assert local == SEED_CREATED_AT and night.replica.rows("memories")[-1]["created_at"] == SEED_CREATED_AT
     out = night.run()
     logged = {(r["tbl"], tuple(r["pk"])) for r in replicator.iter_log("s1")}
     assert ("memories", (500,)) in logged, "the replicator added the parent"
