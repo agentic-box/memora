@@ -255,3 +255,61 @@ def test_the_port_probe_recognises_a_guarded_graph_server(stores):
         assert gs._check_port_status("127.0.0.1", port) == "memora"
     finally:
         srv.should_exit = True
+
+
+# ---------------------------------------------------------------- review 7922: the exact origin
+
+SELF = "http://testserver"  # TestClient's scheme://host (port 80)
+
+
+@pytest.mark.parametrize("origin", ["http://testserver:8080", "http://testserver:9999", "https://testserver",
+                                    "http://localhost", "http://127.0.0.1:8766", "null", "http://evil.example"])
+def test_a_cross_origin_browser_request_is_refused_on_every_mutating_route(stores, origin):
+    """SameSite cookies are scoped by site, not port: another service on the
+    same host (a different port) must not drive the graph with the cookie."""
+    c = _client()
+    mid = c.get("/api/memories?db=alpha").json()["memories"][0]["id"]
+    h = {"Origin": origin}
+    assert c.patch(f"/api/memories/{mid}?db=alpha", json={"tags": ["x"]}, headers=h).status_code == 403
+    assert c.post("/api/chat?db=alpha", content='{"message": "delete memory 1"}',
+                  headers={**h, "Content-Type": "text/plain"}).status_code == 403
+    assert c.get("/api/events?db=alpha", headers=h).status_code == 403
+    login = _client(auth=False).post("/login", data={"token": TOKEN}, headers=h, follow_redirects=False)
+    assert login.status_code == 403 and "memora_graph" not in login.cookies
+    assert c.get(f"/api/memories/{mid}?db=alpha").json()["tags"] == ["g1"]
+
+
+def test_the_exact_origin_is_accepted(stores):
+    c = _client()
+    mid = c.get("/api/memories?db=alpha").json()["memories"][0]["id"]
+    r = c.patch(f"/api/memories/{mid}?db=alpha", json={"tags": ["same-origin"]}, headers={"Origin": SELF})
+    assert r.status_code == 200
+    login = _client(auth=False).post("/login", data={"token": TOKEN}, headers={"Origin": SELF + ":80"},
+                                     follow_redirects=False)
+    assert login.status_code == 303
+
+
+def test_origin_ok_compares_scheme_host_and_port():
+    from starlette.requests import Request as R
+
+    def req(origin, host="100.104.19.74:8766"):
+        headers = [(b"host", host.encode())] + ([(b"origin", origin.encode())] if origin is not None else [])
+        return R({"type": "http", "scheme": "http", "path": "/", "headers": headers, "query_string": b"",
+                  "server": ("100.104.19.74", 8766)})
+
+    assert gs._origin_ok(req(None))
+    assert gs._origin_ok(req("http://100.104.19.74:8766"))
+    assert not gs._origin_ok(req("http://100.104.19.74:8765"))
+    assert not gs._origin_ok(req("http://100.104.19.74"))
+    assert not gs._origin_ok(req("https://100.104.19.74:8766"))
+    assert not gs._origin_ok(req("http://127.0.0.1:8766"))
+    assert gs._origin_ok(req("http://localhost:8765", host="localhost:8765"))
+    assert not gs._origin_ok(req("http://localhost:3000", host="localhost:8765"))
+
+
+def test_a_refused_single_store_is_503(local_db, monkeypatch):
+    monkeypatch.delenv("MEMORA_DATABASES", raising=False)
+    monkeypatch.setenv("MEMORA_HEALTH_TOKEN", TOKEN)
+    monkeypatch.setattr(storage, "_store_refusals", {None: "data volume unfit"})
+    r = _client().get("/api/memories")
+    assert r.status_code == 503 and r.json()["error"] == "store_refused"

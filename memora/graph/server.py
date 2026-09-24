@@ -224,6 +224,37 @@ def _token_ok(request: Request, token: str) -> bool:
     return bool(token) and bool(presented) and hmac.compare_digest(presented.encode(), token.encode())
 
 
+def _origin_tuple(scheme: str, hostport: str):
+    from urllib.parse import urlsplit
+
+    try:
+        u = urlsplit(f"{scheme}://{hostport}")
+        port = u.port or {"http": 80, "https": 443}.get(scheme)
+    except ValueError:
+        return None
+    return (scheme.lower(), (u.hostname or "").lower(), port)
+
+
+def _origin_ok(request: Request) -> bool:
+    """A browser request's Origin must be EXACTLY this server's origin:
+    scheme, host AND port (review 7922). SameSite cookies are scoped by site,
+    not port, so another service on the same host (any other port) must not
+    be able to drive the graph with the user's cookie. A request without an
+    Origin (curl, the smoke check) is not a browser cross-site request."""
+    from urllib.parse import urlsplit
+
+    origin = request.headers.get("origin")
+    if origin is None:
+        return True
+    try:
+        o = urlsplit(origin)
+        got = (o.scheme.lower(), (o.hostname or "").lower(), o.port or {"http": 80, "https": 443}.get(o.scheme))
+    except ValueError:
+        return False
+    want = _origin_tuple(request.url.scheme, request.headers.get("host", ""))
+    return want is not None and got == want and bool(got[1])
+
+
 def graph_databases() -> dict:
     """The stores the graph can show: the registry's names and its default
     ({} names when memora runs one store without a registry)."""
@@ -253,6 +284,12 @@ def resolve_graph_db(requested):
     if not registry:
         if requested:
             raise GraphDbError(400, {"error": "unknown_db", "known": []})
+        from ..storage import _raise_if_refused
+
+        try:
+            _raise_if_refused(None)  # the single store, refused at startup (review 7922 P2)
+        except Exception as exc:
+            raise GraphDbError(503, {"error": "store_refused", "db": None, "message": str(exc)[:300]})
         return None
     name = requested or default_database_name()
     if name not in registry:
@@ -372,21 +409,7 @@ def build_graph_app(host: str):
 
     GRAPH_HTML = _load_spa_html(version=_get_memora_version())
 
-    def _check_origin(request: Request) -> bool:
-        """Validate Origin header for browser requests (defense in depth)."""
-        from urllib.parse import urlparse
-
-        origin = request.headers.get("origin", "")
-        if not origin:
-            return True  # Non-browser clients don't send Origin
-        parsed = urlparse(origin)
-        origin_host = parsed.hostname or ""
-        # Allow localhost and 127.0.0.1 (any port)
-        if origin_host in ("localhost", "127.0.0.1"):
-            return True
-        # Allow if origin host matches the request Host header exactly
-        req_host = (request.headers.get("host") or "localhost").split(":")[0]
-        return origin_host == req_host
+    _check_origin = _origin_ok  # the exact-origin rule, module level (review 7922)
 
     async def graph_handler(request: Request):
         """Serve the static graph SPA."""
@@ -1060,12 +1083,8 @@ class _GraphGuard:
 
             if request.method != "POST":
                 return await HTMLResponse(_LOGIN_HTML.replace("__NEXT__", "/graph"))(scope, receive, send)
-            origin = request.headers.get("origin", "")
-            if origin:
-                from urllib.parse import urlparse
-                host = (request.headers.get("host") or "").split(":")[0]
-                if (urlparse(origin).hostname or "") not in (host, "localhost", "127.0.0.1"):
-                    return await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
+            if not _origin_ok(request):
+                return await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
             from urllib.parse import parse_qs
 
             form = parse_qs((await request.body()).decode("utf-8", "replace"))

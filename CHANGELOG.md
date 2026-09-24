@@ -30,8 +30,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   health token): a Bearer header, or an HttpOnly SameSite=Strict cookie
   set by a small login form (the token never goes in a URL). Required
   whenever a token is configured and always on a non-loopback bind; a
-  non-loopback bind without any token refuses every route. Edits and the
-  login also check the Origin.
+  non-loopback bind without any token refuses every route. A browser
+  request to an edit, the chat, the event stream or the login must come
+  from exactly this server's origin (scheme, host and port): cookies are
+  scoped by site, not port, so another service on the same host cannot
+  drive the graph with the user's cookie.
 - `scripts/deploy-memora-all.sh` publishes the graph only on nuc8's
   Tailscale address (100.104.19.74:8766 → 8765; `DEPLOY_GRAPH_BIND` /
   `DEPLOY_GRAPH_PORT` are rehearsal parameters, and 0.0.0.0 is refused
