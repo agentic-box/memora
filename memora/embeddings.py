@@ -881,11 +881,15 @@ def _store_cache_key(conn: sqlite3.Connection) -> str:
 
 
 def invalidate_embedding_integrity_cache(conn: Optional[sqlite3.Connection] = None) -> None:
-    """Forget a first-use result after a known write or explicit admin action."""
+    """Forget a first-use result after a known write or explicit admin action.
+    Also forgets that the store's model was seen recorded (E1 review 7935
+    P2): a later reset of the meta row is noticed by the next write."""
     if conn is None:
         _integrity_check_cache.clear()
+        _MODEL_RECORDED.clear()
     else:
         _integrity_check_cache.pop(_store_cache_key(conn), None)
+        _MODEL_RECORDED.discard(_store_cache_key(conn))
 
 
 def _mark_integrity_dirty(conn: sqlite3.Connection) -> None:

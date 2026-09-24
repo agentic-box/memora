@@ -3659,15 +3659,18 @@ def _corpus_base_read_only_locked(conn: sqlite3.Connection, key: str, epoch: int
         return loaded
 
 
-def get_corpus_snapshot(conn: sqlite3.Connection) -> _CorpusSnapshot:
+def get_corpus_snapshot(conn: sqlite3.Connection, *, read_only: bool = False) -> _CorpusSnapshot:
     """Return a PRIVATE, copy-on-write fork of the exact corpus snapshot.
 
     Reuses the process-local cache when this call's epoch stamp matches the
     cached entry; else falls back to an exact D1 scan. Fail closed on the
     cache when the stamp is unavailable. The returned fork is safe to
     append/discard without affecting the shared base or any other call.
+
+    read_only: the no-write load (rows missing a vector are left out and
+    counted unscored, never backfilled) -- for previews (E1, review 7935).
     """
-    return _corpus_base(conn).fork()
+    return _corpus_base(conn, read_only=read_only).fork()
 
 
 def invalidate_corpus_cache(
@@ -7592,7 +7595,8 @@ def _absorb_memory_impl(
     # read. A concurrent duplicate committed after that read is not caught
     # here (a later absorb sees it because its stamp check fails).
     with absorb_phase("corpus_load"):
-        corpus = get_corpus_snapshot(conn)
+        # A dry run is a preview: it must not backfill missing vectors (E1).
+        corpus = get_corpus_snapshot(conn, read_only=dry_run)
 
     decisions: List[Dict[str, Any]] = []
     counts = {"created": 0, "superseded": 0, "skipped": 0, "linked": 0, "contradicted": 0, "consolidated": 0, "tombstoned": 0}

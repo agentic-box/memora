@@ -378,3 +378,44 @@ def test_a_store_with_memories_but_no_vector_searches_instead_of_refusing(store,
     db = sqlite3.connect(store)
     assert db.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0] == 0, "nothing backfilled"
     db.close()
+
+
+# ------------------------------------------------------------------ review 7935: absorb previews write nothing
+
+def _vec(text):
+    return {"tok:" + text.split()[0]: 1.0}
+
+
+@pytest.mark.parametrize("backend", ["local_db", "fake_d1_backend"])
+def test_an_absorb_dry_run_never_backfills_missing_vectors(backend, request, monkeypatch):
+    request.getfixturevalue(backend)
+    monkeypatch.setattr(storage, "_compute_embedding", lambda c, m, t: _vec(c))
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: None)
+    with storage.connect() as conn:
+        ids = [storage.add_memory(conn, content=f"topic{i} existing memory body", embedding=_vec(f"topic{i}"))["id"]
+               for i in range(4)]
+        conn.execute("DELETE FROM memories_embeddings WHERE memory_id IN (?, ?)", (ids[0], ids[1]))
+        conn.commit()
+        embeddings.invalidate_embedding_integrity_cache(conn)
+        storage.invalidate_corpus_cache(conn)
+        before = _vector_state(conn)
+        storage.absorb_memory(conn, ["topic0 a fresh angle"], dry_run=True)
+        assert _vector_state(conn) == before, "a preview wrote vectors or moved the embedding epoch"
+        storage.absorb_memory(conn, ["topic2 another angle"], dry_run=False)  # a real absorb may backfill
+
+
+def test_a_reset_model_row_is_recorded_again_after_an_invalidation(d1):
+    """Review 7935 P2: the record cache (it is only set where statements
+    commit at once, i.e. on D1; a local write inside its transaction re-reads
+    instead) is forgotten with the integrity cache."""
+    conn = storage.connect()
+    try:
+        storage.add_memory(conn, content="one more apple", metadata={}, tags=[])
+        assert embeddings._store_cache_key(conn) in embeddings._MODEL_RECORDED
+        conn.execute("DELETE FROM memories_meta WHERE key = 'embedding_model'")
+        embeddings.invalidate_embedding_integrity_cache(conn)
+        assert embeddings._store_cache_key(conn) not in embeddings._MODEL_RECORDED
+        storage.add_memory(conn, content="and a pear", metadata={}, tags=[])
+        assert embeddings.get_stored_embedding_model(conn) == "tfidf|tfidf|sparse"
+    finally:
+        conn.close()
