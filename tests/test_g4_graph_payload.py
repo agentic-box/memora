@@ -26,9 +26,9 @@ from memora.graph import data, payload
 FIXTURE = Path(__file__).parent / "fixtures" / "g4_pages_payloads.json"
 QUERIES = ["", "&docs=1", "&limit=12", "&docs=1&limit=25"]
 SCENARIOS = ["lineage", "content", "docs", "corrupt_row", "no_crossrefs_table", "retirement_fails", "random",
-             "unicode_times", "odd_values"]
-# Inputs on which graph.ts itself fails (leader 8135): no parity owed, a correct payload here.
-DEFECT_SCENARIOS = ["prototype_keys", "prototype_fragment", "malformed_throws"]
+             "unicode_times", "odd_values",
+             # graph.ts failed on these before PG1 (a 500, or a dropped tag colour)
+             "prototype_keys", "prototype_fragment", "malformed_throws"]
 
 
 def _meta(**kw):
@@ -312,18 +312,11 @@ def _strict_equal(a, b):
     return (type(a) is bool) == (type(b) is bool) and a == b
 
 
-def _defects(conn, query):
-    args = dict(p.split("=", 1) for p in query.lstrip("&").split("&") if p)
-    return payload.pages_defects(data._read_memory_rows(conn), include_docs=args.get("docs") == "1",
-                                 limit=int(args.get("limit", 2000)))
-
-
 @pytest.mark.parametrize("query", QUERIES)
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_the_payload_is_the_one_the_pages_code_returns(tmp_path, scenario, query):
     expected = json.loads(FIXTURE.read_text())[scenario][query]
     conn = build_store(tmp_path / "s.db", scenario)
-    assert _defects(conn, query) == []  # an input Pages handles: parity is owed
     got = _payload(conn, query)
     for key in sorted(set(expected) | set(got)):
         assert key in got and key in expected, f"{key} only in {'pages' if key in expected else 'memora-all'}"
@@ -339,59 +332,19 @@ def test_created_at_is_ordered_by_utf16_code_units():
         build_store(":memory:", "unicode_times"), "")["nodes"]]
 
 
-@pytest.mark.parametrize("query", QUERIES)
-def test_prototype_named_keys_throw_in_pages_and_are_mapped_correctly_here(query):
-    """Pages defect (leader 8135): graph.ts throws; this port answers."""
-    assert "__pages_throws__" in json.loads(FIXTURE.read_text())["prototype_keys"][query]
-    conn = build_store(":memory:", "prototype_keys")
-    assert _defects(conn, query) == [
-        "#2 primary tag 'constructor'", "#2 tag 'constructor'", "#3 tag 'toString'", "#4 section 'hasOwnProperty'",
-        "#5 component 'valueOf'", "#6 category '__proto__'", "#7 issue status 'isPrototypeOf'",
-    ]
-    got = _payload(conn, query)
-    ids = {n["id"] for n in got["nodes"]}
-    if 2 in ids:
-        assert got["tagToNodes"]["constructor"] == [2] and got["tagColors"]["constructor"].startswith("#")
-        # also a duplicate (0.9 to #1): the tag colour is the background
-        assert next(n for n in got["nodes"] if n["id"] == 2)["color"]["background"] == got["tagColors"]["constructor"]
-    if 4 in ids:
-        assert got["sectionToNodes"]["hasOwnProperty"] == [4]
-    if 5 in ids:
-        assert got["issueCategoryToNodes"]["valueOf"] == [5]
-    if 6 in ids:
-        assert got["todoCategoryToNodes"]["__proto__"] == [6]
-    if 7 in ids:
-        assert got["statusToNodes"]["isPrototypeOf"] == [7]
-        assert next(n for n in got["nodes"] if n["id"] == 7)["color"] == "#ff7b72"  # the open colour
-
-
-@pytest.mark.parametrize("query", QUERIES)
-def test_values_graph_ts_throws_on_are_named_and_answered_here(query):
-    """Pages defect (leader 8135): each of these makes graph.ts throw."""
-    assert "__pages_throws__" in json.loads(FIXTURE.read_text())["malformed_throws"][query]
-    conn = build_store(":memory:", "malformed_throws")
-    defects = _defects(conn, query)
-    selected = {n["id"] for n in _payload(conn, query)["nodes"]}
-    expected = ["#2 hierarchy.path str not sliceable", "#3 hierarchy.path dict not sliceable",
-                "#4 subsection not a string", "#5 metadata null", "#6 tags null", "#7 tags not iterable",
-                "#8 tags not iterable", "#9 tags null"]
-    assert defects == [d for d in expected if int(d.split()[0][1:]) in selected]
-    got = _payload(conn, query)
-    if 2 in selected:  # the unsliceable path is treated as absent: no section from it
-        assert "X" not in got["sectionToNodes"] and 2 in got["sectionToNodes"]["Uncategorized"]
-    if 4 in selected:
-        assert got["sectionToNodes"]["S"] == [4] and not any(k.startswith("S/") for k in got["subsectionToNodes"])
-
-
-def test_a_prototype_named_fragment_tag_is_dropped_by_pages_and_kept_here():
-    fx = json.loads(FIXTURE.read_text())["prototype_fragment"]
-    conn = build_store(":memory:", "prototype_fragment")
-    assert _defects(conn, "") == [] and _strict_equal(_payload(conn, ""), fx[""])  # not selected: parity
-    assert _defects(conn, "&docs=1") == ["#3 primary tag 'constructor'"]
-    got, pages = _payload(conn, "&docs=1"), fx["&docs=1"]
-    assert "constructor" not in pages["tagColors"] and got["tagColors"]["constructor"] == payload.TAG_COLORS[1]
-    assert _strict_equal({k: v for k, v in got.items() if k != "tagColors"},
-                         {k: v for k, v in pages.items() if k != "tagColors"})
+def test_the_values_graph_ts_failed_on_before_pg1_now_have_a_payload_there_too():
+    """PG1: the recorded Pages payloads map them (no throw, no dropped colour)."""
+    fx = json.loads(FIXTURE.read_text())
+    for scenario in ("prototype_keys", "malformed_throws", "prototype_fragment"):
+        assert all("__pages_throws__" not in fx[scenario][q] for q in QUERIES), scenario
+    proto = fx["prototype_keys"][""]
+    assert proto["tagToNodes"]["constructor"] == [2] and proto["tagToNodes"]["toString"] == [3]
+    assert proto["tagColors"]["constructor"].startswith("#")
+    assert proto["sectionToNodes"]["hasOwnProperty"] == [4] and proto["issueCategoryToNodes"]["valueOf"] == [5]
+    assert proto["todoCategoryToNodes"]["__proto__"] == [6] and proto["statusToNodes"]["isPrototypeOf"] == [7]
+    assert fx["prototype_fragment"]["&docs=1"]["tagColors"]["constructor"] == payload.TAG_COLORS[1]
+    odd = fx["malformed_throws"][""]["sectionToNodes"]
+    assert "X" not in odd and odd["S"] == [4] and 2 in odd["Uncategorized"] and 5 in odd["Uncategorized"]
 
 
 def test_the_fixture_covers_what_it_claims():
@@ -486,7 +439,7 @@ from tests.test_g1_graph import stores  # noqa: E402,F401  (fixture)
 if __name__ == "__main__":
     out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
-    for s in SCENARIOS + DEFECT_SCENARIOS:
+    for s in SCENARIOS:
         (out / f"{s}.db").unlink(missing_ok=True)
         build_store(out / f"{s}.db", s).close()
         print(out / f"{s}.db")

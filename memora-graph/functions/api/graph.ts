@@ -280,6 +280,28 @@ function parseJson<T>(str: string | null, defaultValue: T): T {
   }
 }
 
+/**
+ * PG1: a map keyed by stored values (tags, sections, statuses, components,
+ * categories). A plain {} inherits Object.prototype, so a key such as
+ * "constructor" or "__proto__" was "already there": the tag got no colour
+ * and the .push() on the inherited function threw (500). No prototype, no
+ * inherited keys; JSON.stringify serialises it like any object.
+ */
+function keyedMap<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
+}
+
+/** PG1: the tags to iterate -- an array, or a string (by code point); any
+ * other stored value (null, an object, a number) has none instead of throwing. */
+function iterableTags(tags: unknown): Iterable<unknown> {
+  return Array.isArray(tags) || typeof tags === "string" ? tags : [];
+}
+
+/** PG1: tags[0] without throwing on a null tags value. */
+function firstTag(tags: unknown): unknown {
+  return tags == null ? undefined : (tags as Record<number, unknown>)[0];
+}
+
 /** Parse a positive-int env override under the shared ASCII-digit grammar.
  * Malformed (non-ASCII, signed, scientific) or unsafe-integer values fall back
  * to the provided default. */
@@ -554,10 +576,10 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   }
 
   // Build tag colors
-  const tagColors: Record<string, string> = {};
+  const tagColors = keyedMap<string>();
   for (const m of memories) {
-    const tags = parseJson<string[]>(m.tags, []);
-    const primaryTag = tags[0] || "untagged";
+    const tags = parseJson<unknown>(m.tags, []);
+    const primaryTag = String(firstTag(tags) || "untagged");
     if (!(primaryTag in tagColors)) {
       tagColors[primaryTag] = TAG_COLORS[Object.keys(tagColors).length % TAG_COLORS.length];
     }
@@ -580,8 +602,8 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     const isFrag = isDocumentFragment(meta);
     if (isFrag && !includeDocs) continue;
 
-    const tags = parseJson<string[]>(m.tags, []);
-    const primaryTag = tags[0] || "untagged";
+    const tags = parseJson<unknown>(m.tags, []);
+    const primaryTag = String(firstTag(tags) || "untagged");
     const content = m.content;
 
     const firstLine = content.split("\n")[0].replace(/^#+\s*/, "").trim().slice(0, 60);
@@ -633,7 +655,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (isIssue(meta)) {
       const status = getIssueStatus(meta);
       node.shape = "dot";
-      node.color = ISSUE_STATUS_COLORS[status] || ISSUE_STATUS_COLORS["open"];
+      node.color = Object.hasOwn(ISSUE_STATUS_COLORS, status) ? ISSUE_STATUS_COLORS[status] : ISSUE_STATUS_COLORS["open"];
       if (meta.severity === "critical") {
         node.borderWidth = 4;
       }
@@ -643,7 +665,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (isTodo(meta)) {
       const status = getTodoStatus(meta);
       node.shape = "dot";
-      node.color = TODO_STATUS_COLORS[status] || TODO_STATUS_COLORS["open"];
+      node.color = Object.hasOwn(TODO_STATUS_COLORS, status) ? TODO_STATUS_COLORS[status] : TODO_STATUS_COLORS["open"];
       if (meta.priority === "high") {
         node.borderWidth = 4;
       }
@@ -712,13 +734,13 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   }
 
   // Build mappings
-  const tagToNodes: Record<string, number[]> = {};
-  const sectionToNodes: Record<string, number[]> = {};
-  const subsectionToNodes: Record<string, number[]> = {};
-  const statusToNodes: Record<string, number[]> = {};
-  const issueCategoryToNodes: Record<string, number[]> = {};
-  const todoStatusToNodes: Record<string, number[]> = {};
-  const todoCategoryToNodes: Record<string, number[]> = {};
+  const tagToNodes = keyedMap<number[]>();
+  const sectionToNodes = keyedMap<number[]>();
+  const subsectionToNodes = keyedMap<number[]>();
+  const statusToNodes = keyedMap<number[]>();
+  const issueCategoryToNodes = keyedMap<number[]>();
+  const todoStatusToNodes = keyedMap<number[]>();
+  const todoCategoryToNodes = keyedMap<number[]>();
   const nodeTimestamps: Record<number, string> = {};
 
   let minDate = "";
@@ -727,15 +749,16 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
   for (const m of memories) {
     const meta = parseJson<Record<string, unknown>>(m.metadata, {});
-    const tags = parseJson<string[]>(m.tags, []);
+    const tags = parseJson<unknown>(m.tags, []);
 
     // Skip sections and document fragments for mappings
     if (isSection(meta) || isDocumentFragment(meta)) continue;
 
     // Tags mapping
-    for (const tag of tags) {
-      if (!tagToNodes[tag]) tagToNodes[tag] = [];
-      tagToNodes[tag].push(m.id);
+    for (const tag of iterableTags(tags)) {
+      const key = String(tag);
+      if (!tagToNodes[key]) tagToNodes[key] = [];
+      tagToNodes[key].push(m.id);
     }
 
     // Issue mappings
@@ -762,21 +785,27 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
     // Section mappings (skip issues and TODOs)
     if (!isIssue(meta) && !isTodo(meta)) {
-      const hierarchy = meta.hierarchy as { path?: string[] } | undefined;
-      let section = "Uncategorized";
-      let parts: string[] = [];
+      // PG1: metadata may be null (stored "null"); a path is taken when it is
+      // a non-empty array or a one-code-unit string (its section; no
+      // subsections). Any other path, and a non-string subsection, used to
+      // throw; they are treated as absent.
+      const hierarchy = meta?.hierarchy as { path?: unknown } | undefined;
+      const path = hierarchy?.path as { length?: unknown } | undefined;
+      let section: unknown = "Uncategorized";
+      let parts: unknown[] = [];
 
-      if (hierarchy?.path?.length) {
-        section = hierarchy.path[0];
-        parts = hierarchy.path.slice(1);
+      if (path?.length && (Array.isArray(path) || (typeof path === "string" && path.length === 1))) {
+        section = (path as ArrayLike<unknown>)[0];
+        parts = Array.isArray(path) ? path.slice(1) : [];
       } else {
-        section = (meta.section as string) || "Uncategorized";
-        const subsection = meta.subsection as string;
-        if (subsection) parts = subsection.split("/");
+        section = meta?.section || "Uncategorized";
+        const subsection = meta?.subsection;
+        if (typeof subsection === "string" && subsection) parts = subsection.split("/");
       }
 
-      if (!sectionToNodes[section]) sectionToNodes[section] = [];
-      sectionToNodes[section].push(m.id);
+      const sectionKey = String(section);
+      if (!sectionToNodes[sectionKey]) sectionToNodes[sectionKey] = [];
+      sectionToNodes[sectionKey].push(m.id);
 
       if (parts.length) {
         for (let i = 0; i < parts.length; i++) {

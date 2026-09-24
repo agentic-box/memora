@@ -14,6 +14,24 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### The Pages viewer's graph no longer fails on unusual stored values (PG1)
+
+- The Pages `/api/graph` (`memora-graph/functions/api/graph.ts`) answered
+  500 when a stored tag, section, status, component or category was named
+  like a JavaScript object property (`constructor`, `toString`,
+  `__proto__`, ...). Its maps were plain objects, which inherit those names.
+  On a document fragment's tag it dropped the tag's colour instead.
+- It also answered 500 on:
+  - tags stored as `null`, or as something other than a list or string;
+  - metadata stored as `null`;
+  - a `hierarchy.path` it could not slice (a string of two or more
+    characters, an object);
+  - a non-string `subsection`.
+- The maps now have no prototype, and those values are treated as absent.
+  The answer is exactly memora-all's (G4); nothing changes for any other
+  input. New CI step: `scripts/test_graph_keys.mjs`.
+- Ships with the next Pages deploy (a user step).
+
 ## 0.5.4
 
 ### The graph API returns exactly what the Pages viewer returns (G4)

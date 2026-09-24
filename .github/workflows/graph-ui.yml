@@ -123,6 +123,11 @@ jobs:
         # workflow and ran nowhere.
         run: node --experimental-strip-types scripts/test_lineage.mjs
 
+      - name: Graph payload key tests
+        # PG1: stored values named like Object.prototype properties, and odd
+        # JSON values, get a payload instead of a 500. Imports the shipped graph.ts.
+        run: node --experimental-strip-types scripts/test_graph_keys.mjs
+
       - name: Read-only viewer tests
         # No write handler, no chat tools, 405 on every write method -- also
         # over HTTP against the seeded server (plan §6 F1).

@@ -19,22 +19,15 @@ Parity means identical output for every input on which Pages itself works
 - Rows an unfinished import still marks (metadata ``import_attempt``) are
   not read (graph/data.py): they are not memories yet, and memora-all's
   other APIs hide them too (leader 8129). Pages lists them.
-- Pages defects, where this port gives the correct payload instead
-  (pages_defects() names them for an input; follow-up PG1 fixes them in
-  memora-graph):
-  * A tag, section, issue/TODO status, component or category named like an
-    Object.prototype property (``constructor``, ``toString``, ``__proto__``,
-    ...). graph.ts keeps those maps in plain objects: the key is "already
-    there", inherited, so the node gets no tag colour and the .push() on the
-    inherited function throws -- /api/graph answers 500. On a document
-    fragment's tag (?docs=1), which is never mapped, it does not throw but
-    silently leaves the tag out of tagColors (and shifts later tags'
-    colours).
-  * Values graph.ts throws on (a 500): tags ``null``; on a mapped memory,
-    tags that are not iterable (an object, a number), metadata ``null``, a
-    ``hierarchy.path`` string of two or more code units or an object with a
-    length, a non-string ``subsection``. This port treats the value as
-    absent.
+- Before PG1, graph.ts failed on some stored values, where this port always
+  gave the correct payload: keys named like Object.prototype properties
+  (``constructor``, ``toString``, ``__proto__``, ...) threw a 500 or dropped
+  a fragment's tag colour, and so did tags ``null`` or not iterable,
+  metadata ``null``, a ``hierarchy.path`` it could not slice and a
+  non-string ``subsection``. PG1 fixed graph.ts to answer exactly as this
+  port does (tests/fixtures/g4_pages_payloads.json: prototype_keys,
+  prototype_fragment, malformed_throws). A Pages deployment older than PG1
+  still fails on those values.
 """
 from __future__ import annotations
 
@@ -662,10 +655,10 @@ def _hierarchy_path(meta: Any) -> Tuple[bool, Any]:
 
 
 def _section_and_parts(meta: Any) -> Tuple[Any, List[Any]]:
-    """graph.ts's section and subsection path for a mapped memory. Where it
-    throws (a path string of 2+ code units, an object path with a length, a
-    truthy non-string subsection: pages_defects) the value is treated as
-    absent."""
+    """graph.ts's section and subsection path for a mapped memory. A path
+    string of 2+ code units, an object path with a length and a truthy
+    non-string subsection are treated as absent (as graph.ts does since PG1;
+    it used to throw)."""
     taken, path = _hierarchy_path(meta)
     if taken and isinstance(path, list):
         return path[0], path[1:]
@@ -674,74 +667,6 @@ def _section_and_parts(meta: Any) -> Tuple[Any, List[Any]]:
     section = _or(_get(meta, "section"), "Uncategorized")
     subsection = _get(meta, "subsection")
     return section, (subsection.split("/") if isinstance(subsection, str) and subsection else [])
-
-
-# ------------------------------------------------------------------ Pages defects
-
-# Object.prototype's own property names: graph.ts finds these "in" any plain
-# object, so a key named like one breaks its maps (see the module docstring).
-OBJECT_PROTOTYPE_KEYS = frozenset({
-    "constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__",
-    "__lookupSetter__", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "__proto__",
-    "toLocaleString",
-})
-
-
-def pages_defects(memory_rows: List[Dict[str, Any]], *, include_docs: bool, limit: int) -> List[str]:
-    """The inputs on which graph.ts itself misbehaves (so no parity is
-    owed), per selected memory: a tag, section, status, component or
-    category that is an Object.prototype name; and the values graph.ts
-    throws on -- tags null (any memory); on a mapped memory (not a section
-    or fragment) tags that are not iterable, metadata null, a
-    hierarchy.path it takes but cannot slice/join (a string of 2+ code
-    units, an object with a truthy length), a truthy non-string
-    subsection. Empty for every other input."""
-    found: List[str] = []
-
-    def check(mid, what, key):
-        if js_str(key) in OBJECT_PROTOTYPE_KEYS:
-            found.append(f"#{js_str(mid)} {what} {js_str(key)!r}")
-
-    def eligible(m) -> bool:
-        meta = parse_json(m.get("metadata"), {})
-        return not _is_type(meta, "section") and not (_is_type(meta, "document_fragment") and not include_docs)
-
-    def created(m) -> str:
-        c = _or(m.get("created_at"), "")
-        return c if isinstance(c, str) else js_str(c)
-
-    selected = sorted((m for m in memory_rows if eligible(m)),
-                      key=lambda m: (_u16_order(created(m)), m["id"]), reverse=True)[:limit]
-    for m in selected:
-        meta = parse_json(m.get("metadata"), {})
-        tags = parse_json(m.get("tags"), [])
-        if tags is None:
-            found.append(f"#{js_str(m['id'])} tags null")
-        check(m["id"], "primary tag", _or(_index(tags, 0), "untagged"))
-        if _is_type(meta, "document_fragment"):
-            continue
-        if tags is not None and not isinstance(tags, (list, str)):
-            found.append(f"#{js_str(m['id'])} tags not iterable")
-        if meta is None:
-            found.append(f"#{js_str(m['id'])} metadata null")
-        if not _is_type(meta, "issue") and not _is_type(meta, "todo"):
-            taken, path = _hierarchy_path(meta)
-            if taken and not (isinstance(path, list) or (isinstance(path, str) and _u16len(path) == 1)):
-                found.append(f"#{js_str(m['id'])} hierarchy.path {type(path).__name__} not sliceable")
-            subsection = _get(meta, "subsection")
-            if not taken and _truthy(subsection) and not isinstance(subsection, str):
-                found.append(f"#{js_str(m['id'])} subsection not a string")
-        for tag in _iter(tags):
-            check(m["id"], "tag", tag)
-        if _is_type(meta, "issue"):
-            check(m["id"], "issue status", _issue_status(meta))
-            check(m["id"], "component", _or(_get(meta, "component"), "uncategorized"))
-        elif _is_type(meta, "todo"):
-            check(m["id"], "todo status", _todo_status(meta))
-            check(m["id"], "category", _or(_get(meta, "category"), "uncategorized"))
-        else:
-            check(m["id"], "section", _section_and_parts(meta)[0])
-    return found
 
 
 # ------------------------------------------------------------------ graph.ts onRequestGet
