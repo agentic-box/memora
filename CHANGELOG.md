@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.3
+
 ### Scheduled compares of the live local primaries (NC1)
 
 - `scripts/nightly_compare.sh` runs on the deploy host from cron. For
