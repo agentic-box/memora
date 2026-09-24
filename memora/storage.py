@@ -5405,10 +5405,47 @@ def _build_similarity_graph(
 
     adj: Dict[int, Dict[int, float]] = {mid: {} for mid in ids_with_emb}
 
-    for i in range(len(ids_with_emb)):
-        for j in range(i + 1, len(ids_with_emb)):
-            a, b = ids_with_emb[i], ids_with_emb[j]
-            score = _cosine_similarity(embeddings[a], embeddings[b])
+    # G3: the same scores as _cosine_similarity(a, b), bit for bit, without
+    # its per-pair costs. Each vector's norm is computed ONCE (the same
+    # expression); vectors whose keys come in the same order (every dense
+    # vector) are dotted as plain float lists in that order -- the same
+    # summation sequence as the dict loop, so the same rounding. Anything
+    # else (sparse vectors, differing keys) takes the original dict loop.
+    # reduce(add, ..., 0.0), not sum(): since Python 3.12 sum() of floats is
+    # compensated and would round differently from the loop's +=.
+    import operator
+    from functools import reduce
+
+    add, mul = operator.add, operator.mul
+    norms: Dict[int, float] = {}
+    layout: Dict[int, Tuple[Any, ...]] = {}
+    values: Dict[int, List[float]] = {}
+    signatures: Dict[Tuple[str, ...], Tuple[str, ...]] = {}
+    for mid in ids_with_emb:
+        vec = embeddings[mid]
+        norms[mid] = math.sqrt(sum(w * w for w in vec.values()))
+        keys = tuple(vec.keys())
+        layout[mid] = signatures.setdefault(keys, keys)  # one shared object per key order
+        values[mid] = list(vec.values())
+
+    n = len(ids_with_emb)
+    for i in range(n):
+        a = ids_with_emb[i]
+        vec_a, keys_a, vals_a, norm_a = embeddings[a], layout[a], values[a], norms[a]
+        for j in range(i + 1, n):
+            b = ids_with_emb[j]
+            if not vec_a or not embeddings[b]:
+                score = 0.0
+            else:
+                if layout[b] is keys_a:
+                    dot = reduce(add, map(mul, vals_a, values[b]), 0.0)
+                else:
+                    dot = 0.0
+                    vec_b = embeddings[b]
+                    for token, weight in vec_a.items():
+                        dot += weight * vec_b.get(token, 0.0)
+                norm_b = norms[b]
+                score = 0.0 if norm_a == 0.0 or norm_b == 0.0 else dot / (norm_a * norm_b)
             if score >= min_score:
                 adj[a][b] = score
                 adj[b][a] = score

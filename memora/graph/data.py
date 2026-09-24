@@ -1,11 +1,13 @@
 """Graph data generation and transformation logic."""
 
+import bisect
 import json
+import math
 import os
 import re
 from datetime import datetime, timedelta
 from importlib.metadata import version as get_version
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def _get_memora_version() -> str:
@@ -20,7 +22,6 @@ STALE_DAYS = int(os.getenv("MEMORA_STALE_DAYS", "30"))
 
 from ..storage import (  # noqa: E402
     connect,
-    detect_clusters,
     find_duplicate_pairs,
     get_crossrefs,
     get_memory,
@@ -445,63 +446,209 @@ CLUSTER_COLORS = [
 ]
 
 
-def _build_cluster_data(
-    conn, memories: List[Dict], min_score: float = 0.40
-) -> Dict[str, Any]:
-    """Build cluster mappings using Louvain community detection.
+def _load_crossrefs_map(conn) -> Tuple[Dict[int, List[Dict[str, Any]]], bool]:
+    """Every stored crossref row, parsed as the Pages viewer parses it
+    (functions/api/_lineage.ts parseRelatedPayload), in memory_id order --
+    the order D1 returns ``SELECT memory_id, related FROM memories_crossrefs``
+    (memory_id is the INTEGER PRIMARY KEY, so rowid order).
 
-    Returns dict with clusterToNodes, nodeToCluster, clusterColors, clusterMeta.
-    """
-    # Filter out section memories
-    non_section_ids = [
-        m["id"] for m in memories if not is_section(m.get("metadata"))
-    ]
-
-    clusters = detect_clusters(
-        conn, min_cluster_size=3, min_score=min_score, algorithm="louvain"
-    )
-
-    if not clusters:
-        return {
-            "clusterToNodes": {},
-            "nodeToCluster": {},
-            "clusterColors": {},
-            "clusterMeta": {},
-        }
-
-    cluster_to_nodes: Dict[str, List[int]] = {}
-    node_to_cluster: Dict[str, int] = {}
-    cluster_colors: Dict[str, str] = {}
-    cluster_meta: Dict[str, Dict] = {}
-
-    non_section_set = set(non_section_ids)
-
-    for c in clusters:
-        cid = str(c["cluster_id"])
-        # Only include non-section memories that are in the graph
-        members = [mid for mid in c["memory_ids"] if mid in non_section_set]
-        if len(members) < 3:
+    Returns (map, available). As there, a corrupt row is left out of the map
+    and makes ``available`` False (the query failing does too); Pages then
+    emits no clusters at all."""
+    out: Dict[int, List[Dict[str, Any]]] = {}
+    available = True
+    try:
+        rows = conn.execute(
+            "SELECT memory_id, related FROM memories_crossrefs ORDER BY memory_id"
+        ).fetchall()
+    except Exception:
+        return out, False
+    for row in rows:
+        raw = row[1]
+        if raw is None or raw == "":
+            out[row[0]] = []
             continue
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            available = False
+            continue
+        if not isinstance(parsed, list):
+            available = False
+            continue
+        entries = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                entries = None
+                break
+            ref_id = item.get("id")
+            if not _is_js_number(ref_id):
+                entries = None
+                break
+            score = item.get("score")
+            edge_type = item.get("edge_type")
+            entries.append({
+                "id": ref_id,
+                "score": score if _is_js_number(score) else None,
+                "edge_type": edge_type if isinstance(edge_type, str) else None,
+            })
+        if entries is None:
+            available = False
+        else:
+            out[row[0]] = entries
+    return out, available
 
-        cluster_to_nodes[cid] = members
-        color = CLUSTER_COLORS[(c["cluster_id"] - 1) % len(CLUSTER_COLORS)]
-        cluster_colors[cid] = color
 
-        for mid in members:
-            node_to_cluster[str(mid)] = c["cluster_id"]
+def _is_js_number(value: Any) -> bool:
+    """typeof value === "number" && Number.isFinite(value)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
-        # Build a human-readable label from top tags
-        label_tags = [t for t in c.get("top_tags", []) if "/" not in t][:2]
-        if not label_tags:
-            label_tags = [t.split("/")[-1] for t in c.get("top_tags", [])[:2]]
-        label = ", ".join(label_tags) if label_tags else f"Cluster {cid}"
 
-        cluster_meta[cid] = {
-            "size": len(members),
-            "top_tags": c.get("top_tags", []),
-            "label": label,
-        }
+def _louvain_communities_pages(
+    adj: Dict[int, Dict[int, float]], min_community_size: int = 3
+) -> Dict[int, int]:
+    """A port of the Pages viewer's louvainCommunities
+    (memora-graph/functions/api/graph.ts): single-level local moves, at most
+    50 sweeps, nodes and neighbours visited in insertion order, then
+    communities of at least ``min_community_size`` numbered from 0 in order
+    of first appearance. Same arithmetic in the same order (JS numbers are
+    IEEE doubles), so the same assignment for the same graph.
 
+    Pages recomputes every community's total strength before each node's
+    move (a pass over all nodes); here a total is summed over its members in
+    node order -- the same additions -- and cached until one of its members
+    moves.
+    """
+    node_list = list(adj.keys())
+    if not node_list:
+        return {}
+    community: Dict[int, int] = {n: n for n in node_list}
+
+    m2 = 0.0
+    for neighbors in adj.values():
+        for w in neighbors.values():
+            m2 += w
+    if m2 == 0:
+        return community  # as Pages: every node its own community, unfiltered
+
+    strength: Dict[int, float] = {}
+    for n in node_list:
+        s = 0.0
+        for w in adj[n].values():
+            s += w
+        strength[n] = s
+
+    index = {n: i for i, n in enumerate(node_list)}
+    members: Dict[int, List[int]] = {n: [index[n]] for n in node_list}
+    totals: Dict[int, float] = {}
+
+    def total(c: int) -> float:
+        t = totals.get(c)
+        if t is None:
+            t = 0.0
+            for i in members.get(c, ()):
+                t += strength[node_list[i]]
+            totals[c] = t
+        return t
+
+    improved = True
+    iterations = 0
+    while improved and iterations < 50:
+        improved = False
+        iterations += 1
+        for node in node_list:
+            current = community[node]
+            ki = strength[node]
+            comm_weights: Dict[int, float] = {}
+            for neighbor, w in adj[node].items():
+                nc = community[neighbor]
+                comm_weights[nc] = comm_weights.get(nc, 0.0) + w
+            ki_in = comm_weights.get(current, 0.0)
+            sigma_tot = total(current) - ki
+            remove_loss = ki_in / m2 - (sigma_tot * ki) / (m2 * m2)
+            best_gain = 0.0
+            best = current
+            for target, ki_target in comm_weights.items():
+                if target == current:
+                    continue
+                sigma_target = total(target)
+                gain = ki_target / m2 - (sigma_target * ki) / (m2 * m2) - remove_loss
+                if gain > best_gain:
+                    best_gain = gain
+                    best = target
+            if best != current:
+                community[node] = best
+                members[current].remove(index[node])
+                bisect.insort(members.setdefault(best, []), index[node])
+                totals.pop(current, None)
+                totals.pop(best, None)
+                improved = True
+
+    unique: List[int] = list(dict.fromkeys(community.values()))
+    counts: Dict[int, int] = {}
+    for c in community.values():
+        counts[c] = counts.get(c, 0) + 1
+    renumber: Dict[int, int] = {}
+    for c in unique:
+        if counts[c] >= min_community_size:
+            renumber[c] = len(renumber)
+    return {n: renumber[c] for n, c in community.items() if c in renumber}
+
+
+def _build_cluster_data(
+    crossrefs: Tuple[Dict[int, List[Dict[str, Any]]], bool],
+    node_ids: List[int],
+    min_score: float = 0.4,
+    min_cluster_size: int = 3,
+) -> Dict[str, Any]:
+    """Clusters exactly as the Pages viewer computes them (G3, leader 8079;
+    functions/api/graph.ts buildClusterData): Louvain over the STORED
+    crossrefs with score >= ``min_score``, restricted to the graph's own
+    nodes (``node_ids``, in node order), labelled "Cluster N".
+
+    ``crossrefs`` is what _load_crossrefs_map returns; when the crossrefs
+    are not available (a corrupt row, a failed query) there are no clusters,
+    as in Pages.
+
+    Returns clusterToNodes, clusterColors and clusterMeta as Pages does, plus
+    nodeToCluster (the inverse map, kept for this server's callers).
+    """
+    empty: Dict[str, Any] = {
+        "clusterToNodes": {}, "nodeToCluster": {}, "clusterColors": {}, "clusterMeta": {},
+    }
+    crossrefs, available = crossrefs
+    if not available or len(node_ids) < min_cluster_size:
+        return empty
+    id_set = set(node_ids)
+    adj: Dict[int, Dict[int, float]] = {nid: {} for nid in node_ids}
+    for mem_id, refs in crossrefs.items():
+        if mem_id not in id_set:
+            continue
+        for ref in refs:
+            score = ref["score"] if ref.get("score") is not None else 0
+            if score < min_score or ref["id"] not in id_set:
+                continue
+            adj[mem_id][ref["id"]] = score
+            adj[ref["id"]][mem_id] = score
+
+    communities = _louvain_communities_pages(adj, min_cluster_size)
+
+    grouped: Dict[int, List[int]] = {}
+    for node_id, cluster_id in communities.items():
+        grouped.setdefault(cluster_id, []).append(node_id)
+    # A JS object lists integer-like keys in ascending numeric order; colours
+    # follow that order.
+    cluster_to_nodes: Dict[str, List[int]] = {}
+    cluster_colors: Dict[str, str] = {}
+    cluster_meta: Dict[str, Dict[str, Any]] = {}
+    node_to_cluster: Dict[str, int] = {}
+    for i, cluster_id in enumerate(sorted(grouped)):
+        cid = str(cluster_id)
+        cluster_to_nodes[cid] = grouped[cluster_id]
+        cluster_colors[cid] = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
+        cluster_meta[cid] = {"size": len(grouped[cluster_id]), "label": f"Cluster {cluster_id + 1}"}
+        for mid in grouped[cluster_id]:
+            node_to_cluster[str(mid)] = cluster_id
     return {
         "clusterToNodes": cluster_to_nodes,
         "nodeToCluster": node_to_cluster,
@@ -651,8 +798,9 @@ def get_graph_data(
         # Build timeline data
         node_timestamps, min_date, max_date = _build_timeline_data(memories)
 
-        # Build cluster data using Louvain community detection
-        cluster_data = _build_cluster_data(conn, memories)
+        # Clusters as the Pages viewer computes them: Louvain over the stored
+        # crossrefs of the graph's own nodes (G3)
+        cluster_data = _build_cluster_data(_load_crossrefs_map(conn), [n["id"] for n in nodes])
 
         result = {
             "nodes": nodes,
@@ -757,8 +905,9 @@ def export_graph_html(
                 "metadata": meta,
             }
 
-        # Build cluster data using Louvain community detection
-        cluster_data = _build_cluster_data(conn, memories)
+        # Clusters as the Pages viewer computes them: Louvain over the stored
+        # crossrefs of the graph's own nodes (G3)
+        cluster_data = _build_cluster_data(_load_crossrefs_map(conn), [n["id"] for n in nodes])
 
         # Build HTML components
         legend_html = _build_legend_html(tag_colors)

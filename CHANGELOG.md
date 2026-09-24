@@ -14,6 +14,27 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Graph clusters match the Pages viewer, and the graph builds in well under a second (G3)
+
+- memora-all's `/api/graph` clustered with a different algorithm from the
+  Pages viewer: Louvain over the embedding similarity of EVERY pair of
+  memories (sections included, whatever the node set) scoring at least 0.40.
+  With dense (bge-m3) vectors that graph is nearly complete, so each store
+  came out as 3-4 giant clusters ("clusters look wrong"). The all-pairs pass
+  was also the whole build time: 76.7 s on a copy of the memora store.
+- It now clusters exactly as Pages does (`functions/api/graph.ts`
+  buildClusterData): Louvain over the STORED crossrefs (score >= 0.4) of the
+  graph's own nodes, with the same moves, iteration cap, numbering, colours
+  and "Cluster N" labels. As in Pages, a corrupt crossref row means no
+  clusters at all. On copies of the production stores the cluster output
+  (clusterToNodes, clusterColors, clusterMeta) is identical to what the Pages
+  code computes. The build now takes 0.16 s (memora), 0.13 s (ob1) and
+  0.04 s (re).
+- The `memory_clusters` tool's `louvain` pass still builds the all-pairs
+  similarity graph. It now computes each vector's norm once and dots dense
+  vectors as float lists, with the same additions in the same order as
+  before.
+
 ## 0.5.2
 
 ### Reconcile: the evidence digest covers what was read, not when (RC1)
@@ -38,6 +59,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   still before its read-back bound (`waiting`) is accepted as before, on
   the receipt.
 - Digests shown before this change do not match: show the intents again.
+
 
 ## 0.5.1
 
