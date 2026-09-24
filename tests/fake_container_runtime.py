@@ -56,7 +56,7 @@ if verb == "inspect":
     print(json.dumps([{"Name": args[1], "Mounts": [{"Name": cur, "Destination": "/data"}]}]))
     sys.exit(0)
 if verb == "volume":
-    name = args[2]
+    name = args[-1] if args[1] == "create" else args[2]  # `volume create [--label k=v]... NAME`
     if args[1] == "inspect":
         if not os.path.isdir(vol(name)):
             sys.exit(1)

@@ -338,6 +338,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
     proc, calls, cfg = deploy(runtime_env={
         "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+        "DEPLOY_LABELS": "memora.rehearsal=rh-run-7",
         "DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
         "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
         "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
@@ -357,6 +358,11 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     assert rename[1] == "memora-rh" and rename[2].startswith("memora-rh-grok-")
     assert (rcfg / "all.admin-token").exists() and not (cfg / "all.admin-token").exists()
     assert _files(deploy.volroot / "memora-rh-data") == _files(deploy.old)
+    # 7729: everything the deploy creates carries the rehearsal run's label
+    create = calls[_index(calls, lambda c: c[:2] == ["volume", "create"])]
+    copy = calls[_index(calls, _is_copy)]
+    for made in (create, copy, run):
+        assert _flag_values(made, "--label") == ["memora.rehearsal=rh-run-7"], made
 
 
 REHEARSAL = {"DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
@@ -373,6 +379,7 @@ def _nothing_done(deploy, proc, calls):
 @pytest.mark.parametrize("override", [
     {"RUNTIME": "podman"}, {"DEPLOY_PORT": "18920"}, {"DEPLOY_CONTAINER": "memora-rh"},
     {"DEPLOY_HOST": "localhost"}, {"DEPLOY_SKIP_CHECKOUT": "1"}, {"DEPLOY_TAG": "v9"},
+    {"DEPLOY_LABELS": "memora.rehearsal=x"},
 ])
 def test_an_override_without_the_rehearsal_sentinel_is_refused(deploy, override):
     """7725 P1: a stray variable cannot re-target the production deploy."""
@@ -389,12 +396,14 @@ def test_an_override_without_the_rehearsal_sentinel_is_refused(deploy, override)
     ({"DEPLOY_HOST": "nuc8"}, "DEPLOY_HOST must be localhost"),
     ({"DEPLOY_CONFIG_DIR": "/etc"}, "DEPLOY_CONFIG_DIR is not under"),
     ({"DEPLOY_REHEARSAL_ROOT": ""}, "DEPLOY_REHEARSAL_ROOT must name an existing directory"),
+    ({"DEPLOY_LABELS": ""}, "DEPLOY_LABELS must carry memora.rehearsal=<run-id>"),
+    ({"DEPLOY_LABELS": "memora.rehearsal="}, "DEPLOY_LABELS must carry memora.rehearsal=<run-id>"),
 ])
 def test_a_rehearsal_with_a_production_like_target_is_refused(deploy, tmp_path, change, match):
     rcfg = tmp_path / "rcfg"
     rcfg.mkdir()
     env = {**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
-           "DEPLOY_CONFIG_DIR": str(rcfg), **change}
+           "DEPLOY_LABELS": "memora.rehearsal=rh-run-7", "DEPLOY_CONFIG_DIR": str(rcfg), **change}
     proc, calls, cfg = deploy(runtime_env=env)
     _nothing_done(deploy, proc, calls)
     assert match in proc.stderr
@@ -403,7 +412,7 @@ def test_a_rehearsal_with_a_production_like_target_is_refused(deploy, tmp_path, 
 def test_a_rehearsal_env_file_outside_the_root_is_refused(deploy, tmp_path):
     root = tmp_path / "rh"
     (root / "cfg").mkdir(parents=True)
-    proc, calls, cfg = deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
+    proc, calls, cfg = deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root), "DEPLOY_LABELS": "memora.rehearsal=r",
                                            "DEPLOY_CONFIG_DIR": str(root / "cfg")})
     _nothing_done(deploy, proc, calls)
     assert "DEPLOY_ENV_FILE is not under" in proc.stderr

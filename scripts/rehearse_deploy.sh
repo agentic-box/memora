@@ -46,6 +46,11 @@ RESULTS="$RH_ROOT/results.txt"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")"
 REG='{"memora": "/data/memora.db", "ob1": "/data/ob1.db", "bestation": "/data/bestation.db", "re": "/data/re.db"}'
 
+# Every container and volume this run creates carries this label (review
+# 7729); the cleanup removes only what carries a run id from its own ledger.
+RUN_ID="rh-$(date +%s)-$$"
+RUN_LABEL="memora.rehearsal=$RUN_ID"
+LEDGER="$RH_ROOT/ledger.txt"
 mkdir -p "$RH_ROOT" "$CFG" "$RH_ROOT/fixtures"
 chmod 700 "$CFG"
 : > "$RESULTS"
@@ -62,7 +67,7 @@ mint() { ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 
 # Every helper container is named and removed with a plain `rm`.
 once() {  # once NAME ARGS... -- run a helper container, then remove it (never its volumes)
   local name="rh-helper-$1-$$"; shift
-  "$RT" run --name "$name" --tmpfs /data "$@"; local rc=$?  # --tmpfs: no anonymous /data volume left behind
+  "$RT" run --name "$name" --label "$RUN_LABEL" --tmpfs /data "$@"; local rc=$?  # --tmpfs: no anonymous /data volume
   "$RT" rm "$name" >/dev/null 2>&1
   return $rc
 }
@@ -91,44 +96,17 @@ admin() {  # admin TOKEN PATH -- the HTTP status of GET PATH with TOKEN
   curl -s -o "$RH_ROOT/last-body.json" -w '%{http_code}' -H "Authorization: Bearer $1" "http://127.0.0.1:$PORT$2"
 }
 deploy() {
-  DEPLOY_REHEARSAL=1 DEPLOY_REHEARSAL_ROOT="$RH_ROOT" DEPLOY_HOST=localhost RUNTIME="$RT" DEPLOY_CONTAINER="$NAME" DEPLOY_DATA_VOLUME="$VOL" \
+  DEPLOY_REHEARSAL=1 DEPLOY_REHEARSAL_ROOT="$RH_ROOT" DEPLOY_LABELS="$RUN_LABEL" DEPLOY_HOST=localhost RUNTIME="$RT" DEPLOY_CONTAINER="$NAME" DEPLOY_DATA_VOLUME="$VOL" \
   DEPLOY_IMAGE="$IMAGE" DEPLOY_PORT="$PORT" DEPLOY_CONFIG_DIR="$CFG" DEPLOY_REPO="$ROOT" \
   DEPLOY_SKIP_CHECKOUT=1 DEPLOY_SMOKE_ABSORB=0 DEPLOY_ENV_FILE="$ENVF" DEPLOY_TAG="v$VERSION" \
     bash "$ROOT/scripts/deploy-memora-all.sh"
 }
 
-echo "== 0. clean up an earlier rehearsal (only what it created; no prune)"
-for c in $("$RT" ps -a --format '{{.Names}}' | grep -E "^($NAME(-grok-[0-9]+|-migrate-[0-9]+)?|rh-helper-.*)$" || true); do
-  "$RT" rm -f "$c" >/dev/null
-done
-# Volumes: only those this rehearsal RECORDED (review 7725 P2), each checked
-# with inspect first. An anonymous one must be 64-hex, flagged anonymous by
-# the runtime, and used by no container other than the one recorded with it.
-# A named one must be one of the rehearsal's own -rh names. Nothing else.
-LEDGER="$RH_ROOT/volumes-created.txt"
-cleanup_volume() {  # cleanup_volume KIND CONTAINER_ID VOLUME
-  local kind="$1" cid="$2" v="$3" u
-  "$RT" volume exists "$v" 2>/dev/null || return 0
-  if [ "$kind" = anon ]; then
-    printf '%s' "$v" | grep -Eqx '[0-9a-f]{64}' || { echo "cleanup: keeping $v (not an anonymous id)"; return 0; }
-    [ "$("$RT" volume inspect "$v" --format '{{.Anonymous}}' 2>/dev/null)" = true ] \
-      || { echo "cleanup: keeping $v (the runtime does not flag it anonymous)"; return 0; }
-    for u in $("$RT" ps -a -q --no-trunc --filter "volume=$v"); do
-      [ "$u" = "$cid" ] || { echo "cleanup: keeping $v (also used by container $u)"; return 0; }
-      "$RT" rm -f "$u" >/dev/null
-    done
-  else
-    case "$v" in memora-rh-data|memora-rh-scratch|memora-rh-scratch2) ;; *) echo "cleanup: keeping $v"; return 0 ;; esac
-  fi
-  "$RT" volume rm "$v" >/dev/null && echo "cleanup: removed $kind volume $v"
-}
-record() { echo "$1 $2 $3" >> "$LEDGER"; }   # record KIND CONTAINER_ID VOLUME
-if [ -f "$LEDGER" ]; then
-  while read -r kind cid v; do
-    [ -n "$v" ] && cleanup_volume "$kind" "$cid" "$v"
-  done < "$LEDGER"
-fi
-: > "$LEDGER"
+echo "== 0. clean up earlier rehearsals: only what they labelled and recorded; never by name alone, never prune"
+. "$ROOT/scripts/rehearse_cleanup.sh"   # cleanup_ledger, created_in_run (shared with its self-test)
+record() { echo "$*" >> "$LEDGER"; }
+cleanup_ledger "$LEDGER"
+record run "$RUN_ID" "$(date +%s)"
 
 # The rehearsal's own config: throwaway tokens (0600), no Cloudflare anything.
 HEALTH_TOKEN="$(mint)"
@@ -143,12 +121,12 @@ echo "== 1. the OLD image (production's memora:latest today) from $OLD_SRC"
 check "build the old image from $OLD_SRC" "$RT" build -t "$IMAGE" "$OLD_SRC"
 
 echo "== 2. the old container, the production way (anonymous /data)"
-check "start the old container" "$RT" run -d --name "$NAME" --restart unless-stopped -p "0.0.0.0:$PORT:8000" \
+check "start the old container" "$RT" run -d --name "$NAME" --label "$RUN_LABEL" --restart unless-stopped -p "0.0.0.0:$PORT:8000" \
   -e "MEMORA_DATABASES=$REG" -e MEMORA_DEFAULT_DB=memora -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
   -e MEMORA_EMBEDDING_MODEL=tfidf -e MEMORA_ALLOW_ANY_TAG=1 "$IMAGE"
 check "the old container answers /health" wait_health
 OLD_VOL="$(old_anon "$NAME")"
-record anon "$("$RT" inspect "$NAME" --format '{{.Id}}')" "$OLD_VOL"
+record anon "$RUN_ID" "$("$RT" inspect "$NAME" --format '{{.Id}}')" "$OLD_VOL"
 if printf '%s' "$OLD_VOL" | grep -Eqx '[0-9a-f]{64}'; then pass "the old container's /data is an anonymous volume ($OLD_VOL)"; \
   else fail "the old container's /data is not an anonymous volume: '$OLD_VOL'"; fi
 check "write memories to all four stores" "$RT" exec -i "$NAME" python - <<'PY'
@@ -181,7 +159,6 @@ check "the WAL sidecars exist" "$RT" exec "$NAME" sh -c 'test -s /data/wal-probe
 "$RT" inspect "$NAME" > "$RH_ROOT/fixtures/inspect-old.raw.json"
 
 echo "== 3. deploy (scripts/deploy-memora-all.sh in rehearsal mode)"
-record named - "$VOL"   # the deploy creates it
 if deploy > "$RH_ROOT/deploy-1.log" 2>&1; then pass "first deploy (log: deploy-1.log)"; \
   else fail "first deploy (exit $?; see deploy-1.log)"; tail -30 "$RH_ROOT/deploy-1.log"; fi
 GROK1="$("$RT" ps -a --format '{{.Names}}' | grep -E "^$NAME-grok-[0-9]+$" | sort | tail -1)"
@@ -201,7 +178,7 @@ OLD_DIGEST="$(mig_digest "$OLD_VOL")"
 grep -q "digest=$OLD_DIGEST" "$RH_ROOT/marker-1.txt" \
   && pass "the marker's digest is the old volume's content (the copy verified exactly this source)" \
   || fail "marker digest != the old volume's digest $OLD_DIGEST"
-"$RT" volume create memora-rh-scratch >/dev/null && record named - memora-rh-scratch
+"$RT" volume create --label "$RUN_LABEL" memora-rh-scratch >/dev/null
 if once mig -v "$OLD_VOL:/from:ro" -v memora-rh-scratch:/to "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
      migrate_data_volume migrate "$OLD_VOL" >> "$RH_ROOT/commands.log" 2>&1 \
    && [ "$(vol_digest "$OLD_VOL")" = "$(vol_digest memora-rh-scratch)" ]; then
@@ -268,12 +245,12 @@ grep -q '^\.memora-previous-' "$RH_ROOT/volume-listing.txt" && pass "the replace
   || fail "no .memora-previous-* after the recopy"
 
 echo "== 3d. podman: run --rm deletes an unreferenced anonymous volume; the migration form does not"
-"$RT" run -d --name rh-helper-probe-$$ --entrypoint sleep "$IMAGE" 600 >/dev/null
+"$RT" run -d --name rh-helper-probe-$$ --label "$RUN_LABEL" --entrypoint sleep "$IMAGE" 600 >/dev/null
 PROBE="$(old_anon rh-helper-probe-$$)"
-record anon "$("$RT" inspect rh-helper-probe-$$ --format '{{.Id}}')" "$PROBE"
+record anon "$RUN_ID" "$("$RT" inspect rh-helper-probe-$$ --format '{{.Id}}')" "$PROBE"
 "$RT" exec rh-helper-probe-$$ sh -c 'echo precious > /data/p'
 "$RT" rm -f rh-helper-probe-$$ >/dev/null   # the container goes, its volume stays (no -v)
-"$RT" volume create memora-rh-scratch2 >/dev/null && record named - memora-rh-scratch2
+"$RT" volume create --label "$RUN_LABEL" memora-rh-scratch2 >/dev/null
 once mig2 -v "$PROBE:/from:ro" -v memora-rh-scratch2:/to "$IMAGE" sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" \
   migrate_data_volume migrate "$PROBE" >> "$RH_ROOT/commands.log" 2>&1
 "$RT" volume exists "$PROBE" && pass "the migration form (named container + plain rm) keeps an unreferenced source volume" \
@@ -326,17 +303,36 @@ done
 grep -l "$HEALTH_TOKEN\|$ADMIN_TOKEN" "$RH_ROOT"/fixtures/*.json && fail "a token survived the redaction" \
   || pass "inspect samples saved without token values"
 
-echo "== 6. the cleanup removes only what it recorded (review 7725 P2)"
-"$RT" volume create memora-rh-decoy >/dev/null                      # a name the ledger never saw
-"$RT" run -d --name rh-helper-other-$$ --entrypoint sleep "$IMAGE" 600 >/dev/null
-OTHER="$(old_anon rh-helper-other-$$)"                                  # anonymous, used by ANOTHER container
-cleanup_volume named - memora-rh-decoy >/dev/null
-cleanup_volume anon "not-this-container" "$OTHER" >/dev/null
-cleanup_volume anon - "$VOL" >/dev/null                                # the named data volume is not anonymous
-"$RT" volume exists memora-rh-decoy && "$RT" volume exists "$OTHER" && "$RT" volume exists "$VOL" \
-  && pass "cleanup kept an unrecorded name, an anonymous volume used by another container, and a named volume passed as anonymous" \
-  || fail "cleanup removed a volume it must keep"
-"$RT" rm -f rh-helper-other-$$ >/dev/null; "$RT" volume rm "$OTHER" memora-rh-decoy >/dev/null
+echo "== 6. the cleanup: labelled with a recorded run AND the expected name, nothing else (7725, 7729)"
+DL="$RH_ROOT/decoy-ledger.txt"; S="rh-decoyrun-$RUN_ID"
+echo "run $S $(date +%s)" > "$DL"
+"$RT" run -d --name rh-helper-pos-$$ --label "memora.rehearsal=$S" --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null
+"$RT" volume create --label "memora.rehearsal=$S" memora-rh-scratch9 >/dev/null            # control: removed
+"$RT" run -d --name rh-helper-backup --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null   # unlabelled: kept
+"$RT" volume create --label memora.rehearsal=another-run memora-rh-scratch8 >/dev/null   # another run's: kept
+"$RT" run -d --name not-a-rehearsal-name-$$ --label "memora.rehearsal=$S" --tmpfs /data --entrypoint sleep "$IMAGE" 600 >/dev/null  # our label, wrong name: kept
+cleanup_ledger "$DL" >> "$RH_ROOT/commands.log"
+exists_c() { "$RT" container exists "$1"; }
+! exists_c rh-helper-pos-$$ && ! "$RT" volume exists memora-rh-scratch9 \
+  && pass "cleanup removed the container and volume labelled with its recorded run (control)" \
+  || fail "cleanup did not remove its own labelled container/volume"
+exists_c rh-helper-backup && "$RT" volume exists memora-rh-scratch8 && exists_c not-a-rehearsal-name-$$ \
+  && pass "cleanup kept an unlabelled rh-helper-backup, a volume labelled by another run, and a labelled container with an unexpected name" \
+  || fail "cleanup removed something it must keep"
+"$RT" rm -f rh-helper-backup not-a-rehearsal-name-$$ >/dev/null; "$RT" volume rm memora-rh-scratch8 >/dev/null  # this step's decoys
+# An anonymous volume recorded with a run whose window it was NOT created in
+# is kept, even though its (labelled, rightly named) container goes.
+DL2="$RH_ROOT/decoy-ledger2.txt"; S2="rh-decoywin-$RUN_ID"
+echo "run $S2 $(( $(date +%s) + 3600 ))" > "$DL2"
+"$RT" run -d --name rh-helper-anon-$$ --label "memora.rehearsal=$S2" --entrypoint sleep "$IMAGE" 600 >/dev/null
+AV="$(old_anon rh-helper-anon-$$)"
+echo "anon $S2 $("$RT" inspect rh-helper-anon-$$ --format '{{.Id}}') $AV" >> "$DL2"
+cleanup_ledger "$DL2" >> "$RH_ROOT/commands.log"
+! exists_c rh-helper-anon-$$ && "$RT" volume exists "$AV" \
+  && pass "cleanup kept an anonymous volume created outside its recorded run's window" \
+  || fail "the anonymous-volume time window was not enforced"
+"$RT" volume rm "$AV" >/dev/null 2>&1   # this step's decoy
+record end "$RUN_ID" "$(date +%s)"
 
 echo
 echo "== summary: $(grep -c '^PASS' "$RESULTS") passed, $FAILS failed ($RESULTS)"

@@ -14,14 +14,30 @@ ssh server2 'cd ~/verify/feat-r1-rehearsal && PYTHON=~/verify/venv312/bin/python
 Everything it creates is suffixed `-rh`: the container `memora-rh`, the
 volume `memora-rh-data`, the image `memora-rh:latest`, port 18920. State lives
 under `~/rehearsal-r1` (`results.txt`, `commands.log`, `deploy-*.log`,
-`fixtures/`). A rerun removes only what an earlier run recorded, and it never prunes.
-- The volume ledger records each anonymous volume with the ID of the
-  container that created it.
-- An anonymous volume is removed only when it is 64-hex, the runtime flags
-  it anonymous, and no container other than the recorded one uses it.
-- A named volume is removed only when it is one of the rehearsal's own
-  `-rh` names.
-- Step 6 checks that decoys survive.
+`fixtures/`). The cleanup never removes anything by name alone, and it never prunes
+(reviews 7725 and 7729).
+- **Labels.** Every run gets a run id. Every container and volume it
+  creates carries `--label memora.rehearsal=<run id>`: helpers, the old and
+  probe containers, and the scratch volumes. The deploy's own container,
+  volume and migrator get it too, through `DEPLOY_LABELS`, which is honoured
+  only under `DEPLOY_REHEARSAL=1` and must carry the label there.
+- **The ledger** (`~/rehearsal-r1/ledger.txt`) records `run ID START`,
+  `end ID END` and `anon ID CONTAINER_ID VOLUME`.
+- **Removal (`scripts/rehearse_cleanup.sh`).**
+  - A container or labelled volume is removed only when its label is a run
+    id from the ledger AND its name matches the rehearsal pattern.
+  - The image's anonymous `/data` volumes cannot be labelled when they are
+    created. One is removed only when all of these hold:
+    - it is recorded with its run and container;
+    - it is 64-hex and flagged anonymous by the runtime;
+    - no other container uses it;
+    - its `CreatedAt` falls inside that run's recorded window.
+- **Self-test.** `scripts/rehearse_cleanup_selftest.sh IMAGE` checks every
+  rule against the real runtime: a labelled control is removed, and eight
+  decoys survive. Among the decoys: an unlabelled container, another run's
+  volume, a labelled but unexpected name, a named volume with a 64-hex
+  name, and an anonymous volume from outside its window. Step 6 of the
+  rehearsal repeats this.
 
 ## The deploy script's rehearsal parameters
 

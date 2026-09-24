@@ -119,6 +119,7 @@ DEPLOY_CONFIG_DIR="${DEPLOY_CONFIG_DIR:-~/.config/memora}"   # expanded on the t
 DEPLOY_REPO="${DEPLOY_REPO:-~/repos/agentic-box/memora}"     # expanded on the target host
 DEPLOY_SKIP_CHECKOUT="${DEPLOY_SKIP_CHECKOUT:-0}"            # 1: build DEPLOY_REPO as it is
 DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed absorb in the smoke check
+DEPLOY_LABELS="${DEPLOY_LABELS:-}"                          # rehearsal only: k=v labels on what it creates
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -146,6 +147,7 @@ DEPLOY_REPO|DEPLOY_REPO|~/repos/agentic-box/memora
 DEPLOY_SKIP_CHECKOUT|DEPLOY_SKIP_CHECKOUT|0
 DEPLOY_SMOKE_ABSORB|DEPLOY_SMOKE_ABSORB|1
 DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
+DEPLOY_LABELS|DEPLOY_LABELS|
 DEFAULTS
 if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   RH_ROOT="${DEPLOY_REHEARSAL_ROOT:-}"
@@ -159,6 +161,7 @@ if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   under() { python3 -c 'import os, sys; r, p = map(os.path.realpath, sys.argv[1:]); sys.exit(0 if os.path.commonpath([r, p]) == r else 1)' "$1" "$2"; }
   under "$RH_ROOT" "$DEPLOY_CONFIG_DIR" || refuse "DEPLOY_CONFIG_DIR is not under $RH_ROOT"
   under "$RH_ROOT" "$ENV_FILE" || refuse "DEPLOY_ENV_FILE is not under $RH_ROOT"
+  case "$DEPLOY_LABELS" in *memora.rehearsal=?*) ;; *) refuse "DEPLOY_LABELS must carry memora.rehearsal=<run-id>" ;; esac
 elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
   echo "refused: ${OVERRIDDEN[*]} differ(s) from the production deploy; overrides are for rehearsals only" \
        "(DEPLOY_REHEARSAL=1, scripts/rehearse_deploy.sh) — nothing was done" >&2
@@ -183,13 +186,15 @@ else
 fi
 "${TARGET[@]}" "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER" \
   "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO" \
-  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" <<'REMOTE'
+  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" <<'REMOTE'
 set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
 MIGRATE_SCRIPT="$(printf '%s' "$3" | base64 -d)"
 RT="$4"; CONTAINER="$5"; DATA_VOLUME="$6"; IMAGE="$7"; PORT="$8"
 CONFIG_DIR="${9/#\~/$HOME}"; REPO_DIR="${10/#\~/$HOME}"; SKIP_CHECKOUT="${11}"; SMOKE_ABSORB="${12}"
+LABEL_ARGS=()   # rehearsal only (the guard allows DEPLOY_LABELS under DEPLOY_REHEARSAL=1 alone)
+for l in ${13:-}; do LABEL_ARGS+=(--label "$l"); done
 [ -n "$MIGRATE_SCRIPT" ] || { echo "empty /data migration program" >&2; exit 1; }
 TS=$(date +%s)
 # Keyed by registry store name (MEMORA_DATABASES); see the header for why.
@@ -264,7 +269,7 @@ OLD_VOLUME=$("$RT" inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Dest
 [ -n "$OLD_VOLUME" ] || { echo "could not read $CONTAINER's /data volume" >&2; exit 1; }
 # Created and checked BEFORE the stop, so a runtime that cannot create or
 # name it fails with memora-all still serving.
-"$RT" volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || "$RT" volume create "$DATA_VOLUME" >/dev/null
+"$RT" volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || "$RT" volume create ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} "$DATA_VOLUME" >/dev/null
 MOUNTED=$("$RT" volume inspect "$DATA_VOLUME" --format '{{.Name}}')
 if [ "$MOUNTED" != "$DATA_VOLUME" ] || printf '%s' "$MOUNTED" | grep -Eqx '[0-9a-f]{64}'; then
   echo "volume $DATA_VOLUME resolved to '$MOUNTED' — refusing to mount it at /data" >&2; exit 1
@@ -361,7 +366,7 @@ if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
   # rehearsal on server2). A plain `rm` never removes volumes, on either runtime;
   # --tmpfs /data keeps the image's VOLUME /data from leaving an anonymous one.
   MIGRATOR="$CONTAINER-migrate-$TS"
-  if ! "$RT" run --name "$MIGRATOR" --tmpfs /data -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" "$IMAGE" \
+  if ! "$RT" run --name "$MIGRATOR" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} --tmpfs /data -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" "$IMAGE" \
        sh -c "$MIGRATE_SCRIPT" migrate_data_volume migrate "$OLD_VOLUME"; then
     "$RT" rm "$MIGRATOR" >/dev/null 2>&1 || true
     echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — $CONTAINER is stopped, restart it with: $RT start $CONTAINER" >&2
@@ -372,7 +377,7 @@ fi
 
 "$RT" rename "$CONTAINER" "$CONTAINER-grok-$TS"
 
-"$RT" run -d --name "$CONTAINER" \
+"$RT" run -d --name "$CONTAINER" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} \
   --restart unless-stopped \
   --memory 960m --cpus 4 \
   -p "0.0.0.0:$PORT:8000" \
