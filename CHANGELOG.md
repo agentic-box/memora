@@ -14,6 +14,10 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.1
+
+Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
+
 ### E1: no implicit embedding rebuild; the fingerprint no longer includes the endpoint host
 - Production finding (nuc8 v0.5.0). After the M1 moved hosts (same Ollama bge-m3), every store's stored fingerprint mismatched, because it carried the embedding endpoint's host (`backend|model|host|repr`).
   - The first search on the seeded local `re` rebuilt all 238 embeddings.
@@ -25,11 +29,6 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - An absorb dry run (`memory_absorb(dry_run=True)`) loads its corpus without the backfill as well (`get_corpus_snapshot(read_only=True)`); a real absorb still backfills (review 7935).
 - The store's model is recorded by the write path: the first vector the current model computes records the fingerprint once (`record_embedding_model_once`, `INSERT OR IGNORE`, only when the vector's kind matches the backend). The per-process cache holds only a committed record (a rolled-back first write does not stop the next one). A store never audited, or with rows missing a vector, is searched without a warning.
 - The warning names the actual integrity reason instead of always "Embedding model changed".
-
-## 0.5.1
-
-Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
-
 
 ### Graph UI with a store selector, served by memora-all (G1)
 
