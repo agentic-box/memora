@@ -40,7 +40,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ### Reconcile: the evidence digest covers what was read, not when (RC1)
 
 - `reconcile --accept` could never accept an open D1 write intent
-  (production: bestation intent 53).
+  (production: beta intent 53).
   - Every `GET /admin/intents` re-gathers the evidence with a new
     `read_at`, and the evidence digest covered it, so the digest an
     operator quoted never matched the CLI's own re-read or the server's

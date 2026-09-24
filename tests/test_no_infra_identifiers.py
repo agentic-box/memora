@@ -226,7 +226,7 @@ def identifier_pattern(value: str) -> re.Pattern:
     end = r"(?![\w.-])"   # not followed by a word character, a dot or a hyphen (`re.compile`, `re-run`)
     ctx = [rf"[\"'`]{v}[\"'`]", rf"/{v}(?:\.db|\.env|/|{end})", rf"(?<![\w.]){v}\.(?:db|env|credentials)\b",
            rf"(?:--host|--store|freeze|thaw|seed|rollback|restore|cutover_store\.sh) {v}{end}",
-           rf"\bstore {v}{end}", rf"=\s*{v}{end}"]
+           rf"\bstore {v}{end}", rf"=\s*{v}{end}", rf"(?<![\w.-]){v}'s\b", rf"^\W*{v}: "]
     return re.compile("|".join(ctx))
 
 
@@ -249,6 +249,7 @@ def test_the_identifier_pattern_is_word_bounded_and_context_aware():
     short = identifier_pattern("io")
     assert short.search('{"io": "/data/io.db"}') and short.search("store io: ok")
     assert short.search("--host io") and not short.search("an io-bound step, io:")
+    assert short.search("holds io's primary lock") and short.search('"^io: 0 row(s)"')
     assert not short.search("x = io.open(p)") and not short.search("import json, io, sys")
     assert not short.search("disk/cpu/io-wait") and not short.search("a store io-runs it")
 

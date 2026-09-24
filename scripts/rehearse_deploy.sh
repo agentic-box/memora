@@ -266,8 +266,8 @@ code="$(graph_code /api/graph)"
 code="$(graph_code /graph/force "$GRAPH_TOKEN")"
 [ "$code" = 307 ] || [ "$code" = 302 ] && pass "graph /graph/force redirects to the force-graph view with the token ($code)" \
   || fail "graph /graph/force with the token answered $code"
-[ "$(graph_code "/api/memories?db=ob1" "$GRAPH_TOKEN")" = 200 ] && pass "graph /api/memories?db=ob1 answers with the token" \
-  || fail "graph /api/memories?db=ob1 with the token"
+[ "$(graph_code "/api/memories?db=alpha" "$GRAPH_TOKEN")" = 200 ] && pass "graph /api/memories?db=alpha answers with the token" \
+  || fail "graph /api/memories?db=alpha with the token"
 rm -f "$RH_ROOT/graph-body.txt"
 # REL1: the Cloudflare tokens are files of a read-only mount; the container's
 # configuration carries only their paths.
@@ -435,35 +435,35 @@ done
 [ "$LOGGED" = 1 ] && pass "the write was logged: lag_rows 0, log cursor moved (no D1 involved)" \
   || fail "log mode did not catch up: $(cat "$RH_ROOT/health-re2.json")"
 check "remove the tool's token files" "$RT" exec "$NAME" rm -rf "$SHM"
-# v0.5.1 hotfix: a deploy while the RUNNING container holds re as a live
+# v0.5.1 hotfix: a deploy while the RUNNING container holds gamma as a live
 # local primary (its primary lock and WAL) -- production's case. The
-# import_attempt preflight must read re read-only, not take its writer lock.
-if deploy > "$RH_ROOT/deploy-5.log" 2>&1; then pass "deploy 5 while re is a live local primary of the running container"; \
+# import_attempt preflight must read gamma read-only, not take its writer lock.
+if deploy > "$RH_ROOT/deploy-5.log" 2>&1; then pass "deploy 5 while gamma is a live local primary of the running container"; \
   else fail "deploy 5 (exit $?; see deploy-5.log)"; tail -30 "$RH_ROOT/deploy-5.log"; fi
 adopt NEW5_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
-grep -q "^re: 0 row(s) with import_attempt in metadata" "$RH_ROOT/deploy-5.log" \
-  && pass "the preflight read the live primary re without its writer lock" \
-  || fail "deploy 5's preflight did not read re (see deploy-5.log)"
+grep -q "^gamma: 0 row(s) with import_attempt in metadata" "$RH_ROOT/deploy-5.log" \
+  && pass "the preflight read the live primary gamma without its writer lock" \
+  || fail "deploy 5's preflight did not read gamma (see deploy-5.log)"
 
 echo "== 4c. the embedding preflight (E1b) refuses a store that would refuse searches, before the stop"
-check "record a different dense model on bestation (its vectors are tfidf)" "$RT" exec "$NAME" python -c '
+check "record a different dense model on beta (its vectors are tfidf)" "$RT" exec "$NAME" python -c '
 import sqlite3
-db = sqlite3.connect("/data/bestation.db")
+db = sqlite3.connect("/data/beta.db")
 db.execute("INSERT OR REPLACE INTO memories_meta (key, value) VALUES (?, ?)", ("embedding_model", "openai|bge-m3|dense:1024"))
 db.commit()'
 RUNNING_ID="$("$RT" inspect "$NAME" --format '{{.Id}}')"
 if deploy > "$RH_ROOT/deploy-6.log" 2>&1; then fail "deploy 6 was not refused"; \
   else grep -q "embedding preflight refused" "$RH_ROOT/deploy-6.log" \
     && pass "deploy 6 refused by the embedding preflight" || fail "deploy 6 failed otherwise (see deploy-6.log)"; fi
-grep -q "store 'bestation' would refuse semantic search" "$RH_ROOT/deploy-6.log" \
-  && pass "the refusal names bestation and its fix" || fail "the refusal does not name bestation"
+grep -q "store 'beta' would refuse semantic search" "$RH_ROOT/deploy-6.log" \
+  && pass "the refusal names beta and its fix" || fail "the refusal does not name beta"
 [ "$("$RT" inspect "$NAME" --format '{{.Id}} {{.State.Running}}')" = "$RUNNING_ID true" ] \
   && pass "the running container was not touched (same ID, still running)" || fail "deploy 6 touched the running container"
 [ -z "$("$RT" ps -a -q --filter "name=$NAME-embedpf-")" ] \
   && pass "the preflight container was removed" || fail "an embedding preflight container was left behind"
 check "remove the recorded model again" "$RT" exec "$NAME" python -c '
 import sqlite3
-db = sqlite3.connect("/data/bestation.db")
+db = sqlite3.connect("/data/beta.db")
 db.execute("DELETE FROM memories_meta WHERE key = ?", ("embedding_model",))
 db.commit()'
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"

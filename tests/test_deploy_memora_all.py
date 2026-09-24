@@ -1122,7 +1122,7 @@ class TestEmbeddingPreflight:
 
     def test_the_preflight_cannot_swallow_the_rest_of_the_deploy(self, deploy):
         """podman's `start -a` reads stdin; the remote script IS bash's stdin
-        (rehearsal on server2): without `< /dev/null` the deploy ended there."""
+        (rehearsal on build-host): without `< /dev/null` the deploy ended there."""
         proc, calls, _ = deploy()
         assert any(c[:2] == ["run", "-d"] for c in calls), proc.stderr[-800:]
         assert ["rm", "pf0123456789"] in calls

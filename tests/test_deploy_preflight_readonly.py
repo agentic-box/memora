@@ -35,7 +35,7 @@ other = storage.backend_for("other").connect()
 schema.ensure_schema(other)
 other.commit()
 other.close()
-conn = storage.backend_for("re").connect()        # memora-all's writer: primary lock + WAL
+conn = storage.backend_for("gamma").connect()        # memora-all's writer: primary lock + WAL
 schema.ensure_schema(conn)
 conn.commit()
 conn.execute("INSERT INTO memories (content, metadata) VALUES ('held', ?)", (sys.argv[1],))
@@ -47,11 +47,11 @@ time.sleep(60)
 
 @pytest.fixture
 def live_primary(tmp_path):
-    """`re` as a live local primary (in MEMORA_REPLICAS) plus a plain local
-    store; a holder process owns re's primary lock and keeps its WAL open."""
-    reg = {"re": str(tmp_path / "re.db"), "other": str(tmp_path / "other.db")}
+    """`gamma` as a live local primary (in MEMORA_REPLICAS) plus a plain local
+    store; a holder process owns gamma's primary lock and keeps its WAL open."""
+    reg = {"gamma": str(tmp_path / "gamma.db"), "other": str(tmp_path / "other.db")}
     env = dict(os.environ, MEMORA_DATABASES=json.dumps(reg), MEMORA_DEFAULT_DB="other",
-               MEMORA_REPLICAS=json.dumps({"re": "d1://acct/re"}), MEMORA_DATA_DIR=str(tmp_path / "data"),
+               MEMORA_REPLICAS=json.dumps({"gamma": "d1://acct/gamma"}), MEMORA_DATA_DIR=str(tmp_path / "data"),
                PYTHONPATH=str(REPO), PYTHONDONTWRITEBYTECODE="1")
     env.pop("MEMORA_REPLICATION", None)
     procs = []
@@ -77,10 +77,10 @@ def live_primary(tmp_path):
 def test_a_live_primary_is_inspected_without_its_writer_lock(live_primary):
     start, preflight, tmp = live_primary
     start()
-    assert Path(f"{tmp / 're.db'}.primary-lock").exists()
+    assert Path(f"{tmp / 'gamma.db'}.primary-lock").exists()
     out = preflight(_preflight_program(SCRIPT.read_text()))
     assert out.returncode == 0, out.stderr
-    assert "re: 0 row(s) with import_attempt in metadata" in out.stdout
+    assert "gamma: 0 row(s) with import_attempt in metadata" in out.stdout
     assert "other: 0 row(s) with import_attempt in metadata" in out.stdout
 
 
@@ -89,7 +89,7 @@ def test_an_import_attempt_row_in_the_live_primary_is_still_refused(live_primary
     start(json.dumps({"import_attempt": {"id": "x"}}))
     out = preflight(_preflight_program(SCRIPT.read_text()))
     assert out.returncode != 0
-    assert "re: 1 row(s) with import_attempt in metadata" in out.stdout
+    assert "gamma: 1 row(s) with import_attempt in metadata" in out.stdout
     assert "rows the startup sweep could complete or remove" in out.stderr
 
 

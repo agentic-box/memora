@@ -157,7 +157,7 @@ DECISIONS = ("applied", "not-applied")
 # rule's version, the status, the query, the rows, the row count and
 # served_by_primary. read_at and a waiting intent's eligible_in_s change on
 # every gather -- including them made the digest change on every GET, so no
-# operator decision could ever match (bestation intent 53). Evidence is
+# operator decision could ever match (beta intent 53). Evidence is
 # gathered on every GET, and accept_intent gathers it AGAIN (reads D1) at
 # POST time: the decision is judged against D1 as it is when accepted, so a
 # real change between show and accept is refused even on a direct POST.

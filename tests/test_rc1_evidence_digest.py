@@ -1,5 +1,5 @@
 """RC1 (leader 8063): the reconcile evidence digest covers the evidence's
-CONTENT, not the time it was read. Production: bestation intent 53 could
+CONTENT, not the time it was read. Production: beta intent 53 could
 never be accepted -- every GET /admin/intents re-gathers the evidence with a
 new read_at, so the digest the operator quoted never matched."""
 from __future__ import annotations

@@ -171,7 +171,7 @@ def test_the_preflight_probes_the_dense_dimension(reg, monkeypatch):
 
 
 def test_the_preflight_reads_a_live_primary_whose_lock_another_process_holds(reg, monkeypatch):
-    """memora-all holds re's primary lock while the preflight runs beside it."""
+    """memora-all holds gamma's primary lock while the preflight runs beside it."""
     holder = subprocess.Popen(
         [sys.executable, "-c", "import sys, time; sys.path.insert(0, sys.argv[2]); from memora import backends; "
          "backends.acquire_primary_lock(sys.argv[1]); print('held', flush=True); time.sleep(60)",
@@ -205,7 +205,7 @@ def test_the_preflight_reads_a_d1_store_with_the_read_token(tmp_path, monkeypatc
     db.close()
     monkeypatch.setattr(backends.D1SelectOnlyConnection, "_post", lambda self, body: replica.reader_post(body))
     monkeypatch.setenv("MEMORA_D1_READ_TOKEN", "read-token")
-    s = ep.run("tfidf", registry={"bestation": "d1://acct/db1"})["stores"]["bestation"]
+    s = ep.run("tfidf", registry={"beta": "d1://acct/db1"})["stores"]["beta"]
     assert s["ok"] and s["state"] == "recorded model matches", s  # the old host is ignored (E1)
 
 
@@ -275,7 +275,7 @@ def test_the_preflight_is_never_green_where_the_search_refuses_orphans(reg, tmp_
         db.close()
         monkeypatch.setattr(backends.D1SelectOnlyConnection, "_post", lambda self, body: replica.reader_post(body))
         monkeypatch.setenv("MEMORA_D1_READ_TOKEN", "read-token")
-        s = ep.run("tfidf", registry={"bestation": "d1://acct/db1"})["stores"]["bestation"]
+        s = ep.run("tfidf", registry={"beta": "d1://acct/db1"})["stores"]["beta"]
     assert s["ok"] is False and s["integrity"] == "orphan_embeddings" and "search would refuse" in s["state"], s
 
 
