@@ -206,7 +206,11 @@ def operator_identifiers() -> List[Tuple[str, str]]:
     if ids.exists():
         found += [("identifiers.local", line.strip()) for line in ids.read_text().splitlines()
                   if line.strip() and not line.startswith("#")]
-    return [(src, v) for src, v in found if v and v.lower() not in NEUTRAL]
+    # A value the tracked template itself carries (a copy of
+    # wrangler.toml.example, say) is public by definition.
+    template = (REPO / "memora-graph" / "wrangler.toml.example").read_text()
+    return [(src, v) for src, v in found
+            if v and v.lower() not in NEUTRAL and not identifier_pattern(v).search(template)]
 
 
 def identifier_pattern(value: str) -> re.Pattern:

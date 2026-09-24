@@ -92,6 +92,15 @@ check_cloudflare_login() {
 }
 
 # Create D1 database
+# wrangler.toml is the operator's and git-ignored (CFG1): start it from the
+# template only at the point something is about to be written into it.
+ensure_wrangler_toml() {
+    if [ ! -f "$PROJECT_DIR/wrangler.toml" ]; then
+        cp "$PROJECT_DIR/wrangler.toml.example" "$PROJECT_DIR/wrangler.toml"
+        print_success "Created wrangler.toml from wrangler.toml.example (fill in your ids)"
+    fi
+}
+
 setup_d1_database() {
     print_step "Setting up D1 database..."
 
@@ -112,6 +121,7 @@ setup_d1_database() {
             print_success "Database created with ID: $DB_ID"
 
             # Update wrangler.toml with the new database ID
+            ensure_wrangler_toml
             if grep -q "database_id" "$PROJECT_DIR/wrangler.toml"; then
                 sed -i "s/database_id = \"[^\"]*\"/database_id = \"$DB_ID\"/" "$PROJECT_DIR/wrangler.toml"
                 print_success "Updated wrangler.toml with database ID"
@@ -145,6 +155,7 @@ deploy_worker() {
         print_success "Worker deployed to: $WORKER_URL"
 
         # Update wrangler.toml with worker URL
+        ensure_wrangler_toml
         if grep -q "WS_WORKER_URL" "$PROJECT_DIR/wrangler.toml"; then
             sed -i "s|WS_WORKER_URL = \"[^\"]*\"|WS_WORKER_URL = \"$WORKER_URL\"|" "$PROJECT_DIR/wrangler.toml"
             print_success "Updated wrangler.toml with worker URL"
@@ -283,11 +294,6 @@ main() {
     echo "================================="
 
     check_prerequisites
-    # wrangler.toml is the operator's and git-ignored (CFG1): start from the template.
-    if [ ! -f "$PROJECT_DIR/wrangler.toml" ]; then
-        cp "$PROJECT_DIR/wrangler.toml.example" "$PROJECT_DIR/wrangler.toml"
-        print_success "Created wrangler.toml from wrangler.toml.example (fill in your ids)"
-    fi
     install_dependencies
     check_cloudflare_login
     setup_d1_database
