@@ -816,7 +816,7 @@ def _write_embedding_integrity(
     *,
     lease_owner: Optional[str] = None,
 ) -> None:
-    value = json.dumps(data, ensure_ascii=False, sort_keys=True)
+    value = integrity_stamp_value(data)
     if lease_owner is None:
         _meta_set(conn, _INTEGRITY_KEY, value)
     else:
@@ -1359,6 +1359,13 @@ def _stamp_integrity_audit(
     lease_owner: Optional[str] = None,
 ) -> None:
     """Persist a completed SQL audit as a drift baseline, never as live truth."""
+    _write_embedding_integrity(conn, integrity_stamp(audit, stored), lease_owner=lease_owner)
+    conn.commit()
+
+
+def integrity_stamp(audit: Dict[str, Any], stored: Optional[str]) -> Dict[str, Any]:
+    """The stamp _stamp_integrity_audit writes for an audit (the operator's
+    `restamp`, L6, sends exactly this value as its one D1 write)."""
     import uuid
     stamped = dict(audit)
     stamped.update({
@@ -1367,8 +1374,12 @@ def _stamp_integrity_audit(
         "generation": str(uuid.uuid4()),
         "state": "initialized",
     })
-    _write_embedding_integrity(conn, stamped, lease_owner=lease_owner)
-    conn.commit()
+    return stamped
+
+
+def integrity_stamp_value(stamped: Dict[str, Any]) -> str:
+    """The memories_meta value _write_embedding_integrity stores."""
+    return json.dumps(stamped, ensure_ascii=False, sort_keys=True)
 
 
 def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], current_model: str) -> bool:

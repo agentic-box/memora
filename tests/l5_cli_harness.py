@@ -24,10 +24,26 @@ def main() -> int:
 
     mode = os.environ.get("L5_TEST_D1_WRITES", "")
 
+    from memora.sql_classify import READ, classify_statement
+
+    def run(sql, params):
+        db = replica._db()
+        try:
+            cur = db.execute(sql, tuple(params or ()))
+            rows = [dict(r) for r in cur.fetchall()] if cur.description else []
+            db.commit()
+            return {"success": True, "result": [{"results": rows, "success": True,
+                                                  "meta": {"changes": max(cur.rowcount, 0),
+                                                           "served_by_primary": True}}]}
+        finally:
+            db.close()
+
     def d1_send(self, sql, params=None):
-        # Only the operator writer may reach here, and only when a test asks:
-        # "apply" runs the statement on the FakeReplica file, "reject" fails
-        # like D1 would. Otherwise any D1 write is a test failure.
+        # A D1Connection read (the read-only integrity audit, L6) is served
+        # from the FakeReplica. A write only when a test asks: "apply" runs
+        # it, "reject" fails like D1 would; otherwise it is a test failure.
+        if classify_statement(sql).kind == READ:
+            return run(sql, params)
         if mode == "apply":
             db = replica._db()
             try:

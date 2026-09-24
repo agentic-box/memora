@@ -520,6 +520,7 @@ class FreezeServer:
         self.intents = {"state": "frozen", "open_intents": []}  # GET /admin/intents/<db>
         self.reconcile_bodies = []                              # POST /admin/reconcile/<db>/<id>
         self.reconcile_status = 200
+        self.health_extra = {}  # merged into /health/db (e.g. {"journal": ...} for a d1:// store)
         self.health = list(health or [])
         self.post_status = post_status
         self.delete_status = delete_status
@@ -545,7 +546,8 @@ class FreezeServer:
                     if server.state == "open":
                         return self._reply(200, {"status": "ok", "freeze": {"state": "open", "in_flight": 0, "open_intents": []}})
                     fr = server.health.pop(0) if len(server.health) > 1 else (server.health[0] if server.health else None)
-                    return self._reply(200, {"status": "ok", "freeze": fr or {"state": "frozen", "in_flight": 0, "open_intents": []}})
+                    return self._reply(200, {"status": "ok", **server.health_extra,
+                                             "freeze": fr or {"state": "frozen", "in_flight": 0, "open_intents": []}})
                 if path == f"/admin/freeze/{server.db}" and self.command == "POST":
                     if server.post_status == 200:
                         server.state = "frozen"

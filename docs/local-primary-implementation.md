@@ -1243,6 +1243,56 @@ lines.
 
 A test drains under the freeze.
 
+**As built in L6 (piece b)**: `memora/rollback.py`, run by hand as
+`local_primary.py rollback <db> --phase drain|verify|finish --store P`. The
+operator does the deployment actions (stop, repoint, start) between the
+phases; every step boundary is checked. The state is
+`<out-dir>/<db>/rollback-state.json`, bound to the store and its D1
+identity.
+- **`drain`** (memora-all live), steps 1-2:
+  - Places the freeze, or keeps the operator's.
+  - Waits until `last_acked_seq >= head`, re-checking the freeze on every
+    poll. The replicator drains through its gate-exempt writer; a test
+    drains a store named in `MEMORA_READONLY_DBS`.
+  - Past `--drain-timeout` it refuses and leaves the freeze in place.
+  - Then the operator stops memora-all.
+- **`verify`** (memora-all stopped: `docker inspect` State.Running=false,
+  re-checked at every boundary), steps 3-7:
+  - It requires the drain phase and a drained store file.
+  - Step 3: a verified export and receipt.
+  - Step 4: a barrier compare, recorded under the primary lock. Any diff
+    HALTS. Nothing on D1 is changed or deleted (P7): keys present only on
+    D1 are listed as deletions a human must decide.
+  - Step 5: the §4 sequence high-water, through L5's allow-listed operator
+    writer. A HALT stops.
+  - Step 6: `verify_embedding_integrity(stamp=False)` against D1, through a
+    D1Connection holding the read token and marked read-only, so any
+    mutation is refused before it is sent. The audit must equal the same
+    audit of the local store's `.backup`; the reps, missing, orphan and
+    unknown ids, and the counts are compared.
+  - Step 7: `recheck`. A fresh export is accepted only when `sqlite_sequence`
+    alone moved, and only after step 5 sent an UPDATE.
+  - It then prints the repoint: `MEMORA_DATABASES[<db>] =
+    d1://<account>/<database>`, and the store removed from `MEMORA_REPLICAS`
+    in memora-all's own configuration. (L8's `repoint_mcp_config.py` is for
+    client configurations, not this.)
+- **`finish`** (repointed and started), step 9:
+  - The store must be served from D1: `/health/db` shows its intent
+    journal and no replication block.
+  - The freeze must be in place with nothing in flight.
+  - Then it lifts the freeze.
+- **`restamp <db> --receipt R --store P --credential-file C`** (write
+  path 4, never automatic):
+  - It requires the rollback's verify phase and a freeze.
+  - It rechecks a fresh receipt.
+  - It audits D1 read-only, then sends exactly ONE statement through the
+    operator writer: `INSERT INTO memories_meta (key, value) VALUES (?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value` with the key
+    `embedding_integrity`. The allow-list refuses any other key or
+    statement.
+  - The value is `embeddings.integrity_stamp`, the same stamp
+    `verify_embedding_integrity(stamp=True)` writes. It is read back.
+
 ## 6. Writer freeze checklist
 
 Verified D1 write paths (grep of the repo, including `memora-graph/`, at
@@ -1670,4 +1720,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (t) a memory whose `images` field keeps changing between the upload and the swap stays `images_pending` until a later startup or thaw sweep: conservative by design, since the swap never overwrites a newer `images` (L4 review 7614 P2) | L9 | add a metric for rows left `images_pending` |
 | (u) `_absorb_link`'s fixed savepoint name assumes `add_link` never opens a same-named nested savepoint (L4 review 7614 P2) | L5 | **done in L5 piece a**: `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection, and `add_link`'s docstring records the constraint |
 | (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |
-| (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | with L6 piece b |
+| (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | **done in L6 piece b**: each memory group lists `inbound_refs` (the memories whose crossrefs point at it, per side, and whether they are conflict groups); the apply report and `--dry-run` list `dangling_references` for the chosen sides (a warning) |

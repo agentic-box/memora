@@ -790,6 +790,10 @@ def seed(db: str, receipt_path: str, out: Path, deps: Deps, out_dir: Path, *,
 # ------------------------------------------------------------------ sequence high-water on D1 (§4, H7)
 
 SEQ_UPDATE_SQL = "UPDATE sqlite_sequence SET seq = ? WHERE name = ? AND seq < ?"
+# `restamp` (write path 4, §5.3/§8): one memories_meta row, embedding_integrity.
+RESTAMP_SQL = ("INSERT INTO memories_meta (key, value) VALUES (?, ?) "
+               "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+RESTAMP_KEY = "embedding_integrity"
 
 
 class OperatorD1Writer:
@@ -803,21 +807,25 @@ class OperatorD1Writer:
     # _build_statements and accepted by its P2 _check_statement, nothing else.
     RESTORE_SHAPES = frozenset({"upsert", "insert", "delete"})
 
-    def __init__(self, conn, *, allow_restore: bool = False):
+    def __init__(self, conn, *, allow_restore: bool = False, allow_restamp: bool = False):
         self.conn = conn  # backends.D1Connection (or a test double with _send)
         self.allow_restore = allow_restore
+        self.allow_restamp = allow_restamp
         self.sent: List[Tuple[str, tuple]] = []
 
     @classmethod
     def from_credential_file(cls, account_id: str, database_id: str, path: str, *,
-                             allow_restore: bool = False) -> "OperatorD1Writer":
+                             allow_restore: bool = False, allow_restamp: bool = False) -> "OperatorD1Writer":
         from .backends import D1Connection
 
-        return cls(D1Connection(account_id, database_id, load_credential_file(path)), allow_restore=allow_restore)
+        return cls(D1Connection(account_id, database_id, load_credential_file(path)), allow_restore=allow_restore,
+                   allow_restamp=allow_restamp)
 
-    def _allowed(self, sql: str) -> bool:
+    def _allowed(self, sql: str, params: tuple = ()) -> bool:
         if sql in self.ALLOWED:
             return True
+        if self.allow_restamp and sql == RESTAMP_SQL:
+            return len(params) == 2 and params[0] == RESTAMP_KEY
         if not self.allow_restore:
             return False
         from .replicator import ReplicatorStatementError, _check_statement
@@ -828,7 +836,7 @@ class OperatorD1Writer:
             return False
 
     def send(self, sql: str, params: tuple) -> Dict[str, Any]:
-        if not self._allowed(sql):
+        if not self._allowed(sql, tuple(params)):
             raise L5Refused(f"statement not on the operator allow-list: {sql[:80]}")
         self.sent.append((sql, tuple(params)))
         return self.conn._send(sql, tuple(params))
@@ -1143,7 +1151,66 @@ def build_conflicts(snapshot_db: Path, d1_db: Path, columns: Dict[str, List[str]
         groups.append({"group": gid, "keys": [{"table": t, "pk": list(pk)} for t, pk in keys],
                        "snapshot_rows": _group_rows(snap, tables, keys), "d1_rows": d1_rows,
                        "d1_preimage_sha256": _group_digest(d1_rows)})
+    _annotate_inbound_refs(groups, snap, d1)
     return groups
+
+
+def _crossref_targets(related: Any) -> List[int]:
+    """The memory ids a memories_crossrefs.related value points at (a JSON
+    list of ids or of {"id": ...} objects)."""
+    try:
+        items = json.loads(related) if isinstance(related, str) else (related or [])
+    except ValueError:
+        return []
+    out = []
+    for it in items if isinstance(items, list) else []:
+        mid = it.get("id") if isinstance(it, dict) else it
+        if isinstance(mid, int) and not isinstance(mid, bool):
+            out.append(mid)
+    return out
+
+
+def _annotate_inbound_refs(groups: List[Dict[str, Any]], snap: Dict[str, Dict], d1: Dict[str, Dict]) -> None:
+    """§9 (w): per memory group, the memories whose crossrefs point at it on
+    either side, so the operator sees the dependencies between groups
+    (conflicting choices can leave a stale reference)."""
+    refs: Dict[int, set] = {}
+    for side_name, side in (("snapshot", snap), ("d1", d1)):
+        for row in side.get("memories_crossrefs", {}).values():
+            for target in _crossref_targets(row.get("related")):
+                if target != row.get("memory_id"):
+                    refs.setdefault(target, set()).add((int(row["memory_id"]), side_name))
+    gids = {g["group"] for g in groups}
+    for g in groups:
+        kind, _, ident = g["group"].partition(":")
+        if kind != "memory":
+            continue
+        g["inbound_refs"] = [{"from": f"memory:{src}", "side": side, "from_is_conflict": f"memory:{src}" in gids}
+                             for src, side in sorted(refs.get(int(ident), ()))]
+
+
+def dangling_references(conflicts: Dict[str, Any], sel: Dict[str, str]) -> List[Dict[str, Any]]:
+    """With these choices, the crossrefs that would point at a memory the
+    chosen side does not have (a warning for the operator, §9 (w))."""
+    groups = {g["group"]: g for g in conflicts["groups"]}
+
+    def chosen_rows(g):
+        return g["snapshot_rows"] if sel[g["group"]] == "snapshot" else g["d1_rows"]
+
+    out = []
+    for gid, g in groups.items():
+        if not gid.startswith("memory:") or any(r["table"] == "memories" for r in chosen_rows(g)):
+            continue
+        target = int(gid.split(":", 1)[1])
+        for ref in g.get("inbound_refs", []):
+            src = groups.get(ref["from"])
+            if src is None:  # not a conflict: the same crossref on both sides, it stays
+                out.append({"from": ref["from"], "to": gid})
+                continue
+            rows = [r for r in chosen_rows(src) if r["table"] == "memories_crossrefs"]
+            if any(target in _crossref_targets(r["row"].get("related")) for r in rows):
+                out.append({"from": ref["from"], "to": gid})
+    return sorted({(d["from"], d["to"]): d for d in out}.values(), key=lambda d: (d["to"], d["from"]))
 
 
 def _fetch_snapshot(r2, key: str, work: Path) -> Tuple[Path, str]:
@@ -1351,7 +1418,8 @@ def restore_apply(db: str, conflicts_path: str, approve_path: str, receipt_path:
     report: Dict[str, Any] = {"conflicts_sha256": csha, "attempt": attempt, "receipt": str(used),
                               "d1_groups": sorted(g for g, v in sel.items() if v == "d1"),
                               "statements": {g: plan[g] for g in sorted(plan)}, "dry_run": dry_run,
-                              "delete_guard": halt or "within bounds"}
+                              "delete_guard": halt or "within bounds",
+                              "dangling_references": dangling_references(conflicts, sel)}
     if dry_run:
         report["local"] = (f"would be rebuilt from a fresh verified export of D1 into {out} "
                            f"(the old store moved aside)")

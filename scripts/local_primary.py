@@ -16,6 +16,8 @@ this file only parses arguments and builds the dependencies.
   reconcile <db> [--accept ID --receipt R --operator NAME --decision applied|not-applied --evidence-sha256 X]
   resume  <db> --store /data/<db>.db [--accept-d1-epoch N | --allow-deletes ATTEMPT]   (memora-all stopped)
   compare <db> --mode barrier|nightly|log --store P   §5.2 compare; report; record (exit 5 diff, 6 skipped)
+  rollback <db> --phase drain|verify|finish --store P   §5.3 runbook (stop memora-all before verify)
+  restamp <db> --receipt R --credential-file C          write path 4: one embedding_integrity row on D1
   thaw    <db>              lift the freeze -- the only command that does
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
@@ -150,6 +152,17 @@ def _parser() -> argparse.ArgumentParser:
     cp.add_argument("--no-record", action="store_true", help="write the report only")
     cp.add_argument("--brief-freeze", action="store_true",
                     help="barrier (the weekly job): place the freeze if none is in place and lift only that one")
+    rb = sub.add_parser("rollback", help="§5.3 rollback runbook, in three phases")
+    common(rb)
+    rb.add_argument("--phase", required=True, choices=("drain", "verify", "finish"))
+    rb.add_argument("--store", required=True, help="the local store file")
+    rb.add_argument("--credential-file", help="0600 operator D1 edit token (verify: the sequence UPDATE)")
+    rb.add_argument("--drain-timeout", type=float, default=600.0)
+    rs2 = sub.add_parser("restamp", help="write path 4 (§5.3, §8): one embedding_integrity row on D1")
+    common(rs2)
+    rs2.add_argument("--receipt", required=True, help="a fresh verified export receipt")
+    rs2.add_argument("--store", required=True, help="the (former) local store file: its rollback state")
+    rs2.add_argument("--credential-file", required=True, help="0600 operator D1 edit token")
     sn = sub.add_parser("snapshot", help="§4 nightly snapshot of a local store to R2")
     sn.add_argument("db")
     sn.add_argument("--store", required=True)
@@ -197,7 +210,7 @@ def _r2(args):
     return lp.FsR2(Path(args.r2_dir)) if args.r2_dir else lp.S3R2(args.r2_bucket)
 
 
-FROZEN_STEPS = ("export", "recheck", "seed", "sequence-highwater", "restore")
+FROZEN_STEPS = ("export", "recheck", "seed", "sequence-highwater", "restore", "rollback", "restamp")
 
 
 def _recovery(args) -> dict:
@@ -208,6 +221,35 @@ def _recovery(args) -> dict:
     return {"freeze": "left in place (a failed step never lifts it)",
             "recovery": f"to abandon the procedure: local_primary.py thaw {args.db} "
                         f"--memora-url {args.memora_url} --admin-token-file <file> --health-token-file <file>"}
+
+
+def _rollback(args) -> dict:
+    """§5.3 rollback phases and restamp. Both memora-all's admin route (the
+    freeze, health) and --service-stopped's check are built: each phase
+    uses the one its step needs."""
+    from memora import rollback as rb
+    from memora.backends import D1SelectOnlyConnection
+
+    token = lp.read_token(args.read_token_file)
+    if not (args.admin_token_file and args.health_token_file):
+        raise lp.L5Refused("rollback/restamp need --admin-token-file and --health-token-file (the freeze)")
+    admin = lp.AdminClient(args.memora_url, lp.load_credential_file(args.admin_token_file), args.db,
+                           health_token=lp.load_credential_file(args.health_token_file))
+    writer_factory = None
+    if args.credential_file:
+        lp.load_credential_file(args.credential_file)
+        writer_factory = lambda: lp.OperatorD1Writer.from_credential_file(  # noqa: E731
+            args.account, args.database_id, args.credential_file, allow_restamp=args.cmd == "restamp")
+    deps = rb.RollbackDeps(
+        db=args.db, store=Path(args.store), account_id=args.account, database_id=args.database_id,
+        reader=lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, token)), admin=admin,
+        stopped=lp.ServiceStopped(args.container), r2=_r2(args), out_dir=Path(args.out_dir),
+        d1_audit_conn=lambda: rb.d1_audit_connection(args.account, args.database_id, token),
+        writer_factory=writer_factory, container=args.container,
+        drain_timeout_s=getattr(args, "drain_timeout", 600.0))
+    if args.cmd == "restamp":
+        return rb.restamp(deps, args.receipt)
+    return {"drain": rb.phase_drain, "verify": rb.phase_verify, "finish": rb.phase_finish}[args.phase](deps)
 
 
 def _compare(args) -> int:
@@ -339,6 +381,10 @@ def main(argv=None) -> int:
             return 0
         if args.cmd == "compare":
             return _compare(args)
+        if args.cmd in ("rollback", "restamp"):
+            out = {"ok": True, **_rollback(args)}
+            print(json.dumps(out, default=str))
+            return 0
         if args.cmd == "resume":
             from memora.backends import D1SelectOnlyConnection
 

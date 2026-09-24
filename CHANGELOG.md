@@ -14,6 +14,16 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L6 (piece b): rollback runbook, restamp
+- Per `docs/local-primary-implementation.md` §5.3, §8 L6, §9 w.
+- **`local_primary.py rollback <db> --phase drain|verify|finish --store P`** (`memora/rollback.py`):
+  - `drain` (live): freeze, then wait for the replicator to ack the whole outbox.
+  - `verify` (memora-all stopped, checked at every boundary): verified export; barrier compare (any diff halts; D1-only keys are reported, never deleted); the D1 sequence high-water; a read-only D1 integrity audit that must equal the local store's; recheck (only the sequence counters may move). It then prints the repoint.
+  - `finish` (repointed): the store must be served from D1 and still frozen, then the freeze is lifted.
+- **`restamp <db> --receipt R`** (write path 4, never automatic): under a freeze and a rechecked receipt, a read-only D1 audit, then exactly one allow-listed `embedding_integrity` UPSERT carrying `verify_embedding_integrity(stamp=True)`'s stamp, read back.
+- §9 (w): conflict groups list their inbound crossrefs, and the R2 restore apply and `--dry-run` warn of `dangling_references`.
+- A test drains a store named in `MEMORA_READONLY_DBS` through the replicator's exempt writer.
+
 ### Local-primary L6 (piece a): the §5.2 compare
 - Per `docs/local-primary-implementation.md` §5.2, §2.7, §2.9 (b), §9 m. New `memora/compare.py` and `local_primary.py compare <db> --mode barrier|nightly|log --store P`. D1 is read with the read token only; nothing is written to D1.
 - One `.backup` snapshot per run. Every replicated table and column is compared: keys on one side only, changed rows, embedding provenance mismatches, `d1_missing_vectors`, and meta minus the excluded keys.
