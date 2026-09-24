@@ -100,9 +100,16 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
         with _schema_lock:
             if not _backend_schema_ensured(storage_backend):
                 state = _gate_state(storage_backend)
-                if state not in (None, "open") and _checked_frozen(storage_backend):
-                    return conn  # checked in this gate generation, still not open: no pass, no re-check
                 if state not in (None, "open"):
+                    try:
+                        version = _schema_change_signature(conn)
+                    except BaseException:
+                        conn.close()
+                        raise
+                    if _checked_frozen(storage_backend, version):
+                        # Checked in this thaw generation and no DDL since
+                        # (schema_version unchanged): no pass, no re-check.
+                        return conn
                     # A frozen (or read-only) store refuses the schema pass's
                     # DDL, which used to make it serve nothing, reads
                     # included. Skip the pass when a read-only check shows
@@ -123,7 +130,7 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
                     # NOT the ensured mark (review 7767 P1): only "checked while
                     # frozen", valid until the gate thaws. An open gate then
                     # runs the full pass, whatever happened meanwhile.
-                    _mark_checked_frozen(storage_backend)
+                    _mark_checked_frozen(storage_backend, version)
                     return conn
                 ensure_schema(conn)
                 _mark_backend_schema_ensured(storage_backend)
@@ -137,18 +144,31 @@ def _thaw_generation(storage_backend) -> Optional[int]:
         return None
 
 
-def _checked_frozen(storage_backend) -> bool:
+def _schema_change_signature(conn) -> Optional[int]:
+    """Re-read on EVERY frozen connect (review 7771): local SQLite's
+    `PRAGMA schema_version`, which any DDL bumps -- one cheap read. None for
+    D1: no equivalent is confirmed on D1's read path (see the plan), so a
+    frozen D1 store re-runs schema_pending on every connect."""
+    if isinstance(conn, D1Connection):
+        return None
+    return int(conn.execute("PRAGMA schema_version").fetchone()[0])
+
+
+def _checked_frozen(storage_backend, version: Optional[int]) -> bool:
     """The frozen read-only check ran for this backend in the gate's current
-    thaw generation (a thaw invalidates it)."""
+    thaw generation (a thaw invalidates it) at this schema version (any DDL
+    invalidates it). D1 never has a mark (_mark_checked_frozen)."""
     mark = getattr(storage_backend, "_schema_checked_frozen", None)
     return mark is not None and mark == (_backend_schema_signature(storage_backend),
-                                         _thaw_generation(storage_backend))
+                                         _thaw_generation(storage_backend), version)
 
 
-def _mark_checked_frozen(storage_backend) -> None:
+def _mark_checked_frozen(storage_backend, version: Optional[int]) -> None:
+    if version is None:
+        return
     try:
         storage_backend._schema_checked_frozen = (_backend_schema_signature(storage_backend),
-                                                  _thaw_generation(storage_backend))
+                                                  _thaw_generation(storage_backend), version)
     except (AttributeError, TypeError):
         pass  # no mark: the next frozen connect checks again
 

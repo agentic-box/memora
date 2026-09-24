@@ -28,13 +28,14 @@ TXN = "txn"
 UNKNOWN = "unknown"
 
 # Read-only PRAGMA forms (plan §2.9 P1-3). memora itself uses table_info and
-# database_list; the rest are listed for tools. journal_mode and user_version
-# are read only in their bare form (no argument, no `=`).
+# database_list; the rest are listed for tools. journal_mode, user_version and
+# schema_version are read only in their bare form (no argument, no `=`);
+# schema.connect reads schema_version on a frozen store (X2 round 3).
 PRAGMA_READ_WITH_ARG = frozenset({
     "table_info", "table_xinfo", "index_list", "index_info", "foreign_key_list",
 })
 PRAGMA_READ_BARE = frozenset({
-    "database_list", "integrity_check", "quick_check", "journal_mode", "user_version",
+    "database_list", "integrity_check", "quick_check", "journal_mode", "user_version", "schema_version",
 })
 
 # Primary keys of the tables whose effects reconciliation can read back.

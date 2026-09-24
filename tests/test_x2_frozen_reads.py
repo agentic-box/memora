@@ -179,9 +179,9 @@ def test_a_frozen_check_is_not_a_completed_schema_pass(loc, monkeypatch):
     raw.execute("DROP TABLE import_lease")
     raw.commit()
     raw.close()
-    conn = storage.connect()  # still frozen: the check is not repeated, reads still work
-    assert conn.execute("SELECT content FROM memories WHERE id = 1").fetchone()[0] == "kept"
-    conn.close()
+    # still frozen: schema_version moved, so the check runs again (review 7771)
+    with pytest.raises(StoreReadOnlyError, match="schema upgrade pending.*table import_lease"):
+        storage.connect()
     status, _ = admin.thaw_store("loc")
     assert status == 200
     conn = storage.connect()
@@ -204,4 +204,84 @@ def test_a_thaw_invalidates_the_frozen_check(loc, monkeypatch):
     raw.commit()
     raw.close()
     with pytest.raises(StoreReadOnlyError, match="schema upgrade pending"):
+        storage.connect()
+
+
+# ------------------------------------------------------------------ review 7771 P1
+
+def test_without_ddl_a_frozen_connect_does_not_re_check(loc, monkeypatch):
+    _make_store(loc)
+    _start_frozen("freeze file", monkeypatch)
+    runs = []
+    real = schema.schema_pending
+    monkeypatch.setattr(schema, "schema_pending", lambda conn: (runs.append(1), real(conn))[1])
+    for _ in range(3):
+        conn = storage.connect()
+        conn.execute("SELECT 1 FROM memories").fetchone()
+        conn.close()
+    assert runs == [1], "one check, then only PRAGMA schema_version"
+
+
+def test_any_ddl_while_frozen_forces_a_re_check(loc, monkeypatch):
+    _make_store(loc)
+    _start_frozen("freeze file", monkeypatch)
+    storage.connect().close()
+    raw = sqlite3.connect(loc)
+    raw.execute("CREATE TABLE unrelated (x)")  # bumps schema_version; nothing pending
+    raw.commit()
+    raw.close()
+    runs = []
+    real = schema.schema_pending
+    monkeypatch.setattr(schema, "schema_pending", lambda conn: (runs.append(1), real(conn))[1])
+    storage.connect().close()
+    assert runs == [1]
+
+
+def test_a_frozen_d1_store_re_checks_on_every_connect(tmp_path, monkeypatch):
+    server = FakeD1Server(tmp_path / "d1.db")
+    monkeypatch.setattr(backends.D1Connection, "_send", lambda self, sql, params=None: server.send(sql, params))
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "edit-token")
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"remote": "d1://acct/db1", "other": "d1://acct/db2"}))
+    token = storage.CURRENT_DB.set("remote")
+    try:
+        storage.connect().close()
+        write_gate.persist_freeze("remote")
+        write_gate._reset_for_tests()
+        monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"remote": "d1://acct/db1"}))
+        runs = []
+        real = schema.schema_pending
+        monkeypatch.setattr(schema, "schema_pending", lambda conn: (runs.append(1), real(conn))[1])
+        storage.connect().close()
+        storage.connect().close()
+        assert runs == [1, 1], "no schema-change signature on D1's read path: checked every time"
+    finally:
+        storage.CURRENT_DB.reset(token)
+
+
+def test_bare_schema_version_is_a_read_and_setting_it_is_not():
+    from memora.sql_classify import DDL, READ, classify_statement
+
+    assert classify_statement("PRAGMA schema_version").kind == READ
+    assert classify_statement("PRAGMA schema_version = 7").kind == DDL
+
+
+def test_a_thaw_invalidates_even_when_schema_version_is_unchanged(loc, monkeypatch):
+    """The thaw generation is the second guard: schema_version can be set
+    back by hand (PRAGMA schema_version = N), so after a thaw the store is
+    checked again whatever the version says."""
+    _make_store(loc)
+    _start_frozen("freeze file", monkeypatch)
+    storage.connect().close()
+    raw = sqlite3.connect(loc)
+    version = raw.execute("PRAGMA schema_version").fetchone()[0]
+    raw.close()
+    gate = storage.backend_for("loc").write_gate()
+    gate.thaw()
+    raw = sqlite3.connect(loc)
+    raw.execute("DROP TABLE import_lease")
+    raw.execute(f"PRAGMA schema_version = {version}")  # the version no longer shows the change
+    raw.commit()
+    raw.close()
+    gate.freeze_at_start()
+    with pytest.raises(StoreReadOnlyError, match="schema upgrade pending.*import_lease"):
         storage.connect()

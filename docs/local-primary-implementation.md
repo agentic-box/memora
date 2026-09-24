@@ -285,6 +285,15 @@ Not replicated:
         (review 7767). It is valid only until the gate thaws: each thaw
         bumps the gate's `thaw_generation`. On an open gate, a store that
         was only checked runs the full pass.
+      - Every frozen connect re-reads a schema-change signature (review
+        7771). On local SQLite it is `PRAGMA schema_version`: one cheap read
+        that any DDL bumps, and in its bare form a read for the gate
+        (`sql_classify`). If it differs from the mark, the check runs
+        again. On D1 no equivalent is confirmed on the read path: it was not
+        tested against real D1, which the rules forbid here, and D1
+        restricts PRAGMAs. So a frozen D1 store re-runs `schema_pending` on
+        every connect; D1 stores are frozen only during short operator
+        windows.
     - `/health/db/<name>` reports `freeze: {state, in_flight}`.
     - `local_primary.py` export, seed, recheck and repoint call the endpoint
       and re-read `/health/db/<name>` at every step boundary. They refuse
