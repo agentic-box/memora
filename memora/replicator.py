@@ -631,7 +631,11 @@ class StoreReplicator:
              "epoch_unverified_batches = epoch_unverified_batches + ? WHERE id = 1",
              (hi, post_epoch, _now_iso(), 1 if unverified else 0)),
             ("DELETE FROM sync_outbox WHERE seq <= MIN(?, (SELECT compare_consumed_seq FROM sync_state WHERE id = 1)) "
-             "AND created_at < julianday('now') - 1", (hi,)),
+             "AND created_at < julianday('now') - 1 "
+             # never a row newer than the oldest compare still running (review 7695 P2b; >24 h old = stale)
+             "AND created_at < COALESCE((SELECT MIN(j.value) FROM sync_state s, "
+             "json_each(COALESCE(s.compare_runs, '{}')) j WHERE s.id = 1 AND j.value > julianday('now') - ?), 1e9)",
+             (hi, COMPARE_RUN_STALE_S / 86400.0)),
         ])
 
     def _reconcile(self, state: Dict[str, Any]) -> str:
@@ -816,46 +820,147 @@ def resume(conn, *, accept_d1_epoch: Optional[int] = None, allow_deletes: Option
 
 
 COMPARE_MODES = ("barrier", "nightly", "log")
+COMPARE_MAX_RUN_S = 12 * 3600      # a run older than this cannot record (review 7695 P2b)
+COMPARE_RUN_STALE_S = 24 * 3600    # an unfinished run older than this no longer holds pruning back
 
 
-def record_compare(conn, *, mode: str, clean: bool, consumed_seq: Optional[int], d1_missing_vectors: int,
-                   report_sha256: str, at: Optional[str] = None) -> Dict[str, Any]:
-    """Record a §5.2 compare's outcome on a local store (L6). Only a CLEAN
-    barrier or nightly compare advances compare_consumed_seq -- which lets
-    acked outbox rows older than 24 h be pruned -- and never past the
-    acked head or backwards. Every run updates the health fields."""
-    if mode not in COMPARE_MODES:
-        raise ValueError(f"mode must be one of {COMPARE_MODES}")
-    if not isinstance(clean, bool) or not isinstance(d1_missing_vectors, int) or d1_missing_vectors < 0:
-        raise ValueError("clean must be a boolean and d1_missing_vectors a count")
-    if not isinstance(report_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", report_sha256):
-        raise ValueError("report_sha256 must be a sha256 hex digest")
+class CompareNotRecorded(ValueError):
+    """The report did not verify; nothing was recorded (the reason is the message)."""
+
+
+def _compare_runs(st: Dict[str, Any]) -> Dict[str, float]:
+    try:
+        runs = json.loads(st.get("compare_runs") or "{}")
+    except ValueError:
+        runs = {}
+    return {k: float(v) for k, v in runs.items() if isinstance(v, (int, float))} if isinstance(runs, dict) else {}
+
+
+def begin_compare(conn) -> Dict[str, Any]:
+    """Register a compare run (plan §5.2, review 7695 P2b): its start, by
+    THIS store's clock, holds outbox pruning back to it and bounds its age.
+    Returns the run id the report must carry."""
+    from .backends import store_write
+
+    run_id = uuid.uuid4().hex
+    with store_write(conn):
+        st = dict(conn.execute("SELECT * FROM sync_state WHERE id = 1").fetchone())
+        now = float(conn.execute("SELECT julianday('now')").fetchone()[0])
+        runs = {k: v for k, v in _compare_runs(st).items() if (now - v) * 86400.0 <= COMPARE_RUN_STALE_S}
+        runs[run_id] = now
+        conn.execute("UPDATE sync_state SET compare_runs = ? WHERE id = 1", (json.dumps(runs),))
+    return {"run_id": run_id, "started_julianday": now}
+
+
+def abort_compare(conn, run_id: str) -> None:
     from .backends import store_write
 
     with store_write(conn):
         st = dict(conn.execute("SELECT * FROM sync_state WHERE id = 1").fetchone())
+        runs = _compare_runs(st)
+        runs.pop(run_id, None)
+        conn.execute("UPDATE sync_state SET compare_runs = ? WHERE id = 1", (json.dumps(runs),))
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def record_compare(conn, *, db: str, report_path: str, report_sha256: Optional[str] = None,
+                   at: Optional[str] = None) -> Dict[str, Any]:
+    """Record a §5.2 compare from its REPORT FILE (review 7695 P1): nothing
+    the caller asserts is trusted. The file must be readable here and hash
+    to `report_sha256` (when given); it must be for this store (name, and
+    the D1 URI sync_state replicates to); its run must be one this store
+    registered (begin_compare), at most COMPARE_MAX_RUN_S old; its snapshot
+    file must exist with the recorded hash. Only a clean barrier or
+    nightly report advances compare_consumed_seq, to the report's H -- never
+    past last_acked_seq, never backwards. Anything else raises
+    CompareNotRecorded and records nothing."""
+    from .backends import store_write
+
+    path = Path(report_path) if isinstance(report_path, str) and report_path else None
+    try:
+        raw = path.read_bytes() if path is not None else None
+        report = json.loads(raw) if raw is not None else None
+    except (OSError, ValueError) as exc:
+        raise CompareNotRecorded(f"the report is unreadable: {exc}")
+    if not isinstance(report, dict):
+        raise CompareNotRecorded("no report file")
+    sha = hashlib.sha256(raw).hexdigest()
+    if report_sha256 is not None and report_sha256 != sha:
+        raise CompareNotRecorded(f"the report's sha256 is {sha}, not {report_sha256}")
+    mode = report.get("mode")
+    if mode not in COMPARE_MODES:
+        raise CompareNotRecorded(f"the report's mode {mode!r} is not a compare mode")
+    if report.get("db") != db:
+        raise CompareNotRecorded(f"the report is for {report.get('db')!r}, not {db!r}")
+    snap = report.get("snapshot_path")
+    try:
+        snap_ok = bool(snap) and _file_sha256(Path(snap)) == report.get("snapshot_sha256")
+    except OSError:
+        snap_ok = False
+    if not snap_ok:
+        raise CompareNotRecorded("the report's snapshot is missing or does not match its sha256")
+    clean = report.get("clean") is True
+    missing = report.get("d1_missing_vectors")
+    if not isinstance(missing, int) or isinstance(missing, bool) or missing < 0:
+        raise CompareNotRecorded("the report has no d1_missing_vectors count")
+    with store_write(conn):
+        st = dict(conn.execute("SELECT * FROM sync_state WHERE id = 1").fetchone())
+        if report.get("d1_uri") != st["replica_uri"]:
+            raise CompareNotRecorded(f"the report compares {report.get('d1_uri')!r}; this store replicates to "
+                                     f"{st['replica_uri']!r}")
+        runs = _compare_runs(st)
+        run_id = report.get("run_id")
+        if run_id not in runs:
+            raise CompareNotRecorded(f"run {run_id!r} was not registered on this store (or was already recorded)")
+        now = float(conn.execute("SELECT julianday('now')").fetchone()[0])
+        age_s = (now - runs[run_id]) * 86400.0
+        if age_s > COMPARE_MAX_RUN_S:
+            raise CompareNotRecorded(f"run {run_id} started {age_s / 3600:.1f} h ago; a compare must record "
+                                     f"within {COMPARE_MAX_RUN_S // 3600} h")
         consumed = int(st.get("compare_consumed_seq") or 0)
-        if clean and mode != "log" and consumed_seq is not None:
-            if not isinstance(consumed_seq, int) or consumed_seq < 0:
-                raise ValueError("consumed_seq must be a non-negative integer")
-            if consumed_seq > int(st["last_acked_seq"]):
-                raise ValueError(f"consumed_seq {consumed_seq} is past the acked head {st['last_acked_seq']}")
-            consumed = max(consumed, consumed_seq)
+        if clean and mode in ("barrier", "nightly"):
+            h = report.get("snapshot_head")
+            if not isinstance(h, int) or isinstance(h, bool) or h < 0:
+                raise CompareNotRecorded("the report has no snapshot head H")
+            if h > int(st["last_acked_seq"]):
+                raise CompareNotRecorded(f"the report's H {h} is past the acked head {st['last_acked_seq']}")
+            consumed = max(consumed, h)
+        runs.pop(run_id)
         conn.execute(
             "UPDATE sync_state SET compare_consumed_seq = ?, last_compare_at = ?, last_compare_mode = ?, "
-            "last_compare_clean = ?, d1_missing_vectors = ?, last_compare_report = ? WHERE id = 1",
-            (consumed, at or _now_iso(), mode, 1 if clean else 0, d1_missing_vectors, report_sha256))
-    return {"compare_consumed_seq": consumed, "last_compare_clean": clean, "d1_missing_vectors": d1_missing_vectors}
+            "last_compare_clean = ?, d1_missing_vectors = ?, last_compare_report = ?, compare_runs = ? WHERE id = 1",
+            (consumed, at or _now_iso(), mode, 1 if clean else 0, missing, sha, json.dumps(runs)))
+    return {"compare_consumed_seq": consumed, "last_compare_clean": clean, "d1_missing_vectors": missing,
+            "report_sha256": sha}
+
+
+def _with_replicator_conn(backend, fn):
+    conn = backend.connect_replicator()
+    try:
+        return fn(conn)
+    finally:
+        conn.close()
+
+
+def begin_compare_for(backend) -> Dict[str, Any]:
+    """The admin route's path (memora-all serves the store; the freeze may be
+    in place): the replicator's gate-exempt writer."""
+    return _with_replicator_conn(backend, begin_compare)
+
+
+def abort_compare_for(backend, run_id: str) -> None:
+    _with_replicator_conn(backend, lambda c: abort_compare(c, run_id))
 
 
 def record_compare_for(backend, **kw) -> Dict[str, Any]:
-    """record_compare through the replicator's gate-exempt writer (memora-all
-    serving the store: the freeze may be in place)."""
-    conn = backend.connect_replicator()
-    try:
-        return record_compare(conn, **kw)
-    finally:
-        conn.close()
+    return _with_replicator_conn(backend, lambda c: record_compare(c, **kw))
 
 
 # ------------------------------------------------------------------ startup

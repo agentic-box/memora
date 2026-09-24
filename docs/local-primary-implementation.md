@@ -1162,20 +1162,41 @@ Two modes:
     `(seq, index)`, which dropped a child statement sharing its seq with the
     FK parent the batch added. It now deduplicates on
     `(seq, table, pk, index)`.
-- **Report and record.**
-  - A report is written to `<out-dir>/<db>/compare-<mode>-<ts>.json`, and
-    its sha256 is recorded.
-  - `replicator.record_compare` writes `last_compare_at/_mode/_clean`,
-    `d1_missing_vectors` and `last_compare_report`. It advances
-    `compare_consumed_seq` only on a clean barrier or nightly run, never
-    past `last_acked_seq` and never backwards.
-  - With memora-all serving the store, the outcome goes through
-    `POST /admin/compare/<db>` (admin token), which writes through the
-    replicator's gate-exempt connection. With `--service-stopped` it is
-    written directly under the store's primary lock.
-  - The replicator's health block shows `d1_missing_vectors` (no longer
-    null), `last_compare_at`, `last_compare_mode`, `last_compare_clean` and
-    `compare_consumed_seq`.
+- **Report and record** (after review 7695). The store verifies the
+  report; it does not take the caller's word.
+  - **Begin.** A run first registers itself on the store with
+    `begin_compare`. The store records the start by its own clock in
+    `sync_state.compare_runs`.
+  - **The report** carries the run id, the store name, the D1 identity
+    (`d1_uri`), H, and the snapshot's path, sha256 and time. It is written
+    to `<out-dir>/<db>/compare-<mode>-<ts>.json`.
+  - **Record.** `record_compare` takes only the report FILE path, which must
+    be readable by the store's process, like a reconcile receipt, and
+    optionally its sha256. It verifies:
+    - the file's actual hash;
+    - the store name, and that `d1_uri` equals `sync_state.replica_uri`;
+    - that the run was registered here and started at most 12 h ago
+      (P2b: a longer run cannot record, well inside the 24 h retention);
+    - that the snapshot file exists and matches its hash.
+  - **Consume.** `compare_consumed_seq` is derived from the report's H,
+    only for a clean barrier or nightly report. It never goes past
+    `last_acked_seq` and never backwards. Unclean and log reports record
+    only the health fields. Any failed check records nothing
+    (`CompareNotRecorded`, a 409 on the route).
+  - **Routes.** `POST /admin/compare/<db>/begin|record|abort` (admin token)
+    is operator attestation of a verified report: the admin token is the
+    operator, and the server checks what it can check itself. With
+    `--service-stopped` the same functions run directly under the store's
+    primary lock. A failed or skipped run is aborted. The snapshots are
+    removed once a run completes, and kept as evidence when it fails.
+  - **Pruning.** The outbox prune also never removes a row newer than the
+    oldest registered compare start; runs older than 24 h are ignored as
+    stale. With these bounds the rule is defence in depth. A prunable row
+    is over 24 h old, so a run that started before it would be stale; a
+    test with a longer stale bound shows the rule working.
+  - **Health.** The replicator's health block shows `d1_missing_vectors`
+    (no longer null), `last_compare_at`, `last_compare_mode`,
+    `last_compare_clean` and `compare_consumed_seq`.
 - **Exit codes**: 0 clean, 5 diffs, 6 skipped, 2 refused.
 - **Cron entries** (documented, not installed by the code; tokens are 0600
   files):

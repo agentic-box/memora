@@ -195,13 +195,19 @@ def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = No
     return 200, {"id": intent_id, "outcome": "operator-accepted", **backend.write_gate().status()}
 
 
-def record_compare_result(name: str, body: Any) -> Result:
-    """POST /admin/compare/<name> (plan §5.2, L6): the operator tool's compare
-    outcome for a store memora-all serves. Body: {mode, clean, consumed_seq,
-    d1_missing_vectors, report_sha256}. The replicator module validates and
-    writes it (compare_consumed_seq advances only on a clean run)."""
+def compare_action(name: str, action: str, body: Any) -> Result:
+    """POST /admin/compare/<name>/<begin|record|abort> (plan §5.2, L6).
+
+    Operator ATTESTATION of a verified report, not a trusted assertion
+    (review 7695): the admin token is the operator; the server verifies
+    what it can itself. `begin` registers a run (its start by this server's
+    clock); `record` takes the report FILE path -- readable here, like a
+    reconcile receipt -- and the replicator module verifies the file's hash,
+    the store identity, the registered run and its age, the snapshot's hash,
+    and derives compare_consumed_seq from the report's H (clean barrier or
+    nightly only, never past the acked head). `abort` drops a run."""
     from .backends import LocalSQLiteBackend
-    from .replicator import record_compare_for
+    from .replicator import CompareNotRecorded, abort_compare_for, begin_compare_for, record_compare_for
 
     backend, err = _backend(name)
     if err:
@@ -211,15 +217,21 @@ def record_compare_result(name: str, body: Any) -> Result:
     if not isinstance(body, dict):
         return 400, {"error": "bad_request"}
     try:
-        out = record_compare_for(backend, mode=body.get("mode"), clean=body.get("clean"),
-                                 consumed_seq=body.get("consumed_seq"),
-                                 d1_missing_vectors=body.get("d1_missing_vectors"),
-                                 report_sha256=body.get("report_sha256"))
-    except ValueError as exc:
-        return 400, {"error": "invalid_compare_result", "message": str(exc)}
+        if action == "begin":
+            return 200, begin_compare_for(backend)
+        if action == "abort":
+            if not isinstance(body.get("run_id"), str):
+                return 400, {"error": "run_id_required"}
+            abort_compare_for(backend, body["run_id"])
+            return 200, {"aborted": body["run_id"]}
+        if action == "record":
+            return 200, record_compare_for(backend, db=name, report_path=body.get("report"),
+                                           report_sha256=body.get("report_sha256"))
+    except CompareNotRecorded as exc:
+        return 409, {"error": "compare_not_recorded", "message": str(exc)}
     except Exception as exc:  # e.g. no sync_state: replication is not installed on this store
         return 409, {"error": "compare_not_recorded", "message": f"{type(exc).__name__}: {str(exc)[:200]}"}
-    return 200, out
+    return 404, {"error": "unknown_action", "allowed": ["begin", "record", "abort"]}
 
 
 def gate_health(name: str) -> Optional[Dict[str, Any]]:
@@ -273,7 +285,7 @@ def register_admin_routes(mcp: Any) -> None:
             return respond((400, {"error": "bad_timeout"}))
         return respond(await _run(freeze_store, name, max(0.0, min(timeout_s, 300.0))))
 
-    @mcp.custom_route("/admin/compare/{name}", methods=["POST"])
+    @mcp.custom_route("/admin/compare/{name}/{action}", methods=["POST"])
     async def _compare(request):
         denied = require_admin(request)
         if denied is not None:
@@ -282,7 +294,8 @@ def register_admin_routes(mcp: Any) -> None:
             body = await request.json()
         except (ValueError, json.JSONDecodeError):
             return respond((400, {"error": "bad_request"}))
-        return respond(await _run(record_compare_result, request.path_params["name"], body))
+        return respond(await _run(compare_action, request.path_params["name"],
+                                  request.path_params["action"], body))
 
     @mcp.custom_route("/admin/intents/{name}", methods=["GET"])
     async def _intents(request):

@@ -222,13 +222,20 @@ class Env:
     sleep: Callable[[float], None] = time.sleep
     clock: Callable[[], float] = time.time
     poll_s: float = 5.0
+    snapshots: List[Path] = field(default_factory=list)  # removed once the run is recorded
 
 
 def _snapshot(env: Env, tag: str) -> Tuple[Path, Dict[str, Any]]:
+    from .local_primary import _sha256_file
+
     env.work.mkdir(parents=True, exist_ok=True)
     path = Path(tempfile.mkdtemp(prefix=f"compare-{tag}-", dir=str(env.work))) / "S.db"
+    env.snapshots.append(path.parent)
     backup_store(env.store, path)
-    return path, snapshot_state(path)
+    st = snapshot_state(path)
+    st["snapshot"] = {"snapshot_path": str(path.resolve()), "snapshot_sha256": _sha256_file(path),
+                      "snapshot_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(env.clock()))}
+    return path, st
 
 
 # ------------------------------------------------------------------ barrier
@@ -251,7 +258,7 @@ def barrier_compare(env: Env, *, drain_timeout_s: float = 600.0) -> Dict[str, An
     env.barrier.check("after reading D1")
     body = compare_sides(file_side(snap), d1)
     return {"mode": "barrier", "snapshot_head": st["head"], "consumed_seq": st["head"] if body["clean"] else None,
-            **body}
+            **st["snapshot"], **body}
 
 
 # ------------------------------------------------------------------ nightly
@@ -260,11 +267,12 @@ def _nightly_once(env: Env, attempt: int, wait_timeout_s: float) -> Dict[str, An
     snap, st = _snapshot(env, f"nightly{attempt}")
     h = st["head"]
     if not _wait(lambda: live_acked(env.store) >= h, wait_timeout_s, env.poll_s, env.sleep, env.clock):
-        return {"skipped": f"the acks did not reach H={h} within {wait_timeout_s:.0f} s", "snapshot_head": h}
+        return {"skipped": f"the acks did not reach H={h} within {wait_timeout_s:.0f} s", "snapshot_head": h,
+                **st["snapshot"]}
     d1 = d1_side(env.reader)
     k = live_keys_after(env.store, h)  # read AFTER D1: every key written after S is in K
     body = compare_sides(file_side(snap), d1, exclude=k)
-    return {"snapshot_head": h, "excluded_keys": sorted([t, list(pk)] for t, pk in k), **body}
+    return {"snapshot_head": h, "excluded_keys": sorted([t, list(pk)] for t, pk in k), **st["snapshot"], **body}
 
 
 def _previous_night_keys(state_path: Path, night: str) -> List[List[Any]]:
@@ -375,6 +383,7 @@ def log_compare(env: Env, *, db: str, receipt_path: str, account_id: str, databa
     key_diffs = len(missing) + len(extra)
     clean = body["clean"] and key_diffs == 0 and replay_error is None
     return {"mode": "log", "snapshot_head": st["head"], "log_cursor_seq": cursor, "log_records": len(records),
+            **st["snapshot"],
             "keys_missing_from_log": [[t, list(pk)] for t, pk in missing],
             "unexpected_log_keys": [[t, list(pk)] for t, pk in extra], "replay_error": replay_error,
             **body, "clean": clean, "diff_count": body["diff_count"] + key_diffs + (replay_error is not None),
@@ -399,26 +408,120 @@ def write_report(report: Dict[str, Any], out_dir: Path, db: str, clock: Callable
     return path, hashlib.sha256(raw).hexdigest()
 
 
-def record_fields(report: Dict[str, Any], sha: str) -> Dict[str, Any]:
-    return {"mode": report["mode"], "clean": bool(report["clean"]), "consumed_seq": report.get("consumed_seq"),
-            "d1_missing_vectors": int(report.get("d1_missing_vectors") or 0), "report_sha256": sha}
+class AdminRecorder:
+    """memora-all serves the store: begin/record/abort through its admin
+    routes, which verify the report themselves (review 7695)."""
+
+    def __init__(self, admin):
+        self.admin = admin
+
+    def _post(self, action: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        status, out = self.admin._post_json(f"/admin/compare/{self.admin.db}/{action}", body)
+        if status != 200:
+            raise L5Refused(f"memora-all refused the compare {action} ({status}): {out}")
+        return out
+
+    def begin(self) -> str:
+        return self._post("begin", {})["run_id"]
+
+    def record(self, report_path: Path, sha: str) -> Dict[str, Any]:
+        return self._post("record", {"report": str(Path(report_path).resolve()), "report_sha256": sha})
+
+    def abort(self, run_id: str) -> None:
+        self._post("abort", {"run_id": run_id})
 
 
-def record_direct(store: Path, fields: Dict[str, Any]) -> Dict[str, Any]:
-    """memora-all stopped: write the outcome under the store's primary lock."""
-    from .backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock, release_primary_lock
-    from .replicator import record_compare
+class DirectRecorder:
+    """memora-all is stopped: the same begin/verify/record, written under
+    the store's primary lock."""
 
-    try:
-        acquire_primary_lock(Path(store))
-    except StoreLockedError as exc:
-        raise CompareRefused(f"cannot record the compare on {store}: {exc} (memora-all serves it: "
-                             "record through its admin route instead)")
-    try:
-        conn = LocalSQLiteBackend(Path(store)).connect()
+    def __init__(self, store: Path, db: str):
+        self.store, self.db = Path(store), db
+
+    def _with(self, fn):
+        from .backends import LocalSQLiteBackend, StoreLockedError, acquire_primary_lock, release_primary_lock
+
         try:
-            return record_compare(conn, **fields)
+            acquire_primary_lock(self.store)
+        except StoreLockedError as exc:
+            raise CompareRefused(f"cannot record on {self.store}: {exc} (memora-all serves it: use its admin "
+                                 "route instead)")
+        try:
+            conn = LocalSQLiteBackend(self.store).connect()
+            try:
+                return fn(conn)
+            finally:
+                conn.close()
         finally:
-            conn.close()
+            release_primary_lock(self.store)
+
+    def begin(self) -> str:
+        from .replicator import begin_compare
+
+        return self._with(begin_compare)["run_id"]
+
+    def record(self, report_path: Path, sha: str) -> Dict[str, Any]:
+        from .replicator import CompareNotRecorded, record_compare
+
+        try:
+            return self._with(lambda c: record_compare(c, db=self.db, report_path=str(report_path),
+                                                       report_sha256=sha))
+        except CompareNotRecorded as exc:
+            raise L5Refused(f"the compare was not recorded: {exc}")
+
+    def abort(self, run_id: str) -> None:
+        from .replicator import abort_compare
+
+        self._with(lambda c: abort_compare(c, run_id))
+
+
+class NoRecorder:
+    """--no-record: a report only."""
+
+    def begin(self) -> str:
+        import uuid
+
+        return "unrecorded-" + uuid.uuid4().hex
+
+    def record(self, report_path: Path, sha: str) -> None:
+        return None
+
+    def abort(self, run_id: str) -> None:
+        return None
+
+
+def run_compare(env: Env, recorder, run: Callable[[], Dict[str, Any]], *, db: str, account_id: str,
+                database_id: str, out_dir: Path) -> Tuple[Dict[str, Any], Path, str, Any]:
+    """One compare run: begin (the store registers its start), the mode's
+    compare, the report (with the run id and the store's D1 identity), the
+    record (verified by the store's side), the snapshots removed. A failure
+    or a skipped run aborts the registration."""
+    from .local_primary import d1_uri
+
+    run_id = recorder.begin()
+    recorded, done = None, False
+    try:
+        started = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(env.clock()))
+        report = run()
+        report.update({"run_id": run_id, "db": db, "account_id": account_id, "database_id": database_id,
+                       "d1_uri": d1_uri(account_id, database_id), "store": str(Path(env.store).resolve()),
+                       "started_at": started})
+        path, sha = write_report(report, out_dir, db, env.clock)
+        if report.get("skipped"):
+            recorder.abort(run_id)
+        else:
+            recorded = recorder.record(path, sha)
+        done = True
+    except BaseException:
+        try:
+            recorder.abort(run_id)
+        except Exception:
+            pass
+        raise
     finally:
-        release_primary_lock(Path(store))
+        import shutil
+
+        if done:  # a failed run keeps its snapshot as evidence
+            for d in env.snapshots:
+                shutil.rmtree(d, ignore_errors=True)
+    return report, path, sha, recorded

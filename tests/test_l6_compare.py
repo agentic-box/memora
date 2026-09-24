@@ -303,58 +303,124 @@ def test_nightly_skips_when_the_acks_do_not_reach_h(pair, tmp_path):
 
 # ---------------------------------------------------------------- recording
 
-def test_compare_consumed_seq_advances_only_on_a_clean_run(pair):
-    local, _replica = pair
-    acked = sync_state(local)["last_acked_seq"]
-    sha = "a" * 64
-    conn = local.connect()
-    try:
-        R.record_compare(conn, mode="nightly", clean=False, consumed_seq=acked, d1_missing_vectors=2,
-                         report_sha256=sha)
-        st = dict(conn.execute("SELECT * FROM sync_state").fetchone())
-        assert st["compare_consumed_seq"] == 0 and st["last_compare_clean"] == 0 and st["d1_missing_vectors"] == 2
-        R.record_compare(conn, mode="barrier", clean=True, consumed_seq=acked, d1_missing_vectors=0,
-                         report_sha256=sha)
-        assert conn.execute("SELECT compare_consumed_seq FROM sync_state").fetchone()[0] == acked
-        R.record_compare(conn, mode="nightly", clean=True, consumed_seq=acked - 1, d1_missing_vectors=0,
-                         report_sha256=sha)
-        assert conn.execute("SELECT compare_consumed_seq FROM sync_state").fetchone()[0] == acked  # never back
-        R.record_compare(conn, mode="log", clean=True, consumed_seq=acked + 5, d1_missing_vectors=0,
-                         report_sha256=sha)  # log mode never consumes
-        assert conn.execute("SELECT compare_consumed_seq FROM sync_state").fetchone()[0] == acked
-        with pytest.raises(ValueError, match="past the acked head"):
-            R.record_compare(conn, mode="nightly", clean=True, consumed_seq=acked + 1, d1_missing_vectors=0,
-                             report_sha256=sha)
-        for bad in ({"mode": "weekly"}, {"clean": 1}, {"d1_missing_vectors": -1}, {"report_sha256": "x"}):
-            args = dict(mode="nightly", clean=True, consumed_seq=acked, d1_missing_vectors=0, report_sha256=sha)
-            args.update(bad)
-            with pytest.raises(ValueError):
-                R.record_compare(conn, **args)
-    finally:
-        conn.close()
-
-
-def test_the_outbox_is_pruned_only_after_a_clean_compare_consumed_it(pair):
-    """The consumer of compare_consumed_seq: acked rows older than 24 h stay
-    until a clean compare consumed them."""
+def genuine(pair, tmp_path, conn, *, mode="barrier", mutate=None):
+    """A real compare report, registered as a run on the store: (path, sha)."""
     local, replica = pair
-    raw_db = sqlite3.connect(local.db_path)
-    raw_db.execute("UPDATE sync_outbox SET created_at = julianday('now') - 2")
-    raw_db.commit()
-    raw_db.close()
-    write(local, "UPDATE memories SET content = 'x' WHERE id = 1")
-    drain(local, replica)
-    assert _outbox_count(local) > 1  # not consumed: kept
+    run_id = R.begin_compare(conn)["run_id"]
+    e = env(tmp_path, local, replica)
+    rep = cmp.barrier_compare(e) if mode == "barrier" else cmp.nightly_compare(
+        e, state_path=tmp_path / "n.json", night="n1")
+    rep.update({"run_id": run_id, "db": DB, "d1_uri": URI, "account_id": "acct", "database_id": "replica-db"})
+    if mutate:
+        mutate(rep)
+    return cmp.write_report(rep, tmp_path / "reports", DB)
+
+
+def _st(conn):
+    return dict(conn.execute("SELECT * FROM sync_state WHERE id = 1").fetchone())
+
+
+def test_a_genuine_clean_report_advances_the_cursor_to_its_h(pair, tmp_path):
+    local, _ = pair
     acked = sync_state(local)["last_acked_seq"]
     conn = local.connect()
     try:
-        R.record_compare(conn, mode="barrier", clean=True, consumed_seq=acked, d1_missing_vectors=0,
-                         report_sha256="b" * 64)
+        path, sha = genuine(pair, tmp_path, conn)
+        out = R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
+        st = _st(conn)
+        assert out["compare_consumed_seq"] == st["compare_consumed_seq"] == acked
+        assert st["last_compare_clean"] == 1 and st["last_compare_report"] == sha and json.loads(st["compare_runs"]) == {}
+        with pytest.raises(R.CompareNotRecorded, match="not registered"):  # a run records once
+            R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
     finally:
         conn.close()
-    write(local, "UPDATE memories SET content = 'y' WHERE id = 1")
-    drain(local, replica)
-    assert _outbox_count(local) == 2  # the old rows pruned; the last two are younger than 24 h
+
+
+def _forge(field, value):
+    def mutate(rep):
+        rep[field] = value
+    return mutate
+
+
+@pytest.mark.parametrize("case, match", [
+    ("made-up hash", "sha256 is"),
+    ("no file", "unreadable|no report file"),
+    ("another store", "is for 'other'"),
+    ("another D1", "this store replicates to"),
+    ("H past acked", "past the acked head"),
+    ("stale run", "a compare must record within 12 h"),
+    ("tampered file", "sha256 is"),
+    ("unregistered run", "was not registered"),
+    ("snapshot missing", "snapshot is missing"),
+    ("snapshot tampered", "snapshot is missing or does not match"),
+    ("not a mode", "not a compare mode"),
+])
+def test_a_forged_report_cannot_advance_the_cursor(pair, tmp_path, case, match):
+    """7695 P1: nothing the caller asserts is trusted; nothing is recorded."""
+    local, _ = pair
+    acked = sync_state(local)["last_acked_seq"]
+    conn = local.connect()
+    try:
+        mutate = {"another store": _forge("db", "other"), "another D1": _forge("d1_uri", "d1://acct/other-db"),
+                  "H past acked": _forge("snapshot_head", acked + 5), "unregistered run": _forge("run_id", "f" * 32),
+                  "not a mode": _forge("mode", "weekly")}.get(case)
+        path, sha = genuine(pair, tmp_path, conn, mutate=mutate)
+        kw = {"report_path": str(path), "report_sha256": sha}
+        if case == "made-up hash":
+            kw["report_sha256"] = "0" * 64
+        elif case == "no file":
+            kw["report_path"] = str(tmp_path / "nothing.json")
+        elif case == "tampered file":
+            rep = json.loads(path.read_text())
+            rep["clean"] = True
+            rep["snapshot_head"] = acked
+            path.write_text(json.dumps(rep) + " ")
+        elif case == "stale run":
+            st = _st(conn)
+            runs = {k: v - 13 / 24 for k, v in json.loads(st["compare_runs"]).items()}
+            raw = sqlite3.connect(local.db_path)
+            raw.execute("UPDATE sync_state SET compare_runs = ?", (json.dumps(runs),))
+            raw.commit()
+            raw.close()
+        elif case in ("snapshot missing", "snapshot tampered"):
+            snap = Path(json.loads(path.read_text())["snapshot_path"])
+            snap.unlink() if case == "snapshot missing" else snap.write_bytes(b"x")
+        before = _st(conn)
+        with pytest.raises(R.CompareNotRecorded, match=match):
+            R.record_compare(conn, db=DB, **kw)
+        after = _st(conn)
+        assert after["compare_consumed_seq"] == 0 and after["last_compare_at"] is None
+        assert after["compare_runs"] == before["compare_runs"]
+    finally:
+        conn.close()
+
+
+def test_an_unclean_or_log_report_records_health_only(pair, tmp_path):
+    local, replica = pair
+    replica_exec(replica, "DELETE FROM memories_embeddings WHERE memory_id = 1")
+    conn = local.connect()
+    try:
+        path, sha = genuine(pair, tmp_path, conn)
+        out = R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
+        st = _st(conn)
+        assert out["compare_consumed_seq"] == st["compare_consumed_seq"] == 0
+        assert st["last_compare_clean"] == 0 and st["d1_missing_vectors"] == 1
+    finally:
+        conn.close()
+
+
+def test_the_cursor_never_moves_backwards(pair, tmp_path):
+    local, _ = pair
+    acked = sync_state(local)["last_acked_seq"]
+    conn = local.connect()
+    try:
+        path, sha = genuine(pair, tmp_path, conn)
+        R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
+        path, sha = genuine(pair, tmp_path, conn, mutate=_forge("snapshot_head", acked - 1))
+        R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
+        assert _st(conn)["compare_consumed_seq"] == acked
+    finally:
+        conn.close()
 
 
 def _outbox_count(local):
@@ -365,26 +431,106 @@ def _outbox_count(local):
         db.close()
 
 
-def test_the_admin_route_records_through_the_replicator_and_health_shows_it(pair, monkeypatch):
+def _age_outbox(local, days):
+    raw = sqlite3.connect(local.db_path)
+    raw.execute("UPDATE sync_outbox SET created_at = julianday('now') - ?", (days,))
+    raw.commit()
+    raw.close()
+
+
+def test_the_outbox_is_pruned_only_after_a_clean_compare_consumed_it(pair, tmp_path):
+    local, replica = pair
+    _age_outbox(local, 2)
+    write(local, "UPDATE memories SET content = 'x' WHERE id = 1")
+    drain(local, replica)
+    assert _outbox_count(local) > 1  # not consumed: kept
+    conn = local.connect()
+    try:
+        path, sha = genuine(pair, tmp_path, conn)
+        R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)
+    finally:
+        conn.close()
+    write(local, "UPDATE memories SET content = 'y' WHERE id = 1")
+    drain(local, replica)
+    assert _outbox_count(local) == 2  # the old rows pruned; the last two are younger than 24 h
+
+
+def test_pruning_never_removes_a_row_newer_than_an_in_progress_compare(pair, tmp_path, monkeypatch):
+    """7695 P2b. With the shipped bounds (runs stale after 24 h, rows kept
+    24 h) a prunable row can never be newer than a live run's start, so the
+    rule is defence in depth; a longer stale bound shows it working."""
+    local, replica = pair
+    monkeypatch.setattr(R, "COMPARE_RUN_STALE_S", 72 * 3600)
+    conn = local.connect()
+    try:
+        path, sha = genuine(pair, tmp_path, conn)
+        R.record_compare(conn, db=DB, report_path=str(path), report_sha256=sha)  # everything consumed
+        R.begin_compare(conn)
+    finally:
+        conn.close()
+    raw = sqlite3.connect(local.db_path)
+    runs = {k: v - 2.5 for k, v in json.loads(raw.execute("SELECT compare_runs FROM sync_state").fetchone()[0]).items()}
+    raw.execute("UPDATE sync_state SET compare_runs = ?", (json.dumps(runs),))  # started 2.5 days ago
+    raw.execute("UPDATE sync_outbox SET created_at = julianday('now') - 2")      # 2 days old: newer than it
+    raw.commit()
+    raw.close()
+    kept = _outbox_count(local)
+    write(local, "UPDATE memories SET content = 'z' WHERE id = 1")
+    drain(local, replica)
+    assert _outbox_count(local) == kept + 1  # nothing pruned while that compare runs
+    raw = sqlite3.connect(local.db_path)
+    raw.execute("UPDATE sync_state SET compare_runs = '{}'")
+    raw.commit()
+    raw.close()
+    write(local, "UPDATE memories SET content = 'w' WHERE id = 1")
+    drain(local, replica)
+    assert _outbox_count(local) == 2  # the run gone: the old rows are pruned
+
+
+def test_begin_drops_stale_runs_and_abort_removes_one(pair):
+    local, _ = pair
+    conn = local.connect()
+    try:
+        a = R.begin_compare(conn)["run_id"]
+        raw = sqlite3.connect(local.db_path)
+        runs = {a: json.loads(_st(conn)["compare_runs"])[a] - 2}
+        raw.execute("UPDATE sync_state SET compare_runs = ?", (json.dumps(runs),))
+        raw.commit()
+        raw.close()
+        b = R.begin_compare(conn)["run_id"]
+        assert list(json.loads(_st(conn)["compare_runs"])) == [b]
+        R.abort_compare(conn, b)
+        assert json.loads(_st(conn)["compare_runs"]) == {}
+    finally:
+        conn.close()
+
+
+def test_the_admin_route_begins_verifies_and_records(pair, tmp_path, monkeypatch):
     from memora import admin
 
     local, replica = pair
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({DB: str(local.db_path)}))
     acked = sync_state(local)["last_acked_seq"]
-    status, body = admin.record_compare_result(DB, {"mode": "barrier", "clean": True, "consumed_seq": acked,
-                                                    "d1_missing_vectors": 3, "report_sha256": "c" * 64})
-    assert status == 200 and body["compare_consumed_seq"] == acked
-    status, body = admin.record_compare_result(DB, {"mode": "barrier", "clean": True, "consumed_seq": acked + 9,
-                                                    "d1_missing_vectors": 0, "report_sha256": "c" * 64})
-    assert status == 400 and body["error"] == "invalid_compare_result"
-    rep = _rep(local, replica)
+    status, body = admin.compare_action(DB, "begin", {})
+    assert status == 200 and len(body["run_id"]) == 32
+    rep = cmp.barrier_compare(env(tmp_path, local, replica))
+    rep.update({"run_id": body["run_id"], "db": DB, "d1_uri": URI})
+    path, sha = cmp.write_report(rep, tmp_path / "reports", DB)
+    status, out = admin.compare_action(DB, "record", {"report": str(path), "report_sha256": "0" * 64})
+    assert status == 409 and out["error"] == "compare_not_recorded"
+    status, out = admin.compare_action(DB, "record", {"report": str(path), "report_sha256": sha})
+    assert status == 200 and out["compare_consumed_seq"] == acked
+    status, body = admin.compare_action(DB, "begin", {})
+    assert admin.compare_action(DB, "abort", {"run_id": body["run_id"]})[0] == 200
+    assert admin.compare_action(DB, "weird", {})[0] == 404
+    r = _rep(local, replica)
     try:
-        rep._refresh_metrics()
-        st = rep.status()
+        r._refresh_metrics()
+        st = r.status()
     finally:
-        rep._conn.close()
-        rep._conn = None
-    assert st["d1_missing_vectors"] == 3 and st["last_compare_clean"] is True
+        r._conn.close()
+        r._conn = None
+    assert st["d1_missing_vectors"] == 0 and st["last_compare_clean"] is True
     assert st["last_compare_mode"] == "barrier" and st["compare_consumed_seq"] == acked
 
 
@@ -527,6 +673,7 @@ def test_cli_barrier_compare_with_the_service_stopped_records_directly(pair, tmp
     assert report["mode"] == "barrier" and report["db"] == DB
     st = sync_state(local)
     assert st["last_compare_clean"] == 1 and st["last_compare_report"] == out["report_sha256"]
+    assert not list((tmp_path / "compare" / "work").glob("compare-*"))  # the snapshot removed once recorded
 
 
 def test_cli_nightly_diff_exits_5_and_records_unclean(pair, tmp_path):
@@ -636,6 +783,5 @@ def test_the_admin_route_refuses_a_store_that_is_not_local(monkeypatch):
 
     monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "edit-token")  # the registry builds a D1 backend (no call is made)
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"remote": "d1://acct/remote-db"}))
-    status, body = admin.record_compare_result("remote", {"mode": "barrier", "clean": True, "consumed_seq": 1,
-                                                          "d1_missing_vectors": 0, "report_sha256": "d" * 64})
+    status, body = admin.compare_action("remote", "begin", {})
     assert (status, body["error"]) == (400, "not_a_local_store")

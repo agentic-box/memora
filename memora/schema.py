@@ -467,7 +467,7 @@ CREATE TABLE IF NOT EXISTS sync_state (
   allow_deletes_attempt TEXT, epoch_unverified_batches INTEGER NOT NULL DEFAULT 0,
   last_ack_at TEXT, last_error TEXT,
   last_compare_at TEXT, last_compare_mode TEXT, last_compare_clean INTEGER,
-  d1_missing_vectors INTEGER, last_compare_report TEXT
+  d1_missing_vectors INTEGER, last_compare_report TEXT, compare_runs TEXT
 )
 """
 # Columns added after L2's first sync_state (the replicator, L3); ensured on
@@ -483,6 +483,7 @@ _SYNC_STATE_ADDED = (
     ("last_compare_clean", "INTEGER"),
     ("d1_missing_vectors", "INTEGER"),
     ("last_compare_report", "TEXT"),
+    ("compare_runs", "TEXT"),  # {run_id: julianday start} of the compares in progress
 )
 _SHADOW_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS shadow_state (

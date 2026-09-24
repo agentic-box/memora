@@ -232,39 +232,47 @@ def _compare(args) -> int:
     out_dir = Path(args.out_dir)
     env = cmp.Env(store=Path(args.store), reader=reader, work=Path(args.work_dir or out_dir / "work"),
                   barrier=barrier)
+    if args.no_record:
+        recorder = cmp.NoRecorder()
+    elif args.service_stopped:
+        recorder = cmp.DirectRecorder(Path(args.store), args.db)
+    else:
+        recorder = cmp.AdminRecorder(admin)
     if args.mode == "barrier":
         if barrier is None:
             raise lp.L5Refused("a barrier compare needs the freeze (--admin-token-file ...) or --service-stopped")
-        placed = False
-        if args.brief_freeze:
-            if admin is None:
-                raise lp.L5Refused("--brief-freeze needs memora-all's admin route")
-            status, body = admin._request("GET", f"/health/db/{args.db}")
-            if (body.get("freeze") or {}).get("state") not in ("frozen", "frozen-unsafe"):
-                admin.freeze()  # the weekly job's own brief freeze
-                placed = True
-        try:
-            report = cmp.barrier_compare(env, drain_timeout_s=args.drain_timeout)
-        finally:
-            if placed:
-                admin.thaw()  # only the freeze this run placed; an operator's stays
-        report["brief_freeze_placed"] = placed
+
+        def run():
+            placed = False
+            if args.brief_freeze:
+                if admin is None:
+                    raise lp.L5Refused("--brief-freeze needs memora-all's admin route")
+                status, body = admin._request("GET", f"/health/db/{args.db}")
+                if (body.get("freeze") or {}).get("state") not in ("frozen", "frozen-unsafe"):
+                    admin.freeze()  # the weekly job's own brief freeze
+                    placed = True
+            try:
+                rep = cmp.barrier_compare(env, drain_timeout_s=args.drain_timeout)
+            finally:
+                if placed:
+                    admin.thaw()  # only the freeze this run placed; an operator's stays
+            rep["brief_freeze_placed"] = placed
+            return rep
     elif args.mode == "nightly":
-        report = cmp.nightly_compare(env, state_path=out_dir / args.db / "nightly-state.json",
-                                     wait_timeout_s=args.wait_timeout)
+        def run():
+            return cmp.nightly_compare(env, state_path=out_dir / args.db / "nightly-state.json",
+                                       wait_timeout_s=args.wait_timeout)
     else:
         if not args.receipt:
             raise lp.L5Refused("log mode needs --receipt (the store's seed export)")
         log_dir = Path(args.log_dir) if args.log_dir else None
-        report = cmp.log_compare(env, db=args.db, receipt_path=args.receipt, account_id=args.account,
-                                 database_id=args.database_id, log_records=lambda: iter_log(args.db, log_dir),
-                                 drain_timeout_s=args.drain_timeout)
-    report.update({"db": args.db, "store": args.store})
-    path, sha = cmp.write_report(report, out_dir, args.db)
-    recorded = None
-    if not args.no_record and not report.get("skipped"):
-        fields = cmp.record_fields(report, sha)
-        recorded = cmp.record_direct(Path(args.store), fields) if args.service_stopped else admin.post_compare(fields)
+
+        def run():
+            return cmp.log_compare(env, db=args.db, receipt_path=args.receipt, account_id=args.account,
+                                   database_id=args.database_id, log_records=lambda: iter_log(args.db, log_dir),
+                                   drain_timeout_s=args.drain_timeout)
+    report, path, sha, recorded = cmp.run_compare(env, recorder, run, db=args.db, account_id=args.account,
+                                                  database_id=args.database_id, out_dir=out_dir)
     summary = {"ok": bool(report["clean"]), "mode": args.mode, "report": str(path), "report_sha256": sha,
                "clean": report["clean"], "diff_count": report.get("diff_count"),
                "d1_missing_vectors": report.get("d1_missing_vectors"), "consumed_seq": report.get("consumed_seq"),

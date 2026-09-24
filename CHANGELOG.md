@@ -21,7 +21,9 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   - barrier: freeze or stopped service, re-checked at every boundary, drained first;
   - nightly: `S`/`H`/`K`, skip past the ack timeout, one retry that retakes all three, hot keys across two nights;
   - log: the log's key set against the outbox, then the log replayed into the seed export and compared with `S`.
-- The report is JSON with its sha256. `record_compare` (through `POST /admin/compare/<db>`, or directly with `--service-stopped`) sets the health fields and advances `compare_consumed_seq` only on a clean run. `/health/db` now shows `d1_missing_vectors`, `last_compare_at`, `last_compare_clean`, `last_compare_mode` and `compare_consumed_seq`.
+- Recording is verified by the store, not trusted. A run registers first (`begin`, the store's clock). `record` takes the report file path and checks: its hash, the store name and D1 URI, the registered run (at most 12 h old), and the snapshot's hash. It advances `compare_consumed_seq` to the report's H only for a clean barrier or nightly report, never past `last_acked_seq`. The routes are `POST /admin/compare/<db>/begin|record|abort`, or the same calls directly with `--service-stopped`.
+- The outbox prune never removes a row newer than a running compare's start.
+- `/health/db` now shows `d1_missing_vectors`, `last_compare_at`, `last_compare_clean`, `last_compare_mode` and `compare_consumed_seq`.
 - The weekly barrier's `--brief-freeze` lifts only a freeze it placed. The cron entries are documented in §5.2.
 - Fix found by the log compare: `replicator.iter_log` deduplicated on `(seq, index)` and dropped a child statement that shared its seq with the FK parent the batch added. It now deduplicates on `(seq, table, pk, index)`.
 
