@@ -25,6 +25,16 @@
 #      ( umask 077; python3 -c 'import json,os; e=json.load(open(os.path.expanduser("~/.config/memora/credentials.mcp.json")))["mcpServers"]["memora"]["env"]; print(e.get("CLOUDFLARE_API_TOKEN") or e["CF_API_TOKEN"])' > ~/.config/memora-lp/cloudflare-api.token )
 #    Everything in ~/.config/memora-lp is visible (read-only) to the
 #    container: keep only token files there. The deploy lists its entries.
+#  - THE GRAPH UI (G1): memora-all's graph server (container port 8765) is
+#    published ONLY on nuc8's Tailscale address, DEPLOY_GRAPH_BIND
+#    (100.104.19.74) : DEPLOY_GRAPH_PORT (8766), never on 0.0.0.0 -- it can
+#    edit memories. Every graph route needs the graph token
+#    (~/.config/memora-lp/graph.token, minted here on first use, 0600,
+#    distinct from the health and admin tokens; the container gets
+#    MEMORA_GRAPH_TOKEN_FILE). Open http://100.104.19.74:8766/graph, enter
+#    the token once (an HttpOnly cookie), pick the store in the selector.
+#    The smoke check verifies it refuses without the token and lists the
+#    stores with it.
 #  - LOCAL-PRIMARY SWITCHES from instances/all.env, passed through when
 #    present: MEMORA_REPLICAS (a JSON map store -> d1://account/database; its
 #    stores must be local in MEMORA_DATABASES) and MEMORA_REPLICATION
@@ -157,12 +167,16 @@ DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed 
 DEPLOY_LABELS="${DEPLOY_LABELS:-}"                          # rehearsal only: k=v labels on what it creates
 DEPLOY_SECRETS_DIR="${DEPLOY_SECRETS_DIR:-~/.config/memora-lp}"  # token dir, mounted :ro (expanded on the target host)
 DEPLOY_STORE_WAIT_S="${DEPLOY_STORE_WAIT_S:-90}"            # per-store readiness wait after the start (s)
+# The graph UI (G1): published ONLY on nuc8's Tailscale address, never 0.0.0.0.
+DEPLOY_GRAPH_BIND="${DEPLOY_GRAPH_BIND:-100.104.19.74}"      # the host address the graph port is published on
+DEPLOY_GRAPH_PORT="${DEPLOY_GRAPH_PORT:-8766}"               # the host port (the container's graph is 8765)
 # Production overrides (documented, no sentinel): token file NAMES inside
 # DEPLOY_SECRETS_DIR. The same file may serve both D1 roles (the pilot does).
 DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-cloudflare-api.token}"
 DEPLOY_D1_READ_TOKEN_FILE="${DEPLOY_D1_READ_TOKEN_FILE:-d1-read.token}"
 DEPLOY_D1_REPLICATOR_TOKEN_FILE="${DEPLOY_D1_REPLICATOR_TOKEN_FILE:-d1-read.token}"
-for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE; do
+DEPLOY_GRAPH_TOKEN_FILE="${DEPLOY_GRAPH_TOKEN_FILE:-graph.token}"   # minted on first use (G1)
+for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE DEPLOY_GRAPH_TOKEN_FILE; do
   printf '%s' "${!v}" | grep -Eqx '[A-Za-z0-9_-][A-Za-z0-9._-]*' \
     || { echo "refused: $v must be a plain file name inside DEPLOY_SECRETS_DIR (got '${!v}') — nothing was done" >&2; exit 1; }
 done
@@ -196,6 +210,8 @@ DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
 DEPLOY_LABELS|DEPLOY_LABELS|
 DEPLOY_SECRETS_DIR|DEPLOY_SECRETS_DIR|~/.config/memora-lp
 DEPLOY_STORE_WAIT_S|DEPLOY_STORE_WAIT_S|90
+DEPLOY_GRAPH_BIND|DEPLOY_GRAPH_BIND|100.104.19.74
+DEPLOY_GRAPH_PORT|DEPLOY_GRAPH_PORT|8766
 DEFAULTS
 if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   RH_ROOT="${DEPLOY_REHEARSAL_ROOT:-}"
@@ -206,6 +222,7 @@ if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
     case "${!v}" in *-rh*) ;; *) refuse "$v '${!v}' is not rehearsal-scoped (must contain -rh)" ;; esac
   done
   [ "$DEPLOY_PORT" != 8920 ] || refuse "DEPLOY_PORT 8920 is production's"
+  [ "$DEPLOY_GRAPH_PORT" != 8766 ] || refuse "DEPLOY_GRAPH_PORT 8766 is production's"
   under() { python3 -c 'import os, sys; r, p = map(os.path.realpath, sys.argv[1:]); sys.exit(0 if os.path.commonpath([r, p]) == r else 1)' "$1" "$2"; }
   under "$RH_ROOT" "$DEPLOY_CONFIG_DIR" || refuse "DEPLOY_CONFIG_DIR is not under $RH_ROOT"
   under "$RH_ROOT" "$ENV_FILE" || refuse "DEPLOY_ENV_FILE is not under $RH_ROOT"
@@ -216,8 +233,22 @@ elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
        "(DEPLOY_REHEARSAL=1, scripts/rehearse_deploy.sh) — nothing was done" >&2
   exit 1
 fi
+# The graph can edit memories: it is published on ONE specific address
+# (nuc8's Tailscale IP), never on all interfaces, rehearsals included.
+python3 - "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" <<'PY' || { echo "refused: DEPLOY_GRAPH_BIND / DEPLOY_GRAPH_PORT — nothing was done" >&2; exit 1; }
+import ipaddress, sys
+bind, port = sys.argv[1:]
+try:
+    ip = ipaddress.IPv4Address(bind)
+except ValueError:
+    sys.exit(f"DEPLOY_GRAPH_BIND {bind!r} is not an IPv4 address")
+if ip.is_unspecified:
+    sys.exit("DEPLOY_GRAPH_BIND 0.0.0.0 would publish the graph on every interface")
+if not port.isdigit() or not 1 <= int(port) <= 65535:
+    sys.exit(f"DEPLOY_GRAPH_PORT {port!r} is not a port")
+PY
 echo "deploy target: host=$DEPLOY_HOST runtime=$RUNTIME container=$DEPLOY_CONTAINER volume=$DEPLOY_DATA_VOLUME" \
-     "image=$DEPLOY_IMAGE port=$DEPLOY_PORT tag=$TAG secrets=$DEPLOY_SECRETS_DIR${DEPLOY_REHEARSAL:+ (REHEARSAL)}"
+     "image=$DEPLOY_IMAGE port=$DEPLOY_PORT graph=$DEPLOY_GRAPH_BIND:$DEPLOY_GRAPH_PORT tag=$TAG secrets=$DEPLOY_SECRETS_DIR${DEPLOY_REHEARSAL:+ (REHEARSAL)}"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — need MEMORA_DATABASES for memora-all" >&2; exit 1; }
 MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//")"
 [ -n "$MEMORA_DATABASES" ] || { echo "$ENV_FILE has no MEMORA_DATABASES" >&2; exit 1; }
@@ -295,17 +326,18 @@ MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 # preceded by the blob's sha256 as a second word (review 7889: a changed
 # character that keeps the field count must refuse too). The remote script
 # checks the digest, decodes (a decoder error refuses), requires exactly
-# the 21 parameters it reads, and only then restores $1..$21. A localhost
+# the 24 parameters it reads, and only then restores $1..$24. A localhost
 # rehearsal sends the SAME command line through `sh -c`, i.e. the same
 # re-parsing a remote shell does.
 REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
   "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO"
   "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR"
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
-  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S")
+  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S"
+  "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE")
 PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
 PARAMS_SHA="$(printf '%s' "$PARAMS_B64" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-[ "${#REMOTE_ARGS[@]}" -eq 21 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 21" >&2; exit 1; }
+[ "${#REMOTE_ARGS[@]}" -eq 24 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 24" >&2; exit 1; }
 REMOTE_CMD="bash -s -- $PARAMS_SHA $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
   TARGET=(sh -c "$REMOTE_CMD")
@@ -325,7 +357,7 @@ printf '%s' "$2" | base64 -d > "$DECODED" 2>/dev/null || { rm -f "$DECODED"; bro
 P=()
 while IFS= read -r -d '' v; do P+=("$v"); done < "$DECODED"
 rm -f "$DECODED"
-[ "${#P[@]}" -eq 21 ] || broken "${#P[@]} parameters arrived, not 21"
+[ "${#P[@]}" -eq 24 ] || broken "${#P[@]} parameters arrived, not 24"
 set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -338,15 +370,27 @@ for l in ${13:-}; do LABEL_ARGS+=(--label "$l"); done
 SECRETS_DIR="${14/#\~/$HOME}"
 CF_TOKEN_NAME="${15}"; READ_TOKEN_NAME="${16}"; REPL_TOKEN_NAME="${17}"
 MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
+GRAPH_BIND="${22}"; GRAPH_PORT="${23}"; GRAPH_TOKEN_NAME="${24}"
 SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
+
+# The graph token (G1): minted once in the token directory, like the admin
+# token (48 alphanumerics, 0600, never printed); the checks below cover it.
+GRAPH_TOKEN_PATH="$SECRETS_DIR/$GRAPH_TOKEN_NAME"
+if [ -d "$SECRETS_DIR" ] && [ ! -L "$SECRETS_DIR" ] && [ ! -e "$GRAPH_TOKEN_PATH" ] && [ ! -L "$GRAPH_TOKEN_PATH" ]; then
+  tmp="$(mktemp "$SECRETS_DIR/.graph-token.XXXXXX")"
+  chmod 600 "$tmp"
+  ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 ) > "$tmp"
+  mv -f "$tmp" "$GRAPH_TOKEN_PATH"
+  echo "minted $GRAPH_TOKEN_PATH (the graph UI's token)"
+fi
 
 # Token files (REL1, review 7758), checked BEFORE anything is fetched, built
 # or stopped: the directory is a real directory (not a symlink) owned by this
 # user; each file a regular file (not a symlink) owned by this user, mode
 # exactly 0600, not empty. Refused otherwise, never chmod-ed. Values are
 # never read into this shell.
-python3 - "$SECRETS_DIR" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" <<'PY' || exit 1
+python3 - "$SECRETS_DIR" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" <<'PY' || exit 1
 import os, stat, sys
 d, names = sys.argv[1], sys.argv[2:]
 hint = ("  write it on this host first, e.g. for the Cloudflare token (value never printed):\n"
@@ -385,7 +429,8 @@ if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enfo
 fi
 TOKEN_FILE_ARGS=(-e "CLOUDFLARE_API_TOKEN_FILE=$SECRETS_MOUNT/$CF_TOKEN_NAME"
                  -e "MEMORA_D1_READ_TOKEN_FILE=$SECRETS_MOUNT/$READ_TOKEN_NAME"
-                 -e "MEMORA_D1_REPLICATOR_TOKEN_FILE=$SECRETS_MOUNT/$REPL_TOKEN_NAME")
+                 -e "MEMORA_D1_REPLICATOR_TOKEN_FILE=$SECRETS_MOUNT/$REPL_TOKEN_NAME"
+                 -e "MEMORA_GRAPH_TOKEN_FILE=$SECRETS_MOUNT/$GRAPH_TOKEN_NAME")
 LP_ARGS=()   # the local-primary switches, only when all.env sets them (absent = dark)
 [ -z "$MEMORA_REPLICAS" ] || LP_ARGS+=(-e "MEMORA_REPLICAS=$MEMORA_REPLICAS")
 [ -z "$MEMORA_REPLICATION" ] || LP_ARGS+=(-e "MEMORA_REPLICATION=$MEMORA_REPLICATION")
@@ -455,6 +500,13 @@ ADMIN_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
 [ "${#ADMIN_TOKEN}" -eq 48 ] && [ -z "$(printf '%s' "$ADMIN_TOKEN" | LC_ALL=C tr -d 'A-Za-z0-9')" ] \
   || { echo "$ADMIN_TOKEN_FILE is not 48 alphanumerics — fix or remove it" >&2; exit 1; }
 [ "$ADMIN_TOKEN" != "$HEALTH_TOKEN" ] || { echo "admin token equals the health token — remove $ADMIN_TOKEN_FILE" >&2; exit 1; }
+# The graph token is its own credential (G1): never the health or admin token.
+HEALTH_TOKEN="$HEALTH_TOKEN" ADMIN_TOKEN="$ADMIN_TOKEN" python3 - "$GRAPH_TOKEN_PATH" <<'PY' \
+  || { echo "the graph token equals the health or admin token — remove $GRAPH_TOKEN_PATH to mint a new one" >&2; exit 1; }
+import os, sys
+g = open(sys.argv[1]).read().strip()
+sys.exit(1 if g in (os.environ["HEALTH_TOKEN"], os.environ["ADMIN_TOKEN"]) else 0)
+PY
 
 # /data: the NAMED volume memora-all-data (see the header). OLD_VOLUME is what
 # the running container mounts at /data today; it is copied after the stop.
@@ -597,6 +649,7 @@ fi
   --restart unless-stopped \
   --memory 960m --cpus 4 \
   -p "0.0.0.0:$PORT:8000" \
+  -p "$GRAPH_BIND:$GRAPH_PORT:8765" \
   -v "$DATA_VOLUME:/data" \
   -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
   -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
@@ -623,7 +676,7 @@ fi
 # credentials, so not argv; stdin is the program's heredoc).
 EXPOSED="the new $CONTAINER exposes a token or mounts the tokens writable — remove it: $RT rm -f $CONTAINER, then roll back (below)"
 NEW_INSPECT="$("$RT" inspect "$CONTAINER")" || { echo "cannot inspect the new $CONTAINER. $EXPOSED" >&2; exit 1; }
-NEW_INSPECT="$NEW_INSPECT" python3 - "$SECRETS_DIR" "$SECRETS_MOUNT" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" <<'PY' \
+NEW_INSPECT="$NEW_INSPECT" python3 - "$SECRETS_DIR" "$SECRETS_MOUNT" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" <<'PY' \
   || { echo "$EXPOSED" >&2; exit 1; }
 import json, os, sys
 d, mount, names = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -657,7 +710,7 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 
-python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" "${21}" <<'PY'
+python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" "${21}" "$GRAPH_BIND" "$GRAPH_PORT" "$GRAPH_TOKEN_PATH" <<'PY'
 import json, sys, time, urllib.error, urllib.request
 
 EXPECTED_VERSION = sys.argv[1]
@@ -668,6 +721,8 @@ SMOKE_ABSORB = sys.argv[5] == "1"
 REPLICAS = json.loads(sys.argv[6] or "{}")   # the local-primary switches this deploy set
 REPLICATION = sys.argv[7]
 STORE_WAIT_S = float(sys.argv[8])   # 90 in production (DEPLOY_STORE_WAIT_S: rehearsals only)
+GRAPH_ROOT = f"http://{sys.argv[9]}:{sys.argv[10]}"
+GRAPH_TOKEN_PATH = sys.argv[11]
 L6 = ("rollback: a store already cut over (in MEMORA_REPLICAS) follows docs/cutover-runbook.md \"Rollback\" "
       "and the L6 runbook, docs/local-primary-implementation.md §5.3")
 BASE = f"{ROOT}/mcp/memora"
@@ -933,6 +988,39 @@ while api_status is None:
                   "on the port every check above used", file=sys.stderr)
             sys.exit(1)
         time.sleep(2)
+# The graph UI (G1), on its published address: refuses without the token,
+# serves the registry's stores with it. The token is read here, never printed.
+def _graph_get(path, token=None):
+    req = urllib.request.Request(GRAPH_ROOT + path, headers={"Authorization": f"Bearer {token}"} if token else {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            return exc.code, json.loads(exc.read() or b"{}")
+        except ValueError:
+            return exc.code, {}
+
+graph_deadline = time.time() + 30
+while True:
+    try:
+        anon = _graph_get("/api/databases")
+        break
+    except (urllib.error.URLError, OSError) as exc:
+        if time.time() > graph_deadline:
+            print(f"graph UI not reachable at {GRAPH_ROOT} ({exc})", file=sys.stderr)
+            sys.exit(1)
+        time.sleep(2)
+if anon[0] != 401 or not anon[1].get("memora_graph"):
+    print(f"graph UI at {GRAPH_ROOT} answered {anon[0]} without the token: it must refuse (401)", file=sys.stderr)
+    sys.exit(1)
+graph_token = open(GRAPH_TOKEN_PATH).read().strip()
+status, dbs = _graph_get("/api/databases", graph_token)
+if status != 200 or sorted(dbs.get("databases") or []) != sorted(STORES):
+    print(f"graph UI /api/databases with the token: HTTP {status}, {json.dumps(dbs)[:300]}", file=sys.stderr)
+    sys.exit(1)
+print(f"graph UI at {GRAPH_ROOT}: refuses without the token; serves {len(STORES)} stores with it")
+
 if api_status != 404:
     print(f"/api/v1/memora/health answered {api_status}: the API is registered, but this deploy "
           "sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)

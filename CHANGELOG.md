@@ -14,6 +14,32 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Graph UI with a store selector, served by memora-all (G1)
+
+- memora's graph server reads and edits the store `?db=<store>` selects
+  (validated against `MEMORA_DATABASES`, default `MEMORA_DEFAULT_DB`)
+  through the normal registry backend, so a local primary is read and
+  edited locally (its edits replicate) and a d1:// store through D1. An
+  unknown store is 400, a store refused at startup 503. The page's DB
+  selector is on whenever a registry exists (`/api/databases`), and edit
+  rights and live updates follow the selected store.
+- A frozen or read-only store: reads are served (X2), an edit answers
+  409 `store_read_only`, and `/api/capabilities?db=` reports read-only so
+  the page hides its edit controls.
+- Every route needs the graph token (`MEMORA_GRAPH_TOKEN(_FILE)`, else the
+  health token): a Bearer header, or an HttpOnly SameSite=Strict cookie
+  set by a small login form (the token never goes in a URL). Required
+  whenever a token is configured and always on a non-loopback bind; a
+  non-loopback bind without any token refuses every route. Edits and the
+  login also check the Origin.
+- `scripts/deploy-memora-all.sh` publishes the graph only on nuc8's
+  Tailscale address (100.104.19.74:8766 → 8765; `DEPLOY_GRAPH_BIND` /
+  `DEPLOY_GRAPH_PORT` are rehearsal parameters, and 0.0.0.0 is refused
+  even there), mints `~/.config/memora-lp/graph.token` (0600, distinct from
+  the health and admin tokens) and passes it as `MEMORA_GRAPH_TOKEN_FILE`.
+  The smoke check requires 401 without the token and the store list with
+  it.
+
 ## 0.5.0
 
 The local-primary release. A store can be served from a seeded local SQLite

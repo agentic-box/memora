@@ -341,7 +341,7 @@ def test_the_defaults_are_the_production_deploy(deploy):
     tools = deploy.tools.read_text().splitlines()
     assert tools[0] == "ssh nuc8"
     assert ("deploy target: host=nuc8 runtime=docker container=memora-all volume=memora-all-data "
-            "image=memora:latest port=8920 tag=v0.5.0 secrets=~/.config/memora-lp") in proc.stdout
+            "image=memora:latest port=8920 graph=100.104.19.74:8766 tag=v0.5.0 secrets=~/.config/memora-lp") in proc.stdout
     assert any(t.startswith("git ") and "checkout v0.5.0" in t for t in tools)
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
@@ -364,6 +364,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
         "DEPLOY_LABELS": "memora.rehearsal=rh-run-7",
         "DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
         "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
+        "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "18766",
         "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
         "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
         "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_TAG": "v9.9.9"})
@@ -393,6 +394,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
 
 REHEARSAL = {"DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
              "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
+             "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "18766",
              "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0"}
 
 
@@ -711,6 +713,7 @@ class _FakeMemora:
         outer = self
         self.health_db = health_db
         self.tool_calls = []
+        self.graph_token = None
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -727,6 +730,10 @@ class _FakeMemora:
                 self.wfile.write(raw)
 
             def do_GET(self):
+                if self.path == "/api/databases":  # the graph UI (G1), on the same fake port
+                    if self.headers.get("Authorization", "") != f"Bearer {outer.graph_token}":
+                        return self._send(401, {"error": "unauthorized", "memora_graph": True})
+                    return self._send(200, {"databases": sorted(LOCAL_REGISTRY), "default": "memora"})
                 if self.path == "/health":
                     return self._send(200, {"status": "ok", "version": "0.5.0"})
                 if self.path.startswith("/health/db/"):
@@ -760,6 +767,7 @@ class _FakeMemora:
         self.server.shutdown()
 
 
+GRAPH_TOKEN = "G" * 48
 REPL_OK = {"mode": "write", "status": "running", "replica_uri": "d1://acct/db3", "head_seq": 0,
            "last_acked_seq": 0, "lag_rows": 0, "trigger_version": 2, "trigger_version_expected": 2}
 FROZEN = {"freeze": {"state": "frozen", "in_flight": 0}}
@@ -773,6 +781,8 @@ def poststart(deploy, tmp_path):
     (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
     rsec = tmp_path / "rsec"
     shutil.copytree(deploy.secrets, rsec)
+    (rsec / "graph.token").write_text(GRAPH_TOKEN)
+    os.chmod(rsec / "graph.token", 0o600)
     envf = tmp_path / "rh.env"
     envf.write_text(f"MEMORA_DATABASES='{json.dumps(LOCAL_REGISTRY)}'\n"
                     f"MEMORA_REPLICAS='{json.dumps({'re': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n")
@@ -780,11 +790,13 @@ def poststart(deploy, tmp_path):
 
     def run(health_db):
         fake = _FakeMemora(health_db)
+        fake.graph_token = GRAPH_TOKEN
         servers.append(fake)
         proc, calls, _ = deploy(runtime_env={
             **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
             "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
             "DEPLOY_ENV_FILE": str(envf), "DEPLOY_PORT": str(fake.port), "DEPLOY_TAG": "v0.5.0",
+            "DEPLOY_GRAPH_PORT": str(fake.port),
             "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_STORE_WAIT_S": "2"})
         return proc, fake
 
@@ -891,7 +903,7 @@ class TestDataDirPinned:
 
 # ---------------------------------------------------------------- REL2: the remote arguments survive ssh
 
-N_REMOTE_ARGS = 21
+N_REMOTE_ARGS = 24
 
 
 def _decode_blob(line):
@@ -922,6 +934,7 @@ class TestRemoteArguments:
         assert params[17] == ""                      # MEMORA_REPLICAS_B64: empty (dark)
         assert params[18] == "" and params[19] == ""  # MEMORA_REPLICATION, the timing
         assert params[20] == "90"
+        assert params[21:] == ["100.104.19.74", "8766", "graph.token"]  # G1: the graph publish
 
     def test_spaces_survive_the_transport(self, deploy, tmp_path):
         root = tmp_path / "rh root"
@@ -993,3 +1006,73 @@ def test_every_position_survives_empty_and_spaced_values(tmp_path, pos):
     out = subprocess.run(["bash", str(harness), *values], capture_output=True, timeout=30)
     assert out.returncode == 0, out.stderr
     assert out.stdout.decode().split("\0")[:-1] == values
+
+
+# ---------------------------------------------------------------- G1: the graph UI's publish and token
+
+class TestGraphPublish:
+    def test_published_only_on_the_tailscale_address(self, deploy):
+        proc, calls, _ = deploy()
+        run = _new_container_run(calls)
+        ports = _flag_values(run, "-p")
+        assert "100.104.19.74:8766:8765" in ports
+        assert not [p for p in ports if p.endswith(":8765") and not p.startswith("100.104.19.74:")]
+        assert "graph=100.104.19.74:8766" in proc.stdout
+
+    def test_the_graph_token_is_minted_once_0600_and_passed_as_a_file(self, deploy):
+        proc, calls, _ = deploy()
+        tok = deploy.secrets / "graph.token"
+        assert stat.S_IMODE(os.stat(tok).st_mode) == 0o600
+        value = tok.read_text()
+        assert len(value) == 48 and value.isalnum()
+        envs = _flag_values(_new_container_run(calls), "-e")
+        assert f"MEMORA_GRAPH_TOKEN_FILE={SECRETS_MOUNT}/graph.token" in envs
+        assert not [e for e in envs if e.startswith("MEMORA_GRAPH_TOKEN=")]
+        assert value not in _all_argv(calls) + proc.stdout + proc.stderr
+        deploy()
+        assert tok.read_text() == value  # never re-minted
+
+    def test_a_graph_token_equal_to_the_health_token_is_refused_before_the_stop(self, deploy):
+        tok = deploy.secrets / "graph.token"
+        tok.write_text("h" * 48)
+        os.chmod(tok, 0o600)
+        proc, calls, _ = deploy()
+        assert proc.returncode != 0 and "the graph token equals the health or admin token" in proc.stderr
+        assert not any(c[0] == "stop" for c in calls)
+
+    def test_a_group_readable_graph_token_is_refused_before_anything(self, deploy):
+        tok = deploy.secrets / "graph.token"
+        tok.write_text("q" * 48)
+        os.chmod(tok, 0o640)
+        proc, calls, _ = deploy()
+        _secrets_refused(deploy, proc, calls, "mode 0600")
+
+    @pytest.mark.parametrize("env", [{"DEPLOY_GRAPH_BIND": "127.0.0.1"}, {"DEPLOY_GRAPH_PORT": "9999"}])
+    def test_the_graph_publish_is_not_overridable_without_the_sentinel(self, deploy, env):
+        proc, calls, _ = deploy(runtime_env=env)
+        _nothing_done(deploy, proc, calls)
+        assert "overrides are for rehearsals only" in proc.stderr
+
+    @pytest.mark.parametrize("bind, match", [("0.0.0.0", "every interface"), ("nuc8", "not an IPv4 address"),
+                                             ("", "not an IPv4 address")])
+    def test_the_graph_is_never_published_on_all_interfaces(self, deploy, tmp_path, bind, match):
+        rcfg = tmp_path / "rcfg"
+        rcfg.mkdir()
+        env = {**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+               "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg),
+               "DEPLOY_SECRETS_DIR": str(tmp_path / "rsec"), "DEPLOY_ENV_FILE": str(deploy.env_file),
+               "DEPLOY_GRAPH_BIND": bind, "DEPLOY_GRAPH_PORT": "18766"}
+        if bind == "":
+            env["DEPLOY_GRAPH_BIND"] = " "
+        proc, calls, _ = deploy(runtime_env=env)
+        _nothing_done(deploy, proc, calls)
+        assert match in proc.stderr or "DEPLOY_ENV_FILE is not under" in proc.stderr
+
+    def test_a_rehearsal_may_not_use_the_production_graph_port(self, deploy, tmp_path):
+        rcfg = tmp_path / "rcfg"
+        rcfg.mkdir()
+        proc, calls, _ = deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+                                             "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg),
+                                             "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "8766"})
+        _nothing_done(deploy, proc, calls)
+        assert "DEPLOY_GRAPH_PORT 8766 is production's" in proc.stderr

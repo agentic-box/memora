@@ -15,7 +15,8 @@ from memora import secret_files
 from memora.secret_files import SecretFileError, check_secret_files, read_secret_file, secret
 
 VALUE = "tok-" + "Q7" * 20  # distinctive, so a leak in any message is found
-VARS = ("MEMORA_D1_READ_TOKEN", "MEMORA_D1_REPLICATOR_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN")
+VARS = ("MEMORA_D1_READ_TOKEN", "MEMORA_D1_REPLICATOR_TOKEN", "CLOUDFLARE_API_TOKEN", "CF_API_TOKEN",
+        "MEMORA_GRAPH_TOKEN")
 
 
 @pytest.fixture
@@ -118,7 +119,7 @@ class TestSecret:
 
     def test_check_covers_all_three(self, env, tmp_path):
         assert set(secret_files.FILE_BACKED) == {"MEMORA_D1_READ_TOKEN", "MEMORA_D1_REPLICATOR_TOKEN",
-                                                 "CLOUDFLARE_API_TOKEN"}
+                                                 "CLOUDFLARE_API_TOKEN", "MEMORA_GRAPH_TOKEN"}
         env.setenv("MEMORA_D1_REPLICATOR_TOKEN_FILE", token_file(tmp_path, mode=0o640))
         with pytest.raises(SecretFileError, match="MEMORA_D1_REPLICATOR_TOKEN"):
             check_secret_files()
@@ -126,7 +127,7 @@ class TestSecret:
     def test_check_reports_set(self, env, tmp_path):
         env.setenv("MEMORA_D1_READ_TOKEN_FILE", token_file(tmp_path))
         assert check_secret_files() == {"MEMORA_D1_READ_TOKEN": True, "MEMORA_D1_REPLICATOR_TOKEN": False,
-                                        "CLOUDFLARE_API_TOKEN": False}
+                                        "CLOUDFLARE_API_TOKEN": False, "MEMORA_GRAPH_TOKEN": False}
 
 
 class TestConsumersReadTheFile:

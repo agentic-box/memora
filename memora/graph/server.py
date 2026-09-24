@@ -1,7 +1,9 @@
 """HTTP server and routes for graph visualization."""
 
 import asyncio
+import contextvars
 import functools
+import hmac
 import json
 import logging
 import os
@@ -19,6 +21,8 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
 from ..storage import (
+    CURRENT_DB,
+    DatabaseRegistryError,
     LLM_MODEL,
     _get_llm_client,
     add_memory,
@@ -165,8 +169,10 @@ def _check_port_status(host: str, port: int) -> str:
             return "free"
 
     # Port is in use - verify it's our graph server
+    import urllib.error
+    import urllib.request
+
     try:
-        import urllib.request
         url = f"http://{connect_host}:{port}/api/graph"
         req = urllib.request.Request(url, method="GET")
         with urllib.request.urlopen(req, timeout=2) as resp:
@@ -174,10 +180,122 @@ def _check_port_status(host: str, port: int) -> str:
             # Check for our specific response structure
             if '"nodes"' in data or '"count"' in data:
                 return "memora"
+    except urllib.error.HTTPError as exc:  # the graph guard (G1) answers 401/503
+        try:
+            if '"memora_graph"' in exc.read().decode():
+                return "memora"
+        except Exception:
+            pass
     except Exception as exc:
         logger.debug("Port %s probe could not verify memora server: %s", port, exc)
 
     return "other"
+
+
+# ------------------------------------------------------------------ G1: store selection, auth
+
+GRAPH_COOKIE = "memora_graph"
+_LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _graph_token() -> str:
+    """The graph routes' credential: MEMORA_GRAPH_TOKEN(_FILE), else the health
+    token. "" when neither is configured."""
+    from ..secret_files import secret
+
+    return secret("MEMORA_GRAPH_TOKEN") or os.getenv("MEMORA_HEALTH_TOKEN", "").strip()
+
+
+def _token_required(host: str, token: str) -> bool:
+    """Every route needs the token when one is configured, and always on a
+    non-loopback bind (memora-all binds 0.0.0.0 inside its container)."""
+    return bool(token) or host not in _LOOPBACK
+
+
+def _presented_token(request: Request) -> str:
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return request.cookies.get(GRAPH_COOKIE, "")
+
+
+def _token_ok(request: Request, token: str) -> bool:
+    presented = _presented_token(request)
+    return bool(token) and bool(presented) and hmac.compare_digest(presented.encode(), token.encode())
+
+
+def graph_databases() -> dict:
+    """The stores the graph can show: the registry's names and its default
+    ({} names when memora runs one store without a registry)."""
+    from ..storage import database_registry, default_database_name
+
+    registry = database_registry()
+    return {"databases": sorted(registry), "default": default_database_name() if registry else None}
+
+
+class GraphDbError(Exception):
+    def __init__(self, status: int, body: dict):
+        super().__init__(body.get("error"))
+        self.status, self.body = status, body
+
+
+def resolve_graph_db(requested):
+    """The store a graph request reads and edits: ?db=<name>, validated
+    against MEMORA_DATABASES (default MEMORA_DEFAULT_DB), opened through the
+    normal registry backend (local primary or d1://). Without a registry
+    only the single store exists, and ?db= is refused."""
+    from ..storage import backend_for, database_registry, default_database_name
+
+    try:
+        registry = database_registry()
+    except DatabaseRegistryError:
+        raise GraphDbError(503, {"error": "registry_error"})
+    if not registry:
+        if requested:
+            raise GraphDbError(400, {"error": "unknown_db", "known": []})
+        return None
+    name = requested or default_database_name()
+    if name not in registry:
+        raise GraphDbError(400, {"error": "unknown_db", "known": sorted(registry)})
+    try:
+        backend_for(name)  # a store refused at startup (the /data check) raises
+    except DatabaseRegistryError:
+        raise GraphDbError(503, {"error": "store_unavailable", "db": name})
+    except Exception as exc:
+        raise GraphDbError(503, {"error": "store_refused", "db": name, "message": str(exc)[:300]})
+    return name
+
+
+def _store_gate_state(name):
+    """The write gate's state of the selected store ("open", "frozen", ...), or
+    None for a store without a gate."""
+    from ..storage import backend_for
+
+    try:
+        backend = backend_for(name) if name else None
+    except Exception:
+        return None
+    gate_of = getattr(backend, "write_gate", None) if backend is not None else None
+    if gate_of is None:
+        return None
+    try:
+        return gate_of().state
+    except Exception:
+        return None
+
+
+def _in_context(fn):
+    """fn bound to the CURRENT context (the selected store): for executor and
+    thread work, which does not inherit contextvars by itself."""
+    ctx = contextvars.copy_context()
+    return lambda *a, **k: ctx.run(fn, *a, **k)
+
+
+_LOGIN_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>memora graph</title></head>
+<body style="font-family:sans-serif;background:#0d1117;color:#c9d1d9;padding:3em">
+<form method="post" action="/login"><p>memora graph: enter the graph token.</p>
+<input type="password" name="token" autofocus style="width:28em"> <button type="submit">Open</button>
+<input type="hidden" name="next" value="__NEXT__"></form></body></html>"""
 
 
 def start_graph_server(host: str, port: int) -> None:
@@ -201,15 +319,49 @@ def start_graph_server(host: str, port: int) -> None:
         print(f"Port {port} is in use by another service, skipping graph server", file=sys.stderr)
         return
 
+    app = build_graph_app(host)
+
+    def run_server():
+        import uvicorn
+
+        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        # SO_REUSEADDR is set by default in uvicorn, but we ensure quick restart
+        server.run()
+
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+
+    # Get bucket name for unique URL
+    bucket_name = ""
+    try:
+        from ..storage import STORAGE_BACKEND
+        if hasattr(STORAGE_BACKEND, 'bucket'):
+            bucket_name = STORAGE_BACKEND.bucket
+    except Exception:
+        logger.debug("Unable to include bucket param in graph URL", exc_info=True)
+
+    bucket_param = f"?bucket={bucket_name}" if bucket_name else ""
+    print(f"Graph visualization available at http://{host}:{port}/graph{bucket_param}", file=sys.stderr)
+
+
+def build_graph_app(host: str):
+    """The graph's Starlette app (G1): every route needs the graph token
+    (_token_required), and every /api route reads and edits the store its
+    ?db= selects (resolve_graph_db)."""
     from starlette.applications import Starlette
     from starlette.routing import Route
 
     def _load_spa_html(version: str) -> str:
         html = _pkg_files("memora.graph").joinpath("index.html").read_text("utf-8")
+        try:
+            multi = bool(graph_databases()["databases"])
+        except Exception:
+            multi = False
         config = json.dumps({
             "version": version,
             "r2Prefix": "/r2/",
-            "dbSelector": False,
+            "dbSelector": multi,
             "wsUrl": None,
             "sseUrl": "/api/events",
         })
@@ -460,6 +612,10 @@ def start_graph_server(host: str, port: int) -> None:
 
     async def api_memory_patch(request: Request):
         """API endpoint: Update tags and/or metadata for a memory."""
+        if not _check_origin(request):
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        from ..write_gate import StoreReadOnlyError
+
         try:
             memory_id = int(request.path_params.get("id"))
             body = await request.json()
@@ -504,6 +660,10 @@ def start_graph_server(host: str, port: int) -> None:
             if result is None:
                 return JSONResponse({"error": "not_found"}, status_code=404)
             return JSONResponse(_serialize_memory_api_result(result))
+        except StoreReadOnlyError as e:
+            # a frozen (or read-only) store: the edit is refused, nothing written
+            return JSONResponse({"error": "store_read_only", "db": CURRENT_DB.get(), "message": str(e)[:300]},
+                                status_code=409)
         except ValueError as e:
             logger.exception("Graph memory patch validation failed: %s", e)
             return JSONResponse({"error": str(e)}, status_code=400)
@@ -610,7 +770,7 @@ def start_graph_server(host: str, port: int) -> None:
             loop = asyncio.get_event_loop()
 
             rewrite_result = await loop.run_in_executor(
-                None, functools.partial(rewrite_query, message, max_queries=3)
+                None, _in_context(functools.partial(rewrite_query, message, max_queries=3))
             )
             queries = rewrite_result["queries"]
             filters = rewrite_result.get("filters", {})
@@ -619,7 +779,7 @@ def start_graph_server(host: str, port: int) -> None:
             try:
                 results = await loop.run_in_executor(
                     None,
-                    functools.partial(
+                    _in_context(functools.partial(
                         multi_query_hybrid_search,
                         conn,
                         queries,
@@ -627,7 +787,7 @@ def start_graph_server(host: str, port: int) -> None:
                         date_from=filters.get("date_from"),
                         date_to=filters.get("date_to"),
                         tags_any=filters.get("tags_any"),
-                    ),
+                    )),
                 )
             finally:
                 conn.close()
@@ -792,7 +952,8 @@ def start_graph_server(host: str, port: int) -> None:
                         logger.error("Chat LLM streaming failed: %s", e, exc_info=True)
                         loop.call_soon_threadsafe(queue.put_nowait, ("error", "An error occurred while generating a response."))
 
-                llm_thread = threading.Thread(target=run_llm, daemon=True)
+                # the selected store: _execute_chat_tool's connect() runs in this thread
+                llm_thread = threading.Thread(target=_in_context(run_llm), daemon=True)
                 llm_thread.start()
 
                 while True:
@@ -813,14 +974,24 @@ def start_graph_server(host: str, port: int) -> None:
     async def api_capabilities(request):
         # The shared index.html hides its edit controls unless the server
         # says it may write (fail closed). This server edits through memora
-        # itself, so it may; the Pages viewer answers read_only: true
+        # itself, so it may -- unless the SELECTED store is frozen or
+        # read-only (G1); the Pages viewer answers read_only: true
         # (docs/local-primary-implementation.md §6 F1).
-        return JSONResponse({"read_only": False})
+        state = _store_gate_state(CURRENT_DB.get())
+        return JSONResponse({"read_only": state not in (None, "open"), "db": CURRENT_DB.get(), "gate": state})
+
+    async def api_databases(request):
+        # The SPA's DB selector (the same code path as the Pages viewer's).
+        try:
+            return JSONResponse(graph_databases())
+        except DatabaseRegistryError:
+            return JSONResponse({"error": "registry_error"}, status_code=503)
 
     app = Starlette(
         routes=[
             Route("/graph", graph_handler),
             Route("/api/capabilities", api_capabilities),
+            Route("/api/databases", api_databases),
             Route("/_graph_limit.mjs", graph_limit_module),
             Route("/api/graph", api_graph),
             Route("/api/events", graph_events),
@@ -834,25 +1005,84 @@ def start_graph_server(host: str, port: int) -> None:
         ]
     )
 
-    def run_server():
-        import uvicorn
+    return _GraphGuard(app, host)
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-        server = uvicorn.Server(config)
-        # SO_REUSEADDR is set by default in uvicorn, but we ensure quick restart
-        server.run()
 
-    thread = threading.Thread(target=run_server, daemon=True)
-    thread.start()
+class _GraphGuard:
+    """ASGI wrapper for the graph app (G1).
 
-    # Get bucket name for unique URL
-    bucket_name = ""
-    try:
-        from ..storage import STORAGE_BACKEND
-        if hasattr(STORAGE_BACKEND, 'bucket'):
-            bucket_name = STORAGE_BACKEND.bucket
-    except Exception:
-        logger.debug("Unable to include bucket param in graph URL", exc_info=True)
+    - Auth: every route except the login form needs the graph token (a
+      Bearer header, or the HttpOnly SameSite=Strict cookie /login sets --
+      the token is never put in a URL). Required whenever a token is
+      configured and always on a non-loopback bind; a non-loopback bind
+      without any token answers 503 on every route (fail closed).
+    - Store: every /api route runs with CURRENT_DB set to the store ?db=
+      selects (resolve_graph_db); an unknown store is 400, a refused one 503.
+    """
 
-    bucket_param = f"?bucket={bucket_name}" if bucket_name else ""
-    print(f"Graph visualization available at http://{host}:{port}/graph{bucket_param}", file=sys.stderr)
+    def __init__(self, app, host: str):
+        self.app, self.host = app, host
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        request = Request(scope, receive)
+        path = scope.get("path", "")
+        token = _graph_token()
+        if _token_required(self.host, token):
+            if not token:
+                return await JSONResponse({"error": "graph_token_not_configured", "memora_graph": True},
+                                          status_code=503)(scope, receive, send)
+            if path == "/login":
+                return await self._login(request, token)(scope, receive, send)
+            if not _token_ok(request, token):
+                if path == "/graph" and request.method == "GET":
+                    nxt = "/graph" + (f"?{scope.get('query_string', b'').decode()}" if scope.get("query_string") else "")
+                    return await HTMLResponse(_LOGIN_HTML.replace("__NEXT__", _html_attr(nxt)),
+                                              status_code=401)(scope, receive, send)
+                return await JSONResponse({"error": "unauthorized", "memora_graph": True},
+                                          status_code=401)(scope, receive, send)
+        if path.startswith("/api/") and path != "/api/databases":
+            try:
+                name = resolve_graph_db(request.query_params.get("db"))
+            except GraphDbError as exc:
+                return await JSONResponse(exc.body, status_code=exc.status)(scope, receive, send)
+            reset = CURRENT_DB.set(name)
+            try:
+                return await self.app(scope, receive, send)
+            finally:
+                CURRENT_DB.reset(reset)
+        return await self.app(scope, receive, send)
+
+    def _login(self, request: Request, token: str):
+        async def respond(scope, receive, send):
+            from starlette.responses import RedirectResponse
+
+            if request.method != "POST":
+                return await HTMLResponse(_LOGIN_HTML.replace("__NEXT__", "/graph"))(scope, receive, send)
+            origin = request.headers.get("origin", "")
+            if origin:
+                from urllib.parse import urlparse
+                host = (request.headers.get("host") or "").split(":")[0]
+                if (urlparse(origin).hostname or "") not in (host, "localhost", "127.0.0.1"):
+                    return await JSONResponse({"error": "forbidden"}, status_code=403)(scope, receive, send)
+            from urllib.parse import parse_qs
+
+            form = parse_qs((await request.body()).decode("utf-8", "replace"))
+            presented = (form.get("token") or [""])[0]
+            nxt = (form.get("next") or ["/graph"])[0]
+            if not nxt.startswith("/graph"):
+                nxt = "/graph"  # never an open redirect
+            if not (presented and hmac.compare_digest(presented.encode(), token.encode())):
+                return await HTMLResponse(_LOGIN_HTML.replace("__NEXT__", _html_attr(nxt)),
+                                          status_code=401)(scope, receive, send)
+            resp = RedirectResponse(nxt, status_code=303)
+            resp.set_cookie(GRAPH_COOKIE, token, httponly=True, samesite="strict", path="/")
+            return await resp(scope, receive, send)
+        return respond
+
+
+def _html_attr(value: str) -> str:
+    import html
+
+    return html.escape(value, quote=True)

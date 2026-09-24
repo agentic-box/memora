@@ -59,7 +59,7 @@ def test_force_graph_has_no_favorite_write():
 
 def test_local_graph_server_declares_itself_writable(graph_request):
     status, body = graph_request("GET", "/api/capabilities")
-    assert status == 200 and body == {"read_only": False}
+    assert status == 200 and body["read_only"] is False  # G1 adds the selected db and its gate state
 
 
 def test_pages_capabilities_declares_read_only():
