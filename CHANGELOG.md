@@ -18,7 +18,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 Pages viewer crash fixes, matching memora-all's graph handling.
 
-- The Pages `/api/graph` no longer answers 500 on unusual stored values: a tag, section, status, component or category named like a JavaScript object property (`constructor`, `__proto__`, ...), a value carrying its own `toString`, tags or metadata stored as `null`, an unusable `hierarchy.path` or a non-string `subsection`. They are keyed or ignored exactly as memora-all does. Ships with the next Pages deploy.
+- The Pages `/api/graph` no longer answers 500 on unusual stored values (keys like `constructor` or `__proto__`, `null` tags or metadata, malformed paths); it handles them exactly as memora-all does. Ships with the next Pages deploy.
 - Flaky tests made load-independent.
 
 ## 0.5.4
@@ -54,8 +54,8 @@ Graph viewer served by memora-all, and embedding fixes.
 The local-primary release: a store can be served from a local SQLite file on memora-all's data volume and replicated to its D1 database. Every store stays on `d1://` until it is cut over, one at a time; without `MEMORA_REPLICAS` and `MEMORA_REPLICATION`, memora-all runs as before. Design: `docs/local-primary-implementation.md`; cutover steps: `docs/cutover-runbook.md`; tokens and who holds them: `docs/local-primary-credentials.md`.
 
 - **Replicator:** replays local changes to D1 in order, with a statement allow-list, a guard that halts on mass deletes, a dry "log" mode, and replication status in `/health/db`.
-- **Write gate and D1 intent journal:** a store can be frozen, every D1 write is journaled first, and uncertain writes are reconciled by an operator (`/admin/*`, behind an admin token).
-- **Operator tool `scripts/local_primary.py`:** verified export and recheck, seed, snapshot to R2, restore, conflict review, rollback, compare with D1 and resume. It runs in a one-off container of the current image (`scripts/lp_container.sh`) while holding the store's lock.
+- **Write gate and D1 intent journal:** a store can be frozen, writes from `d1://` stores are journaled before they are sent, and uncertain writes are reconciled by an operator (`/admin/*`, behind an admin token).
+- **Operator tool `scripts/local_primary.py`:** verified export and recheck, seed, snapshot to R2, restore, conflict review, rollback, compare with D1 and resume. It runs in a one-off container of the current image (`scripts/lp_container.sh`); operations that need memora-all stopped also take the store's lock.
 - **Absorb** on a local store runs in one transaction; live primaries use WAL and enforce foreign keys like D1.
 - **Shadow mode:** a D1 store can be mirrored to a local file, with a nightly check that the mirror and the replication log both match D1.
 - **Deploy:** named data volume with a startup mount check, tokens read from mounted files (never printed), `scripts/cutover_store.sh` for one store's cutover, and a rehearsal on a real container runtime (`docs/deploy-rehearsal.md`).
