@@ -84,32 +84,66 @@ last, only after nothing but memora-all uses D1.
      --check-admin-token-file ~/.config/memora/nuc8.admin-token
    ```
 
-   Each direct-D1 stdio entry becomes `{"type": "http", "url": …}`; a 0600
-   backup `FILE.bak-repoint-<timestamp>` is written first. With the check
+   Only the routing of each direct-D1 entry changes: `command`/`args`
+   become `"type": "http", "url": …`, and `CLOUDFLARE_API_TOKEN`,
+   `CF_API_TOKEN`, a `d1://` `MEMORA_STORAGE_URI` and the `d1://` entries of
+   `MEMORA_DATABASES` leave `env`. Every other env key (LLM, embedding, AWS)
+   stays, because `memora-instance.sh` reads its container env from
+   `credentials*.mcp.json` (`--drop-env` removes the env instead, for a
+   client that rejects it on an http entry). The preview prints keys and
+   routing only; every value is shown as `<redacted:LENGTH>`. A 0600 backup
+   `FILE.bak-repoint-<timestamp>` is written first. With the check
    flags, step 2's endpoint check runs first against the URL's server,
    through the scratch store (`--check-store`, default `scratch`), and a
-   failure refuses the repoint. Repeat for every file the audit (step 4) lists: workspace
+   failure refuses the repoint. Repeat for every file the audit (step 5) lists: workspace
    `.mcp.json` files, `~/.claude.json`, `~/.config/memora/*credentials*.mcp.json`
-   on the Mac, ob1, bestation and re. Repointing
-   `~/.config/memora/credentials.mcp.json` on the Mac also retires the Mac's
-   own `memora-instance.sh` containers as D1 clients: that file is their
-   credential source.
-4. **Audit (F4/F5 done when clean)**:
+   on the Mac, ob1, bestation and re.
+4. **Recreate every `memora-instance.sh` container** on every host whose
+   credential file was repointed. A running container keeps the env it was
+   started with, including the old token and its `d1://` routing, until it
+   is recreated:
+
+   ```sh
+   for f in instances/*.env; do n=$(basename "$f" .env); [ "$n" = example ] || scripts/memora-instance.sh up "$n"; done
+   ```
+
+   An instance whose registry is still `d1://` must first be repointed in
+   its `instances/<name>.env` (or retired: its workspaces now use nuc8).
+5. **Audit files AND running containers on every host (F4/F5 done when
+   clean)**:
 
    ```sh
    scripts/audit_configs.py --local --host nuc8 --host ob1 --host bestation --host re
+   scripts/audit_configs.py --local --host nuc8 --host ob1 --host bestation --host re --containers-only   # quick re-check
    ```
 
+   Every run scans the configuration files and inspects the environment of
+   every running container (docker, podman, Apple's `container`), masked.
    Exit 0 only when no host has a direct-D1 client except memora-all itself
-   (`instances/all.env`; on nuc8, `~/.config/memora/credentials.mcp.json`
-   and `all.*`). A host that cannot be audited counts as not clean.
-5. **Move memora-all to (a) (F6)**: put (a) as `CLOUDFLARE_API_TOKEN` in
+   (`instances/all.env`; on nuc8, `~/.config/memora/credentials.mcp.json`,
+   `all.*` and the running `memora-all` container). A host that cannot be
+   audited, or whose runtime cannot list or inspect its containers, counts
+   as not clean.
+6. **check-endpoint from each client host**: run step 2's command on every
+   host that was repointed (the Mac, ob1, bestation, re); each must print
+   `"ok": true`.
+7. **Move memora-all to (a) (F6)**: put (a) as `CLOUDFLARE_API_TOKEN` in
    nuc8's `~/.config/memora/credentials.mcp.json` (a backup is kept by the
    deploy), redeploy, and check `/health/db/<store>` for every store.
-6. **Revoke the OLD token** in the dashboard. Then delete every
-   `*.bak-repoint-*` backup: each still holds it. A stale client now gets
+8. **Revoke the OLD token** in the dashboard, only when ALL of these hold
+   (the revoke gate):
+   - the file audit is clean on every host (step 5);
+   - the running-container audit is clean on every host (step 5);
+   - every `memora-instance.sh` container was recreated after the repoint
+     (step 4);
+   - check-endpoint is green from every client host (step 6);
+   - memora-all is healthy on (a) (step 7).
+
+   Then Then delete every
+   `*.bak-repoint-*` backup: each still holds it (the audit reports them
+   until they are gone). A stale client now gets
    401/403 from Cloudflare; memora-all stays healthy on (a).
-7. (b) goes into memora-all's env when the first store's replicator is
+9. (b) goes into memora-all's env when the first store's replicator is
    switched to write mode (L9); (c) when the first shadow starts or the first
    export runs.
 

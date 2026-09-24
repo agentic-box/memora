@@ -10,17 +10,28 @@ procedure: docs/local-primary-credentials.md).
 
 FILE is a JSON MCP configuration with an "mcpServers" object: a workspace or
 Claude/Codex `.mcp.json`, `~/.claude.json`, or memora's
-`~/.config/memora/credentials*.mcp.json`. Every server entry that reaches D1
-directly -- a stdio entry whose env or args carry a d1:// URI, or
-CLOUDFLARE_API_TOKEN / CF_API_TOKEN -- is replaced by
+`~/.config/memora/credentials*.mcp.json`. For every server entry that reaches
+D1 directly -- a stdio entry whose env or args carry a d1:// URI, or
+CLOUDFLARE_API_TOKEN / CF_API_TOKEN -- only the ROUTING is rewritten
+(review 7667 P1-2b):
 
-    {"type": "http", "url": "<--url>"}
+  * "command" and "args" are replaced by "type": "http", "url": <--url>;
+  * from "env", CLOUDFLARE_API_TOKEN and CF_API_TOKEN are removed, a d1://
+    MEMORA_STORAGE_URI is removed, and the d1:// entries of a
+    MEMORA_DATABASES registry are removed (the key goes when none remain);
+  * every other env key (LLM, embedding, AWS, tuning) is KEPT, because
+    memora-instance.sh's cred_args reads them from
+    credentials*.mcp.json. --drop-env removes the whole env instead, for a
+    client that rejects env on an http entry.
 
 Every other entry and key is kept as it was, in order. With --server NAME
 only that entry is considered.
 
-  * dry run (default): prints the change with every secret masked; writes
-    nothing.
+Output never contains a value from an entry (review 7667 P1-1): the preview
+prints keys and routing fields only, each value as <redacted:LENGTH>, and
+every args element that is not a flag name likewise.
+
+  * dry run (default): prints the change, redacted; writes nothing.
   * --apply: first writes a backup FILE.bak-repoint-<UTC timestamp> with mode
     0600 (the original holds the token), then replaces FILE atomically (temp
     file + rename) with FILE's own mode. The new file holds no D1 URI and no
@@ -32,7 +43,7 @@ only that entry is considered.
     D1-backed; check-endpoint never writes such a store.)
 
 The backup still holds the old token: delete it once the old token is
-revoked (the credential doc's step 6).
+revoked (the credential doc's step 8).
 
 Exit: 0 repointed or dry run with changes shown, 3 nothing to repoint,
 2 refused (bad input, failed check).
@@ -48,12 +59,10 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-from memora.config_audit import TOKEN, mask  # noqa: E402
 
 D1 = re.compile(r"d1://")
 TOKEN_KEYS = ("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN")
@@ -75,10 +84,75 @@ def reaches_d1(entry: Any) -> bool:
     return isinstance(env, dict) and any(env.get(k) for k in TOKEN_KEYS)
 
 
-def _masked(obj: Any) -> Any:
-    text = json.dumps(obj, indent=2)
-    text = re.sub(r"d1://[^\"\s]+", lambda m: mask(m.group(0)), text)
-    return TOKEN.sub(lambda m: m.group(0).replace(m.group(2), mask(m.group(2))) if m.group(2) else m.group(0), text)
+ROUTING_FIELDS = ("type", "url")  # printed as they are; everything else is redacted
+
+
+def _redacted(value: Any) -> str:
+    return f"<redacted:{len(value) if isinstance(value, str) else len(json.dumps(value))}>"
+
+
+def redact_entry(entry: Any) -> Any:
+    """An MCP server entry with every value redacted: env values, args that
+    are not flag names, command, url, headers. Keys and the "type" field
+    remain, so an operator can see WHAT changes, never a secret."""
+    if not isinstance(entry, dict):
+        return _redacted(entry)
+    out: Dict[str, Any] = {}
+    for key, value in entry.items():
+        if key in ROUTING_FIELDS and isinstance(value, str):
+            out[key] = value
+        elif key == "env" and isinstance(value, dict):
+            out[key] = {k: _redacted(v) for k, v in value.items()}
+        elif key == "args" and isinstance(value, list):
+            out[key] = [a if isinstance(a, str) and re.fullmatch(r"--?[A-Za-z][\w-]*", a) else _redacted(a)
+                        for a in value]
+        elif isinstance(value, dict):
+            out[key] = {k: _redacted(v) for k, v in value.items()}
+        else:
+            out[key] = _redacted(value)
+    return out
+
+
+def _without_d1_registry(raw: str) -> Optional[str]:
+    """MEMORA_DATABASES minus its d1:// entries; None when nothing is left
+    or the value is not a JSON object (then the whole key goes)."""
+    try:
+        reg = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(reg, dict):
+        return None
+    kept = {k: v for k, v in reg.items() if not (isinstance(v, str) and v.startswith("d1://"))}
+    return json.dumps(kept) if kept else None
+
+
+def repoint_entry(entry: Dict[str, Any], url: str, *, drop_env: bool = False) -> Dict[str, Any]:
+    """Only the routing changes: command/args -> type/url; the D1 URI and
+    the Cloudflare token leave env; every other env key stays."""
+    out: Dict[str, Any] = {"type": "http", "url": url}
+    for key, value in entry.items():
+        if key in ("command", "args", "type", "url", "env", "cwd", "transport"):
+            continue
+        out[key] = value
+    env = entry.get("env")
+    if isinstance(env, dict) and not drop_env:
+        kept: Dict[str, Any] = {}
+        for k, v in env.items():
+            if k in TOKEN_KEYS:
+                continue
+            if k == "MEMORA_STORAGE_URI" and isinstance(v, str) and D1.search(v):
+                continue
+            if k == "MEMORA_DATABASES" and isinstance(v, str) and D1.search(v):
+                reduced = _without_d1_registry(v)
+                if reduced is not None:
+                    kept[k] = reduced
+                continue
+            if isinstance(v, str) and D1.search(v):
+                continue  # any other d1:// value is routing too
+            kept[k] = v
+        if kept:
+            out["env"] = kept
+    return out
 
 
 def plan(doc: Dict[str, Any], url: str, server: str = None) -> List[str]:
@@ -91,10 +165,10 @@ def plan(doc: Dict[str, Any], url: str, server: str = None) -> List[str]:
     return [n for n in names if reaches_d1(servers[n])]
 
 
-def rewrite(doc: Dict[str, Any], names: List[str], url: str) -> Dict[str, Any]:
+def rewrite(doc: Dict[str, Any], names: List[str], url: str, *, drop_env: bool = False) -> Dict[str, Any]:
     out = json.loads(json.dumps(doc))  # deep copy, key order kept
     for n in names:
-        out["mcpServers"][n] = {"type": "http", "url": url}
+        out["mcpServers"][n] = repoint_entry(out["mcpServers"][n], url, drop_env=drop_env)
     return out
 
 
@@ -145,6 +219,8 @@ def main(argv=None) -> int:
     ap.add_argument("--url", required=True, help="memora-all's MCP URL, e.g. http://nuc8:8920/mcp/memora")
     ap.add_argument("--server", help="only this mcpServers entry")
     ap.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
+    ap.add_argument("--drop-env", action="store_true",
+                    help="remove the whole env of a repointed entry (for clients that reject env on http)")
     ap.add_argument("--check-health-token-file")
     ap.add_argument("--check-admin-token-file")
     ap.add_argument("--check-store", default="scratch", help="the scratch LOCAL store check-endpoint writes")
@@ -163,10 +239,12 @@ def main(argv=None) -> int:
         if not names:
             print(json.dumps({"ok": True, "file": str(path), "repointed": [], "note": "no direct-D1 server entry"}))
             return 3
-        new_doc = rewrite(doc, names, args.url)
+        new_doc = rewrite(doc, names, args.url, drop_env=args.drop_env)
         for n in names:
-            print(f"--- {path} mcpServers.{n} (masked)\n{_masked(doc['mcpServers'][n])}\n"
-                  f"+++ {path} mcpServers.{n}\n{json.dumps(new_doc['mcpServers'][n], indent=2)}", file=sys.stderr)
+            print(f"--- {path} mcpServers.{n} (values redacted)\n"
+                  f"{json.dumps(redact_entry(doc['mcpServers'][n]), indent=2)}\n"
+                  f"+++ {path} mcpServers.{n} (values redacted)\n"
+                  f"{json.dumps(redact_entry(new_doc['mcpServers'][n]), indent=2)}", file=sys.stderr)
         check = None
         if args.check_health_token_file:
             check = _check(args.url, args.check_health_token_file, args.check_admin_token_file, args.check_store)

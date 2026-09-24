@@ -69,7 +69,13 @@ def test_round_trip_for_each_shape(tmp_path, name, doc, expect):
 
     new = json.loads(p.read_text())
     for n in expect:
-        assert new["mcpServers"][n] == {"type": "http", "url": URL}
+        entry = new["mcpServers"][n]
+        assert entry["type"] == "http" and entry["url"] == URL
+        assert "command" not in entry and "args" not in entry
+        old_env = doc["mcpServers"][n].get("env", {})
+        kept = {k: v for k, v in old_env.items()
+                if k not in ("CLOUDFLARE_API_TOKEN", "CF_API_TOKEN", "MEMORA_STORAGE_URI", "MEMORA_DATABASES")}
+        assert entry.get("env", {}) == kept, "only the routing changes; every other env key stays"
     for n, entry in doc["mcpServers"].items():
         if n not in expect:
             assert new["mcpServers"][n] == entry, "other servers are untouched"
@@ -138,3 +144,59 @@ def test_a_passing_endpoint_check_then_repoints(tmp_path):
         assert all(c[1].endswith("/scratch") for c in fake.calls if c[0] == "POST")
     finally:
         fake.close()
+
+
+SECRETS = {"OPENAI_API_KEY": "sk-proj-" + "LeakCheck0001", "MEMORA_EMBEDDING_API_KEY": "emb-" + "LeakCheck0002",
+           "AWS_SECRET_ACCESS_KEY": "aws-" + "LeakCheck0003", "AWS_ACCESS_KEY_ID": "AKIA" + "LEAKCHECK0004"}
+
+
+def test_no_value_is_ever_printed(tmp_path):
+    """Review 7667 P1-1: the preview shows keys and routing only."""
+    doc = {"mcpServers": {"memora": {"command": "/secret/path/memora-server",
+                                     "args": ["--no-graph", f"--storage={D1}acct/db", "positional-secret"],
+                                     "env": {"MEMORA_STORAGE_URI": f"{D1}acct/db", "CLOUDFLARE_API_TOKEN": TOKEN,
+                                             **SECRETS}}}}
+    p = _write(tmp_path, "credentials.mcp.json", doc)
+    for extra in ([], ["--apply"]):
+        r = _run(str(p), "--url", URL, *extra)
+        out = r.stdout + r.stderr
+        for value in [TOKEN, "acct/db", "positional-secret", "/secret/path", *SECRETS.values()]:
+            assert value not in out, (extra, value)
+        for key in SECRETS:
+            assert key in out, "keys are shown so the operator sees what is kept"
+        assert "<redacted:" in out and "--no-graph" in out and URL in out
+        if extra:
+            break
+        p.write_text(json.dumps(doc))
+
+
+def test_instance_credentials_shape_keeps_what_cred_args_reads(tmp_path):
+    """Review 7667 P1-2b: memora-instance.sh's cred_args reads
+    mcpServers.memora.env of credentials.mcp.json; after the repoint it must
+    still deliver every non-D1 key, and nothing that reaches D1."""
+    env = {"MEMORA_STORAGE_URI": f"{D1}acct/db", "CLOUDFLARE_API_TOKEN": TOKEN,
+           "MEMORA_DATABASES": json.dumps({"memora": f"{D1}a/b", "scratch": "/data/scratch.db"}),
+           "MEMORA_LLM_MODEL": "openai/gpt-4o-mini", "MEMORA_EMBEDDING_MODEL": "openai", **SECRETS}
+    p = _write(tmp_path, "credentials.mcp.json",
+               {"mcpServers": {"memora": {"command": "/Users/x/.local/bin/memora-server",
+                                          "args": ["--no-graph"], "env": env}}})
+    assert _run(str(p), "--url", URL, "--apply").returncode == 0
+    new_env = json.loads(p.read_text())["mcpServers"]["memora"]["env"]
+    assert json.loads(new_env["MEMORA_DATABASES"]) == {"scratch": "/data/scratch.db"}, "only the d1 entries leave"
+    # The exact reader memora-instance.sh uses (cred_args, python part).
+    script = (REPO / "scripts" / "memora-instance.sh").read_text()
+    reader = script.split("python3 - \"$CRED_SOURCE\" <<'PYEOF'\n", 1)[1].split("PYEOF", 1)[0]
+    r = subprocess.run([sys.executable, "-c", reader, str(p)], capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0, r.stderr
+    delivered = [a for a in r.stdout.split("\0") if a and a != "-e"]
+    keys = {a.split("=", 1)[0] for a in delivered}
+    assert {"MEMORA_LLM_MODEL", "MEMORA_EMBEDDING_MODEL", *SECRETS} <= keys
+    assert not any(D1 in a or TOKEN in a for a in delivered)
+    assert "CLOUDFLARE_API_TOKEN" not in keys
+
+
+def test_drop_env_removes_the_env(tmp_path):
+    p = _write(tmp_path, ".mcp.json", {"mcpServers": {"memora": {"command": "x", "env": {
+        "CF_API_TOKEN": TOKEN, **SECRETS}}}})
+    assert _run(str(p), "--url", URL, "--apply", "--drop-env").returncode == 0
+    assert json.loads(p.read_text())["mcpServers"]["memora"] == {"type": "http", "url": URL}

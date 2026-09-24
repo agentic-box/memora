@@ -15,6 +15,13 @@ REPO = Path(__file__).resolve().parent.parent
 CLI = REPO / "scripts" / "audit_configs.py"
 MODULE = REPO / "memora" / "config_audit.py"
 
+@pytest.fixture(autouse=True)
+def _no_real_runtimes(monkeypatch):
+    """No test may query the host's real docker/podman/container; the
+    container tests below install fakes explicitly."""
+    monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "")
+
+
 # Assembled so the D1 write guard's own scan of this repo stays quiet.
 D1 = "d1" + "://"
 TOKEN = "cfut_" + "S3cretTokenValue0123456789abcdef"
@@ -190,6 +197,130 @@ def test_the_module_runs_standalone_from_stdin(tmp_path):
     root = _tree(tmp_path / "h")
     r = subprocess.run([sys.executable, "-", "--json", "--host-label", "bestation", str(root)],
                        input=MODULE.read_text(), capture_output=True, text=True, cwd="/", timeout=60,
-                       env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
+                       env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "MEMORA_AUDIT_RUNTIMES": ""})
     assert r.returncode == 1, r.stderr
     assert json.loads(r.stdout)["host"] == "bestation"
+
+
+# ---------------------------------------------------------------- running containers
+
+def _fake_runtime(bindir: Path, name: str, containers: dict, *, fail: str = ""):
+    """A fake docker/podman/container. containers: {name: [env strings]}.
+    fail: "list" or "inspect" makes that verb fail."""
+    bindir.mkdir(exist_ok=True)
+    data = bindir / f"{name}.json"
+    data.write_text(json.dumps(containers))
+    body = f"""#!{sys.executable}
+import json, sys
+data = json.load(open({str(data)!r}))
+verb = sys.argv[1]
+if verb in ("ps", "list"):
+    if {fail!r} == "list":
+        sys.exit("cannot connect to the daemon")
+    if {name!r} == "container":
+        print("ID  IMAGE  OS  ARCH  STATE  ADDR")
+    for n in data:
+        print(n)
+elif verb == "inspect":
+    if {fail!r} == "inspect":
+        sys.exit("inspect failed")
+    env = data[sys.argv[2]]
+    if {name!r} == "container":
+        print(json.dumps([{{"configuration": {{"id": sys.argv[2], "initProcess": {{"environment": env}}}}}}]))
+    else:
+        print(json.dumps([{{"Name": "/" + sys.argv[2], "Config": {{"Env": env}}}}]))
+"""
+    exe = bindir / name
+    exe.write_text(body)
+    exe.chmod(0o755)
+
+
+@pytest.fixture
+def runtimes(tmp_path, monkeypatch):
+    bindir = tmp_path / "rtbin"
+
+    def install(**by_runtime):
+        names = []
+        for rt, spec in by_runtime.items():
+            containers, fail = spec if isinstance(spec, tuple) else (spec, "")
+            _fake_runtime(bindir, rt, containers, fail=fail)
+            names.append(rt)
+        monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+        monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", ",".join(names))
+    return install
+
+
+BASE_ENV = ["PATH=/usr/local/bin:/usr/bin", "HOME=/root"]
+
+
+def test_a_running_container_with_the_old_token_blocks(tmp_path, runtimes):
+    runtimes(container={"memora-agentic": BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}",
+                                                      f"MEMORA_DATABASES={{\"m\":\"{D1}{ACCT}/{DB}\"}}",
+                                                      "OPENAI_API_KEY=sk-live-not-d1"]},
+             docker={"unrelated": BASE_ENV})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert not result["clean"] and result["blocking"] == 2
+    kinds = {(f["container"], f["detail"]) for f in result["findings"]}
+    assert kinds == {("memora-agentic", "cloudflare_token"), ("memora-agentic", "memora_databases")}
+    assert all(f["kind"] == "runtime_env" and f["file"] == "container:memora-agentic" for f in result["findings"])
+    dump = json.dumps(result)
+    assert TOKEN not in dump and ACCT not in dump and "sk-live-not-d1" not in dump
+
+
+def test_memora_all_on_nuc8_is_the_exception(tmp_path, runtimes):
+    env = BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}", f"MEMORA_DATABASES={{\"m\":\"{D1}{ACCT}/{DB}\"}}"]
+    runtimes(docker={"memora-all": env})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    assert config_audit.audit([empty], host="nuc8")["clean"]
+    assert not config_audit.audit([empty], host="ob1")["clean"], "memora-all is only the exception on nuc8"
+
+
+def test_a_clean_container_is_clean(tmp_path, runtimes):
+    runtimes(docker={"web": BASE_ENV + ["MEMORA_URL=http://nuc8:8920/mcp"]})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    assert config_audit.audit([empty], host="mac")["clean"]
+
+
+@pytest.mark.parametrize("fail", ["list", "inspect"])
+def test_a_runtime_query_failure_is_not_clean(tmp_path, runtimes, fail):
+    runtimes(docker=({"x": BASE_ENV}, fail))
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert not result["clean"] and result["errors"] and result["blocking"] == 0
+
+
+def test_an_inspect_without_environment_is_not_clean(tmp_path, runtimes):
+    runtimes(docker={"x": []})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    assert not config_audit.audit([empty], host="mac")["clean"]
+
+
+def test_containers_only_skips_files(tmp_path, runtimes):
+    runtimes(docker={"web": BASE_ENV})
+    root = _tree(tmp_path / "dirty")
+    assert config_audit.audit([root], host="mac", files=False)["clean"]
+    r = _cli("--local", str(root), "--containers-only")
+    assert r.returncode == 0, r.stdout
+    r = _cli("--local", str(root))
+    assert r.returncode == 1
+
+
+def test_containers_are_audited_on_remote_hosts_too(tmp_path, runtimes):
+    """The remote run inherits the host's runtimes: here the fake ones."""
+    runtimes(podman={"memora-ob1": BASE_ENV + [f"CF_API_TOKEN={TOKEN}"]})
+    remote_home = tmp_path / "remote"
+    remote_home.mkdir()
+    ssh = _fake_ssh(tmp_path, f'while [ "$1" = -o ]; do shift 2; done\nshift 2\ncd /\nexec {sys.executable} "$@" '
+                              f'"{remote_home}"\n')
+    r = _cli("--host", "ob1", "--ssh", ssh, "--json", "--containers-only")
+    out = json.loads(r.stdout)
+    assert r.returncode == 1
+    f = out["hosts"][0]["findings"][0]
+    assert f["kind"] == "runtime_env" and f["container"] == "memora-ob1" and f["host"] == "ob1"
+    assert TOKEN not in r.stdout

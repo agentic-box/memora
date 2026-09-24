@@ -7,6 +7,10 @@
   scripts/audit_configs.py --host nuc8 --host ob1 --host bestation --host re
   scripts/audit_configs.py --local --host nuc8 --json
 
+Every audit also inspects the RUNNING containers of each host (docker,
+podman, Apple's `container`): a container keeps the environment it was
+started with. --containers-only re-checks just those.
+
 Each remote host is audited by piping memora/config_audit.py (standard
 library only) to `ssh -o BatchMode=yes HOST python3 - --json`, with the host
 name as its label, so nothing needs to be installed there. Token values are
@@ -34,8 +38,11 @@ from memora import config_audit  # noqa: E402
 AUDIT_SOURCE = Path(config_audit.__file__)
 
 
-def audit_remote(host: str, roots, memora_all, *, ssh: str = "ssh", timeout: int = 300) -> dict:
+def audit_remote(host: str, roots, memora_all, *, ssh: str = "ssh", timeout: int = 300,
+                 containers_only: bool = False) -> dict:
     cmd = [ssh, "-o", "BatchMode=yes", host, "python3", "-", "--json", "--host-label", host]
+    if containers_only:
+        cmd.append("--containers-only")
     for m in memora_all:
         cmd += ["--memora-all", m]
     cmd += list(roots)
@@ -68,6 +75,8 @@ def main(argv=None) -> int:
     ap.add_argument("--memora-all", action="append", default=[], metavar="PATH")
     ap.add_argument("--ssh", default="ssh", help=argparse.SUPPRESS)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--containers-only", action="store_true",
+                    help="only running containers (a quick re-check after recreating them)")
     args = ap.parse_args(argv)
     if args.local is None and not args.host:
         args.local = []
@@ -79,18 +88,18 @@ def main(argv=None) -> int:
             print(f"audit_configs: no such path: {', '.join(missing)}", file=sys.stderr)
             return 2
         label = config_audit.os.uname().nodename.split(".")[0]
-        results.append(config_audit.audit(roots, host=label, memora_all=args.memora_all))
+        results.append(config_audit.audit(roots, host=label, memora_all=args.memora_all,
+                                          files=not args.containers_only))
     for host in args.host:
-        results.append(audit_remote(host, args.remote_root, args.memora_all, ssh=args.ssh))
+        results.append(audit_remote(host, args.remote_root, args.memora_all, ssh=args.ssh,
+                                    containers_only=args.containers_only))
     clean = all(r["clean"] for r in results)
     if args.json:
         print(json.dumps({"clean": clean, "hosts": results}))
     else:
         for r in results:
             for f in r["findings"]:
-                tag = "memora-all" if f["memora_all"] else "DIRECT-D1"
-                name = f" {f['name']}" if "name" in f else ""
-                print(f"{tag:10} {r['host']}:{f['file']}:{f['line']}: {f['kind']}{name} {f['value']}")
+                print(config_audit.format_finding(f))
             for e in r["errors"]:
                 print(f"ERROR      {r['host']}: {e}")
             print(f"{r['host']}: {'clean' if r['clean'] else 'NOT clean'} ({r['blocking']} direct-D1 finding(s))")

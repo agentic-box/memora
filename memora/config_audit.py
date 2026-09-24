@@ -23,17 +23,28 @@ launchd plists (~/Library/LaunchAgents, launchd/), shell rc files
 and ~/.config/memora/*. Heavy or irrelevant trees (node_modules, .git,
 caches, virtualenvs, most of ~/Library) are skipped.
 
+Running containers (review 7667 P1-2a): a container keeps the environment it
+was started with, so a repointed file does not help until the container is
+recreated. Every RUNNING container of every runtime found on the host
+(docker, podman, Apple's `container`; MEMORA_AUDIT_RUNTIMES overrides the
+list) is inspected, and its environment is scanned like a file: kind
+"runtime_env", with the container's name and the underlying kind in
+"detail". A runtime that is installed but cannot list or inspect its
+containers makes the host NOT clean. --containers-only skips the files.
+
 memora-all's own configuration is reported but does not fail the audit:
 instances/all.env (the deploy's registry source, on any host) and, when the
 host label is "nuc8", ~/.config/memora/credentials.mcp.json and
-~/.config/memora/all.* (memora-all's credential source on nuc8). More
-paths can be marked with --memora-all PATH.
+~/.config/memora/all.* (memora-all's credential source on nuc8), and the
+running container named memora-all on nuc8. More paths can be marked with
+--memora-all PATH.
 
 Standard library only: scripts/audit_configs.py pipes this file to
 `ssh HOST python3 -` to audit other hosts.
 
 Exit: 0 clean (only memora-all findings, or none), 1 a non-memora-all
-direct-D1 client remains, 2 usage error.
+direct-D1 client remains (a file or a running container) or something could
+not be audited, 2 usage error.
 """
 from __future__ import annotations
 
@@ -42,6 +53,8 @@ import fnmatch
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
@@ -147,12 +160,101 @@ def scan_text(text: str) -> List[Dict[str, object]]:
     return out
 
 
+RUNTIMES = ("docker", "podman", "container")
+RUNTIME_TIMEOUT = 60
+
+
+class RuntimeQueryFailed(RuntimeError):
+    pass
+
+
+def _runtimes() -> List[str]:
+    """The container runtimes to query: MEMORA_AUDIT_RUNTIMES (comma-separated,
+    empty = none), else every known one installed on this host."""
+    raw = os.environ.get("MEMORA_AUDIT_RUNTIMES")
+    if raw is not None:
+        return [r for r in (x.strip() for x in raw.split(",")) if r]
+    return [r for r in RUNTIMES if shutil.which(r)]
+
+
+def _run(cmd: List[str]) -> str:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=RUNTIME_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeQueryFailed(f"{' '.join(cmd[:2])}: {exc}") from exc
+    if r.returncode != 0:
+        raise RuntimeQueryFailed(f"{' '.join(cmd[:2])} exited {r.returncode}: {(r.stderr or r.stdout).strip()[:200]}")
+    return r.stdout
+
+
+def running_containers(runtime: str) -> List[str]:
+    """Names of the RUNNING containers of one runtime."""
+    if runtime == "container":  # Apple: `container list` shows running ones, ID (= name) first
+        lines = _run([runtime, "list"]).splitlines()
+        return [ln.split()[0] for ln in lines if ln.strip() and ln.split()[0] != "ID"]
+    return [n.strip() for n in _run([runtime, "ps", "--format", "{{.Names}}"]).splitlines() if n.strip()]
+
+
+def _env_lists(obj: object) -> List[str]:
+    """Every "KEY=value" string in env-like lists of an inspect document
+    (docker/podman Config.Env; Apple's environment lists)."""
+    out: List[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k.lower() in ("env", "environment") and isinstance(v, list):
+                out += [e for e in v if isinstance(e, str) and "=" in e]
+            else:
+                out += _env_lists(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            out += _env_lists(v)
+    return out
+
+
+def container_env(runtime: str, name: str) -> List[str]:
+    raw = _run([runtime, "inspect", name])
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        raise RuntimeQueryFailed(f"{runtime} inspect {name}: not JSON") from exc
+    env = _env_lists(doc)
+    if not env:
+        # Every container has at least PATH; none found means we could not read it.
+        raise RuntimeQueryFailed(f"{runtime} inspect {name}: no environment found")
+    return env
+
+
+def audit_containers(host: str) -> Dict[str, List]:
+    findings: List[Dict[str, object]] = []
+    errors: List[str] = []
+    for runtime in _runtimes():
+        try:
+            names = running_containers(runtime)
+        except RuntimeQueryFailed as exc:
+            errors.append(f"runtime {runtime}: cannot list running containers: {exc}")
+            continue
+        for name in names:
+            try:
+                env = container_env(runtime, name)
+            except RuntimeQueryFailed as exc:
+                errors.append(f"runtime {runtime}: {exc}")
+                continue
+            owner_is_all = host == "nuc8" and name == "memora-all"
+            for f in scan_text("\n".join(env)):
+                entry = {"host": host, "file": f"{runtime}:{name}", "line": 0, "kind": "runtime_env",
+                         "detail": f["kind"], "container": name, "value": f["value"], "memora_all": owner_is_all}
+                if "name" in f:
+                    entry["name"] = f["name"]
+                findings.append(entry)
+    return {"findings": findings, "errors": errors}
+
+
 def audit(roots: List[Path], *, host: str = "local", memora_all: Optional[List[str]] = None,
-          max_depth: int = MAX_DEPTH) -> Dict[str, object]:
+          max_depth: int = MAX_DEPTH, files: bool = True, containers: bool = True) -> Dict[str, object]:
     findings: List[Dict[str, object]] = []
     errors: List[str] = []
     seen = set()
-    for root in roots:
+    for root in (roots if files else []):
         for path in candidate_files(root, max_depth=max_depth):
             real = os.path.realpath(path)
             if real in seen:
@@ -169,10 +271,21 @@ def audit(roots: List[Path], *, host: str = "local", memora_all: Optional[List[s
             owner_is_all = _memora_all(path, host, memora_all or [])
             for f in scan_text(text):
                 findings.append({"host": host, "file": str(path), **f, "memora_all": owner_is_all})
+    if containers:
+        c = audit_containers(host)
+        findings += c["findings"]
+        errors += c["errors"]
     blocking = [f for f in findings if not f["memora_all"]]
     # An unreadable candidate was not audited: that is not clean either.
     return {"host": host, "clean": not blocking and not errors, "findings": findings,
             "blocking": len(blocking), "errors": errors}
+
+
+def format_finding(f: Dict[str, object]) -> str:
+    tag = "memora-all" if f["memora_all"] else "DIRECT-D1"
+    name = f" {f['name']}" if "name" in f else ""
+    detail = f" ({f['detail']})" if "detail" in f else ""
+    return f"{tag:10} {f['host']}:{f['file']}:{f['line']}: {f['kind']}{detail}{name} {f['value']}"
 
 
 def main(argv=None) -> int:
@@ -183,20 +296,20 @@ def main(argv=None) -> int:
                     help="a file (glob) that belongs to memora-all itself")
     ap.add_argument("--max-depth", type=int, default=MAX_DEPTH)
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--containers-only", action="store_true", help="only the running containers")
     args = ap.parse_args(argv)
     roots = [Path(r) for r in args.roots] or [Path.home()]
     missing = [str(r) for r in roots if not r.expanduser().exists()]
     if missing:
         print(f"config_audit: no such path: {', '.join(missing)}", file=sys.stderr)
         return 2
-    result = audit(roots, host=args.host_label, memora_all=args.memora_all, max_depth=args.max_depth)
+    result = audit(roots, host=args.host_label, memora_all=args.memora_all, max_depth=args.max_depth,
+                   files=not args.containers_only)
     if args.json:
         print(json.dumps(result))
     else:
         for f in result["findings"]:
-            tag = "memora-all" if f["memora_all"] else "DIRECT-D1"
-            name = f" {f['name']}" if "name" in f else ""
-            print(f"{tag:10} {f['host']}:{f['file']}:{f['line']}: {f['kind']}{name} {f['value']}")
+            print(format_finding(f))
         for e in result["errors"]:
             print(f"ERROR      {result['host']}: {e}")
         print(f"{result['host']}: {'clean' if result['clean'] else 'NOT clean'} "
