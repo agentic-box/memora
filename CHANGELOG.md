@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.4
+
 ### The graph API returns exactly what the Pages viewer returns (G4)
 
 - memora-all's `/api/graph` built its own payload, and it differed from the
