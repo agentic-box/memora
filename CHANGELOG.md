@@ -14,6 +14,31 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Scheduled compares of the live local primaries (NC1)
+
+- `scripts/nightly_compare.sh` runs on the deploy host from cron. For
+  every store in the running memora-all's `MEMORA_REPLICAS`, strictly one
+  at a time (a lock refuses a second run with exit 75), it runs
+  `local_primary.py compare` inside the container.
+  - Monday to Saturday it is `--mode nightly`. On Sunday it is
+    `--mode barrier --brief-freeze`: a brief freeze covering every key,
+    and an operator's own freeze is left alone.
+  - The store path and the D1 identity come from the container's own
+    registry. Admin and health tokens reach the tool as 0600 tmpfs files
+    written inside the container and removed on exit. Outcomes are
+    recorded through the admin route.
+- It writes one line per store to `~/memora-lp/compare-logs/compare-<date>.log`
+  (`NC_LOG_DIR`); files older than 30 days are removed.
+- It exits 1 on:
+  - a diff, a skipped compare, a refusal or a halt;
+  - missing vectors on D1;
+  - a halted replicator;
+  - new would_halt events.
+- `--dry-run` prints the plan. `RUNTIME`, `DEPLOY_CONTAINER` and
+  `DEPLOY_HOST` choose where it runs; the script names no host, store or
+  account. The header documents the crontab lines: 03:15 Monday–Saturday
+  nightly, 04:00 Sunday barrier.
+
 ### Graph clusters match the Pages viewer, and the graph builds in well under a second (G3)
 
 - memora-all's `/api/graph` clustered with a different algorithm from the

@@ -175,6 +175,11 @@ live cutover.
   4. Thaw.
 - The seeded `/data/<db>.db` stays; move it aside before a new attempt.
 
+**After the thaw: scheduled compares.** `scripts/nightly_compare.sh` (NC1,
+from cron on the deploy host) compares every replicated store every night,
+and under a brief freeze every Sunday. Check its log
+(`~/memora-lp/compare-logs/`) after the first nights.
+
 **After the thaw (the store takes writes and replicates them).** Use the L6
 runbook: `docs/local-primary-implementation.md` §5.3,
 `local_primary.py rollback <db> --phase drain|verify|finish --store /data/<db>.db`.
