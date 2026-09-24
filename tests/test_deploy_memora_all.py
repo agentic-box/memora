@@ -18,6 +18,20 @@ from pathlib import Path
 
 import pytest
 
+
+def _free_port() -> int:
+    """An ephemeral port nobody listens on now (FLK3): the rehearsal-mode
+    deploys' smoke check must never reach a real service, e.g. a podman
+    rehearsal on 18920 running on the same build host."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+RH_PORT, RH_GRAPH_PORT = str(_free_port()), str(_free_port())
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(REPO, "scripts", "deploy-memora-all.sh")
 FAKE_RUNTIME = os.path.join(REPO, "tests", "fake_container_runtime.py")
@@ -375,8 +389,8 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
         "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
         "DEPLOY_LABELS": "memora.rehearsal=rh-run-7",
         "DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
-        "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
-        "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "18766",
+        "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": RH_PORT,
+        "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": RH_GRAPH_PORT,
         "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
         "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
         "DEPLOY_REPO": str(deploy.home / "repos" / "memora"), "DEPLOY_TAG": "v9.9.9"})
@@ -390,7 +404,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-rh" and run[-1] == "memora-rh:latest"
     assert _flag_values(run, "-v") == ["memora-rh-data:/data", f"{rsec}:{SECRETS_MOUNT}:ro"]
-    assert "0.0.0.0:18920:8000" in _flag_values(run, "-p")
+    assert f"0.0.0.0:{RH_PORT}:8000" in _flag_values(run, "-p")
     assert "MEMORA_DATA_VOLUME=memora-rh-data" in _flag_values(run, "-e")
     rename = calls[_index(calls, lambda c: c[0] == "rename")]
     assert rename[1] == "memora-rh" and rename[2].startswith("memora-rh-grok-")
@@ -405,8 +419,8 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
 
 
 REHEARSAL = {"DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
-             "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
-             "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "18766",
+             "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": RH_PORT,
+             "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": RH_GRAPH_PORT,
              "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0"}
 
 
@@ -1077,7 +1091,7 @@ class TestGraphPublish:
         env = {**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
                "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg),
                "DEPLOY_SECRETS_DIR": str(tmp_path / "rsec"), "DEPLOY_ENV_FILE": str(deploy.env_file),
-               "DEPLOY_GRAPH_BIND": bind, "DEPLOY_GRAPH_PORT": "18766"}
+               "DEPLOY_GRAPH_BIND": bind, "DEPLOY_GRAPH_PORT": RH_GRAPH_PORT}
         if bind == "":
             env["DEPLOY_GRAPH_BIND"] = " "
         proc, calls, _ = deploy(runtime_env=env)
@@ -1214,3 +1228,33 @@ def test_a_rehearsal_config_file_outside_the_root_is_refused(deploy, tmp_path):
                                          "DEPLOY_SECRETS_DIR": str(root / "sec"), "DEPLOY_ENV_FILE": str(envf)})
     _nothing_done(deploy, proc, calls)
     assert "DEPLOY_CONFIG_FILE is not under" in proc.stderr
+
+
+def test_a_service_on_the_old_fixed_port_is_never_reached(deploy, tmp_path):
+    """FLK3: a podman rehearsal listening on 18920 on the same build host made
+    a rehearsal-mode test slow and flaky; the tests now use free ports."""
+    import socket
+
+    assert RH_PORT not in ("18920", "8920") and RH_GRAPH_PORT not in ("18766", "8766")
+    lst = socket.socket()
+    lst.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        lst.bind(("127.0.0.1", 18920))
+    except OSError:
+        pytest.skip("18920 is in use on this host")
+    lst.listen(8)
+    try:
+        rcfg = tmp_path / "rcfg"
+        shutil.copytree(deploy.home / ".config" / "memora", rcfg)
+        (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
+        rsec = tmp_path / "rsec"
+        shutil.copytree(deploy.secrets, rsec)
+        deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+                            "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg),
+                            "DEPLOY_SECRETS_DIR": str(rsec), "DEPLOY_ENV_FILE": str(deploy.env_file),
+                            "DEPLOY_REPO": str(deploy.home / "repos" / "memora")})
+        lst.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            lst.accept()  # nobody connected to the old fixed port
+    finally:
+        lst.close()
