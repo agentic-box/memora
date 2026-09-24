@@ -404,6 +404,15 @@ done
 [ "$LOGGED" = 1 ] && pass "the write was logged: lag_rows 0, log cursor moved (no D1 involved)" \
   || fail "log mode did not catch up: $(cat "$RH_ROOT/health-re2.json")"
 check "remove the tool's token files" "$RT" exec "$NAME" rm -rf "$SHM"
+# v0.5.1 hotfix: a deploy while the RUNNING container holds re as a live
+# local primary (its primary lock and WAL) -- production's case. The
+# import_attempt preflight must read re read-only, not take its writer lock.
+if deploy > "$RH_ROOT/deploy-5.log" 2>&1; then pass "deploy 5 while re is a live local primary of the running container"; \
+  else fail "deploy 5 (exit $?; see deploy-5.log)"; tail -30 "$RH_ROOT/deploy-5.log"; fi
+adopt NEW5_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
+grep -q "^re: 0 row(s) with import_attempt in metadata" "$RH_ROOT/deploy-5.log" \
+  && pass "the preflight read the live primary re without its writer lock" \
+  || fail "deploy 5's preflight did not read re (see deploy-5.log)"
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
 
 echo "== 5. podman inspect samples (token values redacted)"
