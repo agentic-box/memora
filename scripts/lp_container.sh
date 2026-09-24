@@ -12,14 +12,25 @@
 #   lock); LP_TOKEN_DIR (0600 token files) is mounted read-only at
 #   /run/secrets/memora. The host's docker socket is NEVER mounted, so inside
 #   there is no docker: use --lock-barrier (--service-stopped is refused).
-# - THIS script is authoritative for memora-all's service state (review
-#   7778): it classifies the command -- stopped-required (restore, resume,
+# - The PROOF that memora-all is not running is the data volume's service
+#   lock (/data/.service.lock, review 7823/7825): memora-all takes it at
+#   startup and holds it for its lifetime (MEMORA_SERVICE_LOCK=1 in the
+#   image); the tool, for a stopped-required command, takes it first and
+#   holds it for the whole run, so memora-all cannot start meanwhile (it
+#   exits 2). This script refuses (exit 70) unless memora-all mounts
+#   LP_DATA_VOLUME at /data and, for a stopped-required command, runs with
+#   MEMORA_SERVICE_LOCK=1 -- otherwise the lock would prove nothing.
+# - It classifies the command -- stopped-required (restore, resume,
 #   sequence-highwater, rollback --phase verify) or running-required
 #   (rollback --phase finish|drain) -- and checks `inspect .State.Running`
-#   of memora-all BEFORE the run (refusing, exit 67) and AGAIN after the tool
-#   exits (exit 68, loudly, if it changed during the run). memora-all's own
-#   MEMORA_DATABASES is passed in, so --lock-barrier can refuse a store that
-#   memora-all routes to d1:// or to another path (the in-container check).
+#   BEFORE the run (a friendly early refusal, exit 67) and AFTER it (exit 68
+#   if it changed). memora-all's own MEMORA_DATABASES is passed in, so
+#   --lock-barrier can refuse a store that memora-all routes to d1:// or to
+#   another path.
+# - Orphans: a SIGKILL of this script skips the EXIT trap. Its container is
+#   then left stopped; find and remove it by label, never by name alone:
+#     docker ps -a --filter label=memora.lp.run --format '{{.ID}} {{.Names}} {{.Label "memora.lp.run"}}'
+#     docker rm <ID>     # only when its label equals its name (memora-lp-<ts>-<pid>)
 # - The container is created (`create`, its ID captured only from a
 #   successful create), labelled memora.lp.run=<name>, started attached, and
 #   removed at exit BY THAT ID after its label is re-checked. A failed create
@@ -30,7 +41,8 @@
 # Exit: the tool's own status; 64 the image predates the tool; 65 usage;
 # 66 memora-all cannot be inspected; 67 memora-all is in the wrong state for
 # this command; 68 memora-all's state changed during the run; 69 the
-# container could not be created.
+# container could not be created; 70 memora-all does not use this data
+# volume, or (stopped-required) does not hold the service lock.
 set -euo pipefail
 
 RT="${LP_RUNTIME:-docker}"
@@ -84,8 +96,17 @@ if ! IMAGE="$("$RT" inspect -f '{{.Image}}' "$SERVICE" 2>/dev/null)" || [ -z "$I
   exit 66
 fi
 RUN_USER="$("$RT" inspect -f '{{.Config.User}}' "$SERVICE" 2>/dev/null || true)"
-DATABASES="$("$RT" inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SERVICE" 2>/dev/null \
-  | sed -n 's/^MEMORA_DATABASES=//p' | head -n 1 || true)"
+SERVICE_ENV="$("$RT" inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$SERVICE" 2>/dev/null || true)"
+DATABASES="$(printf '%s\n' "$SERVICE_ENV" | sed -n 's/^MEMORA_DATABASES=//p' | head -n 1)"
+DATA_MOUNT="$("$RT" inspect -f '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$SERVICE" 2>/dev/null || true)"
+if [ "$DATA_MOUNT" != "$VOLUME" ]; then
+  echo "lp_container: $SERVICE mounts '${DATA_MOUNT:-nothing}' at /data, not $VOLUME: the locks would prove nothing" >&2
+  exit 70
+fi
+if [ "$REQUIRED" = stopped ] && ! printf '%s\n' "$SERVICE_ENV" | grep -qx 'MEMORA_SERVICE_LOCK=1'; then
+  echo "lp_container: $SERVICE does not run with MEMORA_SERVICE_LOCK=1 (an image before the service lock?): its absence cannot be proven; nothing was run" >&2
+  exit 70
+fi
 
 NAME="memora-lp-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 CID=""

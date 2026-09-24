@@ -2453,16 +2453,12 @@ def unpin_primary_lock(db_path: Path) -> None:
     release_primary_lock(db_path)
 
 
-def primary_lock_problem(db_path: Path) -> Optional[str]:
-    """None while THIS process holds the store's primary lock on the lock
-    file that is at its canonical path now; otherwise why not (not held, the
-    lock file was removed or replaced -- a flock on a replaced file proves
-    nothing -- or the flock is no longer ours)."""
+def _flock_problem(path: Path, fd: Optional[int]) -> Optional[str]:
+    """None while `fd` (ours) holds the flock on the file that is at `path`
+    NOW; otherwise why not (not held, the file removed or replaced -- a flock
+    on a replaced file proves nothing)."""
     import fcntl
 
-    path = primary_lock_path(db_path)
-    with _PRIMARY_LOCKS_GUARD:
-        fd = _PRIMARY_LOCKS.get(str(path))
     if fd is None:
         return f"{path} is not held by this process"
     try:
@@ -2476,3 +2472,64 @@ def primary_lock_problem(db_path: Path) -> Optional[str]:
     except OSError as exc:
         return f"{path}: the lock is no longer ours ({exc})"
     return None
+
+
+def primary_lock_problem(db_path: Path) -> Optional[str]:
+    """None while THIS process holds the store's primary lock on the lock
+    file that is at its canonical path now; otherwise why not."""
+    path = primary_lock_path(db_path)
+    with _PRIMARY_LOCKS_GUARD:
+        fd = _PRIMARY_LOCKS.get(str(path))
+    return _flock_problem(path, fd)
+
+
+# ------------------------------------------------------------------ the service lock (X3 round 3)
+
+SERVICE_LOCK_NAME = ".service.lock"
+# realpath of <data dir>/.service.lock -> fd, for the lock THIS process holds.
+_SERVICE_LOCKS: Dict[str, int] = {}
+
+
+def service_lock_path(data_dir: Path) -> Path:
+    """The volume-wide service lifecycle lock (review 7823/7825): memora-all
+    holds it from startup for its lifetime, whatever its stores are routed
+    to (D1 included); an operator run that needs memora-all stopped holds it
+    for its whole run. The kernel keeps the two apart across containers on
+    the same volume -- continuously, not as a snapshot."""
+    return Path(os.path.realpath(str(Path(data_dir) / SERVICE_LOCK_NAME)))
+
+
+def acquire_service_lock(data_dir: Path) -> int:
+    """flock(LOCK_EX|LOCK_NB) on <data dir>/.service.lock. Idempotent within
+    a process. Raises StoreLockedError when another process holds it."""
+    import fcntl
+
+    path = service_lock_path(data_dir)
+    with _PRIMARY_LOCKS_GUARD:
+        held = _SERVICE_LOCKS.get(str(path))
+        if held is not None:
+            return held
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise StoreLockedError(f"{path} is held by another process: memora-all (or another operator run) "
+                                   f"is using this data volume")
+        _SERVICE_LOCKS[str(path)] = fd
+        return fd
+
+
+def service_lock_problem(data_dir: Path) -> Optional[str]:
+    path = service_lock_path(data_dir)
+    with _PRIMARY_LOCKS_GUARD:
+        fd = _SERVICE_LOCKS.get(str(path))
+    return _flock_problem(path, fd)
+
+
+def release_service_lock(data_dir: Path) -> None:
+    path = service_lock_path(data_dir)
+    with _PRIMARY_LOCKS_GUARD:
+        fd = _SERVICE_LOCKS.pop(str(path), None)
+    if fd is not None:
+        os.close(fd)

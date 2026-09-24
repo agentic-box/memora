@@ -514,9 +514,29 @@ class LockBarrier:
 
     stopped_service = True  # the steps that need memora-all stopped accept it
 
-    def __init__(self, store: Path):
+    def __init__(self, store: Path, service_data_dir: Optional[Path] = None):
         self.store = Path(store)
+        # Stopped-required runs (X3 round 3): the data volume's service lock,
+        # which memora-all holds for as long as it runs -- the proof that it
+        # does not run, held for the whole run. None for rollback finish.
+        self.service_data_dir = Path(service_data_dir) if service_data_dir is not None else None
+        self.service_placed = False
         self.placed = False
+
+    def take_service_lock(self, where: str) -> None:
+        from .backends import StoreLockedError, acquire_service_lock, service_lock_problem
+
+        if self.service_data_dir is None:
+            return
+        if not self.service_placed:
+            try:
+                acquire_service_lock(self.service_data_dir)
+            except StoreLockedError as exc:
+                raise L5Refused(f"--lock-barrier {where}: maintenance lock: {exc} -- stop memora-all first")
+            self.service_placed = True
+        problem = service_lock_problem(self.service_data_dir)
+        if problem:
+            raise L5Refused(f"--lock-barrier lost {where}: the service lock: {problem}")
 
     def freeze(self) -> None:
         self.check("at the start")
@@ -527,6 +547,7 @@ class LockBarrier:
     def check(self, where: str) -> None:
         from .backends import StoreLockedError, pin_primary_lock, primary_lock_problem
 
+        self.take_service_lock(where)
         if not self.placed:
             try:
                 pin_primary_lock(self.store)
@@ -542,11 +563,14 @@ class LockBarrier:
         return None  # held for the whole run; release() when the process is done
 
     def release(self) -> None:
-        from .backends import unpin_primary_lock
+        from .backends import release_service_lock, unpin_primary_lock
 
         if self.placed:
             unpin_primary_lock(self.store)
             self.placed = False
+        if self.service_placed:
+            release_service_lock(self.service_data_dir)
+            self.service_placed = False
 
 
 # ------------------------------------------------------------------ receipts (P1)

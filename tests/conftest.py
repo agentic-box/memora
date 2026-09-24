@@ -42,6 +42,9 @@ def _isolated_write_gate_state(tmp_path_factory, monkeypatch):
 
     for key in list(_backends._PRIMARY_LOCKS):  # primary locks a test took in-process
         os.close(_backends._PRIMARY_LOCKS.pop(key))
+    _backends._PINNED_PRIMARY_LOCKS.clear()
+    for key in list(_backends._SERVICE_LOCKS):  # the data volume's service lock (X3)
+        os.close(_backends._SERVICE_LOCKS.pop(key))
     _backends.reset_fk_audits()  # the per-process fk audit cache (plan §9 x)
 
 

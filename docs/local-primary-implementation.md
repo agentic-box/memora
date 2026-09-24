@@ -1320,8 +1320,33 @@ labelled with that name; it is not run with `--rm`. It is created with
 attached, and the script removes only that ID, after re-checking its label;
 a failed create (a name collision) removes nothing.
 
-The host wrapper is authoritative for memora-all's service state (review
-7778). It classifies the command:
+**The proof that memora-all is not running: the data volume's service lock**
+(review 7823, leader decision 7825).
+- memora-all takes an exclusive flock on `/data/.service.lock` at startup,
+  before any store is opened and whatever its stores are routed to (D1
+  included), and holds it for its lifetime. The image sets
+  `MEMORA_SERVICE_LOCK=1`. If it cannot get the lock, it exits 2 with
+  "maintenance in progress (lock held)"; the restart policy retries later.
+- For every stopped-required command, the tool takes the same lock
+  (non-blocking) first, before any token read, the routing check or any D1
+  call. It holds the lock for the whole run and re-verifies it at every
+  boundary: the fd is still ours, and its inode is the file at the path now.
+- The kernel keeps the two apart across containers on the same volume,
+  continuously. A deploy, `docker start`, the restart policy or a reboot
+  cannot start a serving memora-all during the run.
+- Running-required commands (rollback `finish`) never take it.
+- The wrapper refuses (exit 70) unless memora-all mounts `LP_DATA_VOLUME` at
+  `/data` and, for a stopped-required command, runs with
+  `MEMORA_SERVICE_LOCK=1`.
+- The per-store primary lock and the routing check stay as additional
+  checks.
+- Orphan cleanup: a SIGKILL of the wrapper skips its EXIT trap. The stopped
+  container is then found by label
+  (`docker ps -a --filter label=memora.lp.run`) and removed by its ID only
+  when its label equals its name.
+
+The host wrapper also checks memora-all's service state as a friendly early
+message; it is not the proof. It classifies the command:
 - stopped-required: `restore`, `resume`, `sequence-highwater`,
   `rollback --phase verify`;
 - running-required: `rollback --phase finish|drain`.
@@ -1873,3 +1898,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |
 | (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | **done in L6 piece b**: each memory group lists `inbound_refs` (the memories whose crossrefs point at it, per side, and whether they are conflict groups); the apply report and `--dry-run` list `dangling_references` for the chosen sides (a warning) |
 | (x) local writers run with `PRAGMA foreign_keys` off while D1 enforces them, so D1's `ON DELETE CASCADE` on `memories_embeddings`, `memories_crossrefs` and `memories_events` does not run locally. The app's `delete_memory` deletes those children itself, so app traffic matches D1, but a raw parent DELETE leaves orphan children locally that D1 would not have (L9a review 7721 P2) | L9 | **done in X1**: `local_primary.py fk-audit <db> --store P` reports orphans read-only (`PRAGMA foreign_key_check` over every table that declares a foreign key; counts and parent ids; exit 5 when any). A live primary, and the L9a shadow file (opt-in `enforce_foreign_keys`), audits its data once per process before its first writer. Orphans refuse the store: every open raises, startup reports it, health shows `refused`, a refused default store stops startup (exit 2), and nothing is repaired. A clean audit turns `PRAGMA foreign_keys = ON` on in `writer_setup_pragmas`. Plain local stores keep them off |
+| (z) the X2 frozen check's mark carries `PRAGMA schema_version`, a change counter, not an identity: a local DB file replaced by another with the same version, or a version reset by hand after DDL while the gate stays frozen, can reuse the mark (X2 review 7805 P2) | L9 | before any restore-while-frozen workflow is allowed: add the file identity (inode) to the mark, or recheck unconditionally |

@@ -270,6 +270,9 @@ def test_main_releases_the_lock_barrier_when_it_returns(tmp_path, monkeypatch):
     assert cli.main([*args, "--allow-deletes", "wrong"]) == 2
     assert backends.primary_lock_problem(store) is not None, "released after a refusal"
     assert _can_take(store)
+    from memora.write_gate import data_dir
+
+    assert backends.service_lock_problem(data_dir()) is not None, "the service lock is released too"
 
 
 
@@ -321,3 +324,133 @@ def test_rollback_finish_needs_no_local_route(sc):
             "--health-token-file", str(sc.tmp / "no-health")]
     code, out, err = _cli(sc.replica, *args, env_extra={"MEMORA_DATABASES": json.dumps({DB: "d1://acct/replica-db"})})
     assert code == 2 and "MEMORA_DATABASES" not in out["refused"] and "memora-all serves" not in out["refused"], out
+
+
+
+# ------------------------------------------------------------------ review 7823/7825: the data volume's service lock
+
+class ServiceHolder:
+    """memora-all holding the data volume's service lock (as it does for its lifetime)."""
+
+    def __init__(self, data_dir):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c",
+             "import sys, time; sys.path.insert(0, sys.argv[2]); from memora import backends; "
+             "backends.acquire_service_lock(sys.argv[1]); print('held', flush=True); time.sleep(120)",
+             str(data_dir), str(REPO)], stdout=subprocess.PIPE, text=True)
+        assert self.proc.stdout.readline().strip() == "held"
+
+    def stop(self):
+        self.proc.kill()
+        self.proc.wait()
+
+
+@pytest.mark.parametrize("cmd", ["restore", "resume", "sequence-highwater", "rollback"])
+def test_a_running_memora_all_refuses_every_stopped_required_command_before_any_d1_call(sc, cmd):
+    from memora.write_gate import data_dir
+
+    store = sc.store
+    store.parent.mkdir(parents=True, exist_ok=True)
+    if not store.exists():
+        store.write_bytes(b"")
+    calls = sc.tmp / f"d1-calls-svc-{cmd}"
+    # no MEMORA_DATABASES at all: the service lock is taken first, before the routing check
+    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": ""}
+    common = [DB, "--account", "acct", "--database-id", "replica-db", "--lock-barrier",
+              "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports")]
+    args = {
+        "restore": ["restore", *common, "--from-r2", sc.key, "--receipt", str(sc.receipt), "--conflicts", "c.json",
+                    "--approve", "a.json", "--out", str(store)],
+        "resume": ["resume", DB, "--store", str(store), "--account", "acct", "--database-id", "replica-db",
+                   "--lock-barrier", "--accept-d1-epoch", "0"],
+        "sequence-highwater": ["sequence-highwater", *common, "--receipt", str(sc.receipt), "--local", str(store)],
+        "rollback": ["rollback", *common, "--phase", "verify", "--store", str(store),
+                     "--admin-token-file", "x", "--health-token-file", "y"],
+    }[cmd]
+    h = ServiceHolder(data_dir())
+    try:
+        code, out, err = _cli(sc.replica, *args, env_extra=env)
+    finally:
+        h.stop()
+    assert code == 2 and "--lock-barrier at the start, before any D1 call: maintenance lock" in out["refused"], (out, err)
+    assert not calls.exists() or calls.read_text() == ""
+    assert _can_take(store), "the store lock was never taken"
+
+
+def test_memora_all_does_not_start_while_an_operator_run_holds_the_service_lock(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    backends.acquire_service_lock(data)
+    try:
+        child = (f"import sys, os; sys.path.insert(0, {str(REPO)!r}); "
+                 f"os.environ['MEMORA_DATA_DIR'] = {str(data)!r}; os.environ['MEMORA_SERVICE_LOCK'] = '1'; "
+                 "from memora import server; server._take_service_lock_or_exit(); print('started')")
+        r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+        assert r.returncode == 2 and "maintenance in progress (lock held)" in r.stderr, (r.stdout, r.stderr)
+        assert "started" not in r.stdout
+    finally:
+        backends.release_service_lock(data)
+    r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "started" in r.stdout, "free again once the run ends"
+
+
+def test_without_the_setting_the_server_takes_no_service_lock(tmp_path, monkeypatch):
+    from memora import server
+
+    monkeypatch.setenv("MEMORA_DATA_DIR", str(tmp_path))
+    monkeypatch.delenv("MEMORA_SERVICE_LOCK", raising=False)
+    server._take_service_lock_or_exit()
+    assert backends.service_lock_problem(tmp_path) is not None, "not taken"
+    assert not (tmp_path / backends.SERVICE_LOCK_NAME).exists()
+
+
+def test_main_takes_the_service_lock_before_any_store_is_opened():
+    import ast
+
+    src = (REPO / "memora" / "server.py").read_text()
+    main = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "main")
+    calls = [n.func.id for n in ast.walk(main) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    order = [c for c in calls if c in ("_take_service_lock_or_exit", "_apply_data_volume_check",
+                                        "_fence_live_primaries_or_exit")]
+    assert order == ["_take_service_lock_or_exit", "_apply_data_volume_check", "_fence_live_primaries_or_exit"]
+    body = src[src.index("def main("):]
+    assert body.index("_take_service_lock_or_exit()") < body.index("Initializing database")
+
+
+def test_a_replaced_or_removed_service_lock_is_caught_at_the_next_boundary(tmp_path):
+    store = tmp_path / "s.db"
+    store.write_bytes(b"")
+    data = tmp_path / "data"
+    data.mkdir()
+    b = lp.LockBarrier(store, service_data_dir=data)
+    b.check("at the start")
+    lock = backends.service_lock_path(data)
+    try:
+        os.replace(lock, str(lock) + ".old")
+        lock.write_text("")
+        with pytest.raises(lp.L5Refused, match="lost before group 1: the service lock: .*replaced"):
+            b.check("before group 1")
+        os.remove(lock)
+        with pytest.raises(lp.L5Refused, match="the service lock: .*was removed"):
+            b.require("before group 2")
+    finally:
+        b.release()
+
+
+def test_rollback_finish_does_not_take_the_service_lock(sc):
+    """finish runs with memora-all up (it holds the service lock then)."""
+    import json
+
+    from memora.write_gate import data_dir
+
+    args = ["rollback", DB, "--account", "acct", "--database-id", "replica-db", "--lock-barrier",
+            "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports"), "--phase", "finish",
+            "--store", str(sc.store), "--admin-token-file", str(sc.tmp / "no-admin"),
+            "--health-token-file", str(sc.tmp / "no-health")]
+    h = ServiceHolder(data_dir())
+    try:
+        code, out, err = _cli(sc.replica, *args,
+                              env_extra={"MEMORA_DATABASES": json.dumps({DB: "d1://acct/replica-db"})})
+    finally:
+        h.stop()
+    assert code == 2 and "maintenance lock" not in out["refused"], out

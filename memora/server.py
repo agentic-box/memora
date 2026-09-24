@@ -3439,6 +3439,24 @@ def _apply_data_volume_check() -> None:
         print(f"Error: refusing to serve database {name or 'default'}: {reason}", file=sys.stderr)
 
 
+def _take_service_lock_or_exit() -> None:
+    """X3 round 3 (review 7823/7825): with MEMORA_SERVICE_LOCK=1 (set in the
+    image), take the data volume's service lock BEFORE any store is opened,
+    whatever the stores are routed to, and hold it for the process lifetime.
+    An operator run that needs memora-all stopped holds it for its whole run;
+    while it does, memora-all does not start (exit 2)."""
+    if os.getenv("MEMORA_SERVICE_LOCK", "").strip() != "1":
+        return
+    from .backends import StoreLockedError, acquire_service_lock
+    from .write_gate import data_dir
+
+    try:
+        acquire_service_lock(data_dir())
+    except (StoreLockedError, OSError) as e:
+        print(f"Error: maintenance in progress (lock held): {e}", file=sys.stderr)
+        sys.exit(2)
+
+
 def _fence_live_primaries_or_exit() -> None:
     """Take every live primary's lock (docs/local-primary-implementation.md
     §1 M10). A refused store stays refused in this process (health reports
@@ -3579,6 +3597,11 @@ def main(argv: Optional[list[str]] = None) -> None:
         except ToolProfileError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
+
+        # The data volume's service lock, before ANY store is opened (X3):
+        # an operator run in a maintenance container excludes this server
+        # for as long as it runs.
+        _take_service_lock_or_exit()
 
         # Stores kept under /data are refused unless /data is a named,
         # writable mount (memora/data_volume.py). Per store: the process

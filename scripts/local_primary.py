@@ -254,11 +254,16 @@ def _lock_barrier(args) -> "lp.LockBarrier | None":
     store = getattr(args, attr, None)
     if not store:
         raise lp.L5Refused(f"--lock-barrier needs --{attr} (the store whose primary lock is the barrier)")
-    if not (args.cmd == "rollback" and args.phase == "finish"):
-        # Needs memora-all stopped: the lock counts only for the file memora-all routes <db> to.
-        lp.check_service_route(args.db, Path(store))
-    barrier = lp.LockBarrier(Path(store))
+    stopped_required = not (args.cmd == "rollback" and args.phase == "finish")
+    from memora.write_gate import data_dir
+
+    barrier = lp.LockBarrier(Path(store), service_data_dir=data_dir() if stopped_required else None)
     _LOCK_BARRIERS.append(barrier)
+    # Stopped-required: the data volume's service lock FIRST (memora-all holds
+    # it while it runs), then the routing, then the store's primary lock.
+    barrier.take_service_lock("at the start, before any D1 call")
+    if stopped_required:
+        lp.check_service_route(args.db, Path(store))
     barrier.check("at the start, before any D1 call")
     return barrier
 

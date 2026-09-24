@@ -42,6 +42,8 @@ if args[:2] == ["inspect", "-f"] and args[3:] == [service]:
     elif "Config.Env" in fmt:
         for line in json.loads(os.environ.get("SERVICE_ENV", "[]")):
             print(line)
+    elif ".Mounts" in fmt:
+        print(os.environ.get("DATA_MOUNT", "memora-all-data"))
     sys.exit(0)
 if args and args[0] == "create":
     st["name"] = args[args.index("--name") + 1]
@@ -72,7 +74,8 @@ def rt(tmp_path):
     tok.mkdir()
     env = {**os.environ, "LP_RUNTIME": str(fake), "LP_TOKEN_DIR": str(tok), "CALL_LOG": str(tmp_path / "calls"),
            "STATE": str(tmp_path / "state.json"),
-           "SERVICE_ENV": json.dumps(["PATH=/usr/bin", f"MEMORA_DATABASES={json.dumps(ROUTES)}", "OTHER=1"])}
+           "SERVICE_ENV": json.dumps(["PATH=/usr/bin", f"MEMORA_DATABASES={json.dumps(ROUTES)}",
+                                      "MEMORA_SERVICE_LOCK=1", "OTHER=1"])}
 
     def run(*args, **extra):
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, timeout=60,
@@ -196,7 +199,7 @@ def test_no_user_flag_when_memora_all_runs_as_the_image_default(rt):
 
 
 def test_no_routing_passed_when_memora_all_has_none(rt):
-    code, calls, _ = rt(*VERIFY, SERVICE_ENV=json.dumps(["PATH=/usr/bin"]))
+    code, calls, _ = rt(*VERIFY, SERVICE_ENV=json.dumps(["PATH=/usr/bin", "MEMORA_SERVICE_LOCK=1"]))
     assert code == 0
     envs = [c for c in _create(calls)]
     assert not any(a.startswith("MEMORA_DATABASES=") for a in envs)
@@ -214,3 +217,29 @@ def test_the_in_container_program_refuses_an_image_without_the_tool(tmp_path):
 
 def test_the_image_carries_the_operator_tool():
     assert "COPY scripts/local_primary.py scripts/local_primary.py" in (REPO / "Dockerfile").read_text()
+
+
+
+# ------------------------------------------------------------------ review 7823: the service lock is the proof
+
+@pytest.mark.parametrize("env", [["PATH=/usr/bin"], ["MEMORA_SERVICE_LOCK=0"], ["MEMORA_SERVICE_LOCK=10"]])
+def test_a_stopped_required_run_needs_memora_all_to_hold_the_service_lock(rt, env):
+    code, calls, err = rt(*VERIFY, SERVICE_ENV=json.dumps(env))
+    assert code == 70 and "MEMORA_SERVICE_LOCK=1" in err
+    assert not [c for c in calls if c[0] in ("create", "start")]
+
+
+def test_a_running_required_run_does_not_need_the_service_lock_setting(rt):
+    code, _, err = rt(*FINISH, RUNNING_BEFORE="true", SERVICE_ENV=json.dumps(["PATH=/usr/bin"]))
+    assert code == 0, err
+
+
+@pytest.mark.parametrize("mount", ["", "other-volume"])
+def test_memora_all_must_mount_this_data_volume(rt, mount):
+    code, calls, err = rt(*VERIFY, DATA_MOUNT=mount)
+    assert code == 70 and "at /data, not memora-all-data" in err
+    assert not [c for c in calls if c[0] in ("create", "start")]
+
+
+def test_the_image_takes_the_service_lock():
+    assert "MEMORA_SERVICE_LOCK=1" in (REPO / "Dockerfile").read_text()

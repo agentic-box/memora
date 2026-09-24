@@ -17,6 +17,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ### Local-primary X3: a maintenance venue on nuc8, and the primary lock as a barrier
 - `scripts/lp_container.sh <local_primary.py arguments>`: runs the operator tool in a one-off container of memora-all's current image (its image ID). It mounts `memora-all-data` at `/data` and `$LP_TOKEN_DIR` read-only at `/run/secrets/memora`, uses no docker socket and no `--rm`, and removes only its own container `memora-lp-<ts>-<pid>`, by name and while it carries this run's label. Exit 64 when the image predates the tool, 65 on a usage error (including `--service-stopped`), 66 when memora-all's image cannot be read.
 - The image now carries `scripts/local_primary.py` (Dockerfile).
+- Round 3 (review 7823, leader decision 7825):
+  - The proof that memora-all is not running is the data volume's service lock, `/data/.service.lock`. memora-all takes it at startup before any store is opened (`MEMORA_SERVICE_LOCK=1`, set in the image) and holds it for its lifetime; if it cannot, it exits 2 ("maintenance in progress (lock held)").
+  - `--lock-barrier` takes the same lock first for every stopped-required command, holds it for the whole run and re-verifies it at every boundary. rollback finish does not take it.
+  - The wrapper refuses (exit 70) unless memora-all mounts `LP_DATA_VOLUME` at `/data` and, for stopped-required commands, runs with `MEMORA_SERVICE_LOCK=1`. Orphan cleanup by label is documented.
+  - Plan §9 (z): the X2 frozen mark's `schema_version` is a counter, not an identity.
 - Round 2 (review 7778):
   - The wrapper is authoritative for memora-all's service state. Stopped-required commands (restore, resume, sequence-highwater, rollback verify) and running-required ones (rollback finish/drain) are checked through `inspect .State.Running` before the run (exit 67) and after it (exit 68 if it changed).
   - memora-all's `MEMORA_DATABASES` is passed in, and `--lock-barrier` refuses a stopped-required run unless memora-all routes the store to exactly that local file (`local_primary.check_service_route`).
