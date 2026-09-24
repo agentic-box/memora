@@ -628,6 +628,45 @@ def test_an_unexpected_log_key_is_reported(logged, tmp_path):
     assert not rep["clean"] and rep["unexpected_log_keys"] == [["tombstones", ["zz", 5]]]
 
 
+def _parent_and_child(recs):
+    """The memories parent the replicator added for the crossrefs update of
+    memory 1 (no memories outbox row), and that child record."""
+    child = next(r for r in recs if r["tbl"] == "memories_crossrefs" and r["pk"] == [1])
+    parent = next(r for r in recs if r["tbl"] == "memories" and r["pk"] == [1])
+    assert (parent["attempt_id"], parent["seq"]) == (child["attempt_id"], child["seq"])
+    return parent, child
+
+
+def test_the_added_parent_is_the_only_extra_memories_key_allowed(logged, tmp_path):
+    """Review 7721 P1: the parent is allowed because it is the replicator's
+    own UPSERT with a real child upsert; a key merely named memories is not."""
+    local, replica, receipt = logged
+    recs = list(R.iter_log(DB))
+    parent, _child = _parent_and_child(recs)
+    assert R.is_added_parent(("memories", (1,)), recs)
+    rep = _log_compare(tmp_path, local, replica, receipt)
+    assert rep["clean"] and rep["unexpected_log_keys"] == []
+
+
+@pytest.mark.parametrize("variant", ["no-op delete of an absent id", "no-op update on the parent",
+                                     "parent without its child"])
+def test_an_extra_memories_key_that_is_not_an_added_parent_is_reported(logged, tmp_path, variant):
+    local, replica, receipt = logged
+    recs = list(R.iter_log(DB))
+    parent, child = _parent_and_child(recs)
+    key = [1]
+    if variant == "no-op delete of an absent id":
+        key = [99999]
+        extra = [{**parent, "index": 0, "pk": key, "sql": "DELETE FROM memories WHERE id = ?", "params": key}]
+    elif variant == "no-op update on the parent":
+        extra = [{**parent, "index": 7, "sql": "UPDATE memories SET content = content WHERE id = ?", "params": [1]}]
+    else:
+        recs = [r for r in recs if r is not child]
+        extra = []
+    rep = _log_compare(tmp_path, local, replica, receipt, lambda: iter(recs + extra))
+    assert not rep["clean"] and ["memories", key] in rep["unexpected_log_keys"], rep["unexpected_log_keys"]
+
+
 def test_log_mode_accepts_the_old_seed_receipt_but_not_another_database(logged, tmp_path):
     local, replica, receipt = logged
     r = json.loads(receipt.read_text())

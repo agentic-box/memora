@@ -255,24 +255,62 @@ def _add_parents(conn, batch: _Batch) -> None:
     batch.keys.extend(extra)
 
 
-def _is_delete_record(record: Dict[str, Any]) -> bool:
-    return str(record["sql"]).lstrip().upper().startswith("DELETE")
+def _builder_upsert_row(record: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The row a log record upserts, when the record is EXACTLY the
+    non-DELETE statement _build_statements emits for its own (table, key) --
+    rebuilt from the record's columns and params and compared as text and
+    values. None for anything else (a hand-written UPDATE, a DELETE, a
+    statement for another key, an unknown shape)."""
+    tbl, sql, params = record.get("tbl"), str(record.get("sql", "")), list(record.get("params") or [])
+    if tbl not in SYNC_TABLES:
+        return None
+    m = (_UPSERT if tbl != EMBEDDINGS else _INSERT).fullmatch(sql)
+    if m is None or m.group("t") != tbl:
+        return None
+    cols = m.group("cols").split(", ")
+    if len(cols) != len(params) or len(set(cols)) != len(cols):
+        return None
+    row = dict(zip(cols, params))
+    pk = [row.get(c) for c in SYNC_TABLES[tbl]]
+    if [_norm_log(v) for v in pk] != [_norm_log(v) for v in record.get("pk") or []]:
+        return None
+    try:
+        built = _build_statements(tbl, pk, row, cols)
+    except ReplicatorStatementError:
+        return None
+    upserts = [st for st in built if not st[0].startswith("DELETE ")]
+    if len(upserts) != 1 or upserts[0][0] != sql or list(upserts[0][1]) != params:
+        return None
+    return row
+
+
+def _norm_log(v: Any) -> Any:
+    from .shadow import _norm
+
+    return _norm(v)
 
 
 def is_added_parent(key: Tuple[str, Tuple[Any, ...]], records: List[Dict[str, Any]]) -> bool:
-    """A memories key the replicator added as the FK parent of a child upsert
-    (_add_parents; review 7701 P1-1): every log record of it is an upsert in
-    the same attempt and seq as an upsert of a child keyed by that memory id.
-    `key` is (table, pk tuple) with pk values as read back from the log."""
-    from .shadow import _norm
-
-    tbl, pk = key
-    if tbl != FK_PARENT:
+    """A memories key that _add_parents added as the FK parent of a child
+    upsert (review 7701 P1-1, 7721 P1). Every log record of the key must be
+    the replicator's own memories UPSERT for that id (_builder_upsert_row),
+    and each must share attempt and seq with a builder-shaped upsert of a
+    memories_embeddings or memories_crossrefs row keyed by that id. Anything
+    else -- a no-op UPDATE, a DELETE, a statement of another shape -- is an
+    unexpected log key. Used by the nightly shadow check and the §5.2 log
+    compare."""
+    tbl, pk = key[0], tuple(_norm_log(v) for v in key[1])
+    if tbl != FK_PARENT or len(pk) != 1:
         return False
+
+    def same_key(r):
+        return tuple(_norm_log(v) for v in r["pk"]) == pk
+
     children = {(r["attempt_id"], int(r["seq"])) for r in records
-                if r["tbl"] in FK_CHILDREN and tuple(_norm(v) for v in r["pk"]) == pk and not _is_delete_record(r)}
-    mine = [r for r in records if r["tbl"] == tbl and tuple(_norm(v) for v in r["pk"]) == pk]
-    return bool(mine) and all(not _is_delete_record(r) and (r["attempt_id"], int(r["seq"])) in children for r in mine)
+                if r["tbl"] in FK_CHILDREN and same_key(r) and _builder_upsert_row(r) is not None}
+    mine = [r for r in records if r["tbl"] == tbl and same_key(r)]
+    return bool(mine) and all(_builder_upsert_row(r) is not None and (r["attempt_id"], int(r["seq"])) in children
+                              for r in mine)
 
 
 def delete_guard_detail(conn, batch: _Batch) -> Optional[Dict[str, Any]]:

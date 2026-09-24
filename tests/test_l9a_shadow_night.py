@@ -260,10 +260,10 @@ def test_an_extra_log_key_fails_the_key_set_check_alone(night):
 
 # ------------------------------------------------------------ review 7701 P1-1
 
-def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(night):
+def _seeded_parent_child_update(night):
     """A memory in the seed (no outbox row ever) whose embedding alone is
     updated: the replicator sends the parent's current row with the child
-    (replicator._add_parents). That log key is allowed; the night is clean."""
+    (replicator._add_parents)."""
     db = night.replica._db()
     db.execute("INSERT INTO memories (id, content) VALUES (500, 'seeded')")
     db.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (500, '[]')")
@@ -279,6 +279,11 @@ def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(nigh
     conn = night.backend.connect()
     conn.execute("UPDATE memories_embeddings SET embedding = ? WHERE memory_id = ?", ('[[\"0\", 1.0]]', 500))
     conn.close()
+
+
+def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(night):
+    """That parent log key is allowed; the night is clean."""
+    _seeded_parent_child_update(night)
     out = night.run()
     logged = {(r["tbl"], tuple(r["pk"])) for r in replicator.iter_log("s1")}
     assert ("memories", (500,)) in logged, "the replicator added the parent"
@@ -286,30 +291,57 @@ def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(nigh
     assert out["clean"], out
 
 
-@pytest.mark.parametrize("variant", ["other seq", "other attempt", "a delete", "child of another memory"])
+@pytest.mark.parametrize("variant", ["no-op update on the parent", "delete of an absent id",
+                                     "parent upsert at another seq", "parent upsert in another attempt",
+                                     "upsert of another id at the child's seq", "parent upsert of another shape",
+                                     "parent without its child", "parent upsert missing a column",
+                                     "parent with a no-op child", "labelled as the parent, writes another id"])
 def test_an_extra_memories_key_that_is_not_an_added_parent_is_a_defect(night, variant):
-    _app_writes(night)
-    night.run()
+    """Review 7701 P1-1 / 7721 P1: only the replicator's own memories UPSERT
+    for that id, in the same attempt and seq as a real child upsert, passes."""
+    _seeded_parent_child_update(night)
+    night.run("2026-09-24")
     path = sorted(replicator.log_dir("s1").glob("*.jsonl"))[0]
-    recs = [json.loads(ln) for ln in path.read_text().splitlines()]
-    child = next(r for r in recs if r["tbl"] == "memories_embeddings" and not r["sql"].startswith("DELETE"))
-    parent_pk = 99999 if variant == "child of another memory" else child["pk"][0] + 1000
-    fake_child = {**child, "index": 98, "pk": [parent_pk], "params": [parent_pk],
-                  "sql": "UPDATE memories_embeddings SET embedding = embedding WHERE memory_id = ?"}
-    extra = {**child, "index": 99, "tbl": "memories", "pk": [parent_pk],
-             "sql": "UPDATE memories SET content = content WHERE id = ?", "params": [parent_pk]}
-    if variant == "other seq":
-        extra["seq"] = next(r["seq"] for r in recs if r["seq"] != child["seq"])
-    elif variant == "other attempt":
-        extra["attempt_id"] = "0" * 16
-    elif variant == "a delete":
-        extra["sql"] = "DELETE FROM memories WHERE id = ?"
-    add = [extra] if variant == "child of another memory" else [fake_child, extra]
+    lines = path.read_text().splitlines()
+    recs = [json.loads(ln) for ln in lines]
+    parent = next(r for r in recs if r["tbl"] == "memories" and r["pk"] == [500])
+    other_seq = parent["seq"] - 1  # within the cursor, and no child there
+    bad_key = 500
+    if variant == "no-op update on the parent":  # the reviewer's case
+        add = [{**parent, "index": 5, "sql": "UPDATE memories SET content = content WHERE id = ?", "params": [500]}]
+    elif variant == "delete of an absent id":
+        bad_key = 999
+        add = [{**parent, "index": 0, "pk": [999], "sql": "DELETE FROM memories WHERE id = ?", "params": [999]}]
+    elif variant == "parent upsert at another seq":
+        add = [{**parent, "seq": other_seq}]
+    elif variant == "parent upsert in another attempt":
+        # a distinct record (index 3): the same (seq, table, key, index) is a crash re-append
+        add = [{**parent, "attempt_id": "0" * 16, "index": 3}]
+    elif variant == "upsert of another id at the child's seq":
+        bad_key = 501
+        add = [{**parent, "pk": [501], "params": [501 if v == 500 else v for v in parent["params"]]}]
+    elif variant == "parent upsert of another shape":
+        add = [{**parent, "index": 3, "sql": parent["sql"].replace(" DO UPDATE SET ", " DO UPDATE SET content = content, ")}]
+    elif variant == "parent upsert missing a column":  # the regex shape, not the builder's statement
+        add = [{**parent, "index": 4, "sql": parent["sql"].replace("SET content = excluded.content, ", "SET ")}]
+        assert add[0]["sql"] != parent["sql"]
+    elif variant == "labelled as the parent, writes another id":  # the log key says 500, the row is 501
+        add = [{**parent, "index": 6, "params": [501 if v == 500 else v for v in parent["params"]]}]
+    elif variant == "parent with a no-op child":
+        path.write_text("".join(ln + "\n" for ln, r in zip(lines, recs) if r["tbl"] != "memories_embeddings"
+                                or r["pk"] != [500]))
+        child = next(r for r in recs if r["tbl"] == "memories_embeddings" and r["pk"] == [500])
+        add = [{**child, "index": 0, "sql": "UPDATE memories_embeddings SET embedding = embedding WHERE memory_id = ?",
+                "params": [500]}]
+    else:  # the child's records removed: a parent with no child
+        path.write_text("".join(ln + "\n" for ln, r in zip(lines, recs) if r["tbl"] != "memories_embeddings"
+                                or r["pk"] != [500]))
+        add = []
     with open(path, "a") as fh:
         for r in add:
             fh.write(json.dumps(r) + "\n")
     out = night.run("2026-09-25")
-    assert f"('memories', ({parent_pk},))" in out["builder"]["key_set"]["extra_in_log"], out["builder"]
+    assert f"('memories', ({bad_key},))" in out["builder"]["key_set"]["extra_in_log"], (variant, out["builder"])
     assert not out["clean"]
 
 

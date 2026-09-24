@@ -819,10 +819,13 @@ CREATE TABLE shadow_state (   -- in the shadow file only
   events recorded since the previous night (`would_halt`, tracked by
   `shadow_state.would_halt_reported_id`), and they do not fail the night.
   In (b) a log key with no outbox row is a defect, except a `memories`
-  parent the replicator adds to a child upsert: allowed only when every log
-  record of it is an upsert with the same attempt and seq as an upsert of
-  `memories_embeddings`/`memories_crossrefs` for that memory id (review
-  7701 P1-1; `replicator.is_added_parent`). Such a parent shares its
+  parent the replicator adds to a child upsert (`replicator.is_added_parent`,
+  reviews 7701 P1-1 and 7721 P1). Every log record of the key must be
+  exactly the replicator's own memories UPSERT for that id: rebuilt with
+  `_build_statements` from the record's columns and params, it must give
+  the same SQL text and params. Each must also share attempt and seq with
+  an upsert of that id's `memories_embeddings`/`memories_crossrefs` row,
+  checked the same way. A no-op UPDATE or a DELETE is a defect. Such a parent shares its
   child's seq, which is why the log reader deduplicates by (seq, table,
   key, index) (the L6 fix).
   A diff in (a) or (b) marks the shadow dirty.
@@ -1211,7 +1214,9 @@ Two modes:
 - **Log** (the shadow period, §2.9 (b)):
   - The compare waits for `log_cursor_seq >= head` and snapshots `S`.
   - Up to the cursor, every outbox key must appear in the log. An extra log
-    key must be a `memories` FK parent that the replicator added.
+    key must be a `memories` FK parent that the replicator added, by the
+    same strict rule as the nightly check (`replicator.is_added_parent`;
+    review 7721 P1: it had exempted every `memories` key).
   - The log is replayed in order, with foreign keys on, into the store's
     seed export (`--receipt`; its age is not limited, it is the seed's) and
     compared with `S`. D1 is not read, and nothing is consumed.
@@ -1793,3 +1798,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (u) `_absorb_link`'s fixed savepoint name assumes `add_link` never opens a same-named nested savepoint (L4 review 7614 P2) | L5 | **done in L5 piece a**: `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection, and `add_link`'s docstring records the constraint |
 | (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |
 | (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | **done in L6 piece b**: each memory group lists `inbound_refs` (the memories whose crossrefs point at it, per side, and whether they are conflict groups); the apply report and `--dry-run` list `dangling_references` for the chosen sides (a warning) |
+| (x) local writers run with `PRAGMA foreign_keys` off while D1 enforces them, so D1's `ON DELETE CASCADE` on `memories_embeddings`, `memories_crossrefs` and `memories_events` does not run locally. The app's `delete_memory` deletes those children itself, so app traffic matches D1, but a raw parent DELETE leaves orphan children locally that D1 would not have (L9a review 7721 P2) | L9 | before the first local-primary cutover (L9 write mode): enforce `PRAGMA foreign_keys=ON` on local writers or emulate the cascades, after an orphan audit of the existing data |

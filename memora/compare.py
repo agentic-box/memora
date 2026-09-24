@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .local_primary import (D1Reader, L5Refused, _norm, _order_for, _scratch_connect, backup_store,
                             load_receipt, load_sql)
+from .replicator import is_added_parent
 
 PROVENANCE = ("representation", "dimension", "encoding_source", "writer_token")
 EMBEDDINGS = "memories_embeddings"
@@ -363,7 +364,9 @@ def log_compare(env: Env, *, db: str, receipt_path: str, account_id: str, databa
     for r in records:
         logged.setdefault((r["tbl"], tuple(r["pk"])), int(r["seq"]))
     missing = sorted(set(outbox) - set(logged), key=str)
-    extra = sorted((k for k in set(logged) - set(outbox) if k[0] != "memories"), key=str)
+    # An extra log key is allowed only as the memories parent the replicator
+    # added to a child upsert, in its exact statement shape (review 7721 P1).
+    extra = sorted((k for k in set(logged) - set(outbox) if not is_added_parent(k, records)), key=str)
     scratch = Path(tempfile.mkdtemp(prefix="compare-log-replay-", dir=str(env.work))) / "replay.db"
     load_sql(Path(receipt["sql_path"]), scratch)
     rdb = _scratch_connect(scratch)

@@ -14,6 +14,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L9a round 3 / L6 (review 7721)
+- `replicator.is_added_parent` is strict. An extra `memories` log key passes only when every record of it is exactly the replicator's own memories UPSERT for that id (rebuilt with `_build_statements` from the record's columns and params, same SQL text and params). Each such record must share attempt and seq with an upsert of that id's `memories_embeddings`/`memories_crossrefs` row, checked the same way. A no-op UPDATE, a DELETE, another id or another shape is an unexpected log key.
+- L6's log-mode compare (`compare.log_compare`) used to exempt every `memories` key missing from the outbox. It now uses the same predicate.
+- Plan §9 (x): local writers run without `PRAGMA foreign_keys`, while D1 runs the cascades. To be settled before the first local-primary cutover.
+
 ### Local-primary L9a round 2 (review 7701)
 - `shadow-night` needs a drained, stable applier: it reads the `shadow` block of `/health/db/<db>` (new `--health-token-file`, `--memora-url`) and waits up to `--stable-wait-s` (300 s) for `applier_alive`, with `queue_depth`, `unfinished`, `pending_keys` and `inflight` all 0. After the D1 compare, the applier `instance` and `generation` must be unchanged and the block still drained. Otherwise the night is DEFERRED: exit 6, `shadow_state` untouched, nothing marked dirty, nothing counted.
 - The `shadow` health block adds `inflight`, `unfinished`, `generation` and `instance`.
