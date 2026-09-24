@@ -153,10 +153,24 @@ def _load_receipt(name: str, receipt: Any) -> Tuple[Optional[Dict[str, Any]], Op
 DECISIONS = ("applied", "not-applied")
 
 
+# The evidence digest covers what was READ, never when (RC1): the gathering
+# rule's version, the status, the query, the rows, the row count and
+# served_by_primary. read_at and a waiting intent's eligible_in_s change on
+# every gather -- including them made the digest change on every GET, so no
+# operator decision could ever match (bestation intent 53). Evidence is
+# still gathered on every GET: the accept is judged against evidence read
+# at accept time, so a real D1 change between show and accept is refused.
+EVIDENCE_RULE = 1
+_EVIDENCE_TIMING_KEYS = ("read_at", "eligible_in_s")
+
+
 def evidence_sha256(evidence: Any) -> str:
     """The digest an operator quotes to prove which evidence they decided on
-    (GET /admin/intents returns it per intent)."""
-    payload = json.dumps(evidence, sort_keys=True, default=str, separators=(",", ":"))
+    (GET /admin/intents returns it per intent): the evidence CONTENT only."""
+    content = ({k: v for k, v in evidence.items() if k not in _EVIDENCE_TIMING_KEYS}
+               if isinstance(evidence, dict) else evidence)
+    payload = json.dumps({"rule": EVIDENCE_RULE, "evidence": content}, sort_keys=True, default=str,
+                         separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

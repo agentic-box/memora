@@ -14,6 +14,23 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Reconcile: the evidence digest covers what was read, not when (RC1)
+
+- `reconcile --accept` could never accept an open D1 write intent
+  (production: bestation intent 53).
+  - Every `GET /admin/intents` re-gathers the evidence with a new
+    `read_at`, and the evidence digest covered it, so the digest an
+    operator quoted never matched the CLI's own re-read or the server's
+    check.
+- The digest (`admin.evidence_sha256`) now covers the evidence content
+  only, plus a rule version: status, query, rows, row count and
+  `served_by_primary`. `read_at` and a waiting intent's `eligible_in_s`
+  are excluded.
+- Evidence is still gathered on every GET, so the accept is judged against
+  evidence read at accept time. An unchanged D1 matches; a real change
+  between show and accept is still refused.
+- Digests shown before this change do not match: show the intents again.
+
 ## 0.5.1
 
 Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
