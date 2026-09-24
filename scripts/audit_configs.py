@@ -7,9 +7,13 @@
   scripts/audit_configs.py --host nuc8 --host ob1 --host bestation --host re
   scripts/audit_configs.py --local --host nuc8 --json
 
-Every audit also inspects the RUNNING containers of each host (docker,
-podman, Apple's `container`): a container keeps the environment it was
-started with. --containers-only re-checks just those.
+Every audit also inspects EVERY persisted container of each host, running
+or stopped (docker/podman `ps -a`, Apple's `container list --all`): a
+container keeps the environment it was created with, and a stopped one can
+be started again. --containers-only re-checks just those. Each host's
+report starts with its coverage: only what that user can see (another
+user's rootless runtime is invisible; an empty MEMORA_AUDIT_RUNTIMES audits
+no containers). Nothing ssh or a runtime prints is copied into a report.
 
 Each remote host is audited by piping memora/config_audit.py (standard
 library only) to `ssh -o BatchMode=yes HOST python3 - --json`, with the host
@@ -48,17 +52,20 @@ def audit_remote(host: str, roots, memora_all, *, ssh: str = "ssh", timeout: int
     cmd += list(roots)
     try:
         r = subprocess.run(cmd, input=AUDIT_SOURCE.read_text(), capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
         return {"host": host, "clean": False, "findings": [], "blocking": 0,
-                "errors": [f"could not run the audit over ssh: {exc}"]}
+                "errors": [f"the audit over ssh timed out after {timeout}s"]}
+    except OSError as exc:
+        return {"host": host, "clean": False, "findings": [], "blocking": 0,
+                "errors": [f"could not run ssh ({exc.strerror or type(exc).__name__})"]}
     try:
         result = json.loads(r.stdout.strip().splitlines()[-1])
         if not isinstance(result, dict) or result.get("host") != host or "clean" not in result:
             raise ValueError("unexpected output")
     except (ValueError, IndexError):
-        detail = (r.stderr or r.stdout).strip()[-300:]
+        # What ssh or the remote printed is never echoed: it may hold a token.
         return {"host": host, "clean": False, "findings": [], "blocking": 0,
-                "errors": [f"audit did not complete (exit {r.returncode}): {detail}"]}
+                "errors": [f"audit did not complete on {host} (ssh exit {r.returncode}; output withheld)"]}
     if r.returncode not in (0, 1) or bool(result["clean"]) != (r.returncode == 0):
         result = dict(result, clean=False,
                       errors=list(result.get("errors", [])) + [f"audit exit {r.returncode} disagrees with its report"])
@@ -100,6 +107,8 @@ def main(argv=None) -> int:
         for r in results:
             for f in r["findings"]:
                 print(config_audit.format_finding(f))
+            if r.get("coverage"):
+                print(f"coverage {r['host']}: {r['coverage']}")
             for e in r["errors"]:
                 print(f"ERROR      {r['host']}: {e}")
             print(f"{r['host']}: {'clean' if r['clean'] else 'NOT clean'} ({r['blocking']} direct-D1 finding(s))")

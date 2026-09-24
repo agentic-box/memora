@@ -205,26 +205,36 @@ def test_the_module_runs_standalone_from_stdin(tmp_path):
 # ---------------------------------------------------------------- running containers
 
 def _fake_runtime(bindir: Path, name: str, containers: dict, *, fail: str = ""):
-    """A fake docker/podman/container. containers: {name: [env strings]}.
-    fail: "list" or "inspect" makes that verb fail."""
+    """A fake docker/podman/container. containers: {name: [env strings]} or
+    {name: ([env strings], state)}. fail: "list" or "inspect" makes that
+    verb fail, printing a token to stderr (which must never be echoed)."""
     bindir.mkdir(exist_ok=True)
     data = bindir / f"{name}.json"
-    data.write_text(json.dumps(containers))
+    data.write_text(json.dumps({k: (v if isinstance(v, tuple) else (v, "running")) for k, v in containers.items()}))
     body = f"""#!{sys.executable}
 import json, sys
 data = json.load(open({str(data)!r}))
 verb = sys.argv[1]
+leak = "Error: token=" + {TOKEN!r} + " rejected"
 if verb in ("ps", "list"):
     if {fail!r} == "list":
-        sys.exit("cannot connect to the daemon")
+        sys.stderr.write(leak)
+        sys.exit(1)
+    everything = "-a" in sys.argv or "--all" in sys.argv
     if {name!r} == "container":
         print("ID  IMAGE  OS  ARCH  STATE  ADDR")
-    for n in data:
-        print(n)
+        for n, (env, state) in data.items():
+            if everything or state == "running":
+                print(n, "img", "linux", "arm64", state, "-")
+    else:
+        for n, (env, state) in data.items():
+            if everything or state == "running":
+                print(n + "\\t" + state)
 elif verb == "inspect":
     if {fail!r} == "inspect":
-        sys.exit("inspect failed")
-    env = data[sys.argv[2]]
+        sys.stderr.write(leak)
+        sys.exit(1)
+    env = data[sys.argv[2]][0]
     if {name!r} == "container":
         print(json.dumps([{{"configuration": {{"id": sys.argv[2], "initProcess": {{"environment": env}}}}}}]))
     else:
@@ -324,3 +334,68 @@ def test_containers_are_audited_on_remote_hosts_too(tmp_path, runtimes):
     f = out["hosts"][0]["findings"][0]
     assert f["kind"] == "runtime_env" and f["container"] == "memora-ob1" and f["host"] == "ob1"
     assert TOKEN not in r.stdout
+
+
+
+def test_a_stopped_container_with_the_old_token_blocks(tmp_path, runtimes):
+    """Review 7680 P1-1: a stopped container keeps its env and can be restarted."""
+    runtimes(docker={"memora-old": (BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}"], "exited")},
+             container={"memora-mac": (BASE_ENV + [f"CF_API_TOKEN={TOKEN}"], "stopped")})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert not result["clean"] and result["blocking"] == 2
+    states = {(f["container"], f["state"]) for f in result["findings"]}
+    assert states == {("memora-old", "exited"), ("memora-mac", "stopped")}
+    r = _cli("--local", str(empty), "--containers-only")
+    assert r.returncode == 1 and "exited" in r.stdout and "stopped" in r.stdout
+
+
+def test_a_stopped_memora_all_on_nuc8_is_still_the_exception(tmp_path, runtimes):
+    runtimes(docker={"memora-all": (BASE_ENV + [f"CLOUDFLARE_API_TOKEN={TOKEN}"], "exited")})
+    empty = tmp_path / "home"
+    empty.mkdir()
+    assert config_audit.audit([empty], host="nuc8")["clean"]
+
+
+@pytest.mark.parametrize("fail", ["list", "inspect"])
+def test_runtime_output_is_never_echoed(tmp_path, runtimes, fail):
+    """Review 7680 P1-2b: a runtime's stderr can carry a token."""
+    runtimes(docker=({"x": BASE_ENV}, fail))
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert result["errors"] and TOKEN not in json.dumps(result) and TOKEN[:12] not in json.dumps(result)
+    assert "exited 1" in json.dumps(result)
+    r = _cli("--local", str(empty), "--json")
+    assert TOKEN not in r.stdout + r.stderr
+
+
+def test_invalid_remote_output_is_never_echoed(tmp_path):
+    ssh = _fake_ssh(tmp_path, f"cat >/dev/null\necho 'CLOUDFLARE_API_TOKEN={TOKEN} not json'\n"
+                              f"echo 'stderr {TOKEN}' >&2\nexit 3\n")
+    r = _cli("--host", "ob1", "--ssh", ssh, "--json")
+    assert r.returncode == 1 and TOKEN not in r.stdout + r.stderr
+    assert "ssh exit 3" in r.stdout
+
+
+def test_the_report_states_its_coverage(tmp_path, runtimes, monkeypatch):
+    empty = tmp_path / "home"
+    empty.mkdir()
+    runtimes(docker={"x": BASE_ENV})
+    r = _cli("--local", str(empty))
+    assert "coverage" in r.stdout and "rootless" in r.stdout and "docker" in r.stdout
+    monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "")
+    r = _cli("--local", str(empty))
+    assert "NO containers: MEMORA_AUDIT_RUNTIMES is set and empty" in r.stdout
+
+
+def test_the_module_report_states_its_coverage(tmp_path):
+    """The module itself (what runs on a remote host) prints coverage too."""
+    empty = tmp_path / "home"
+    empty.mkdir()
+    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "ob1", str(empty)],
+                       capture_output=True, text=True, timeout=60,
+                       env={**os.environ, "MEMORA_AUDIT_RUNTIMES": ""})
+    assert r.returncode == 0
+    assert r.stdout.startswith("coverage ob1: ") and "NO containers" in r.stdout

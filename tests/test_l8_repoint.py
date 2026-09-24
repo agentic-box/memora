@@ -200,3 +200,21 @@ def test_drop_env_removes_the_env(tmp_path):
         "CF_API_TOKEN": TOKEN, **SECRETS}}}})
     assert _run(str(p), "--url", URL, "--apply", "--drop-env").returncode == 0
     assert json.loads(p.read_text())["mcpServers"]["memora"] == {"type": "http", "url": URL}
+
+
+
+def test_a_url_with_userinfo_or_query_is_never_printed(tmp_path):
+    """Review 7680 P1-2a."""
+    doc = {"mcpServers": {
+        "other": {"type": "http", "url": "https://admin:hunter2secret@example.com:8443/mcp?token=q-" + "Leak9"},
+        "memora": {"command": "x", "env": {"CF_API_TOKEN": TOKEN}}}}
+    p = _write(tmp_path, ".mcp.json", doc)
+    for url in (URL, "http://user:pw-" + "Leak7@nuc8:8920/mcp/memora"):
+        r = _run(str(p), "--url", url)
+        out = r.stdout + r.stderr
+        assert "hunter2secret" not in out and "q-Leak9" not in out and "pw-Leak7" not in out
+        assert TOKEN not in out
+    from scripts.repoint_mcp_config import safe_url
+    assert safe_url("https://a:b@h.example:8443/p/q?x=1#f") == "https://h.example:8443/p/q (userinfo/query withheld)"
+    assert safe_url("http://nuc8:8920/mcp/memora") == "http://nuc8:8920/mcp/memora"
+    assert safe_url("not a url").startswith("<redacted:")

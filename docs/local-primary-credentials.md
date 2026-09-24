@@ -89,19 +89,30 @@ last, only after nothing but memora-all uses D1.
    `CF_API_TOKEN`, a `d1://` `MEMORA_STORAGE_URI` and the `d1://` entries of
    `MEMORA_DATABASES` leave `env`. Every other env key (LLM, embedding, AWS)
    stays, because `memora-instance.sh` reads its container env from
-   `credentials*.mcp.json` (`--drop-env` removes the env instead, for a
-   client that rejects it on an http entry). The preview prints keys and
-   routing only; every value is shown as `<redacted:LENGTH>`. A 0600 backup
+   `credentials*.mcp.json`. `--drop-env` removes the env instead; it is for
+   CLIENT configs only (a workspace `.mcp.json`, `~/.claude.json`) whose
+   client rejects env on an http entry. NEVER use `--drop-env` on
+   `~/.config/memora/credentials*.mcp.json`: that file is the credential
+   source `memora-instance.sh` reads, and the containers would lose their
+   LLM, embedding and AWS keys. The preview prints keys and
+   routing only; every value is shown as `<redacted:LENGTH>`, and a URL as
+   `scheme://host[:port]/path` (never userinfo or a query string). A 0600 backup
    `FILE.bak-repoint-<timestamp>` is written first. With the check
    flags, step 2's endpoint check runs first against the URL's server,
    through the scratch store (`--check-store`, default `scratch`), and a
    failure refuses the repoint. Repeat for every file the audit (step 5) lists: workspace
    `.mcp.json` files, `~/.claude.json`, `~/.config/memora/*credentials*.mcp.json`
    on the Mac, ob1, bestation and re.
+   Then **verify a real client connection through the new entry**: start
+   the client (for example Claude Code in that workspace) and call
+   `memory_stats` through the repointed server entry; it must answer with
+   the expected `database`. The endpoint check proves the server; this
+   proves the client's own config.
 4. **Recreate every `memora-instance.sh` container** on every host whose
-   credential file was repointed. A running container keeps the env it was
-   started with, including the old token and its `d1://` routing, until it
-   is recreated:
+   credential file was repointed. A container keeps the env it was created
+   with, including the old token and its `d1://` routing, until it is
+   recreated; a STOPPED one still holds it and can be started again, so
+   remove the ones you do not recreate:
 
    ```sh
    for f in instances/*.env; do n=$(basename "$f" .env); [ "$n" = example ] || scripts/memora-instance.sh up "$n"; done
@@ -118,7 +129,19 @@ last, only after nothing but memora-all uses D1.
    ```
 
    Every run scans the configuration files and inspects the environment of
-   every running container (docker, podman, Apple's `container`), masked.
+   every persisted container, running OR stopped (docker/podman `ps -a`,
+   Apple's `container list --all`), masked, and reports each container's
+   state. A stopped container holding the old token blocks until it is
+   recreated or removed.
+
+   **Coverage limits** (also printed at the top of every report): only the
+   files of the user running the audit, under the given roots, and only the
+   containers that user's runtimes can see. Another user's rootless
+   docker/podman is invisible: run the audit as each user that runs
+   containers. An explicitly empty `MEMORA_AUDIT_RUNTIMES` audits no
+   containers at all, so never set it for the revoke gate. Nothing ssh or
+   a runtime prints is copied into a report (only command names and exit
+   status).
    Exit 0 only when no host has a direct-D1 client except memora-all itself
    (`instances/all.env`; on nuc8, `~/.config/memora/credentials.mcp.json`,
    `all.*` and the running `memora-all` container). A host that cannot be
@@ -133,10 +156,13 @@ last, only after nothing but memora-all uses D1.
 8. **Revoke the OLD token** in the dashboard, only when ALL of these hold
    (the revoke gate):
    - the file audit is clean on every host (step 5);
-   - the running-container audit is clean on every host (step 5);
+   - the container audit (running and stopped) is clean on every host
+     (step 5);
    - every `memora-instance.sh` container was recreated after the repoint
      (step 4);
-   - check-endpoint is green from every client host (step 6);
+   - check-endpoint is green from every client host (step 6), and a real
+     client connection through each repointed entry answered
+     `memory_stats` (step 3);
    - memora-all is healthy on (a) (step 7).
 
    Then Then delete every

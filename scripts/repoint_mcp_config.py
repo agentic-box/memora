@@ -84,7 +84,24 @@ def reaches_d1(entry: Any) -> bool:
     return isinstance(env, dict) and any(env.get(k) for k in TOKEN_KEYS)
 
 
-ROUTING_FIELDS = ("type", "url")  # printed as they are; everything else is redacted
+def safe_url(value: Any) -> str:
+    """A URL as scheme://host[:port]/path: never userinfo, query or
+    fragment, which can carry credentials (review 7680 P1-2a)."""
+    if not isinstance(value, str):
+        return _redacted(value)
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname or ""
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return _redacted(value)
+    if not parts.scheme or not host:
+        return _redacted(value)
+    extra = " (userinfo/query withheld)" if (parts.username or parts.password or parts.query or parts.fragment) else ""
+    return f"{parts.scheme}://{host}{port}{parts.path}{extra}"
+
+
+ROUTING_FIELDS = ("type",)  # printed as they are; url through safe_url; everything else is redacted
 
 
 def _redacted(value: Any) -> str:
@@ -101,6 +118,8 @@ def redact_entry(entry: Any) -> Any:
     for key, value in entry.items():
         if key in ROUTING_FIELDS and isinstance(value, str):
             out[key] = value
+        elif key == "url":
+            out[key] = safe_url(value)
         elif key == "env" and isinstance(value, dict):
             out[key] = {k: _redacted(v) for k, v in value.items()}
         elif key == "args" and isinstance(value, list):
@@ -228,7 +247,7 @@ def main(argv=None) -> int:
     path = Path(args.file).expanduser()
     try:
         if not re.match(r"^https?://[^/]+/mcp(/[A-Za-z0-9._-]+)?/?$", args.url):
-            raise Refused(f"--url must be http(s)://host:port/mcp[/<store>], not {args.url!r}")
+            raise Refused(f"--url must be http(s)://host:port/mcp[/<store>], not {safe_url(args.url)!r}")
         if bool(args.check_health_token_file) != bool(args.check_admin_token_file):
             raise Refused("give both --check-health-token-file and --check-admin-token-file, or neither")
         try:
