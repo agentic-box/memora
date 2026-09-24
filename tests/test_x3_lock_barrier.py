@@ -555,10 +555,11 @@ def test_a_lock_on_another_device_is_refused(tmp_path, monkeypatch):
     data = tmp_path / "data"
     data.mkdir()
     real_stat = os.stat
+    target = os.path.realpath(data)  # resolved BEFORE the patch: pathlib itself calls os.stat
 
     def fake_stat(p, *a, **kw):
         st = real_stat(p, *a, **kw)
-        if str(p) == str(data.resolve()):
+        if os.fspath(p) == target:
             return os.stat_result((st.st_mode, st.st_ino, st.st_dev + 1) + tuple(st)[3:])
         return st
     monkeypatch.setattr(backends.os, "stat", fake_stat)
