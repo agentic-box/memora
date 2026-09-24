@@ -291,17 +291,22 @@ MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 # vanishes and every later one shifts (production died with "$18: unbound
 # variable": DEPLOY_LABELS and MEMORA_REPLICAS are empty there). So all of
 # them travel as ONE base64 blob of NUL-terminated values: a single
-# non-empty word of [A-Za-z0-9+/=], which no word-joining can split or drop.
-# The remote script decodes it back into $1..$N and refuses unless exactly
-# N arrived. A localhost rehearsal sends the SAME command line through
-# `sh -c`, i.e. the same re-parsing a remote shell does.
+# non-empty word of [A-Za-z0-9+/=], which no word-joining can split or drop,
+# preceded by the blob's sha256 as a second word (review 7889: a changed
+# character that keeps the field count must refuse too). The remote script
+# checks the digest, decodes (a decoder error refuses), requires exactly
+# the 21 parameters it reads, and only then restores $1..$21. A localhost
+# rehearsal sends the SAME command line through `sh -c`, i.e. the same
+# re-parsing a remote shell does.
 REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
   "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO"
   "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR"
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
   "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S")
 PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
-REMOTE_CMD="bash -s -- ${#REMOTE_ARGS[@]} $PARAMS_B64"
+PARAMS_SHA="$(printf '%s' "$PARAMS_B64" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
+[ "${#REMOTE_ARGS[@]}" -eq 21 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 21" >&2; exit 1; }
+REMOTE_CMD="bash -s -- $PARAMS_SHA $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
   TARGET=(sh -c "$REMOTE_CMD")
 else
@@ -309,11 +314,18 @@ else
 fi
 "${TARGET[@]}" <<'REMOTE'
 set -euo pipefail
-# The parameters: $1 is their count, $2 the blob (see REMOTE_CMD above).
-[ "$#" -eq 2 ] || { echo "deploy: the remote command arrived with $# words, not 2 -- argument transport broken; nothing was done" >&2; exit 1; }
-WANT="$1"; P=()
-while IFS= read -r -d '' v; do P+=("$v"); done < <(printf '%s' "$2" | base64 -d)
-[ "${#P[@]}" -eq "$WANT" ] || { echo "deploy: ${#P[@]} parameters arrived, not $WANT -- argument transport broken; nothing was done" >&2; exit 1; }
+# The parameters: $1 the blob's sha256, $2 the blob (see REMOTE_CMD above).
+broken() { echo "deploy: $* -- argument transport broken; nothing was done" >&2; exit 1; }
+[ "$#" -eq 2 ] || broken "the remote command arrived with $# words, not 2"
+GOT_SHA="$(printf '%s' "$2" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')" \
+  || broken "cannot hash the parameters"
+[ "$GOT_SHA" = "$1" ] || broken "the parameters' sha256 does not match"
+DECODED="$(mktemp)"
+printf '%s' "$2" | base64 -d > "$DECODED" 2>/dev/null || { rm -f "$DECODED"; broken "the parameters do not decode"; }
+P=()
+while IFS= read -r -d '' v; do P+=("$v"); done < "$DECODED"
+rm -f "$DECODED"
+[ "${#P[@]}" -eq 21 ] || broken "${#P[@]} parameters arrived, not 21"
 set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"

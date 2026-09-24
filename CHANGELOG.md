@@ -31,8 +31,11 @@ newest first, are the slices of the implementation plan
   ssh joins its arguments into one command line, so the empty
   `DEPLOY_LABELS` and `MEMORA_REPLICAS` vanished and later ones shifted.
   - All 21 parameters now travel as one base64 blob of NUL-terminated
-    values, a single non-empty word. The remote script decodes it into
-    `$1..$21` and refuses (nothing done) unless exactly 21 arrive.
+    values, a single non-empty word, preceded by the blob's sha256.
+  - The remote script refuses (nothing done) unless the digest matches,
+    the blob decodes, and exactly 21 values arrive; only then does it
+    restore `$1..$21`. A changed character that keeps the field count is
+    therefore refused too.
   - A localhost rehearsal sends the same command line through `sh -c`.
   - The tests' fake ssh now joins and re-splits like real ssh, which
     reproduces the production failure on the old script.

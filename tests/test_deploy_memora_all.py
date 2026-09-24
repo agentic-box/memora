@@ -896,10 +896,11 @@ N_REMOTE_ARGS = 21
 
 def _decode_blob(line):
     import base64
+    import hashlib
 
     words = line.split()
     assert words[:3] == ["bash", "-s", "--"] and len(words) == 5, words
-    assert words[3] == str(N_REMOTE_ARGS)
+    assert words[3] == hashlib.sha256(words[4].encode()).hexdigest()
     raw = base64.b64decode(words[4])
     assert raw.endswith(b"\0")
     return [v.decode() for v in raw[:-1].split(b"\0")]
@@ -943,11 +944,19 @@ class TestRemoteArguments:
 
     @pytest.mark.parametrize("mangle, match", [
         ("drop-last-word", "arrived with 1 words, not 2"),
-        ("truncate-blob", "parameters arrived, not 21"),
+        ("truncate-blob", "the parameters' sha256 does not match"),
+        # review 7889: one base64 character changed -- still 21 NUL-terminated
+        # fields, a different value (inside DEPLOY_IMAGE's or another field)
+        ("same-count-change", "the parameters' sha256 does not match"),
+        ("digest-changed", "the parameters' sha256 does not match"),
     ])
     def test_a_broken_transport_refuses_before_anything(self, deploy, mangle, match):
+        flip = ('python3 -c \'import base64,sys; b=bytearray(base64.b64decode(sys.argv[1])); '
+                'i=b.index(b"memora:latest"); b[i]=ord("n"); print(base64.b64encode(bytes(b)).decode())\' "$5"')
         body = {"drop-last-word": 'set -- $*; n=$#; a=""; i=1; for w in "$@"; do [ $i -lt $n ] && a="$a $w"; i=$((i+1)); done; exec sh -c "$a"',
-                "truncate-blob": 'set -- $*; b="$5"; exec sh -c "$1 $2 $3 $4 ${b%????????????????}"'}[mangle]
+                "truncate-blob": 'set -- $*; b="$5"; exec sh -c "$1 $2 $3 $4 ${b%????????????????}"',
+                "same-count-change": f'set -- $*; exec sh -c "$1 $2 $3 $4 $({flip})"',
+                "digest-changed": 'set -- $*; exec sh -c "$1 $2 $3 0000$4 $5"'}[mangle]
         _exe(deploy.bin / "ssh", f'#!/bin/bash\nshift\n{body}\n')
         proc, calls, _ = deploy()
         assert proc.returncode != 0 and match in proc.stderr, proc.stderr[-800:]
@@ -958,10 +967,11 @@ class TestRemoteArguments:
 def _transport_block(script):
     """The encode line and the decode block, as the deploy script has them."""
     lines = script.splitlines()
-    enc = next(l for l in lines if l.startswith("PARAMS_B64="))
-    i = next(k for k, l in enumerate(lines) if l.startswith('[ "$#" -eq 2 ]'))
+    a = next(k for k, l in enumerate(lines) if l.startswith("PARAMS_B64="))
+    b = next(k for k, l in enumerate(lines) if l.startswith("REMOTE_CMD="))
+    i = next(k for k, l in enumerate(lines) if l.startswith("broken() {"))
     j = next(k for k, l in enumerate(lines) if l == 'set -- "${P[@]}"')
-    return enc, "\n".join(lines[i:j + 1])
+    return "\n".join(lines[a:b]), "\n".join(lines[i:j + 1])
 
 
 @pytest.mark.parametrize("pos", range(N_REMOTE_ARGS))
@@ -977,7 +987,7 @@ def test_every_position_survives_empty_and_spaced_values(tmp_path, pos):
     harness = tmp_path / "t.sh"
     harness.write_text(
         "set -euo pipefail\nREMOTE_ARGS=(\"$@\")\n" + enc + "\n"
-        'sh -c "bash -s -- ${#REMOTE_ARGS[@]} $PARAMS_B64" <<\'REMOTE\'\n'
+        'sh -c "bash -s -- $PARAMS_SHA $PARAMS_B64" <<\'REMOTE\'\n'
         "set -euo pipefail\n" + dec + "\n"
         'printf "%s\\0" "$@"\nREMOTE\n')
     out = subprocess.run(["bash", str(harness), *values], capture_output=True, timeout=30)
