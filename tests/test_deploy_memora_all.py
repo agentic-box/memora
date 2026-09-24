@@ -73,7 +73,12 @@ def deploy(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     tool_log = tmp_path / "tools.txt"
-    _exe(bin_dir / "ssh", f'#!/bin/bash\necho "ssh $1" >> "{tool_log}"\nshift\nexec "$@"\n')
+    # Like real ssh (REL2): the arguments after the host are JOINED with
+    # spaces into one command line, which the remote shell re-splits -- an
+    # empty argument vanishes and one with a space splits. The joined line is
+    # recorded too.
+    _exe(bin_dir / "ssh", f'#!/bin/bash\necho "ssh $1" >> "{tool_log}"\nshift\n'
+                          f'printf "%s\\n" "$*" > "{tmp_path / "ssh-command.txt"}"\nexec sh -c "$*"\n')
     os.symlink(FAKE_RUNTIME, bin_dir / "docker")
     os.symlink(FAKE_RUNTIME, bin_dir / "podman")
     _exe(bin_dir / "git", f'#!/bin/bash\necho "git $*" >> "{tool_log}"\nexit 0\n')
@@ -882,3 +887,99 @@ class TestDataDirPinned:
         deploy.env_file.write_text(deploy.env_file.read_text() + "MEMORA_DATA_DIR=/data\n")
         _, calls, _ = deploy()
         assert self._data_dirs(calls) == ["MEMORA_DATA_DIR=/data"]
+
+
+# ---------------------------------------------------------------- REL2: the remote arguments survive ssh
+
+N_REMOTE_ARGS = 21
+
+
+def _decode_blob(line):
+    import base64
+
+    words = line.split()
+    assert words[:3] == ["bash", "-s", "--"] and len(words) == 5, words
+    assert words[3] == str(N_REMOTE_ARGS)
+    raw = base64.b64decode(words[4])
+    assert raw.endswith(b"\0")
+    return [v.decode() for v in raw[:-1].split(b"\0")]
+
+
+class TestRemoteArguments:
+    """Production died with `$18: unbound variable` (leader 7885): ssh joins
+    its arguments into one command line, so empty ones vanished. The fake ssh
+    now does the same joining (fixture); these pin the transport itself."""
+
+    def test_the_remote_command_is_one_word_carrying_every_parameter(self, deploy, tmp_path):
+        deploy()
+        line = (tmp_path / "ssh-command.txt").read_text().strip()
+        params = _decode_blob(line)
+        assert len(params) == N_REMOTE_ARGS
+        assert params[0] == "v0.5.0" and params[3] == "docker" and params[4] == "memora-all"
+        assert params[12] == ""                      # DEPLOY_LABELS: empty in production
+        assert params[13] == "~/.config/memora-lp"
+        assert params[17] == ""                      # MEMORA_REPLICAS_B64: empty (dark)
+        assert params[18] == "" and params[19] == ""  # MEMORA_REPLICATION, the timing
+        assert params[20] == "90"
+
+    def test_spaces_survive_the_transport(self, deploy, tmp_path):
+        root = tmp_path / "rh root"
+        rcfg = root / "c f g"
+        shutil.copytree(deploy.home / ".config" / "memora", rcfg)
+        (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
+        rsec = root / "s e c"
+        shutil.copytree(deploy.secrets, rsec)
+        envf = root / "all env"
+        envf.write_text(f"MEMORA_DATABASES='{json.dumps(REGISTRY)}'\n")
+        proc, calls, _ = deploy(runtime_env={
+            **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
+            "DEPLOY_LABELS": "memora.rehearsal=rh-t extra=x", "DEPLOY_CONFIG_DIR": str(rcfg),
+            "DEPLOY_SECRETS_DIR": str(rsec), "DEPLOY_ENV_FILE": str(envf),
+            "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora")})
+        run = _new_container_run(calls)
+        assert f"{rsec}:{SECRETS_MOUNT}:ro" in _flag_values(run, "-v"), proc.stderr[-1500:]
+        assert _flag_values(run, "--label") == ["memora.rehearsal=rh-t", "extra=x"]
+        assert (rcfg / "all.admin-token").exists()
+
+    @pytest.mark.parametrize("mangle, match", [
+        ("drop-last-word", "arrived with 1 words, not 2"),
+        ("truncate-blob", "parameters arrived, not 21"),
+    ])
+    def test_a_broken_transport_refuses_before_anything(self, deploy, mangle, match):
+        body = {"drop-last-word": 'set -- $*; n=$#; a=""; i=1; for w in "$@"; do [ $i -lt $n ] && a="$a $w"; i=$((i+1)); done; exec sh -c "$a"',
+                "truncate-blob": 'set -- $*; b="$5"; exec sh -c "$1 $2 $3 $4 ${b%????????????????}"'}[mangle]
+        _exe(deploy.bin / "ssh", f'#!/bin/bash\nshift\n{body}\n')
+        proc, calls, _ = deploy()
+        assert proc.returncode != 0 and match in proc.stderr, proc.stderr[-800:]
+        assert "argument transport broken; nothing was done" in proc.stderr
+        assert calls == []
+
+
+def _transport_block(script):
+    """The encode line and the decode block, as the deploy script has them."""
+    lines = script.splitlines()
+    enc = next(l for l in lines if l.startswith("PARAMS_B64="))
+    i = next(k for k, l in enumerate(lines) if l.startswith('[ "$#" -eq 2 ]'))
+    j = next(k for k, l in enumerate(lines) if l == 'set -- "${P[@]}"')
+    return enc, "\n".join(lines[i:j + 1])
+
+
+@pytest.mark.parametrize("pos", range(N_REMOTE_ARGS))
+def test_every_position_survives_empty_and_spaced_values(tmp_path, pos):
+    """The script's own encode/decode, through `sh -c` (what ssh's remote
+    shell does): an empty value and values with spaces, quotes, $, newlines
+    and globs at every position arrive in place."""
+    enc, dec = _transport_block(open(SCRIPT).read())
+    values = [f"v{i}" for i in range(N_REMOTE_ARGS)]
+    values[pos] = ""
+    values[(pos + 1) % N_REMOTE_ARGS] = "a b  c"
+    values[(pos + 2) % N_REMOTE_ARGS] = "q'uo\"te $HOME *\nline2"
+    harness = tmp_path / "t.sh"
+    harness.write_text(
+        "set -euo pipefail\nREMOTE_ARGS=(\"$@\")\n" + enc + "\n"
+        'sh -c "bash -s -- ${#REMOTE_ARGS[@]} $PARAMS_B64" <<\'REMOTE\'\n'
+        "set -euo pipefail\n" + dec + "\n"
+        'printf "%s\\0" "$@"\nREMOTE\n')
+    out = subprocess.run(["bash", str(harness), *values], capture_output=True, timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.decode().split("\0")[:-1] == values

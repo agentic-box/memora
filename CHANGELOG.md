@@ -26,6 +26,17 @@ newest first, are the slices of the implementation plan
 
 ### Release prep (REL1): tokens as mounted files, the cutover script
 
+- **The deploy's remote arguments survive ssh (REL2).** The first
+  production deploy stopped, before any change, at `$18: unbound variable`:
+  ssh joins its arguments into one command line, so the empty
+  `DEPLOY_LABELS` and `MEMORA_REPLICAS` vanished and later ones shifted.
+  - All 21 parameters now travel as one base64 blob of NUL-terminated
+    values, a single non-empty word. The remote script decodes it into
+    `$1..$21` and refuses (nothing done) unless exactly 21 arrive.
+  - A localhost rehearsal sends the same command line through `sh -c`.
+  - The tests' fake ssh now joins and re-splits like real ssh, which
+    reproduces the production failure on the old script.
+
 - **Credentials from files.** `MEMORA_D1_READ_TOKEN_FILE`,
   `MEMORA_D1_REPLICATOR_TOKEN_FILE` and `CLOUDFLARE_API_TOKEN_FILE` name a
   file that holds the token (`memora/secret_files.py`). The D1 backend,

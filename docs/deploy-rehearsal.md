@@ -69,7 +69,7 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
 
 | variable | default | rehearsal |
 |---|---|---|
-| `DEPLOY_HOST` | `nuc8` | `localhost` (no ssh; the same remote script runs locally) |
+| `DEPLOY_HOST` | `nuc8` | `localhost` (no ssh; the same remote command line runs through `sh -c`, re-parsed as ssh's remote shell would: REL2) |
 | `RUNTIME` | `docker` | `podman` (every runtime call goes through it) |
 | `DEPLOY_CONTAINER` / `DEPLOY_DATA_VOLUME` / `DEPLOY_IMAGE` | `memora-all` / `memora-all-data` / `memora:latest` | `memora-rh` / `memora-rh-data` / `memora-rh:latest` |
 | `DEPLOY_PORT` | `8920` | `18920` |

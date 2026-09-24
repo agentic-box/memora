@@ -286,17 +286,35 @@ MEMORA_REPLICAS_B64="$(printf '%s' "$MEMORA_REPLICAS" | base64 | tr -d '\n')"
 # THIS checkout: the nuc8 checkout is at $TAG and may predate it.
 MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 
+# The remote script's parameters (REL2): ssh JOINS its arguments into one
+# command line for the remote shell, which re-splits it -- an EMPTY argument
+# vanishes and every later one shifts (production died with "$18: unbound
+# variable": DEPLOY_LABELS and MEMORA_REPLICAS are empty there). So all of
+# them travel as ONE base64 blob of NUL-terminated values: a single
+# non-empty word of [A-Za-z0-9+/=], which no word-joining can split or drop.
+# The remote script decodes it back into $1..$N and refuses unless exactly
+# N arrived. A localhost rehearsal sends the SAME command line through
+# `sh -c`, i.e. the same re-parsing a remote shell does.
+REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
+  "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO"
+  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR"
+  "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
+  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S")
+PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
+REMOTE_CMD="bash -s -- ${#REMOTE_ARGS[@]} $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
-  TARGET=(bash -s --)
+  TARGET=(sh -c "$REMOTE_CMD")
 else
-  TARGET=(ssh "$DEPLOY_HOST" bash -s --)
+  TARGET=(ssh "$DEPLOY_HOST" "$REMOTE_CMD")
 fi
-"${TARGET[@]}" "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER" \
-  "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO" \
-  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR" \
-  "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE" \
-  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S" <<'REMOTE'
+"${TARGET[@]}" <<'REMOTE'
 set -euo pipefail
+# The parameters: $1 is their count, $2 the blob (see REMOTE_CMD above).
+[ "$#" -eq 2 ] || { echo "deploy: the remote command arrived with $# words, not 2 -- argument transport broken; nothing was done" >&2; exit 1; }
+WANT="$1"; P=()
+while IFS= read -r -d '' v; do P+=("$v"); done < <(printf '%s' "$2" | base64 -d)
+[ "${#P[@]}" -eq "$WANT" ] || { echo "deploy: ${#P[@]} parameters arrived, not $WANT -- argument transport broken; nothing was done" >&2; exit 1; }
+set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
 MIGRATE_SCRIPT="$(printf '%s' "$3" | base64 -d)"
