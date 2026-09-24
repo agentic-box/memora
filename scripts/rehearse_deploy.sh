@@ -238,6 +238,26 @@ code="$(admin "$HEALTH_TOKEN" /admin/data-volume)"
   || fail "/admin/data-volume answered $code to the health token"
 code="$(admin "" /admin/data-volume)"
 [ "$code" = 401 ] || [ "$code" = 403 ] && pass "/admin/data-volume refuses no token ($code)" || fail "no token: $code"
+# G1/G2: the graph UI and its force-graph view, on the published graph
+# address, answer only with the graph token (minted by the deploy).
+GRAPH_URL="http://127.0.0.1:18766"
+GRAPH_TOKEN="$(cat "$SECRETS/graph.token")"
+graph_code() {  # graph_code PATH [TOKEN] -- the HTTP status, no redirect followed
+  curl -s -o "$RH_ROOT/graph-body.txt" -w '%{http_code}' ${2:+-H "Authorization: Bearer $2"} "$GRAPH_URL$1"
+}
+for path in /force-graph.html /graph/force /api/graph; do
+  code="$(graph_code "$path")"
+  [ "$code" = 401 ] && grep -q memora_graph "$RH_ROOT/graph-body.txt" \
+    && pass "graph $path refuses without the graph token (401)" || fail "graph $path without the token answered $code"
+done
+[ "$(graph_code /force-graph.html "$GRAPH_TOKEN")" = 200 ] && grep -qi "force" "$RH_ROOT/graph-body.txt" \
+  && pass "graph /force-graph.html answers 200 with the graph token" || fail "graph /force-graph.html with the token"
+code="$(graph_code /graph/force "$GRAPH_TOKEN")"
+[ "$code" = 307 ] || [ "$code" = 302 ] && pass "graph /graph/force redirects to the force-graph view with the token ($code)" \
+  || fail "graph /graph/force with the token answered $code"
+[ "$(graph_code "/api/memories?db=ob1" "$GRAPH_TOKEN")" = 200 ] && pass "graph /api/memories?db=ob1 answers with the token" \
+  || fail "graph /api/memories?db=ob1 with the token"
+rm -f "$RH_ROOT/graph-body.txt"
 # REL1: the Cloudflare tokens are files of a read-only mount; the container's
 # configuration carries only their paths.
 "$RT" inspect "$NAME" > "$RH_ROOT/inspect-tokens.json"
