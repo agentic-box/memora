@@ -21,7 +21,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   - The D1 store `bestation` re-tried a rebuild on every search behind a leftover rebuild lease, logging "Embedding model changed" each time.
 - The fingerprint is now `backend|model|repr`. A stamp written with the host compares equal when backend, model and representation match (`embeddings.normalize_fingerprint`, on read; nothing is rewritten).
 - A search never rebuilds embeddings, on any backend. It searches as a read-only search would: comparable vectors are used; otherwise it raises `SearchUnavailable`, logs once and shows `embeddings.repair_needed` in `/health/db/<name>`. The repair is the explicit `memory_rebuild_embeddings` tool (it rewrites every embedding; on a live primary each one replicates to D1).
-- The store's model is recorded by the write path: the first vector the current model computes records the fingerprint once (`record_embedding_model_once`, `INSERT OR IGNORE`, only when the vector's kind matches the backend). A store never audited, or with rows missing a vector, is searched without a warning.
+- A search never writes vectors either. The corpus load's backfill of rows missing a vector is only for write paths; a search leaves such rows out and counts them in `unscored`, as a read-only search does (review 7929).
+- The store's model is recorded by the write path: the first vector the current model computes records the fingerprint once (`record_embedding_model_once`, `INSERT OR IGNORE`, only when the vector's kind matches the backend). The per-process cache holds only a committed record (a rolled-back first write does not stop the next one). A store never audited, or with rows missing a vector, is searched without a warning.
 - The warning names the actual integrity reason instead of always "Embedding model changed".
 
 ## 0.5.1

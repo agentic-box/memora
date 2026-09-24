@@ -9642,7 +9642,10 @@ def semantic_search(
     candidate_top_k = _follow_candidate_limit(top_k, follow)
     fresh_empty: List[_CorpusEntry] = []
     with absorb_phase("corpus"):
-        corpus = _corpus_base(conn, meta=meta, empty_sink=fresh_empty, read_only=read_only)
+        # E1 (review 7929): a search never writes vectors either -- the load
+        # that backfills rows missing a vector is for write paths; here such
+        # rows are left out and counted unscored, as in a read-only search.
+        corpus = _corpus_base(conn, meta=meta, empty_sink=fresh_empty, read_only=True)
     if coverage is not None:
         coverage["unscored"] = int(corpus.unscored)
     results = _search_by_vector(

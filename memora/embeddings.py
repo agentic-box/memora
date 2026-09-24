@@ -1007,7 +1007,10 @@ def record_embedding_model_once(conn: sqlite3.Connection, vector: Dict[str, floa
     model, record the current fingerprint (INSERT OR IGNORE, part of the
     caller's transaction, no commit). Only when the vector's kind matches the
     backend (sparse for tfidf, dense otherwise): a fallback vector never
-    certifies a model. One meta read per store per process."""
+    certifies a model. The process cache is set only once a recorded model
+    has been READ back (committed state), never after this call's own
+    uncommitted insert: a rolled-back first write must not stop the next one
+    from recording (review 7929)."""
     key = _store_cache_key(conn)
     if key in _MODEL_RECORDED:
         return
@@ -1017,12 +1020,17 @@ def record_embedding_model_once(conn: sqlite3.Connection, vector: Dict[str, floa
     dense = rep.startswith("dense")
     if (current_model == "tfidf") == dense:
         return  # the vector does not match the configured backend: record nothing
-    if get_stored_embedding_model(conn) is None:
-        dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
-        conn.execute("INSERT OR IGNORE INTO memories_meta (key, value) VALUES ('embedding_model', ?)",
-                     (current_embedding_fingerprint(current_model, observed_dim=dim),))
-        invalidate_embedding_integrity_cache(conn)
-    _MODEL_RECORDED.add(key)
+    if get_stored_embedding_model(conn) is not None:
+        # Cache only a COMMITTED record: inside an open transaction the row
+        # read back may be this transaction's own insert, which can still
+        # roll back (a local store_write). D1 statements commit at once.
+        if not getattr(conn, "in_transaction", False):
+            _MODEL_RECORDED.add(key)
+        return
+    dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
+    conn.execute("INSERT OR IGNORE INTO memories_meta (key, value) VALUES ('embedding_model', ?)",
+                 (current_embedding_fingerprint(current_model, observed_dim=dim),))
+    invalidate_embedding_integrity_cache(conn)
 
 
 def upsert_embeddings_batch(

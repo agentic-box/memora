@@ -30,6 +30,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     storage._EMBEDDING_REPAIR_NEEDED.clear()
+    embeddings._MODEL_RECORDED.clear()
     token = storage.CURRENT_DB.set("re")
     conn = storage.connect()
     for i in range(3):
@@ -197,6 +198,7 @@ def d1(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     storage._EMBEDDING_REPAIR_NEEDED.clear()
+    embeddings._MODEL_RECORDED.clear()  # one key per D1 database id; each test has its own fake
     token = storage.CURRENT_DB.set("bestation")
     conn = storage.connect()
     for i in range(3):
@@ -289,6 +291,76 @@ def test_a_fallback_vector_never_records_a_model(tmp_path):
     assert embeddings.get_stored_embedding_model(db) is None
 
 
+def _vector_state(db):
+    return (db.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0],
+            db.execute("SELECT value FROM memories_meta WHERE key = 'embedding_change_epoch'").fetchone()[0])
+
+
+@pytest.mark.parametrize("drop", ["all", "one"])
+def test_a_search_never_writes_vectors_for_rows_missing_them_local(store, monkeypatch, drop):
+    """Review 7929 P1: no backfill from a search -- counted unscored instead."""
+    db = sqlite3.connect(store)
+    db.execute("DELETE FROM memories_embeddings" + ("" if drop == "all" else " WHERE memory_id = 1"))
+    db.commit()
+    before = _vector_state(db)
+    db.close()
+    conn = storage.connect()
+    try:
+        embeddings.invalidate_embedding_integrity_cache(conn)
+        coverage = {}
+        results = storage.semantic_search(conn, "apples", top_k=5, coverage=coverage)
+    finally:
+        conn.close()
+    db = sqlite3.connect(store)
+    assert _vector_state(db) == before, "no vector written, the epoch did not move"
+    db.close()
+    assert coverage["unscored"] == (3 if drop == "all" else 1)
+    assert len(results) == (0 if drop == "all" else 2)
+
+
+def test_a_search_never_writes_vectors_for_rows_missing_them_d1(d1):
+    db = d1._db()
+    db.execute("DELETE FROM memories_embeddings WHERE memory_id = 1")
+    db.commit()
+    before = _vector_state(db)
+    db.close()
+    coverage = {}
+    conn = storage.connect()
+    try:
+        embeddings.invalidate_embedding_integrity_cache(conn)
+        storage.semantic_search(conn, "apples", top_k=5, coverage=coverage)
+    finally:
+        conn.close()
+    db = d1._db()
+    assert _vector_state(db) == before and coverage["unscored"] == 1
+    db.close()
+
+
+def test_a_rolled_back_first_write_does_not_stop_the_next_one_from_recording(tmp_path, monkeypatch):
+    """Review 7929 P1: the record cache holds only a committed record."""
+    path = tmp_path / "fresh.db"
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"fresh": str(path)}))
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    embeddings._MODEL_RECORDED.clear()
+    token = storage.CURRENT_DB.set("fresh")
+    try:
+        conn = storage.connect()
+        conn.commit()
+        storage.add_memory(conn, content="first, rolled back", metadata={}, tags=[], commit=False)
+        storage.add_memory(conn, content="second in the same transaction", metadata={}, tags=[], commit=False)
+        assert conn.in_transaction
+        conn.rollback()
+        assert embeddings.get_stored_embedding_model(conn) is None, "rolled back with the rows"
+        storage.add_memory(conn, content="apples, committed", metadata={}, tags=[])
+        conn.commit()
+        assert embeddings.get_stored_embedding_model(conn) == "tfidf|tfidf|sparse"
+        conn.close()
+        assert len(_search()[0]) == 1
+    finally:
+        storage.CURRENT_DB.reset(token)
+
+
 def test_a_store_with_memories_but_no_vector_searches_instead_of_refusing(store, monkeypatch):
     db = sqlite3.connect(store)
     db.execute("DELETE FROM memories_embeddings")
@@ -299,7 +371,10 @@ def test_a_store_with_memories_but_no_vector_searches_instead_of_refusing(store,
     conn = storage.connect()
     try:
         embeddings.invalidate_embedding_integrity_cache(conn)
-        assert storage.semantic_search(conn, "apples", top_k=2) is not None
+        assert storage.semantic_search(conn, "apples", top_k=2) == []
     finally:
         conn.close()
     assert calls == []
+    db = sqlite3.connect(store)
+    assert db.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0] == 0, "nothing backfilled"
+    db.close()

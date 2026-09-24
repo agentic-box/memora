@@ -602,9 +602,14 @@ def test_a_read_only_load_never_seeds_the_shared_corpus_cache(api):
     # The incomplete read-only load lives only in the read-only slot.
     keys = list(storage._corpus_cache)
     assert len(keys) == 1 and keys[0].endswith("|ro")
-    # The normal (MCP) path still repairs, and the API then reuses its snapshot.
+    # E1: the normal (MCP) search no longer repairs either -- the row stays
+    # unscored -- until the explicit rebuild (memory_rebuild_embeddings).
     with _connect_store() as conn:
         storage.semantic_search(conn, "memora")
+    r = api.post("/api/v1/memora/search", headers=AUTH, json={"query": "memora"})
+    assert r.status_code == 200 and r.json()["unscored"] == 1
+    with _connect_store() as conn:
+        storage.rebuild_embeddings(conn)
     r = api.post("/api/v1/memora/search", headers=AUTH, json={"query": "memora"})
     assert r.status_code == 200 and r.json()["unscored"] == 0
 
