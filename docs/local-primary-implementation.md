@@ -1335,6 +1335,15 @@ a failed create (a name collision) removes nothing.
   continuously. A deploy, `docker start`, the restart policy or a reboot
   cannot start a serving memora-all during the run.
 - Running-required commands (rollback `finish`) never take it.
+- Both sides lock the same FILE (review 7830).
+  - The wrapper refuses a stopped-required command unless memora-all's
+    effective `MEMORA_DATA_DIR` is unset or exactly `/data`. It passes that
+    dir to the tool as `LP_SERVICE_DATA_DIR`, and the tool refuses unless
+    its own data dir resolves to the same path.
+  - memora-all refuses to start (exit 2) with `MEMORA_SERVICE_LOCK=1` when
+    its data dir is not a mount point. REL1's deploy pins
+    `-e MEMORA_DATA_DIR=/data` after the credentials env.
+  - `memora-server migrate-images` (not `--dry-run`) takes the lock too.
 - The wrapper refuses (exit 70) unless memora-all mounts `LP_DATA_VOLUME` at
   `/data` and, for a stopped-required command, runs with
   `MEMORA_SERVICE_LOCK=1`.

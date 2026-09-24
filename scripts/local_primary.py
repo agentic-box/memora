@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -256,6 +257,18 @@ def _lock_barrier(args) -> "lp.LockBarrier | None":
         raise lp.L5Refused(f"--lock-barrier needs --{attr} (the store whose primary lock is the barrier)")
     stopped_required = not (args.cmd == "rollback" and args.phase == "finish")
     from memora.write_gate import data_dir
+
+    if stopped_required:
+        # memora-all locks <its MEMORA_DATA_DIR>/.service.lock; lp_container.sh
+        # passes that dir as LP_SERVICE_DATA_DIR. A different dir here would be
+        # a different lock file (review 7830).
+        service_dir = os.getenv("LP_SERVICE_DATA_DIR", "").strip()
+        if not service_dir:
+            raise lp.L5Refused("--lock-barrier needs LP_SERVICE_DATA_DIR, memora-all's data dir "
+                               "(scripts/lp_container.sh passes it)")
+        if os.path.realpath(service_dir) != os.path.realpath(str(data_dir())):
+            raise lp.L5Refused(f"--lock-barrier: memora-all's data dir is {service_dir}, this run's is {data_dir()}: "
+                               "the service lock would be another file")
 
     barrier = lp.LockBarrier(Path(store), service_data_dir=data_dir() if stopped_required else None)
     _LOCK_BARRIERS.append(barrier)

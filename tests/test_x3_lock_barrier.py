@@ -24,7 +24,7 @@ def _routes(store, db=DB):
     """memora-all's MEMORA_DATABASES as lp_container.sh passes it."""
     import json
 
-    return {"MEMORA_DATABASES": json.dumps({db: str(store)})}
+    return {"MEMORA_DATABASES": json.dumps({db: str(store)}), "LP_SERVICE_DATA_DIR": os.environ["MEMORA_DATA_DIR"]}
 
 
 class Holder:
@@ -292,7 +292,7 @@ def test_a_stopped_required_run_refuses_unless_memora_all_routes_the_store_to_th
 
     store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
     calls = tmp_path / "d1-calls"
-    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": ""}
+    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": "", "LP_SERVICE_DATA_DIR": os.environ["MEMORA_DATA_DIR"]}
     if routes is not None:
         env["MEMORA_DATABASES"] = routes if isinstance(routes, str) else json.dumps(routes)
     code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
@@ -309,7 +309,8 @@ def test_a_file_uri_route_to_the_same_file_is_accepted(replica, tmp_path):
     store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
     code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
                           "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier",
-                          env_extra={"MEMORA_DATABASES": json.dumps({DB: f"file://{store}"})})
+                          env_extra={"MEMORA_DATABASES": json.dumps({DB: f"file://{store}"}),
+                                     "LP_SERVICE_DATA_DIR": os.environ["MEMORA_DATA_DIR"]})
     assert code == 0, (out, err)
 
 
@@ -355,7 +356,7 @@ def test_a_running_memora_all_refuses_every_stopped_required_command_before_any_
         store.write_bytes(b"")
     calls = sc.tmp / f"d1-calls-svc-{cmd}"
     # no MEMORA_DATABASES at all: the service lock is taken first, before the routing check
-    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": ""}
+    env = {"L5_TEST_D1_CALLS": str(calls), "MEMORA_DATABASES": "", "LP_SERVICE_DATA_DIR": str(data_dir())}
     common = [DB, "--account", "acct", "--database-id", "replica-db", "--lock-barrier",
               "--r2-dir", str(sc.tmp / "r2"), "--out-dir", str(sc.tmp / "exports")]
     args = {
@@ -384,7 +385,8 @@ def test_memora_all_does_not_start_while_an_operator_run_holds_the_service_lock(
     try:
         child = (f"import sys, os; sys.path.insert(0, {str(REPO)!r}); "
                  f"os.environ['MEMORA_DATA_DIR'] = {str(data)!r}; os.environ['MEMORA_SERVICE_LOCK'] = '1'; "
-                 "from memora import server; server._take_service_lock_or_exit(); print('started')")
+                 "from memora import server; server.os.path.ismount = lambda p: True; "  # a tmp dir stands in for the volume
+                 "server._take_service_lock_or_exit(); print('started')")
         r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
         assert r.returncode == 2 and "maintenance in progress (lock held)" in r.stderr, (r.stdout, r.stderr)
         assert "started" not in r.stdout
@@ -409,10 +411,13 @@ def test_main_takes_the_service_lock_before_any_store_is_opened():
 
     src = (REPO / "memora" / "server.py").read_text()
     main = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.FunctionDef) and n.name == "main")
-    calls = [n.func.id for n in ast.walk(main) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+    calls = [n.func.id for n in sorted((n for n in ast.walk(main) if isinstance(n, ast.Call)
+                                        and isinstance(n.func, ast.Name)), key=lambda n: (n.lineno, n.col_offset))]
     order = [c for c in calls if c in ("_take_service_lock_or_exit", "_apply_data_volume_check",
                                         "_fence_live_primaries_or_exit")]
-    assert order == ["_take_service_lock_or_exit", "_apply_data_volume_check", "_fence_live_primaries_or_exit"]
+    # migrate-images (non-dry-run) takes it too; then the serving path, in order:
+    assert order == ["_take_service_lock_or_exit", "_take_service_lock_or_exit", "_apply_data_volume_check",
+                     "_fence_live_primaries_or_exit"]
     body = src[src.index("def main("):]
     assert body.index("_take_service_lock_or_exit()") < body.index("Initializing database")
 
@@ -454,3 +459,55 @@ def test_rollback_finish_does_not_take_the_service_lock(sc):
     finally:
         h.stop()
     assert code == 2 and "maintenance lock" not in out["refused"], out
+
+
+
+# ------------------------------------------------------------------ review 7830: the same lock FILE on both sides
+
+@pytest.mark.parametrize("service_dir, needle", [
+    (None, "needs LP_SERVICE_DATA_DIR"),
+    ("/tmp", "memora-all's data dir is /tmp"),
+])
+def test_a_stopped_required_run_needs_memora_alls_data_dir_to_be_its_own(replica, tmp_path, service_dir, needle):
+    store = _halted_store(tmp_path, "delete_guard: memories 60/100 attempt=abc123")
+    env = {**_routes(store), "LP_SERVICE_DATA_DIR": service_dir or ""}
+    calls = tmp_path / "d1-calls"
+    env["L5_TEST_D1_CALLS"] = str(calls)
+    code, out, err = _cli(replica, "resume", DB, "--store", str(store), "--account", "acct",
+                          "--database-id", "replica-db", "--allow-deletes", "abc123", "--lock-barrier", env_extra=env)
+    assert code == 2 and needle in out["refused"], (out, err)
+    assert not calls.exists() or calls.read_text() == ""
+    from memora.write_gate import data_dir
+
+    assert backends.service_lock_problem(data_dir()) is not None
+
+
+def test_memora_all_refuses_a_data_dir_that_is_not_a_mounted_volume(tmp_path):
+    child = (f"import sys, os; sys.path.insert(0, {str(REPO)!r}); "
+             f"os.environ['MEMORA_DATA_DIR'] = {str(tmp_path)!r}; os.environ['MEMORA_SERVICE_LOCK'] = '1'; "
+             "from memora import server; server._take_service_lock_or_exit(); print('started')")
+    r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "is not a mounted volume" in r.stderr, (r.stdout, r.stderr)
+    assert not (tmp_path / backends.SERVICE_LOCK_NAME).exists(), "no lock file on a non-volume"
+
+
+@pytest.mark.parametrize("dry_run, expect", [(False, 2), (True, 0)])
+def test_migrate_images_takes_the_service_lock_unless_dry_run(tmp_path, dry_run, expect):
+    data = tmp_path / "data"
+    data.mkdir()
+    backends.acquire_service_lock(data)
+    try:
+        argv = ["migrate-images"] + (["--dry-run"] if dry_run else [])
+        child = (f"import sys, os; sys.path.insert(0, {str(REPO)!r}); "
+                 f"os.environ['MEMORA_DATA_DIR'] = {str(data)!r}; os.environ['MEMORA_SERVICE_LOCK'] = '1'; "
+                 "from memora import server; server.os.path.ismount = lambda p: True; "
+                 "server._handle_migrate_images = lambda dry_run: print('ran', dry_run); "
+                 f"server.main({argv!r})")
+        r = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True, timeout=60)
+    finally:
+        backends.release_service_lock(data)
+    assert r.returncode == expect, (r.stdout, r.stderr)
+    if dry_run:
+        assert "ran True" in r.stdout
+    else:
+        assert "maintenance in progress (lock held)" in r.stderr and "ran" not in r.stdout

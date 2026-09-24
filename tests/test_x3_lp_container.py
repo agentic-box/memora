@@ -111,7 +111,8 @@ def test_it_runs_the_tool_in_memora_alls_current_image_without_docker_or_rm(rt):
     vols = [create[i + 1] for i, a in enumerate(create) if a == "-v"]
     assert vols == ["memora-all-data:/data", f"{rt.tok}:/run/secrets/memora:ro"]
     envs = [create[i + 1] for i, a in enumerate(create) if a == "-e"]
-    assert envs == ["MEMORA_DATA_DIR=/data", f"MEMORA_DATABASES={json.dumps(ROUTES)}"], "memora-all's routing, nothing else"
+    assert envs == ["MEMORA_DATA_DIR=/data", "LP_SERVICE_DATA_DIR=/data",
+                    f"MEMORA_DATABASES={json.dumps(ROUTES)}"], "memora-all's routing and data dir, nothing else"
     image_at = create.index("sha256:1mage")  # the image ID memora-all runs, not a tag
     assert create[image_at + 1] == "-c" and create[image_at + 3] == "lp"
     assert create[image_at + 4:] == VERIFY, "the tool's arguments pass through unchanged"
@@ -243,3 +244,16 @@ def test_memora_all_must_mount_this_data_volume(rt, mount):
 
 def test_the_image_takes_the_service_lock():
     assert "MEMORA_SERVICE_LOCK=1" in (REPO / "Dockerfile").read_text()
+
+
+
+@pytest.mark.parametrize("value, code", [("/tmp", 70), ("/data/", 70), ("/data", 0), (None, 0)])
+def test_memora_alls_data_dir_must_be_data_for_a_stopped_required_run(rt, value, code):
+    env = ["PATH=/usr/bin", "MEMORA_SERVICE_LOCK=1"] + ([f"MEMORA_DATA_DIR={value}"] if value is not None else [])
+    got, calls, err = rt(*VERIFY, SERVICE_ENV=json.dumps(env))
+    assert got == code, err
+    if code == 70:
+        assert "not /data" in err and not [c for c in calls if c[0] == "create"]
+    else:
+        create = _create(calls)
+        assert "LP_SERVICE_DATA_DIR=/data" in create

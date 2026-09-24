@@ -19,7 +19,8 @@
 #   holds it for the whole run, so memora-all cannot start meanwhile (it
 #   exits 2). This script refuses (exit 70) unless memora-all mounts
 #   LP_DATA_VOLUME at /data and, for a stopped-required command, runs with
-#   MEMORA_SERVICE_LOCK=1 -- otherwise the lock would prove nothing.
+#   MEMORA_SERVICE_LOCK=1 and MEMORA_DATA_DIR unset or /data (review 7830:
+#   the same lock FILE on both sides) -- otherwise the lock proves nothing.
 # - It classifies the command -- stopped-required (restore, resume,
 #   sequence-highwater, rollback --phase verify) or running-required
 #   (rollback --phase finish|drain) -- and checks `inspect .State.Running`
@@ -107,6 +108,14 @@ if [ "$REQUIRED" = stopped ] && ! printf '%s\n' "$SERVICE_ENV" | grep -qx 'MEMOR
   echo "lp_container: $SERVICE does not run with MEMORA_SERVICE_LOCK=1 (an image before the service lock?): its absence cannot be proven; nothing was run" >&2
   exit 70
 fi
+# memora-all locks <MEMORA_DATA_DIR>/.service.lock; this run locks
+# /data/.service.lock. They are the same file only when memora-all's data
+# dir is /data (unset means /data) -- review 7830.
+SERVICE_DATA_DIR="$(printf '%s\n' "$SERVICE_ENV" | sed -n 's/^MEMORA_DATA_DIR=//p' | tail -n 1)"
+if [ "$REQUIRED" = stopped ] && [ -n "$SERVICE_DATA_DIR" ] && [ "$SERVICE_DATA_DIR" != /data ]; then
+  echo "lp_container: $SERVICE runs with MEMORA_DATA_DIR=$SERVICE_DATA_DIR, not /data: its service lock would be another file; nothing was run" >&2
+  exit 70
+fi
 
 NAME="memora-lp-$(date -u +%Y%m%dT%H%M%SZ)-$$"
 CID=""
@@ -125,7 +134,7 @@ trap cleanup EXIT
 
 CREATE_ARGS=(create --name "$NAME" --label "$LABEL=$NAME" --network "$NETWORK"
              -v "$VOLUME:/data" -v "$LP_TOKEN_DIR:/run/secrets/memora:ro"
-             -e MEMORA_DATA_DIR=/data --entrypoint sh)
+             -e MEMORA_DATA_DIR=/data -e "LP_SERVICE_DATA_DIR=${SERVICE_DATA_DIR:-/data}" --entrypoint sh)
 if [ -n "$RUN_USER" ]; then
   CREATE_ARGS+=(--user "$RUN_USER")
 fi

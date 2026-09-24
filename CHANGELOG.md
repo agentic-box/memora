@@ -17,6 +17,10 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ### Local-primary X3: a maintenance venue on nuc8, and the primary lock as a barrier
 - `scripts/lp_container.sh <local_primary.py arguments>`: runs the operator tool in a one-off container of memora-all's current image (its image ID). It mounts `memora-all-data` at `/data` and `$LP_TOKEN_DIR` read-only at `/run/secrets/memora`, uses no docker socket and no `--rm`, and removes only its own container `memora-lp-<ts>-<pid>`, by name and while it carries this run's label. Exit 64 when the image predates the tool, 65 on a usage error (including `--service-stopped`), 66 when memora-all's image cannot be read.
 - The image now carries `scripts/local_primary.py` (Dockerfile).
+- Round 4 (review 7830, leader decision 7833):
+  - Both sides lock the same file. lp_container.sh refuses (70) a stopped-required command unless memora-all's `MEMORA_DATA_DIR` is unset or `/data`, and passes it as `LP_SERVICE_DATA_DIR`; the tool refuses unless its own data dir is that one.
+  - memora-all refuses to start (exit 2) with `MEMORA_SERVICE_LOCK=1` when its data dir is not a mount point.
+  - `migrate-images` without `--dry-run` takes the service lock.
 - Round 3 (review 7823, leader decision 7825):
   - The proof that memora-all is not running is the data volume's service lock, `/data/.service.lock`. memora-all takes it at startup before any store is opened (`MEMORA_SERVICE_LOCK=1`, set in the image) and holds it for its lifetime; if it cannot, it exits 2 ("maintenance in progress (lock held)").
   - `--lock-barrier` takes the same lock first for every stopped-required command, holds it for the whole run and re-verifies it at every boundary. rollback finish does not take it.

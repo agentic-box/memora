@@ -3450,6 +3450,13 @@ def _take_service_lock_or_exit() -> None:
     from .backends import StoreLockedError, acquire_service_lock
     from .write_gate import data_dir
 
+    # The lock is only an interlock if it lives on the data VOLUME the
+    # operator venue mounts: a stray MEMORA_DATA_DIR (/tmp, from a
+    # credentials file) would split it (X3 review 7830).
+    if not os.path.ismount(os.path.realpath(str(data_dir()))):
+        print(f"Error: MEMORA_DATA_DIR={data_dir()} is not a mounted volume: the service lock there would not "
+              "exclude a maintenance run on the data volume; refusing to start", file=sys.stderr)
+        sys.exit(2)
     try:
         acquire_service_lock(data_dir())
     except (StoreLockedError, OSError) as e:
@@ -3579,6 +3586,10 @@ def main(argv: Optional[list[str]] = None) -> None:
     elif args.command == "info":
         _handle_info()
     elif args.command == "migrate-images":
+        if not args.dry_run:
+            # It writes stores and R2: excluded by a maintenance run like
+            # the server itself (X3 review 7830 P2).
+            _take_service_lock_or_exit()
         _handle_migrate_images(dry_run=args.dry_run)
     else:
         # Default: start server
