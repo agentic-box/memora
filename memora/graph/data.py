@@ -1,8 +1,6 @@
 """Graph data generation and transformation logic."""
 
-import bisect
 import json
-import math
 import os
 import re
 from datetime import datetime, timedelta
@@ -36,6 +34,13 @@ from .issues import (  # noqa: E402
     build_status_to_nodes,
     get_issue_node_style,
     is_issue,
+)
+from .payload import (  # noqa: E402
+    build_cluster_data,
+    build_graph_payload,
+    classify_retirement_query_error,
+    louvain_communities,
+    parse_related_payload,
 )
 from .templates import build_static_html  # noqa: E402
 from .todos import (  # noqa: E402
@@ -448,157 +453,28 @@ CLUSTER_COLORS = [
 
 def _load_crossrefs_map(conn) -> Tuple[Dict[int, List[Dict[str, Any]]], bool]:
     """Every stored crossref row, parsed as the Pages viewer parses it
-    (functions/api/_lineage.ts parseRelatedPayload), in memory_id order --
-    the order D1 returns ``SELECT memory_id, related FROM memories_crossrefs``
-    (memory_id is the INTEGER PRIMARY KEY, so rowid order).
+    (payload.parse_related_payload), in memory_id order -- the order D1
+    returns ``SELECT memory_id, related FROM memories_crossrefs``.
 
-    Returns (map, available). As there, a corrupt row is left out of the map
-    and makes ``available`` False (the query failing does too); Pages then
-    emits no clusters at all."""
+    Returns (map, available). A corrupt row is left out of the map and makes
+    ``available`` False (the query failing does too); Pages then emits no
+    clusters at all."""
+    rows = _read_crossref_rows(conn)
+    if rows is None:
+        return {}, False
     out: Dict[int, List[Dict[str, Any]]] = {}
     available = True
-    try:
-        rows = conn.execute(
-            "SELECT memory_id, related FROM memories_crossrefs ORDER BY memory_id"
-        ).fetchall()
-    except Exception:
-        return out, False
-    for row in rows:
-        raw = row[1]
-        if raw is None or raw == "":
-            out[row[0]] = []
-            continue
-        try:
-            parsed = json.loads(raw, parse_constant=_reject_non_json_constant)
-        except (TypeError, ValueError):
-            available = False
-            continue
-        if not isinstance(parsed, list):
-            available = False
-            continue
-        entries = []
-        for item in parsed:
-            if not isinstance(item, dict):
-                entries = None
-                break
-            ref_id = item.get("id")
-            if not _is_js_number(ref_id):
-                entries = None
-                break
-            score = item.get("score")
-            edge_type = item.get("edge_type")
-            entries.append({
-                "id": ref_id,
-                "score": score if _is_js_number(score) else None,
-                "edge_type": edge_type if isinstance(edge_type, str) else None,
-            })
-        if entries is None:
-            available = False
+    for memory_id, related in rows:
+        ok, parsed = parse_related_payload(related)
+        if ok:
+            out[memory_id] = parsed
         else:
-            out[row[0]] = entries
+            available = False
     return out, available
 
 
-def _reject_non_json_constant(name: str) -> Any:
-    """NaN / Infinity / -Infinity are not JSON: JSON.parse rejects the row
-    (Pages: invalid_json, a corrupt row), where json.loads would accept it."""
-    raise ValueError(f"not JSON: {name}")
-
-
-def _is_js_number(value: Any) -> bool:
-    """typeof value === "number" && Number.isFinite(value)."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
-
-
-def _louvain_communities_pages(
-    adj: Dict[int, Dict[int, float]], min_community_size: int = 3
-) -> Dict[int, int]:
-    """A port of the Pages viewer's louvainCommunities
-    (memora-graph/functions/api/graph.ts): single-level local moves, at most
-    50 sweeps, nodes and neighbours visited in insertion order, then
-    communities of at least ``min_community_size`` numbered from 0 in order
-    of first appearance. Same arithmetic in the same order (JS numbers are
-    IEEE doubles), so the same assignment for the same graph.
-
-    Pages recomputes every community's total strength before each node's
-    move (a pass over all nodes); here a total is summed over its members in
-    node order -- the same additions -- and cached until one of its members
-    moves.
-    """
-    node_list = list(adj.keys())
-    if not node_list:
-        return {}
-    community: Dict[int, int] = {n: n for n in node_list}
-
-    m2 = 0.0
-    for neighbors in adj.values():
-        for w in neighbors.values():
-            m2 += w
-    if m2 == 0:
-        return community  # as Pages: every node its own community, unfiltered
-
-    strength: Dict[int, float] = {}
-    for n in node_list:
-        s = 0.0
-        for w in adj[n].values():
-            s += w
-        strength[n] = s
-
-    index = {n: i for i, n in enumerate(node_list)}
-    members: Dict[int, List[int]] = {n: [index[n]] for n in node_list}
-    totals: Dict[int, float] = {}
-
-    def total(c: int) -> float:
-        t = totals.get(c)
-        if t is None:
-            t = 0.0
-            for i in members.get(c, ()):
-                t += strength[node_list[i]]
-            totals[c] = t
-        return t
-
-    improved = True
-    iterations = 0
-    while improved and iterations < 50:
-        improved = False
-        iterations += 1
-        for node in node_list:
-            current = community[node]
-            ki = strength[node]
-            comm_weights: Dict[int, float] = {}
-            for neighbor, w in adj[node].items():
-                nc = community[neighbor]
-                comm_weights[nc] = comm_weights.get(nc, 0.0) + w
-            ki_in = comm_weights.get(current, 0.0)
-            sigma_tot = total(current) - ki
-            remove_loss = ki_in / m2 - (sigma_tot * ki) / (m2 * m2)
-            best_gain = 0.0
-            best = current
-            for target, ki_target in comm_weights.items():
-                if target == current:
-                    continue
-                sigma_target = total(target)
-                gain = ki_target / m2 - (sigma_target * ki) / (m2 * m2) - remove_loss
-                if gain > best_gain:
-                    best_gain = gain
-                    best = target
-            if best != current:
-                community[node] = best
-                members[current].remove(index[node])
-                bisect.insort(members.setdefault(best, []), index[node])
-                totals.pop(current, None)
-                totals.pop(best, None)
-                improved = True
-
-    unique: List[int] = list(dict.fromkeys(community.values()))
-    counts: Dict[int, int] = {}
-    for c in community.values():
-        counts[c] = counts.get(c, 0) + 1
-    renumber: Dict[int, int] = {}
-    for c in unique:
-        if counts[c] >= min_community_size:
-            renumber[c] = len(renumber)
-    return {n: renumber[c] for n, c in community.items() if c in renumber}
+# The Pages Louvain (G3); the one implementation lives in payload.py.
+_louvain_communities_pages = louvain_communities
 
 
 def _build_cluster_data(
@@ -607,60 +483,60 @@ def _build_cluster_data(
     min_score: float = 0.4,
     min_cluster_size: int = 3,
 ) -> Dict[str, Any]:
-    """Clusters exactly as the Pages viewer computes them (G3, leader 8079;
-    functions/api/graph.ts buildClusterData): Louvain over the STORED
-    crossrefs with score >= ``min_score``, restricted to the graph's own
-    nodes (``node_ids``, in node order), labelled "Cluster N".
-
-    ``crossrefs`` is what _load_crossrefs_map returns; when the crossrefs
-    are not available (a corrupt row, a failed query) there are no clusters,
-    as in Pages.
-
-    Returns clusterToNodes, clusterColors and clusterMeta as Pages does, plus
-    nodeToCluster (the inverse map, kept for this server's callers).
-    """
-    empty: Dict[str, Any] = {
-        "clusterToNodes": {}, "nodeToCluster": {}, "clusterColors": {}, "clusterMeta": {},
-    }
+    """Clusters exactly as the Pages viewer computes them (G3;
+    payload.build_cluster_data), for the static export: ``crossrefs`` is
+    what _load_crossrefs_map returns; when the crossrefs are not available
+    there are no clusters, as in Pages. Adds nodeToCluster (the inverse
+    map)."""
     crossrefs, available = crossrefs
-    if not available or len(node_ids) < min_cluster_size:
-        return empty
-    id_set = set(node_ids)
-    adj: Dict[int, Dict[int, float]] = {nid: {} for nid in node_ids}
-    for mem_id, refs in crossrefs.items():
-        if mem_id not in id_set:
-            continue
-        for ref in refs:
-            score = ref["score"] if ref.get("score") is not None else 0
-            if score < min_score or ref["id"] not in id_set:
+    if not available:
+        return {"clusterToNodes": {}, "nodeToCluster": {}, "clusterColors": {}, "clusterMeta": {}}
+    data = build_cluster_data(crossrefs, node_ids, min_score, min_cluster_size)
+    data["nodeToCluster"] = {str(mid): int(cid) for cid, members in data["clusterToNodes"].items() for mid in members}
+    return data
+
+
+def _read_crossref_rows(conn) -> Optional[List[Tuple[Any, Any]]]:
+    """``SELECT memory_id, related FROM memories_crossrefs`` as pairs, in
+    memory_id (rowid) order, or None when the query fails."""
+    try:
+        rows = conn.execute(
+            "SELECT memory_id, related FROM memories_crossrefs ORDER BY memory_id"
+        ).fetchall()
+    except Exception:
+        return None
+    return [(r[0], r[1]) for r in rows]
+
+
+def _read_retirement(conn) -> Dict[str, Any]:
+    """graph.ts ingestRetired: tombstone_components then tombstones; a
+    missing table is empty, any other failure makes retirement unavailable."""
+    ids: List[Any] = []
+    available = True
+    for table in ("tombstone_components", "tombstones"):
+        try:
+            rows = conn.execute(f"SELECT memory_id FROM {table}").fetchall()
+        except Exception as exc:
+            if classify_retirement_query_error(exc, table) == "absent":
                 continue
-            adj[mem_id][ref["id"]] = score
-            adj[ref["id"]][mem_id] = score
+            available = False
+            continue
+        ids.extend(r[0] for r in rows)
+    return {"ids": ids, "available": available}
 
-    communities = _louvain_communities_pages(adj, min_cluster_size)
 
-    grouped: Dict[int, List[int]] = {}
-    for node_id, cluster_id in communities.items():
-        grouped.setdefault(cluster_id, []).append(node_id)
-    # A JS object lists integer-like keys in ascending numeric order; colours
-    # follow that order.
-    cluster_to_nodes: Dict[str, List[int]] = {}
-    cluster_colors: Dict[str, str] = {}
-    cluster_meta: Dict[str, Dict[str, Any]] = {}
-    node_to_cluster: Dict[str, int] = {}
-    for i, cluster_id in enumerate(sorted(grouped)):
-        cid = str(cluster_id)
-        cluster_to_nodes[cid] = grouped[cluster_id]
-        cluster_colors[cid] = CLUSTER_COLORS[i % len(CLUSTER_COLORS)]
-        cluster_meta[cid] = {"size": len(grouped[cluster_id]), "label": f"Cluster {cluster_id + 1}"}
-        for mid in grouped[cluster_id]:
-            node_to_cluster[str(mid)] = cluster_id
-    return {
-        "clusterToNodes": cluster_to_nodes,
-        "nodeToCluster": node_to_cluster,
-        "clusterColors": cluster_colors,
-        "clusterMeta": cluster_meta,
-    }
+def _read_memory_rows(conn) -> List[Dict[str, Any]]:
+    """graph.ts's memories query, in rowid order. One deliberate difference:
+    rows an unfinished import still marks are left out, as everywhere else in
+    memora-all (they are not memories yet); Pages lists them."""
+    from ..embeddings import not_import_pending_sql
+
+    rows = conn.execute(
+        "SELECT id, content, metadata, tags, created_at, updated_at FROM memories WHERE 1=1"
+        + not_import_pending_sql("metadata")
+    ).fetchall()
+    cols = ("id", "content", "metadata", "tags", "created_at", "updated_at")
+    return [dict(zip(cols, (r[i] for i in range(6)))) for r in rows]
 
 
 def _build_cluster_legend_html(
@@ -733,103 +609,34 @@ def get_graph_data(
     min_score: float = 0.40,
     rebuild: bool = False,
     limit: Optional[int] = None,
+    include_docs: bool = False,
 ) -> Dict[str, Any]:
-    """Get graph nodes, edges, and metadata for API response.
+    """The /api/graph payload, exactly as the Pages viewer's /api/graph
+    builds it from the same rows (G4; payload.build_graph_payload).
 
     Args:
-        min_score: Minimum similarity score for edges
-        rebuild: If True, rebuild crossrefs (slow). If False, use existing.
-        limit: Optional node cap (positive int). When set, only the `limit`
-            newest eligible memories are included, ordered by created_at DESC
-            then id DESC (stable). The result dict gains ``truncated`` (True when
-            eligible memories exceeded the cap) and ``total`` (the number of
-            eligible memories in the unbounded graph) so callers can gauge how
-            much was dropped. Mirrors the ?limit= behaviour of the Pages
-            ``/api/graph`` endpoint.
-
-    Returns:
-        Dict with nodes, edges, and various mappings.
+        min_score: Minimum score for a related_to edge (Pages:
+            MIN_EDGE_SCORE, default 0.40).
+        rebuild: If True, rebuild crossrefs (slow) first.
+        limit: Optional node cap (positive int), as ?limit=; without one the
+            effective default applies (env-resolved, clamped to the max).
+        include_docs: ?docs=1 -- document fragments become nodes, linked to
+            their document root.
     """
     conn = connect()
     try:
-        memories = list_memories(conn, None, None, None, 0, None, None, None, None, None)
-        if not memories:
-            return {"error": "no_memories", "message": "No memories to visualize"}
-
-        # Node cap: deterministic "newest first" subset. Eligible = not section
-        # and not document-fragment, mirroring _build_nodes below. Without an
-        # explicit limit the effective default applies (env-resolved, clamped to
-        # the effective max). Order: created_at DESC, id DESC (stable). The
-        # selected set is ALWAYS the sorted eligible prefix — even when not
-        # truncated — so hidden sections/fragments never count as included by
-        # _build_edges (no dangling edges) and the declared ordering holds.
-        eligible = [
-            m
-            for m in memories
-            if not is_section(m.get("metadata"))
-            and not _is_document_fragment(m.get("metadata"))
-        ]
-        total = len(eligible)
-        effective_default, effective_max = resolve_graph_limits()
-        effective = effective_default if limit is None else min(limit, effective_max)
-        truncated = total > effective
-        memories = sorted(
-            eligible,
-            key=lambda m: (m.get("created_at") or "", m.get("id") or 0),
-            reverse=True,
-        )[:effective]
-
         if rebuild:
             rebuild_crossrefs(conn)
-
-        # Build edges first to calculate connection counts for node sizing
-        edges = _build_edges(conn, memories, min_score)
-        connection_counts = _count_connections(edges)
-
-        # Find duplicate memories from canonical duplicate pairs.
-        duplicate_ids = _find_duplicate_ids(conn, memories)
-        retired_ids = retired_memory_ids(conn)
-
-        tag_colors = _build_tag_colors(memories)
-        nodes = _build_nodes(
-            memories, tag_colors, connection_counts, duplicate_ids, retired_ids
+        effective_default, effective_max = resolve_graph_limits()
+        effective = effective_default if limit is None else min(limit, effective_max)
+        return build_graph_payload(
+            _read_memory_rows(conn),
+            _read_crossref_rows(conn),
+            _read_retirement(conn),
+            include_docs=include_docs,
+            limit=effective,
+            min_score=min_score,
         )
-        tag_to_nodes = _build_tag_to_nodes(memories)
-        section_to_nodes, path_to_nodes = _build_section_mappings(memories)
-        status_to_nodes = build_status_to_nodes(memories)
-        issue_category_to_nodes = build_issue_category_to_nodes(memories)
-        todo_status_to_nodes = build_todo_status_to_nodes(memories)
-        todo_category_to_nodes = build_todo_category_to_nodes(memories)
-
-        # Build timeline data
-        node_timestamps, min_date, max_date = _build_timeline_data(memories)
-
-        # Clusters as the Pages viewer computes them: Louvain over the stored
-        # crossrefs of the graph's own nodes (G3)
-        cluster_data = _build_cluster_data(_load_crossrefs_map(conn), [n["id"] for n in nodes])
-
-        result = {
-            "nodes": nodes,
-            "edges": edges,
-            "tagColors": tag_colors,
-            "tagToNodes": tag_to_nodes,
-            "sectionToNodes": section_to_nodes,
-            "subsectionToNodes": path_to_nodes,
-            "statusToNodes": status_to_nodes,
-            "issueCategoryToNodes": issue_category_to_nodes,
-            "todoStatusToNodes": todo_status_to_nodes,
-            "todoCategoryToNodes": todo_category_to_nodes,
-            "duplicateIds": list(duplicate_ids),
-            "retiredIds": list(retired_ids),
-            "nodeTimestamps": node_timestamps,
-            "minDate": min_date,
-            "maxDate": max_date,
-            "truncated": truncated,
-            "total": total,
-        }
-        result.update(cluster_data)
-        return result
-
     finally:
         conn.close()
 

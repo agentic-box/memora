@@ -14,6 +14,29 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### The graph API returns exactly what the Pages viewer returns (G4)
+
+- memora-all's `/api/graph` built its own payload, and it differed from the
+  Pages viewer's for the same data:
+  - `?docs=1` was ignored, so no document fragments and no document edges;
+  - edges had no `edge_type`, `score` or `directed`;
+  - there was no lineage: no superseded, authority-unknown or supersedes
+    marks on nodes, and none of `crossrefsAvailable`, `lineageAvailable`,
+    `supersededIds`, `supersedesEdges` or `duplicatePairCount`;
+  - labels, titles, colours and node sizes differed;
+  - the default edge threshold was 0.25 instead of 0.40.
+- The payload is now built by `memora/graph/payload.py`, a statement-by-
+  statement port of `functions/api/graph.ts` and `_lineage.ts`. It keeps
+  JavaScript's iteration orders, numbers and string handling (UTF-16
+  lengths and slices, JS whitespace, JS `String()` of keys). On copies of
+  the three production stores the whole payload is identical to what the
+  Pages code returns, with and without `docs=1` and `limit`. The default
+  edge threshold is 0.40, and `?min_score=` still overrides it.
+- One deliberate difference: rows an unfinished import still marks are left
+  out, as everywhere else in memora-all.
+- The response carries no `nodeToCluster` (Pages has none). A label cut
+  inside an emoji is sent as a JSON escape, as JSON.stringify does.
+
 ## 0.5.3
 
 ### Scheduled compares of the live local primaries (NC1)
@@ -44,6 +67,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   `DEPLOY_HOST` choose where it runs; the script names no host, store or
   account. The header documents the crontab lines: 03:15 Monday–Saturday
   nightly, 04:00 Sunday barrier.
+
 
 ### Graph clusters match the Pages viewer, and the graph builds in well under a second (G3)
 

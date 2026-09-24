@@ -256,7 +256,8 @@ def test_the_graph_api_serves_those_clusters_end_to_end(stores):
     assert groups == [sorted(ids[0:4]), sorted(ids[4:8]), sorted(ids[8:12])]
     assert sorted(m["label"] for m in body["clusterMeta"].values()) == ["Cluster 1", "Cluster 2", "Cluster 3"]
     assert set(body["clusterColors"]) == set(body["clusterToNodes"])
-    assert str(section) not in body["nodeToCluster"]
+    assert section not in {m for members in body["clusterToNodes"].values() for m in members}
+    assert "nodeToCluster" not in body  # G4: the payload is exactly Pages' (it has none)
 
 if __name__ == "__main__":
     out = Path(sys.argv[1])

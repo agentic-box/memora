@@ -382,6 +382,18 @@ def start_graph_server(host: str, port: int) -> None:
     print(f"Graph visualization available at http://{host}:{port}/graph{bucket_param}", file=sys.stderr)
 
 
+def _graph_json(result) -> Response:
+    """The graph payload as JSON. Labels are cut in UTF-16 code units, as in
+    Pages, so one can end in half a surrogate pair: JSON.stringify writes it
+    as an escape, and so does this (UTF-8 cannot carry it)."""
+    body = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+    try:
+        encoded = body.encode("utf-8")
+    except UnicodeEncodeError:
+        encoded = json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
+    return Response(encoded, media_type="application/json")
+
+
 def build_graph_app(host: str):
     """The graph's Starlette app (G1): every route needs the graph token
     (_token_required), and every /api route reads and edits the store its
@@ -452,13 +464,15 @@ def build_graph_app(host: str):
     async def api_graph(request: Request):
         """API endpoint: Get graph nodes and edges."""
         try:
-            min_score = float(request.query_params.get("min_score", 0.25))
+            # The Pages default (MIN_EDGE_SCORE 0.40); ?min_score= still overrides.
+            min_score = float(request.query_params.get("min_score", 0.40))
             rebuild = request.query_params.get("rebuild", "").lower() == "true"
             limit = parse_graph_limit_value(request.query_params.get("limit"))
             if limit is _INVALID_LIMIT:
                 return JSONResponse({"error": "invalid_limit"}, status_code=400)
-            result = get_graph_data(min_score, rebuild=rebuild, limit=limit)
-            return JSONResponse(result)
+            include_docs = request.query_params.get("docs") == "1"
+            result = get_graph_data(min_score, rebuild=rebuild, limit=limit, include_docs=include_docs)
+            return _graph_json(result)
         except Exception as e:
             logger.exception("Graph API request failed: %s", e)
             return JSONResponse({"error": "internal_error"}, status_code=500)
