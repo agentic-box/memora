@@ -11,9 +11,28 @@ order D1 returns them). It follows graph.ts statement by statement, keeping
 its iteration orders (JS Map/Set insertion order), its numbers (IEEE doubles;
 Math.log1p through a table of V8's values where Python's libm differs) and
 its strings (lengths and slices in UTF-16 code units, JS whitespace, JS
-String() of non-string keys). Where graph.ts would throw on malformed
-metadata (e.g. metadata "null" on a plain memory) Pages answers 500; this
-port does not throw, and treats the value as absent.
+String() of non-string keys).
+
+Parity means identical output for every input on which Pages itself works
+(leader 8135). The differences, all deliberate:
+
+- Rows an unfinished import still marks (metadata ``import_attempt``) are
+  not read (graph/data.py): they are not memories yet, and memora-all's
+  other APIs hide them too (leader 8129). Pages lists them.
+- Pages defects, where this port gives the correct payload instead
+  (pages_defects() names them for an input; follow-up PG1 fixes them in
+  memora-graph):
+  * A tag, section, issue/TODO status, component or category named like an
+    Object.prototype property (``constructor``, ``toString``, ``__proto__``,
+    ...). graph.ts keeps those maps in plain objects: the key is "already
+    there", inherited, so the node gets no tag colour and the .push() on the
+    inherited function throws -- /api/graph answers 500. On a document
+    fragment's tag (?docs=1), which is never mapped, it does not throw but
+    silently leaves the tag out of tagColors (and shifts later tags'
+    colours).
+  * Malformed values where graph.ts throws (metadata ``null`` on a plain
+    memory, tags that are an object or null, a non-string subsection): this
+    port treats the value as absent.
 """
 from __future__ import annotations
 
@@ -183,6 +202,12 @@ def _iter(obj: Any) -> List[Any]:
 
 def _u16(s: str) -> bytes:
     return s.encode("utf-16-le", "surrogatepass")
+
+
+def _u16_order(s: str) -> bytes:
+    """A sort key in JS string order (UTF-16 code units): big-endian code
+    units compare bytewise in the same order (review 8133 P2)."""
+    return s.encode("utf-16-be", "surrogatepass")
 
 
 def _u16len(s: str) -> int:
@@ -626,6 +651,58 @@ def _parse_int(s: str) -> float:
     return int(m.group(1)) if m else math.nan
 
 
+# ------------------------------------------------------------------ Pages defects
+
+# Object.prototype's own property names: graph.ts finds these "in" any plain
+# object, so a key named like one breaks its maps (see the module docstring).
+OBJECT_PROTOTYPE_KEYS = frozenset({
+    "constructor", "__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__",
+    "__lookupSetter__", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "__proto__",
+    "toLocaleString",
+})
+
+
+def pages_defects(memory_rows: List[Dict[str, Any]], *, include_docs: bool, limit: int) -> List[str]:
+    """The inputs on which graph.ts itself misbehaves (so no parity is
+    owed): each selected memory whose tag, section, status, component or
+    category is an Object.prototype name. Empty for every other input."""
+    found: List[str] = []
+
+    def check(mid, what, key):
+        if js_str(key) in OBJECT_PROTOTYPE_KEYS:
+            found.append(f"#{js_str(mid)} {what} {js_str(key)!r}")
+
+    def eligible(m) -> bool:
+        meta = parse_json(m.get("metadata"), {})
+        return not _is_type(meta, "section") and not (_is_type(meta, "document_fragment") and not include_docs)
+
+    def created(m) -> str:
+        c = _or(m.get("created_at"), "")
+        return c if isinstance(c, str) else js_str(c)
+
+    selected = sorted((m for m in memory_rows if eligible(m)),
+                      key=lambda m: (_u16_order(created(m)), m["id"]), reverse=True)[:limit]
+    for m in selected:
+        meta = parse_json(m.get("metadata"), {})
+        tags = parse_json(m.get("tags"), [])
+        check(m["id"], "primary tag", _or(_index(tags, 0), "untagged"))
+        if _is_type(meta, "document_fragment"):
+            continue
+        for tag in _iter(tags):
+            check(m["id"], "tag", tag)
+        if _is_type(meta, "issue"):
+            check(m["id"], "issue status", _issue_status(meta))
+            check(m["id"], "component", _or(_get(meta, "component"), "uncategorized"))
+        elif _is_type(meta, "todo"):
+            check(m["id"], "todo status", _todo_status(meta))
+            check(m["id"], "category", _or(_get(meta, "category"), "uncategorized"))
+        else:
+            path = _get(_get(meta, "hierarchy"), "path")
+            section = path[0] if isinstance(path, list) and path else _or(_get(meta, "section"), "Uncategorized")
+            check(m["id"], "section", section)
+    return found
+
+
 # ------------------------------------------------------------------ graph.ts onRequestGet
 
 def _is_type(meta: Any, name: str) -> bool:
@@ -739,7 +816,7 @@ def build_graph_payload(
         return c if isinstance(c, str) else js_str(c)
 
     # created_at DESC, then id DESC (a stable sort, as Array.prototype.sort)
-    memories = sorted(eligible_memories, key=lambda m: (_u16(created(m)), m["id"]), reverse=True)[:limit]
+    memories = sorted(eligible_memories, key=lambda m: (_u16_order(created(m)), m["id"]), reverse=True)[:limit]
 
     def is_dup_excluded(meta) -> bool:
         return _is_type(meta, "section") or _is_type(meta, "document_fragment") or _is_type(meta, "document_root")
@@ -934,7 +1011,7 @@ def build_graph_payload(
             dates.append(m["created_at"])
     min_date = max_date = ""
     if dates:
-        dates.sort(key=lambda d: _u16(js_str(d)))
+        dates.sort(key=lambda d: _u16_order(js_str(d)))
         min_date, max_date = dates[0], dates[-1]
 
     node_ids = [n["id"] for n in nodes]

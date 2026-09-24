@@ -25,7 +25,10 @@ from memora.graph import data, payload
 
 FIXTURE = Path(__file__).parent / "fixtures" / "g4_pages_payloads.json"
 QUERIES = ["", "&docs=1", "&limit=12", "&docs=1&limit=25"]
-SCENARIOS = ["lineage", "content", "docs", "corrupt_row", "no_crossrefs_table", "retirement_fails", "random"]
+SCENARIOS = ["lineage", "content", "docs", "corrupt_row", "no_crossrefs_table", "retirement_fails", "random",
+             "unicode_times"]
+# Inputs on which graph.ts itself fails (leader 8135): no parity owed, a correct payload here.
+DEFECT_SCENARIOS = ["prototype_keys", "prototype_fragment"]
 
 
 def _meta(**kw):
@@ -173,6 +176,42 @@ def _rows_random():
     return mem, refs, tomb, [(tomb[0][0],)]
 
 
+def _rows_unicode_times():
+    """created_at compared as JS compares strings: by UTF-16 code unit
+    (review 8133 P2). By code point U+1F600 > U+FFFF; by code unit it is
+    D83D < FFFF. U+0100 vs U+0001 also flips under UTF-16-LE bytes."""
+    stamps = ["2026-09-30 \U0001F600", "2026-09-30 \uffff", "2026-09-30 \u0100", "2026-09-30 \u0001",
+              "2026-09-30 \u00e9", "2026-09-30 z", "2026-09-30 \U00010000", "2026-09-30 \ud7ff"]
+    mem = [(i + 1, f"stamp {i + 1}", _meta(), '["u"]', st) for i, st in enumerate(stamps)]
+    refs = {1: [{"id": 2, "score": 0.9}, {"id": 3, "score": 0.9}], 2: [{"id": 3, "score": 0.9}]}
+    return mem, refs, [], []
+
+
+def _rows_prototype_keys():
+    """Object.prototype names as keys: graph.ts throws (a Pages defect)."""
+    mem = [
+        (1, "plain", _meta(), '["alpha"]', "2026-09-09"),
+        (2, "tag constructor", _meta(), '["constructor"]', "2026-09-08"),
+        (3, "second tag toString", _meta(), '["beta", "toString"]', "2026-09-07"),
+        (4, "section hasOwnProperty", _meta(section="hasOwnProperty"), '["alpha"]', "2026-09-06"),
+        (5, "issue component valueOf", _meta(type="issue", component="valueOf"), '["alpha"]', "2026-09-05"),
+        (6, "todo category __proto__", _meta(type="todo", category="__proto__"), '["alpha"]', "2026-09-04"),
+        (7, "issue status isPrototypeOf", _meta(type="issue", status="isPrototypeOf"), '["alpha"]', "2026-09-03"),
+    ]
+    return mem, {1: [{"id": 2, "score": 0.9}]}, [], []
+
+
+def _rows_prototype_fragment():
+    """Only a document fragment carries the name: graph.ts does not throw
+    (fragments are never mapped) but leaves the tag out of tagColors."""
+    mem = [
+        (1, "plain", _meta(), '["alpha"]', "2026-09-09"),
+        (2, "root", _meta(type="document_root", document_key="k"), '["alpha"]', "2026-09-08"),
+        (3, "fragment", _meta(type="document_fragment", document_key="k", ordinal=1), '["constructor"]', "2026-09-01"),
+    ]
+    return mem, {}, [], []
+
+
 def build_store(path, scenario):
     if scenario in ("lineage", "corrupt_row", "no_crossrefs_table", "retirement_fails"):
         mem, refs, tomb, comp = _rows_lineage()
@@ -182,6 +221,12 @@ def build_store(path, scenario):
         mem, refs, tomb, comp = _rows_docs()
     elif scenario == "random":
         mem, refs, tomb, comp = _rows_random()
+    elif scenario == "unicode_times":
+        mem, refs, tomb, comp = _rows_unicode_times()
+    elif scenario == "prototype_keys":
+        mem, refs, tomb, comp = _rows_prototype_keys()
+    elif scenario == "prototype_fragment":
+        mem, refs, tomb, comp = _rows_prototype_fragment()
     else:
         raise ValueError(scenario)
     conn = sqlite3.connect(path)
@@ -224,15 +269,68 @@ def _strict_equal(a, b):
     return (type(a) is bool) == (type(b) is bool) and a == b
 
 
+def _defects(conn, query):
+    args = dict(p.split("=", 1) for p in query.lstrip("&").split("&") if p)
+    return payload.pages_defects(data._read_memory_rows(conn), include_docs=args.get("docs") == "1",
+                                 limit=int(args.get("limit", 2000)))
+
+
 @pytest.mark.parametrize("query", QUERIES)
 @pytest.mark.parametrize("scenario", SCENARIOS)
 def test_the_payload_is_the_one_the_pages_code_returns(tmp_path, scenario, query):
     expected = json.loads(FIXTURE.read_text())[scenario][query]
-    got = _payload(build_store(tmp_path / "s.db", scenario), query)
+    conn = build_store(tmp_path / "s.db", scenario)
+    assert _defects(conn, query) == []  # an input Pages handles: parity is owed
+    got = _payload(conn, query)
     for key in sorted(set(expected) | set(got)):
         assert key in got and key in expected, f"{key} only in {'pages' if key in expected else 'memora-all'}"
         assert _strict_equal(got[key], expected[key]), key
     assert list(got["nodes"][i]["id"] for i in range(len(got["nodes"]))) == [n["id"] for n in expected["nodes"]]
+
+
+def test_created_at_is_ordered_by_utf16_code_units():
+    fx = json.loads(FIXTURE.read_text())["unicode_times"][""]
+    order = [n["id"] for n in fx["nodes"]]
+    assert order.index(2) < order.index(1)  # U+FFFF sorts after U+1F600's D83D (newest first)
+    assert fx["maxDate"] == "2026-09-30 \uffff" and order == [n["id"] for n in _payload(
+        build_store(":memory:", "unicode_times"), "")["nodes"]]
+
+
+@pytest.mark.parametrize("query", QUERIES)
+def test_prototype_named_keys_throw_in_pages_and_are_mapped_correctly_here(query):
+    """Pages defect (leader 8135): graph.ts throws; this port answers."""
+    assert "__pages_throws__" in json.loads(FIXTURE.read_text())["prototype_keys"][query]
+    conn = build_store(":memory:", "prototype_keys")
+    assert _defects(conn, query) == [
+        "#2 primary tag 'constructor'", "#2 tag 'constructor'", "#3 tag 'toString'", "#4 section 'hasOwnProperty'",
+        "#5 component 'valueOf'", "#6 category '__proto__'", "#7 issue status 'isPrototypeOf'",
+    ]
+    got = _payload(conn, query)
+    ids = {n["id"] for n in got["nodes"]}
+    if 2 in ids:
+        assert got["tagToNodes"]["constructor"] == [2] and got["tagColors"]["constructor"].startswith("#")
+        # also a duplicate (0.9 to #1): the tag colour is the background
+        assert next(n for n in got["nodes"] if n["id"] == 2)["color"]["background"] == got["tagColors"]["constructor"]
+    if 4 in ids:
+        assert got["sectionToNodes"]["hasOwnProperty"] == [4]
+    if 5 in ids:
+        assert got["issueCategoryToNodes"]["valueOf"] == [5]
+    if 6 in ids:
+        assert got["todoCategoryToNodes"]["__proto__"] == [6]
+    if 7 in ids:
+        assert got["statusToNodes"]["isPrototypeOf"] == [7]
+        assert next(n for n in got["nodes"] if n["id"] == 7)["color"] == "#ff7b72"  # the open colour
+
+
+def test_a_prototype_named_fragment_tag_is_dropped_by_pages_and_kept_here():
+    fx = json.loads(FIXTURE.read_text())["prototype_fragment"]
+    conn = build_store(":memory:", "prototype_fragment")
+    assert _defects(conn, "") == [] and _strict_equal(_payload(conn, ""), fx[""])  # not selected: parity
+    assert _defects(conn, "&docs=1") == ["#3 primary tag 'constructor'"]
+    got, pages = _payload(conn, "&docs=1"), fx["&docs=1"]
+    assert "constructor" not in pages["tagColors"] and got["tagColors"]["constructor"] == payload.TAG_COLORS[1]
+    assert _strict_equal({k: v for k, v in got.items() if k != "tagColors"},
+                         {k: v for k, v in pages.items() if k != "tagColors"})
 
 
 def test_the_fixture_covers_what_it_claims():
@@ -327,7 +425,7 @@ from tests.test_g1_graph import stores  # noqa: E402,F401  (fixture)
 if __name__ == "__main__":
     out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
-    for s in SCENARIOS:
+    for s in SCENARIOS + DEFECT_SCENARIOS:
         (out / f"{s}.db").unlink(missing_ok=True)
         build_store(out / f"{s}.db", s).close()
         print(out / f"{s}.db")

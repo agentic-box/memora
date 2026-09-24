@@ -34,6 +34,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   edge threshold is 0.40, and `?min_score=` still overrides it.
 - One deliberate difference: rows an unfinished import still marks are left
   out, as everywhere else in memora-all.
+- Parity covers every input on which the Pages code works. A tag, section,
+  status, component or category named like a JavaScript object property
+  (`constructor`, `toString`, `__proto__`, ...) makes the Pages code fail
+  (500), or drop a fragment's tag colour. memora-all returns the correct
+  payload for these. The fix on the Pages side is follow-up PG1.
+- created_at is ordered as JavaScript orders strings (by UTF-16 code unit),
+  including for non-ASCII values.
 - The response carries no `nodeToCluster` (Pages has none). A label cut
   inside an emoji is sent as a JSON escape, as JSON.stringify does.
 
