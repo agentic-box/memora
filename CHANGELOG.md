@@ -14,6 +14,10 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.1
+
+Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
+
 ### Graph UI with a store selector, served by memora-all (G1)
 
 - memora's graph server reads and edits the store `?db=<store>` selects
