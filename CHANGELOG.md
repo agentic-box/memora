@@ -18,7 +18,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 - `scripts/nightly_compare.sh` runs on the deploy host from cron. For
   every store in the running memora-all's `MEMORA_REPLICAS`, strictly one
-  at a time (a lock refuses a second run with exit 75), it runs
+  at a time, it runs
   `local_primary.py compare` inside the container.
   - Monday to Saturday it is `--mode nightly`. On Sunday it is
     `--mode barrier --brief-freeze`: a brief freeze covering every key,
@@ -27,6 +27,10 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
     registry. Admin and health tokens reach the tool as 0600 tmpfs files
     written inside the container and removed on exit. Outcomes are
     recorded through the admin route.
+- One run at a time: a kernel lock (`flock` on
+  `<log dir>/nightly_compare.lock`) is held for the run's lifetime and
+  released when it ends, however it ends, so no stale lock is ever left
+  behind. A run that finds it held logs `result=skipped-locked` and exits 0.
 - It writes one line per store to `~/memora-lp/compare-logs/compare-<date>.log`
   (`NC_LOG_DIR`); files older than 30 days are removed.
 - It exits 1 on:

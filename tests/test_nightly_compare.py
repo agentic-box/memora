@@ -134,61 +134,65 @@ class TestRun:
         proc, calls = nc("--mode", "nightly", env={"NC_RUNNING": str(running), "NC_SLEEP": "0.2"})
         assert proc.returncode == 0 and "OVERLAP" not in proc.stdout
 
-    def test_a_live_run_holding_the_lock_refuses_and_says_so_in_the_log(self, nc):
+    def test_a_run_while_another_holds_the_lock_logs_and_exits_0(self, nc):
+        import fcntl
+
         nc.logs.mkdir()
-        (nc.logs / ".lock").mkdir()
-        owner = subprocess.Popen(["bash", "-c", "exec -a nightly_compare_owner sleep 30"])
+        fd = os.open(nc.logs / "nightly_compare.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)  # another run holds it
         try:
-            time.sleep(0.2)
-            (nc.logs / ".lock" / "pid").write_text(str(owner.pid))
             proc, calls = nc("--mode", "nightly")
         finally:
-            owner.kill()
-            owner.wait()
-        assert proc.returncode == 75 and _compares(calls) == []
-        assert f"result=locked exit=75 detail='another nightly_compare run (pid {owner.pid})" in _log_lines(nc)[0]
-        assert (nc.logs / ".lock").exists(), "the live owner's lock is left alone"
+            os.close(fd)
+        assert proc.returncode == 0 and _compares(calls) == []
+        assert "result=skipped-locked" in _log_lines(nc)[0]
 
-    def test_a_lock_left_by_a_killed_run_is_reclaimed(self, nc):
-        """Review 8111: SIGKILL or a reboot leaves the lock; the next run
-        must not be disabled by it."""
-        dead = subprocess.Popen(["true"])
-        dead.wait()
-        nc.logs.mkdir()
-        (nc.logs / ".lock").mkdir()
-        (nc.logs / ".lock" / "pid").write_text(str(dead.pid))
+    def test_concurrent_runs_one_runs_the_other_logs_and_exits_0(self, nc):
+        """Reviews 8111/8122: two simultaneous starts can never both run."""
+        e = {k: v for k, v in os.environ.items() if k not in ("DEPLOY_HOST", "RUNTIME", "DEPLOY_CONTAINER")}
+        e.update(PATH=f"{nc.tmp / 'bin'}:{os.environ['PATH']}", CALL_LOG=str(nc.tmp / "calls.txt"),
+                 NC_LOG_DIR=str(nc.logs), NC_SLEEP="1", NC_RUNNING=str(nc.tmp / "running"))
+        procs = [subprocess.Popen(["bash", str(SCRIPT), "--mode", "nightly"], env=e, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for _ in range(2)]
+        outs = [p.communicate(timeout=60) for p in procs]
+        assert [p.returncode for p in procs] == [0, 0], outs
+        lines = _log_lines(nc)
+        assert sum("result=skipped-locked" in l for l in lines) == 1
+        assert sum(" result=clean " in l for l in lines) == 2  # one run, both stores
+        assert not any("OVERLAP" in o for o, _ in outs)
+        raw = (nc.tmp / "calls.txt").read_text()
+        assert raw.count("local_primary.py\x1fcompare") == 2
+
+    def test_a_killed_run_leaves_no_lock_behind(self, nc):
+        """SIGKILL mid-run: the kernel drops the lock; the next run proceeds."""
+        e = {k: v for k, v in os.environ.items() if k not in ("DEPLOY_HOST", "RUNTIME", "DEPLOY_CONTAINER")}
+        e.update(PATH=f"{nc.tmp / 'bin'}:{os.environ['PATH']}", CALL_LOG=str(nc.tmp / "calls.txt"),
+                 NC_LOG_DIR=str(nc.logs), NC_SLEEP="30")
+        victim = subprocess.Popen(["bash", str(SCRIPT), "--mode", "nightly"], env=e, start_new_session=True,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 20
+        while time.time() < deadline and "local_primary.py" not in ((nc.tmp / "calls.txt").read_text()
+                                                                   if (nc.tmp / "calls.txt").exists() else ""):
+            time.sleep(0.1)
+        import signal
+
+        os.killpg(victim.pid, signal.SIGKILL)  # the run and its children, mid-compare
+        victim.wait()
+        time.sleep(0.2)
         proc, calls = nc("--mode", "nightly")
         assert proc.returncode == 0, proc.stderr
         assert [c[5] for c in _compares(calls)] == ["alpha", "beta"]
-        lines = _log_lines(nc)
-        assert "reclaiming a stale lock" in lines[0] and f"owner {dead.pid} is gone" in lines[0]
-        assert not (nc.logs / ".lock").exists()
-
-    def test_a_pid_reused_by_another_program_is_not_an_owner(self, nc):
-        other = subprocess.Popen(["sleep", "30"])
-        try:
-            nc.logs.mkdir()
-            (nc.logs / ".lock").mkdir()
-            (nc.logs / ".lock" / "pid").write_text(str(other.pid))
-            proc, _ = nc("--mode", "nightly")
-        finally:
-            other.kill()
-            other.wait()
-        assert proc.returncode == 0 and "reclaiming a stale lock" in _log_lines(nc)[0]
-
-    def test_a_lock_without_a_pid_is_busy_briefly_then_stale(self, nc):
-        nc.logs.mkdir()
-        (nc.logs / ".lock").mkdir()
-        proc, _ = nc("--mode", "nightly")
-        assert proc.returncode == 75  # fresh: a run between mkdir and its pid
-        past = time.time() - 300
-        os.utime(nc.logs / ".lock", (past, past))
-        proc, _ = nc("--mode", "nightly")
-        assert proc.returncode == 0 and "owner unknown is gone" in "\n".join(_log_lines(nc))
+        assert not any("skipped-locked" in l for l in _log_lines(nc))
 
     def test_the_lock_is_released_after_a_run(self, nc):
+        import fcntl
+
         nc("--mode", "nightly")
-        assert not (nc.logs / ".lock").exists()
+        fd = os.open(nc.logs / "nightly_compare.lock", os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # free again
+        finally:
+            os.close(fd)
 
     def test_no_replicated_store_is_a_clean_no_op(self, nc):
         proc, calls = nc("--mode", "nightly", env={"NC_STORES": "{}"})

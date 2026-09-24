@@ -25,9 +25,10 @@
 # diff (tool exit 5), a skipped compare (6), a refusal (2), a halt (3) or
 # any other failure, missing vectors on D1, a halted replicator, or new
 # would_halt events (counted per store in $NC_LOG_DIR/would-halt-<db>.count).
-# Exit 75 when another LIVE run holds the lock ($NC_LOG_DIR/.lock, with its
-# owner's PID): two compares never run at once. The refusal is logged; a lock
-# left by a killed run (or a reboot) is reclaimed by the next run.
+# When another run holds the lock (a kernel flock on
+# $NC_LOG_DIR/nightly_compare.lock, released when that run ends however it
+# ends), this run logs "result=skipped-locked" and exits 0: two compares
+# never run at once, and no lock is ever left behind.
 #
 # Where: on the deploy host, next to memora-all (the default), or from
 # elsewhere with DEPLOY_HOST=<ssh host>. RUNTIME (docker) and
@@ -50,6 +51,7 @@ TOOL=(python /app/scripts/local_primary.py)
 SHM=/dev/shm/memora-nightly-compare
 AUTH=(--admin-token-file "$SHM/admin.token" --health-token-file "$SHM/health.token")
 
+ORIG_ARGS=("$@")
 MODE=""; DRY=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -125,33 +127,35 @@ fi
 
 mkdir -p "$LOG_DIR"
 LOG="$LOG_DIR/compare-$(date +%Y-%m-%d).log"
-# One run at a time (review 8111): a lock directory holding its owner's PID.
-# A lock whose owner is gone (killed, or the host rebooted) is reclaimed, so
-# an interrupted run never disables the schedule. The owner is alive only if
-# that PID still runs nightly_compare (PID reuse after a reboot is not an
-# owner). A lock without a PID yet is busy for its first minute (a run
-# between mkdir and writing its PID), then stale. A refusal is logged.
-LOCK="$LOG_DIR/.lock"
-take_lock() {
-  local owner
-  if mkdir "$LOCK" 2>/dev/null; then echo $$ > "$LOCK/pid"; return 0; fi
-  owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
-  if [ -n "$owner" ]; then
-    ps -p "$owner" -o args= 2>/dev/null | grep -q nightly_compare && return 1
-  elif [ -z "$(find "$LOCK" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
-    return 1
+# One run at a time (reviews 8111, 8122): a KERNEL lock, flock(LOCK_EX|NB) on
+# $NC_LOG_DIR/nightly_compare.lock, taken by a small launcher that then becomes this run
+# (exec); the run and every child inherit the locked descriptor, and the
+# kernel releases it when they exit -- however they exit (SIGKILL, reboot).
+# No stale lock, no PID bookkeeping, and two simultaneous starts cannot both
+# win. When the lock is held the run logs that and exits 0 (leader 8124).
+if [ -z "${NC_LOCK_FD:-}" ]; then
+  rc=0
+  python3 -c '
+import fcntl, os, sys
+path, script, args = sys.argv[1], sys.argv[2], sys.argv[3:]
+fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except OSError:
+    sys.exit(75)
+os.set_inheritable(fd, True)
+os.environ["NC_LOCK_FD"] = str(fd)
+os.execvp("bash", ["bash", script, *args])
+' "$LOG_DIR/nightly_compare.lock" "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"} || rc=$?
+  if [ "$rc" = 75 ]; then  # leader 8124: logged, and not a failure
+    echo "$(date +%Y-%m-%dT%H:%M:%S%z) (all) mode=$MODE result=skipped-locked detail='another compare is running (it holds $LOG_DIR/nightly_compare.lock)'" | tee -a "$LOG"
+    exit 0
   fi
-  echo "note: reclaiming a stale lock $LOCK (owner ${owner:-unknown} is gone)" | tee -a "$LOG" >&2
-  rm -rf "$LOCK" && mkdir "$LOCK" 2>/dev/null && echo $$ > "$LOCK/pid"
-}
-if ! take_lock; then
-  echo "$(date +%Y-%m-%dT%H:%M:%S%z) (all) mode=$MODE result=locked exit=75 detail='another nightly_compare run (pid $(cat "$LOCK/pid" 2>/dev/null || echo '?')) holds $LOCK'" | tee -a "$LOG" >&2
-  exit 75
+  exit "$rc"
 fi
 TOKENS=0
 cleanup() {
   [ "$TOKENS" = 1 ] && { cexec rm -rf "$SHM" >/dev/null 2>&1 || echo "note: remove $SHM in $CONTAINER by hand" >&2; }
-  [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
   return 0
 }
 trap cleanup EXIT
