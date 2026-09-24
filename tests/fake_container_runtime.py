@@ -23,6 +23,8 @@ Environment knobs:
                   -e flags, Mounts from its -v flags (RW false for :ro)
   RUN_INSPECT_EXTRA_ENV  an extra Config.Env entry in that answer
   RUN_INSPECT_RW  1: report every mount of that answer writable
+  CREATE_OUT / CREATE_RC  where `create` writes its argv / its exit status
+  EMBED_PF_RC     exit status of `start -a` (the embedding preflight)
   SECRETS_UNREADABLE  1: a `run --rm … python -c` with the token mount runs
                   its program against a directory that does not exist
 
@@ -113,6 +115,19 @@ if verb == "ps":
     sys.exit(0)
 if verb == "rename":
     sys.exit(int(os.environ.get("RENAME_RC", "0")))
+if verb == "create":  # the embedding preflight (E1b): an ID; `start -a` runs it
+    with open(os.environ.get("CREATE_OUT") or os.devnull, "w") as fh:
+        fh.write("\n".join(args) + "\n")
+    print("pf0123456789")
+    sys.exit(int(os.environ.get("CREATE_RC", "0")))
+if verb == "start" and "-a" in args:
+    sys.stdin.read()  # like podman's attach: it reads stdin (the caller's script, if not redirected)
+    rc = int(os.environ.get("EMBED_PF_RC", "0"))
+    print(json.dumps({"ok": rc == 0, "model": "tfidf", "stores": {}}))
+    if rc:
+        print("embedding preflight: store 'memora' would refuse semantic search: recorded model differs. Fix: x",
+              file=sys.stderr)
+    sys.exit(rc)
 if verb == "exec":
     sys.stdin.read()
     sys.exit(0)

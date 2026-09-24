@@ -616,6 +616,48 @@ if bad:
     sys.exit(f"rows the startup sweep could complete or remove: {bad} -- inspect them first")
 PY
 
+# The new container's environment, shared by Preflight 3 and the run below
+# (one list, so the preflight checks exactly what the new server will see).
+CONTAINER_ENV=(
+  -e "MEMORA_DATA_VOLUME=$DATA_VOLUME"
+  -e "MEMORA_DATA_DIR=/data"
+  -e "MEMORA_TOOL_PROFILE=leader"
+  -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN"
+  -e "MEMORA_ADMIN_TOKEN=$ADMIN_TOKEN"
+  -e "MEMORA_HEALTH_TIMEOUT=30"
+  -e "MEMORA_HEALTH_REFRESH_INTERVAL=15"
+  -e "MEMORA_VECTOR_SCAN_PAGE_SIZE=100"
+  -e "MEMORA_ALLOW_ANY_TAG=1"
+  -e "MEMORA_LOG_LEVEL=INFO"
+  -e "MEMORA_DATABASES=$MEMORA_DATABASES"
+  -e "MEMORA_DEFAULT_DB=memora"
+  -e "MEMORA_PROJECTS=$MEMORA_PROJECTS"
+  "${TOKEN_FILE_ARGS[@]}"
+  ${LP_ARGS[@]+"${LP_ARGS[@]}"}
+  "${ENV_ARGS[@]}"
+)
+
+# Preflight 3 (E1b): would every store still answer semantic search under
+# the NEW image's embedding model? `python -m memora.embedding_preflight`
+# in the new image, with the new container's environment, the token mount
+# and the volume the RUNNING container serves (/data; read-write, because a
+# live primary's WAL is read through the writer's -shm -- the module opens
+# stores only read-only and takes no lock). Created, started attached and
+# removed by its ID, never `run --rm` (podman's --rm deletes an anonymous
+# volume it mounts: the old data, R1). Exit 0 = searchable; anything else
+# refuses before the old container is stopped.
+PF_ID="$("$RT" create --name "$CONTAINER-embedpf-$TS" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} \
+  -v "$OLD_VOLUME:/data" -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
+  "${CONTAINER_ENV[@]}" "$IMAGE" python -m memora.embedding_preflight < /dev/null)" \
+  || { echo "cannot create the embedding preflight container — aborting before touching the live container" >&2; exit 1; }
+[ -n "$PF_ID" ] || { echo "the embedding preflight container has no ID — aborting before touching the live container" >&2; exit 1; }
+PF_RC=0
+# < /dev/null: this script is itself bash's stdin (`bash -s`), and podman's
+# `start -a` attaches stdin -- it would swallow the rest of the script.
+"$RT" start -a "$PF_ID" < /dev/null || PF_RC=$?
+"$RT" rm "$PF_ID" >/dev/null 2>&1 || echo "note: remove the embedding preflight container $PF_ID by hand ($RT rm $PF_ID)" >&2
+[ "$PF_RC" -eq 0 ] || { echo "embedding preflight refused (exit $PF_RC): a store would refuse semantic search under the new image (the lines above name it and the fix) — aborting before touching the live container" >&2; exit 1; }
+
 "$RT" stop "$CONTAINER"
 
 # Copy the old /data into the named volume while memora-all is stopped
@@ -658,22 +700,7 @@ fi
   -p "$GRAPH_BIND:$GRAPH_PORT:8765" \
   -v "$DATA_VOLUME:/data" \
   -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
-  -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
-  -e "MEMORA_DATA_DIR=/data" \
-  -e "MEMORA_TOOL_PROFILE=leader" \
-  -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
-  -e "MEMORA_ADMIN_TOKEN=$ADMIN_TOKEN" \
-  -e "MEMORA_HEALTH_TIMEOUT=30" \
-  -e "MEMORA_HEALTH_REFRESH_INTERVAL=15" \
-  -e "MEMORA_VECTOR_SCAN_PAGE_SIZE=100" \
-  -e "MEMORA_ALLOW_ANY_TAG=1" \
-  -e "MEMORA_LOG_LEVEL=INFO" \
-  -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
-  -e "MEMORA_DEFAULT_DB=memora" \
-  -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" \
-  "${TOKEN_FILE_ARGS[@]}" \
-  ${LP_ARGS[@]+"${LP_ARGS[@]}"} \
-  "${ENV_ARGS[@]}" \
+  "${CONTAINER_ENV[@]}" \
   "$IMAGE"
 
 # The new container's configuration carries no token VALUE, and the token

@@ -29,6 +29,14 @@ Graph viewer with a store selector served by memora-all (G1): every graph route 
   own `-wal`/`-shm`. A d1:// store keeps its read path.
 - A real `import_attempt` row still refuses the deploy. The other
   preflights open no store.
+- **Preflight 3 (with E1b)**: before the old container is stopped, the
+  deploy runs `python -m memora.embedding_preflight` in the NEW image with
+  the new container's exact environment, the token mount and the volume
+  the running container serves. It refuses unless every store would still
+  answer semantic search. The container is created, started attached and
+  removed by its ID, never `run --rm`. The rehearsal records a different
+  dense model on one store and checks that the deploy refuses without
+  touching the running container.
 
 ### E1: no implicit embedding rebuild; the fingerprint no longer includes the endpoint host
 - Production finding (nuc8 v0.5.0). After the M1 moved hosts (same Ollama bge-m3), every store's stored fingerprint mismatched, because it carried the embedding endpoint's host (`backend|model|host|repr`).

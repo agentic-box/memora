@@ -413,6 +413,28 @@ adopt NEW5_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_ta
 grep -q "^re: 0 row(s) with import_attempt in metadata" "$RH_ROOT/deploy-5.log" \
   && pass "the preflight read the live primary re without its writer lock" \
   || fail "deploy 5's preflight did not read re (see deploy-5.log)"
+
+echo "== 4c. the embedding preflight (E1b) refuses a store that would refuse searches, before the stop"
+check "record a different dense model on bestation (its vectors are tfidf)" "$RT" exec "$NAME" python -c '
+import sqlite3
+db = sqlite3.connect("/data/bestation.db")
+db.execute("INSERT OR REPLACE INTO memories_meta (key, value) VALUES (?, ?)", ("embedding_model", "openai|bge-m3|dense:1024"))
+db.commit()'
+RUNNING_ID="$("$RT" inspect "$NAME" --format '{{.Id}}')"
+if deploy > "$RH_ROOT/deploy-6.log" 2>&1; then fail "deploy 6 was not refused"; \
+  else grep -q "embedding preflight refused" "$RH_ROOT/deploy-6.log" \
+    && pass "deploy 6 refused by the embedding preflight" || fail "deploy 6 failed otherwise (see deploy-6.log)"; fi
+grep -q "store 'bestation' would refuse semantic search" "$RH_ROOT/deploy-6.log" \
+  && pass "the refusal names bestation and its fix" || fail "the refusal does not name bestation"
+[ "$("$RT" inspect "$NAME" --format '{{.Id}} {{.State.Running}}')" = "$RUNNING_ID true" ] \
+  && pass "the running container was not touched (same ID, still running)" || fail "deploy 6 touched the running container"
+[ -z "$("$RT" ps -a -q --filter "name=$NAME-embedpf-")" ] \
+  && pass "the preflight container was removed" || fail "an embedding preflight container was left behind"
+check "remove the recorded model again" "$RT" exec "$NAME" python -c '
+import sqlite3
+db = sqlite3.connect("/data/bestation.db")
+db.execute("DELETE FROM memories_meta WHERE key = ?", ("embedding_model",))
+db.commit()'
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
 
 echo "== 5. podman inspect samples (token values redacted)"

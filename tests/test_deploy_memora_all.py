@@ -1076,3 +1076,55 @@ class TestGraphPublish:
                                              "DEPLOY_GRAPH_BIND": "127.0.0.1", "DEPLOY_GRAPH_PORT": "8766"})
         _nothing_done(deploy, proc, calls)
         assert "DEPLOY_GRAPH_PORT 8766 is production's" in proc.stderr
+
+
+# ---------------------------------------------------------------- E1b: Preflight 3, the embedding preflight
+
+class TestEmbeddingPreflight:
+    def _create(self, calls):
+        creates = [c for c in calls if c[0] == "create"]
+        assert len(creates) == 1, creates
+        return creates[0]
+
+    def test_it_runs_in_the_new_image_with_the_new_env_before_the_stop(self, deploy):
+        proc, calls, _ = deploy()
+        c = self._create(calls)
+        assert c[-3:] == ["python", "-m", "memora.embedding_preflight"] and c[-4] == "memora:latest"
+        assert c[c.index("--name") + 1].startswith("memora-all-embedpf-")
+        assert f"{ANON}:/data" in _flag_values(c, "-v")  # the RUNNING container's volume, read-write
+        assert not [v for v in _flag_values(c, "-v") if v.endswith("/data:ro")]
+        assert f"{deploy.secrets}:{SECRETS_MOUNT}:ro" in _flag_values(c, "-v")
+        assert "--rm" not in c
+        # exactly the new container's environment
+        assert sorted(_flag_values(c, "-e")) == sorted(_flag_values(_new_container_run(calls), "-e"))
+        i_create = _index(calls, lambda x: x[0] == "create")
+        i_start = _index(calls, lambda x: x[:2] == ["start", "-a"])
+        i_rm = _index(calls, lambda x: x == ["rm", "pf0123456789"])
+        i_stop = _index(calls, lambda x: x[0] == "stop")
+        assert i_create < i_start < i_rm < i_stop
+        assert calls[i_start] == ["start", "-a", "pf0123456789"]
+
+    def test_the_preflight_cannot_swallow_the_rest_of_the_deploy(self, deploy):
+        """podman's `start -a` reads stdin; the remote script IS bash's stdin
+        (rehearsal on server2): without `< /dev/null` the deploy ended there."""
+        proc, calls, _ = deploy()
+        assert any(c[:2] == ["run", "-d"] for c in calls), proc.stderr[-800:]
+        assert ["rm", "pf0123456789"] in calls
+
+    def test_a_store_that_would_refuse_searches_refuses_before_the_stop(self, deploy):
+        proc, calls, _ = deploy(runtime_env={"EMBED_PF_RC": "2"})
+        assert proc.returncode != 0 and "embedding preflight refused (exit 2)" in proc.stderr
+        assert "would refuse semantic search" in proc.stderr
+        assert not any(c[0] in ("stop", "rename") or c[:2] == ["run", "-d"] for c in calls)
+        assert ["rm", "pf0123456789"] in calls  # removed by its ID even on a refusal
+
+    @pytest.mark.parametrize("rc", ["1", "127"])
+    def test_any_other_failure_refuses_too(self, deploy, rc):
+        proc, calls, _ = deploy(runtime_env={"EMBED_PF_RC": rc})
+        assert proc.returncode != 0 and f"embedding preflight refused (exit {rc})" in proc.stderr
+        assert not any(c[0] == "stop" for c in calls)
+
+    def test_a_failed_create_refuses_before_the_stop(self, deploy):
+        proc, calls, _ = deploy(runtime_env={"CREATE_RC": "125"})
+        assert proc.returncode != 0 and "cannot create the embedding preflight container" in proc.stderr
+        assert not any(c[0] in ("start", "stop") for c in calls)
