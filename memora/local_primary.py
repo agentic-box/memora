@@ -582,7 +582,7 @@ def d1_uri(account_id: str, database_id: str) -> str:
 
 
 def load_receipt(path: str, db: str, *, account_id: str, database_id: str, now: Optional[float] = None,
-                 check_sql: bool = True) -> Dict[str, Any]:
+                 check_sql: bool = True, max_age_s: Optional[float] = RECEIPT_MAX_AGE_S) -> Dict[str, Any]:
     """A usable receipt (P1): verified, for this store name AND this D1
     database (account id, database id and URI; review 7621 P1-3), younger
     than 24 h, with the R2 read-back matched and (by default) its SQL file
@@ -603,7 +603,7 @@ def load_receipt(path: str, db: str, *, account_id: str, database_id: str, now: 
     if not r.get("verified_at") or r.get("r2_sha256") != r.get("sql_sha256"):
         raise L5Refused(f"receipt {path} is not verified (R2 read-back unmatched)")
     age = (now if now is not None else time.time()) - float(r.get("verified_at_epoch") or 0)
-    if age > RECEIPT_MAX_AGE_S:
+    if max_age_s is not None and age > max_age_s:
         raise L5Refused(f"receipt {path} is older than 24 h ({int(age)} s)")
     if check_sql:
         sql = Path(r["sql_path"])
@@ -894,6 +894,26 @@ SNAPSHOT_KEEP = 14
 _SNAPSHOT_KEY = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{6}Z\.db\.gz$")
 
 
+def backup_store(store_path: Path, dest: Path) -> Path:
+    """One consistent copy of a (possibly live) store: `sqlite3 .backup`
+    through its read-only connection, checked with integrity_check."""
+    from .backends import LocalSQLiteBackend
+
+    src = LocalSQLiteBackend(Path(store_path)).connect_read_only()
+    try:
+        dst = _scratch_connect(Path(dest))
+        try:
+            src.backup(dst)
+            ok = dst.execute("PRAGMA integrity_check").fetchone()[0]
+        finally:
+            dst.close()
+    finally:
+        src.close()
+    if ok != "ok":
+        raise L5Refused(f"the copy of {store_path} fails integrity_check: {ok}")
+    return Path(dest)
+
+
 def _store_bytes(path: Path) -> int:
     return sum(p.stat().st_size for p in (path, Path(f"{path}-wal")) if p.exists())
 
@@ -918,18 +938,7 @@ def snapshot(db: str, store_path: Path, r2, work_dir: Path, *, keep: int = SNAPS
     tmpdir = Path(tempfile.mkdtemp(prefix=f"snapshot-{db}-", dir=str(work_dir)))
     try:
         copy, gz = tmpdir / "copy.db", tmpdir / f"{ts}.db.gz"
-        src = LocalSQLiteBackend(store_path).connect_read_only()
-        try:
-            dst = _scratch_connect(copy)
-            try:
-                src.backup(dst)
-                ok = dst.execute("PRAGMA integrity_check").fetchone()[0]
-            finally:
-                dst.close()
-        finally:
-            src.close()
-        if ok != "ok":
-            raise L5Refused(f"the snapshot copy fails integrity_check: {ok}")
+        backup_store(store_path, copy)
         with open(copy, "rb") as fin, gzip.open(gz, "wb") as fout:
             shutil.copyfileobj(fin, fout)
         sha = _sha256_file(gz)
@@ -1443,6 +1452,12 @@ class AdminClient(FreezeClient):
                 return exc.code, {}
         except (urllib.error.URLError, OSError) as exc:
             raise L5Refused(f"memora-all is not reachable at {self.base}: {exc}")
+
+    def post_compare(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        status, out = self._post_json(f"/admin/compare/{self.db}", fields)
+        if status != 200:
+            raise L5Refused(f"memora-all did not record the compare ({status}): {out}")
+        return out
 
     def intents(self) -> Dict[str, Any]:
         status, body = self._request("GET", f"/admin/intents/{self.db}")

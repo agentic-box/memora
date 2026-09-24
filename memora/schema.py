@@ -465,7 +465,9 @@ CREATE TABLE IF NOT EXISTS sync_state (
   inflight_epoch_before INTEGER, inflight_at TEXT,
   halted_reason TEXT, halted_at TEXT,
   allow_deletes_attempt TEXT, epoch_unverified_batches INTEGER NOT NULL DEFAULT 0,
-  last_ack_at TEXT, last_error TEXT
+  last_ack_at TEXT, last_error TEXT,
+  last_compare_at TEXT, last_compare_mode TEXT, last_compare_clean INTEGER,
+  d1_missing_vectors INTEGER, last_compare_report TEXT
 )
 """
 # Columns added after L2's first sync_state (the replicator, L3); ensured on
@@ -475,6 +477,12 @@ _SYNC_STATE_ADDED = (
     ("epoch_unverified_batches", "INTEGER NOT NULL DEFAULT 0"),
     ("last_ack_at", "TEXT"),
     ("last_error", "TEXT"),
+    # the §5.2 compare's outcome (L6): health fields and §2.7's d1_missing_vectors
+    ("last_compare_at", "TEXT"),
+    ("last_compare_mode", "TEXT"),
+    ("last_compare_clean", "INTEGER"),
+    ("d1_missing_vectors", "INTEGER"),
+    ("last_compare_report", "TEXT"),
 )
 _SHADOW_STATE_DDL = """
 CREATE TABLE IF NOT EXISTS shadow_state (

@@ -15,6 +15,7 @@ this file only parses arguments and builds the dependencies.
           --service-stopped [--dry-run]      (apply: memora-all stopped; --dry-run writes nothing)
   reconcile <db> [--accept ID --receipt R --operator NAME --decision applied|not-applied --evidence-sha256 X]
   resume  <db> --store /data/<db>.db [--accept-d1-epoch N | --allow-deletes ATTEMPT]   (memora-all stopped)
+  compare <db> --mode barrier|nightly|log --store P   §5.2 compare; report; record (exit 5 diff, 6 skipped)
   thaw    <db>              lift the freeze -- the only command that does
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
@@ -127,6 +128,28 @@ def _parser() -> argparse.ArgumentParser:
     g = rm.add_mutually_exclusive_group()
     g.add_argument("--accept-d1-epoch", type=int)
     g.add_argument("--allow-deletes")
+    cp = sub.add_parser("compare", help="§5.2 compare a local store with D1 (or its log, in log mode)")
+    cp.add_argument("db")
+    cp.add_argument("--mode", required=True, choices=("barrier", "nightly", "log"))
+    cp.add_argument("--store", required=True, help="the live local store file")
+    cp.add_argument("--account", required=True)
+    cp.add_argument("--database-id", required=True)
+    cp.add_argument("--read-token-file")
+    cp.add_argument("--memora-url", default="http://127.0.0.1:8000")
+    cp.add_argument("--admin-token-file", help="0600; the freeze (barrier) and recording through memora-all")
+    cp.add_argument("--health-token-file", help="0600; required with --admin-token-file")
+    cp.add_argument("--service-stopped", action="store_true",
+                    help="memora-all is stopped: the barrier is docker State.Running=false, record directly")
+    cp.add_argument("--container", default="memora-all")
+    cp.add_argument("--out-dir", default="/data/compare", help="reports and the nightly state")
+    cp.add_argument("--work-dir", help="snapshots (default: <out-dir>/work)")
+    cp.add_argument("--receipt", help="log mode: the store's seed export receipt")
+    cp.add_argument("--log-dir", help="log mode: the replicator log directory (default: its data-volume path)")
+    cp.add_argument("--wait-timeout", type=float, default=1800.0, help="nightly: wait for the acks (s)")
+    cp.add_argument("--drain-timeout", type=float, default=600.0, help="barrier/log: wait for the drain (s)")
+    cp.add_argument("--no-record", action="store_true", help="write the report only")
+    cp.add_argument("--brief-freeze", action="store_true",
+                    help="barrier (the weekly job): place the freeze if none is in place and lift only that one")
     sn = sub.add_parser("snapshot", help="§4 nightly snapshot of a local store to R2")
     sn.add_argument("db")
     sn.add_argument("--store", required=True)
@@ -187,6 +210,69 @@ def _recovery(args) -> dict:
                         f"--memora-url {args.memora_url} --admin-token-file <file> --health-token-file <file>"}
 
 
+def _compare(args) -> int:
+    """§5.2: run the compare, write the report, record the outcome (through
+    memora-all's admin route, or directly with --service-stopped). Exit 0
+    clean, 5 diffs, 6 skipped (nightly: the acks did not reach H)."""
+    from memora import compare as cmp
+    from memora.backends import D1SelectOnlyConnection
+    from memora.replicator import iter_log
+
+    reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, lp.read_token(args.read_token_file)))
+    admin = None
+    if args.admin_token_file:
+        if not args.health_token_file:
+            raise lp.L5Refused("--health-token-file is required with --admin-token-file")
+        admin = lp.AdminClient(args.memora_url, lp.load_credential_file(args.admin_token_file), args.db,
+                               health_token=lp.load_credential_file(args.health_token_file))
+    barrier = lp.ServiceStopped(args.container) if args.service_stopped else admin
+    if not args.no_record and not args.service_stopped and admin is None:
+        raise lp.L5Refused("recording the outcome needs memora-all's admin route (--admin-token-file, "
+                           "--health-token-file) or --service-stopped; or pass --no-record")
+    out_dir = Path(args.out_dir)
+    env = cmp.Env(store=Path(args.store), reader=reader, work=Path(args.work_dir or out_dir / "work"),
+                  barrier=barrier)
+    if args.mode == "barrier":
+        if barrier is None:
+            raise lp.L5Refused("a barrier compare needs the freeze (--admin-token-file ...) or --service-stopped")
+        placed = False
+        if args.brief_freeze:
+            if admin is None:
+                raise lp.L5Refused("--brief-freeze needs memora-all's admin route")
+            status, body = admin._request("GET", f"/health/db/{args.db}")
+            if (body.get("freeze") or {}).get("state") not in ("frozen", "frozen-unsafe"):
+                admin.freeze()  # the weekly job's own brief freeze
+                placed = True
+        try:
+            report = cmp.barrier_compare(env, drain_timeout_s=args.drain_timeout)
+        finally:
+            if placed:
+                admin.thaw()  # only the freeze this run placed; an operator's stays
+        report["brief_freeze_placed"] = placed
+    elif args.mode == "nightly":
+        report = cmp.nightly_compare(env, state_path=out_dir / args.db / "nightly-state.json",
+                                     wait_timeout_s=args.wait_timeout)
+    else:
+        if not args.receipt:
+            raise lp.L5Refused("log mode needs --receipt (the store's seed export)")
+        log_dir = Path(args.log_dir) if args.log_dir else None
+        report = cmp.log_compare(env, db=args.db, receipt_path=args.receipt, account_id=args.account,
+                                 database_id=args.database_id, log_records=lambda: iter_log(args.db, log_dir),
+                                 drain_timeout_s=args.drain_timeout)
+    report.update({"db": args.db, "store": args.store})
+    path, sha = cmp.write_report(report, out_dir, args.db)
+    recorded = None
+    if not args.no_record and not report.get("skipped"):
+        fields = cmp.record_fields(report, sha)
+        recorded = cmp.record_direct(Path(args.store), fields) if args.service_stopped else admin.post_compare(fields)
+    summary = {"ok": bool(report["clean"]), "mode": args.mode, "report": str(path), "report_sha256": sha,
+               "clean": report["clean"], "diff_count": report.get("diff_count"),
+               "d1_missing_vectors": report.get("d1_missing_vectors"), "consumed_seq": report.get("consumed_seq"),
+               "hot_keys": len(report.get("hot_keys") or []), "skipped": report.get("skipped"), "recorded": recorded}
+    print(json.dumps(summary))
+    return 6 if report.get("skipped") else (0 if report["clean"] else 5)
+
+
 def _restore(args, deps) -> dict:
     if not args.from_r2:
         if not args.out:
@@ -243,6 +329,8 @@ def main(argv=None) -> int:
                     account_id=args.account, database_id=args.database_id)}
             print(json.dumps(out))
             return 0
+        if args.cmd == "compare":
+            return _compare(args)
         if args.cmd == "resume":
             from memora.backends import D1SelectOnlyConnection
 

@@ -1122,6 +1122,75 @@ Two modes:
   A key not in `K` had no local write after `S`, and it was acked. So D1
   must equal `S` for it, unless a foreign write happened.
 
+**As built in L6 (piece a)**: `memora/compare.py`, run by
+`local_primary.py compare <db> --mode barrier|nightly|log --store P`.
+- **Snapshot.** Local rows always come from one `.backup` snapshot `S`
+  (`backup_store`: the read-only connection, then `integrity_check`). `H` is
+  the highest outbox seq ever assigned: `sqlite_sequence`, which survives
+  pruning. D1 is read only through the SELECT-only reader.
+- **The compare** covers every §5.2 table and every column: columns present
+  on one side only, keys present on one side only, and changed rows with the
+  changed columns listed.
+  - An embedding row whose changed columns are all provenance
+    (`representation`, `dimension`, `encoding_source`, `writer_token`) is
+    also listed as a `provenance_mismatch`.
+  - `d1_missing_vectors` (§2.7) counts local vectors that D1 lacks: the row
+    is absent on D1, or its `embedding` is NULL there.
+  - The excluded meta keys are dropped on both sides.
+- **Barrier.**
+  - The freeze, or with `--service-stopped` the stopped container, is
+    required, then re-checked after the drain, after the snapshot and after
+    reading D1.
+  - The compare waits for `last_acked_seq >= head`, and refuses if the drain
+    does not finish in time.
+  - `consumed_seq = H` when the compare is clean.
+- **Nightly.** The run follows §5.2 above: `S`, then wait for the acks to
+  pass `H` (skip and exit 6 past `--wait-timeout`), then read D1, then read
+  `K` from the live outbox, then compare excluding `K`.
+  - A diff triggers one retry that retakes `S`, `H` and `K`.
+  - Keys in `K` on two consecutive nights are reported as `hot_keys`. The
+    state is `<out-dir>/<db>/nightly-state.json`, and a rerun on the same
+    night compares with the night before.
+- **Log** (the shadow period, §2.9 (b)):
+  - The compare waits for `log_cursor_seq >= head` and snapshots `S`.
+  - Up to the cursor, every outbox key must appear in the log. An extra log
+    key must be a `memories` FK parent that the replicator added.
+  - The log is replayed in order, with foreign keys on, into the store's
+    seed export (`--receipt`; its age is not limited, it is the seed's) and
+    compared with `S`. D1 is not read, and nothing is consumed.
+  - L6 found a real builder-path bug this way. `iter_log` deduplicated on
+    `(seq, index)`, which dropped a child statement sharing its seq with the
+    FK parent the batch added. It now deduplicates on
+    `(seq, table, pk, index)`.
+- **Report and record.**
+  - A report is written to `<out-dir>/<db>/compare-<mode>-<ts>.json`, and
+    its sha256 is recorded.
+  - `replicator.record_compare` writes `last_compare_at/_mode/_clean`,
+    `d1_missing_vectors` and `last_compare_report`. It advances
+    `compare_consumed_seq` only on a clean barrier or nightly run, never
+    past `last_acked_seq` and never backwards.
+  - With memora-all serving the store, the outcome goes through
+    `POST /admin/compare/<db>` (admin token), which writes through the
+    replicator's gate-exempt connection. With `--service-stopped` it is
+    written directly under the store's primary lock.
+  - The replicator's health block shows `d1_missing_vectors` (no longer
+    null), `last_compare_at`, `last_compare_mode`, `last_compare_clean` and
+    `compare_consumed_seq`.
+- **Exit codes**: 0 clean, 5 diffs, 6 skipped, 2 refused.
+- **Cron entries** (documented, not installed by the code; tokens are 0600
+  files):
+  ```
+  # nightly, 03:15
+  15 3 * * *  scripts/local_primary.py compare <db> --mode nightly --store /data/<db>.db \
+                --account <acct> --database-id <id> --read-token-file ~/.config/memora/d1-read.token \
+                --admin-token-file ~/.config/memora/all.admin-token --health-token-file ~/.config/memora/all.health-token
+  # weekly barrier, Sunday 04:00, under a brief freeze it places and lifts itself
+  0 4 * * 0   scripts/local_primary.py compare <db> --mode barrier --brief-freeze --store /data/<db>.db \
+                --account <acct> --database-id <id> --read-token-file ... --admin-token-file ... --health-token-file ...
+  ```
+  - `--brief-freeze` places the freeze only if none is in place and lifts
+    only the freeze it placed. An operator's freeze stays.
+
 The shadow period uses the §2.9 nightly check instead. There, the log's key
 set for seqs up to `log_cursor_seq` must first equal the outbox's key set
 over the same range; the outbox is retained, so this catches lost log
@@ -1570,7 +1639,7 @@ Pre-existing D1 writes the plan leaves as they are:
 | (j) the journal-health re-check in `_execute_api` is not atomic with `_send`: a repair failure on another thread can land between the check and the send (L2 review 7588 P2). This is safe: the intent is already durable on disk before the check, so a request that goes out anyway is recorded as an open intent (frozen-unsafe until an operator accepts it), exactly like an unknown outcome. L3 may make the check and send one critical section if the replicator needs it. **L3:** it does not: the replicator never uses the application journal (its D1 writer is `ReplicaD1Connection`, guarded by its own durable H3 marker) | L3 | closed in L3: not needed |
 | (k) `acquire_primary_lock` runs before `_ensure_parent_dir`, so a live primary whose parent directory does not exist yet raises FileNotFoundError on first start instead of creating it (L2 review 7592 P2). The seed creates the parent | L5 | **done in L5 piece b**: `_open_writer` creates the parent directory before `fence()`, and the seed creates it before taking the target's primary lock |
 | (l) watchdog alerts for replication (§2.5: `oldest_unacked_age_s > 300`, `status == halted`, `d1_missing_vectors > 0`). L3 exposes the metrics on `/health/db/<db>` (authorised); `scripts/memora_watchdog.py` is liveness-only by design, so the alert is a separate check | L9 | before the first cutover |
-| (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | with L6 |
+| (m) `d1_missing_vectors` is reported as `null` until the §5.2 compare exists; the synchronous-commit flag (§2.8) is not implemented | L6 / optional | **done in L6 piece a**: the compare computes it and `record_compare` stores it; the health block reports the last value. The §2.8 synchronous-commit flag stays unimplemented (optional) |
 | (n) per-table delete-guard configuration, if the log-only week shows `memories_meta` or `tombstone_components` churn tripping the under-100-rows rule (L3 review 7599 P2: the strict rule is accepted for the shadow week) | L9 | after the log-only week |
 | (o) `_WriteGate.enter(exempt=True)` relied on trusted in-process callers (L3 review 7603 P2) | L4 | **done in L4**: exempt entries are refused unless the caller module is `memora.replicator` (`test_exempt_gate_entries_are_for_the_replicator_only`) |
 | (p) a second `freeze()` on an already-frozen store returns without waiting for a newly entered exempt replicator token, so the scripts must re-check `/health/db/<db>` for `in_flight = 0` at every step boundary (already required by §1) (L3 review 7603 P2) | L5 | **done in L5 piece a** (kept through b/c): `FreezeClient.check` re-reads `/health/db/<db>` at every step boundary and continues only on `frozen`, `in_flight = 0` and no open intent |
@@ -1580,3 +1649,4 @@ Pre-existing D1 writes the plan leaves as they are:
 | (t) a memory whose `images` field keeps changing between the upload and the swap stays `images_pending` until a later startup or thaw sweep: conservative by design, since the swap never overwrites a newer `images` (L4 review 7614 P2) | L9 | add a metric for rows left `images_pending` |
 | (u) `_absorb_link`'s fixed savepoint name assumes `add_link` never opens a same-named nested savepoint (L4 review 7614 P2) | L5 | **done in L5 piece a**: `_absorb_link` refuses a nested `absorb_link` savepoint on the same connection, and `add_link`'s docstring records the constraint |
 | (v) a failed step leaves the freeze in place on purpose, so its output must say how to lift it (L5 review 7630 P2) | L5 | **done in L5 piece b**: the failure JSON of export, recheck, seed and sequence-highwater carries `recovery: local_primary.py thaw <db> ...` |
+| (w) the conflicts file and the approve review should show inbound `memories_crossrefs.related` dependencies between groups: conflicting choices can leave a logical stale reference (L5 review 7684 P2) | L6 / L9 | with L6 piece b |

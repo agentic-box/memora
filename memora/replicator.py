@@ -306,13 +306,14 @@ def append_log(name: str, batch: _Batch, *, now: Optional[float] = None) -> Path
     return path
 
 
-def iter_log(name: str):
+def iter_log(name: str, directory: Optional[Path] = None):
     """The logged statements of a store, oldest first, deduplicated by
-    (seq, index) -- a crash between a log fsync and the cursor update makes
-    the next cycle append the same range again -- with a torn final line
-    dropped."""
+    (seq, table, pk, index) -- a crash between a log fsync and the cursor
+    update makes the next cycle append the same range again -- with a torn
+    final line dropped. `directory` overrides log_dir(name) (the operator tool reads
+    the log from the host's view of the data volume)."""
     seen = set()
-    directory = log_dir(name)
+    directory = Path(directory) if directory is not None else log_dir(name)
     if not directory.exists():
         return
     for path in sorted(directory.glob("*.jsonl")):
@@ -320,7 +321,10 @@ def iter_log(name: str):
         end = data.rfind(b"\n") + 1
         for raw in data[:end].split(b"\n")[:-1]:
             rec = json.loads(raw)
-            key = (rec["seq"], rec["index"])
+            # (seq, index) alone is not unique: an FK parent the batch added
+            # for a child carries the child's seq (L6 found the child's line
+            # dropped). A crash's re-append repeats all four, so it still dedups.
+            key = (rec["seq"], rec["tbl"], json.dumps(rec["pk"]), rec["index"])
             if key in seen:
                 continue
             seen.add(key)
@@ -688,6 +692,13 @@ class StoreReplicator:
                 "halted_reason": st.get("halted_reason"), "last_error": st.get("last_error"),
                 "epoch_unverified_batches": int(st.get("epoch_unverified_batches") or 0),
                 "inflight_id": st.get("inflight_id"),
+                # §5.2 / §2.7: the last compare's outcome (null until one ran)
+                "d1_missing_vectors": st.get("d1_missing_vectors"),
+                "last_compare_at": st.get("last_compare_at"),
+                "last_compare_mode": st.get("last_compare_mode"),
+                "last_compare_clean": None if st.get("last_compare_clean") is None
+                else bool(st.get("last_compare_clean")),
+                "compare_consumed_seq": int(st.get("compare_consumed_seq") or 0),
             })
 
     def status(self) -> Dict[str, Any]:
@@ -802,6 +813,49 @@ def resume(conn, *, accept_d1_epoch: Optional[int] = None, allow_deletes: Option
     conn.execute(f"UPDATE sync_state SET {', '.join(updates)} WHERE id = 1", params)
     conn.commit()
     return reason
+
+
+COMPARE_MODES = ("barrier", "nightly", "log")
+
+
+def record_compare(conn, *, mode: str, clean: bool, consumed_seq: Optional[int], d1_missing_vectors: int,
+                   report_sha256: str, at: Optional[str] = None) -> Dict[str, Any]:
+    """Record a §5.2 compare's outcome on a local store (L6). Only a CLEAN
+    barrier or nightly compare advances compare_consumed_seq -- which lets
+    acked outbox rows older than 24 h be pruned -- and never past the
+    acked head or backwards. Every run updates the health fields."""
+    if mode not in COMPARE_MODES:
+        raise ValueError(f"mode must be one of {COMPARE_MODES}")
+    if not isinstance(clean, bool) or not isinstance(d1_missing_vectors, int) or d1_missing_vectors < 0:
+        raise ValueError("clean must be a boolean and d1_missing_vectors a count")
+    if not isinstance(report_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", report_sha256):
+        raise ValueError("report_sha256 must be a sha256 hex digest")
+    from .backends import store_write
+
+    with store_write(conn):
+        st = dict(conn.execute("SELECT * FROM sync_state WHERE id = 1").fetchone())
+        consumed = int(st.get("compare_consumed_seq") or 0)
+        if clean and mode != "log" and consumed_seq is not None:
+            if not isinstance(consumed_seq, int) or consumed_seq < 0:
+                raise ValueError("consumed_seq must be a non-negative integer")
+            if consumed_seq > int(st["last_acked_seq"]):
+                raise ValueError(f"consumed_seq {consumed_seq} is past the acked head {st['last_acked_seq']}")
+            consumed = max(consumed, consumed_seq)
+        conn.execute(
+            "UPDATE sync_state SET compare_consumed_seq = ?, last_compare_at = ?, last_compare_mode = ?, "
+            "last_compare_clean = ?, d1_missing_vectors = ?, last_compare_report = ? WHERE id = 1",
+            (consumed, at or _now_iso(), mode, 1 if clean else 0, d1_missing_vectors, report_sha256))
+    return {"compare_consumed_seq": consumed, "last_compare_clean": clean, "d1_missing_vectors": d1_missing_vectors}
+
+
+def record_compare_for(backend, **kw) -> Dict[str, Any]:
+    """record_compare through the replicator's gate-exempt writer (memora-all
+    serving the store: the freeze may be in place)."""
+    conn = backend.connect_replicator()
+    try:
+        return record_compare(conn, **kw)
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ startup

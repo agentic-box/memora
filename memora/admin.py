@@ -195,6 +195,33 @@ def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = No
     return 200, {"id": intent_id, "outcome": "operator-accepted", **backend.write_gate().status()}
 
 
+def record_compare_result(name: str, body: Any) -> Result:
+    """POST /admin/compare/<name> (plan §5.2, L6): the operator tool's compare
+    outcome for a store memora-all serves. Body: {mode, clean, consumed_seq,
+    d1_missing_vectors, report_sha256}. The replicator module validates and
+    writes it (compare_consumed_seq advances only on a clean run)."""
+    from .backends import LocalSQLiteBackend
+    from .replicator import record_compare_for
+
+    backend, err = _backend(name)
+    if err:
+        return err
+    if not isinstance(backend, LocalSQLiteBackend):
+        return 400, {"error": "not_a_local_store"}
+    if not isinstance(body, dict):
+        return 400, {"error": "bad_request"}
+    try:
+        out = record_compare_for(backend, mode=body.get("mode"), clean=body.get("clean"),
+                                 consumed_seq=body.get("consumed_seq"),
+                                 d1_missing_vectors=body.get("d1_missing_vectors"),
+                                 report_sha256=body.get("report_sha256"))
+    except ValueError as exc:
+        return 400, {"error": "invalid_compare_result", "message": str(exc)}
+    except Exception as exc:  # e.g. no sync_state: replication is not installed on this store
+        return 409, {"error": "compare_not_recorded", "message": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    return 200, out
+
+
 def gate_health(name: str) -> Optional[Dict[str, Any]]:
     """freeze/journal fields for /health/db (live, never raises, no D1 call)."""
     try:
@@ -245,6 +272,17 @@ def register_admin_routes(mcp: Any) -> None:
         except ValueError:
             return respond((400, {"error": "bad_timeout"}))
         return respond(await _run(freeze_store, name, max(0.0, min(timeout_s, 300.0))))
+
+    @mcp.custom_route("/admin/compare/{name}", methods=["POST"])
+    async def _compare(request):
+        denied = require_admin(request)
+        if denied is not None:
+            return respond(denied)
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return respond((400, {"error": "bad_request"}))
+        return respond(await _run(record_compare_result, request.path_params["name"], body))
 
     @mcp.custom_route("/admin/intents/{name}", methods=["GET"])
     async def _intents(request):
