@@ -124,6 +124,48 @@ DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed 
 # git-ignored instance config rather than written into this (public) script.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${DEPLOY_ENV_FILE:-$ROOT/instances/all.env}"
+
+# Guard (review 7725): an override of ANY of the above needs the explicit
+# rehearsal sentinel, and then everything must be rehearsal-scoped. A stray
+# variable in an operator's shell can never re-target the production deploy.
+# (bash 3.2 on macOS runs this: no associative arrays.)
+DEPLOY_ENV_FILE_EFFECTIVE="$ENV_FILE"
+OVERRIDDEN=()
+while IFS='|' read -r var label default; do
+  [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
+done <<DEFAULTS
+TAG|DEPLOY_TAG|v0.4.6
+DEPLOY_HOST|DEPLOY_HOST|nuc8
+RUNTIME|RUNTIME|docker
+DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
+DEPLOY_DATA_VOLUME|DEPLOY_DATA_VOLUME|memora-all-data
+DEPLOY_IMAGE|DEPLOY_IMAGE|memora:latest
+DEPLOY_PORT|DEPLOY_PORT|8920
+DEPLOY_CONFIG_DIR|DEPLOY_CONFIG_DIR|~/.config/memora
+DEPLOY_REPO|DEPLOY_REPO|~/repos/agentic-box/memora
+DEPLOY_SKIP_CHECKOUT|DEPLOY_SKIP_CHECKOUT|0
+DEPLOY_SMOKE_ABSORB|DEPLOY_SMOKE_ABSORB|1
+DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
+DEFAULTS
+if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
+  RH_ROOT="${DEPLOY_REHEARSAL_ROOT:-}"
+  refuse() { echo "rehearsal refused: $* — nothing was done" >&2; exit 1; }
+  [ -n "$RH_ROOT" ] && [ -d "$RH_ROOT" ] || refuse "DEPLOY_REHEARSAL_ROOT must name an existing directory"
+  [ "$DEPLOY_HOST" = localhost ] || refuse "DEPLOY_HOST must be localhost (not '$DEPLOY_HOST')"
+  for v in DEPLOY_CONTAINER DEPLOY_DATA_VOLUME DEPLOY_IMAGE; do
+    case "${!v}" in *-rh*) ;; *) refuse "$v '${!v}' is not rehearsal-scoped (must contain -rh)" ;; esac
+  done
+  [ "$DEPLOY_PORT" != 8920 ] || refuse "DEPLOY_PORT 8920 is production's"
+  under() { python3 -c 'import os, sys; r, p = map(os.path.realpath, sys.argv[1:]); sys.exit(0 if os.path.commonpath([r, p]) == r else 1)' "$1" "$2"; }
+  under "$RH_ROOT" "$DEPLOY_CONFIG_DIR" || refuse "DEPLOY_CONFIG_DIR is not under $RH_ROOT"
+  under "$RH_ROOT" "$ENV_FILE" || refuse "DEPLOY_ENV_FILE is not under $RH_ROOT"
+elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
+  echo "refused: ${OVERRIDDEN[*]} differ(s) from the production deploy; overrides are for rehearsals only" \
+       "(DEPLOY_REHEARSAL=1, scripts/rehearse_deploy.sh) — nothing was done" >&2
+  exit 1
+fi
+echo "deploy target: host=$DEPLOY_HOST runtime=$RUNTIME container=$DEPLOY_CONTAINER volume=$DEPLOY_DATA_VOLUME" \
+     "image=$DEPLOY_IMAGE port=$DEPLOY_PORT tag=$TAG${DEPLOY_REHEARSAL:+ (REHEARSAL)}"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — need MEMORA_DATABASES for memora-all" >&2; exit 1; }
 MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//")"
 [ -n "$MEMORA_DATABASES" ] || { echo "$ENV_FILE has no MEMORA_DATABASES" >&2; exit 1; }

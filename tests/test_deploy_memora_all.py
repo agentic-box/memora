@@ -319,6 +319,8 @@ def test_the_defaults_are_the_production_deploy(deploy):
     proc, calls, cfg = deploy()
     tools = deploy.tools.read_text().splitlines()
     assert tools[0] == "ssh nuc8"
+    assert ("deploy target: host=nuc8 runtime=docker container=memora-all volume=memora-all-data "
+            "image=memora:latest port=8920 tag=v0.4.6") in proc.stdout
     assert any(t.startswith("git ") and "checkout v0.4.6" in t for t in tools)
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
@@ -335,6 +337,7 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     shutil.copytree(deploy.home / ".config" / "memora", rcfg)
     (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
     proc, calls, cfg = deploy(runtime_env={
+        "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
         "DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
         "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
         "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
@@ -354,3 +357,53 @@ def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, 
     assert rename[1] == "memora-rh" and rename[2].startswith("memora-rh-grok-")
     assert (rcfg / "all.admin-token").exists() and not (cfg / "all.admin-token").exists()
     assert _files(deploy.volroot / "memora-rh-data") == _files(deploy.old)
+
+
+REHEARSAL = {"DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
+             "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
+             "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0"}
+
+
+def _nothing_done(deploy, proc, calls):
+    assert proc.returncode != 0
+    assert calls == [], "no runtime call"
+    assert not deploy.tools.exists() or not deploy.tools.read_text(), "no ssh or git"
+
+
+@pytest.mark.parametrize("override", [
+    {"RUNTIME": "podman"}, {"DEPLOY_PORT": "18920"}, {"DEPLOY_CONTAINER": "memora-rh"},
+    {"DEPLOY_HOST": "localhost"}, {"DEPLOY_SKIP_CHECKOUT": "1"}, {"DEPLOY_TAG": "v9"},
+])
+def test_an_override_without_the_rehearsal_sentinel_is_refused(deploy, override):
+    """7725 P1: a stray variable cannot re-target the production deploy."""
+    proc, calls, cfg = deploy(runtime_env=override)
+    _nothing_done(deploy, proc, calls)
+    assert "overrides are for rehearsals only" in proc.stderr and next(iter(override)) in proc.stderr
+
+
+@pytest.mark.parametrize("change, match", [
+    ({"DEPLOY_CONTAINER": "memora-all"}, "DEPLOY_CONTAINER 'memora-all' is not rehearsal-scoped"),
+    ({"DEPLOY_DATA_VOLUME": "memora-all-data"}, "DEPLOY_DATA_VOLUME 'memora-all-data' is not rehearsal-scoped"),
+    ({"DEPLOY_IMAGE": "memora:latest"}, "DEPLOY_IMAGE 'memora:latest' is not rehearsal-scoped"),
+    ({"DEPLOY_PORT": "8920"}, "8920 is production's"),
+    ({"DEPLOY_HOST": "nuc8"}, "DEPLOY_HOST must be localhost"),
+    ({"DEPLOY_CONFIG_DIR": "/etc"}, "DEPLOY_CONFIG_DIR is not under"),
+    ({"DEPLOY_REHEARSAL_ROOT": ""}, "DEPLOY_REHEARSAL_ROOT must name an existing directory"),
+])
+def test_a_rehearsal_with_a_production_like_target_is_refused(deploy, tmp_path, change, match):
+    rcfg = tmp_path / "rcfg"
+    rcfg.mkdir()
+    env = {**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+           "DEPLOY_CONFIG_DIR": str(rcfg), **change}
+    proc, calls, cfg = deploy(runtime_env=env)
+    _nothing_done(deploy, proc, calls)
+    assert match in proc.stderr
+
+
+def test_a_rehearsal_env_file_outside_the_root_is_refused(deploy, tmp_path):
+    root = tmp_path / "rh"
+    (root / "cfg").mkdir(parents=True)
+    proc, calls, cfg = deploy(runtime_env={**REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(root),
+                                           "DEPLOY_CONFIG_DIR": str(root / "cfg")})
+    _nothing_done(deploy, proc, calls)
+    assert "DEPLOY_ENV_FILE is not under" in proc.stderr

@@ -14,13 +14,32 @@ ssh server2 'cd ~/verify/feat-r1-rehearsal && PYTHON=~/verify/venv312/bin/python
 Everything it creates is suffixed `-rh`: the container `memora-rh`, the
 volume `memora-rh-data`, the image `memora-rh:latest`, port 18920. State lives
 under `~/rehearsal-r1` (`results.txt`, `commands.log`, `deploy-*.log`,
-`fixtures/`). A rerun removes only what an earlier run recorded. It never
-prunes, because pruning would delete the host user's other unused volumes.
+`fixtures/`). A rerun removes only what an earlier run recorded, and it never prunes.
+- The volume ledger records each anonymous volume with the ID of the
+  container that created it.
+- An anonymous volume is removed only when it is 64-hex, the runtime flags
+  it anonymous, and no container other than the recorded one uses it.
+- A named volume is removed only when it is one of the rehearsal's own
+  `-rh` names.
+- Step 6 checks that decoys survive.
 
 ## The deploy script's rehearsal parameters
 
 Every default is the production value, so an unparameterised run is exactly
 the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
+
+**The guard (review 7725).**
+- Any value that differs from production is refused unless
+  `DEPLOY_REHEARSAL=1` is set. Only `rehearse_deploy.sh` sets it.
+- With the sentinel, a preflight refuses before anything runs unless all of
+  these hold:
+  - `DEPLOY_REHEARSAL_ROOT` is an existing directory;
+  - `DEPLOY_HOST=localhost` (nuc8 is refused);
+  - the container, volume and image names contain `-rh`;
+  - the port is not 8920;
+  - the config dir and the env file are under the rehearsal root.
+- Every run prints its effective target (host, runtime, container, volume,
+  image, port, tag) before any git or runtime step.
 
 | variable | default | rehearsal |
 |---|---|---|
