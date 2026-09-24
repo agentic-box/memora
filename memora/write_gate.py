@@ -86,6 +86,9 @@ class _WriteGate:
         self._cond = threading.Condition()
         self._frozen = False
         self._draining = False
+        # Bumped by every thaw: schema.connect's frozen read-only check is
+        # valid only for the gate generation it ran in (X2 round 2).
+        self.thaw_generation = 0
         self._in_flight: Dict[int, _GateToken] = {}
         # Supplied by the store's intent journal (D1 stores only):
         # () -> (open intent ids, broken reason or None).
@@ -158,6 +161,7 @@ class _WriteGate:
         with self._cond:
             self._frozen = False
             self._draining = False
+            self.thaw_generation += 1
             self._cond.notify_all()
 
     # --------------------------------------------------------------- status

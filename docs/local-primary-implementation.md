@@ -281,6 +281,10 @@ Not replicated:
       work and writes are refused as before. Otherwise every connect raises
       `store <db> is frozen; schema upgrade pending (...)` until a thaw lets
       the pass run.
+      - The frozen check is its own mark, not the "schema ensured" mark
+        (review 7767). It is valid only until the gate thaws: each thaw
+        bumps the gate's `thaw_generation`. On an open gate, a store that
+        was only checked runs the full pass.
     - `/health/db/<name>` reports `freeze: {state, in_flight}`.
     - `local_primary.py` export, seed, recheck and repoint call the endpoint
       and re-read `/health/db/<name>` at every step boundary. They refuse

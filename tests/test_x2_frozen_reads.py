@@ -162,3 +162,46 @@ def test_a_frozen_d1_store_with_a_current_schema_serves_reads(tmp_path, monkeypa
             conn.close()
     finally:
         storage.CURRENT_DB.reset(token)
+
+
+# ------------------------------------------------------------------ review 7767 P1
+
+def test_a_frozen_check_is_not_a_completed_schema_pass(loc, monkeypatch):
+    """The reviewer's regression: checked while frozen, a table dropped
+    meanwhile, thaw -- the next connect runs ensure_schema."""
+    _make_store(loc)
+    _start_frozen("freeze file", monkeypatch)
+    conn = storage.connect()  # checked (current), no pass
+    conn.close()
+    backend = storage.backend_for("loc")
+    assert not schema._backend_schema_ensured(backend), "a frozen check is not the ensured mark"
+    raw = sqlite3.connect(loc)
+    raw.execute("DROP TABLE import_lease")
+    raw.commit()
+    raw.close()
+    conn = storage.connect()  # still frozen: the check is not repeated, reads still work
+    assert conn.execute("SELECT content FROM memories WHERE id = 1").fetchone()[0] == "kept"
+    conn.close()
+    status, _ = admin.thaw_store("loc")
+    assert status == 200
+    conn = storage.connect()
+    conn.close()
+    assert schema.schema_pending(sqlite3.connect(loc)) == [], "import_lease exists again"
+    assert schema._backend_schema_ensured(backend)
+
+
+def test_a_thaw_invalidates_the_frozen_check(loc, monkeypatch):
+    """Frozen again after a thaw (without a connect in between): the store
+    is checked again, so a pending upgrade is refused, not served."""
+    _make_store(loc)
+    _start_frozen("freeze file", monkeypatch)
+    storage.connect().close()
+    gate = storage.backend_for("loc").write_gate()
+    gate.thaw()
+    gate.freeze_at_start()
+    raw = sqlite3.connect(loc)
+    raw.execute("DROP TABLE import_lease")
+    raw.commit()
+    raw.close()
+    with pytest.raises(StoreReadOnlyError, match="schema upgrade pending"):
+        storage.connect()

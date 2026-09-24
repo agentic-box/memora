@@ -100,6 +100,8 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
         with _schema_lock:
             if not _backend_schema_ensured(storage_backend):
                 state = _gate_state(storage_backend)
+                if state not in (None, "open") and _checked_frozen(storage_backend):
+                    return conn  # checked in this gate generation, still not open: no pass, no re-check
                 if state not in (None, "open"):
                     # A frozen (or read-only) store refuses the schema pass's
                     # DDL, which used to make it serve nothing, reads
@@ -118,10 +120,37 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
                             f"store {getattr(storage_backend, 'store_name', None) or '(default)'!s} is {state}; "
                             f"schema upgrade pending ({', '.join(pending[:8])}"
                             f"{', ...' if len(pending) > 8 else ''}): thaw it to let the upgrade run")
-                else:
-                    ensure_schema(conn)
+                    # NOT the ensured mark (review 7767 P1): only "checked while
+                    # frozen", valid until the gate thaws. An open gate then
+                    # runs the full pass, whatever happened meanwhile.
+                    _mark_checked_frozen(storage_backend)
+                    return conn
+                ensure_schema(conn)
                 _mark_backend_schema_ensured(storage_backend)
     return conn
+
+
+def _thaw_generation(storage_backend) -> Optional[int]:
+    try:
+        return storage_backend.write_gate().thaw_generation
+    except Exception:
+        return None
+
+
+def _checked_frozen(storage_backend) -> bool:
+    """The frozen read-only check ran for this backend in the gate's current
+    thaw generation (a thaw invalidates it)."""
+    mark = getattr(storage_backend, "_schema_checked_frozen", None)
+    return mark is not None and mark == (_backend_schema_signature(storage_backend),
+                                         _thaw_generation(storage_backend))
+
+
+def _mark_checked_frozen(storage_backend) -> None:
+    try:
+        storage_backend._schema_checked_frozen = (_backend_schema_signature(storage_backend),
+                                                  _thaw_generation(storage_backend))
+    except (AttributeError, TypeError):
+        pass  # no mark: the next frozen connect checks again
 
 
 def _gate_state(storage_backend) -> Optional[str]:
