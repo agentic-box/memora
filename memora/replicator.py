@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .schema import SYNC_TABLES
+from .schema import SYNC_TABLES, SYNC_TRIGGER_VERSION
 from .write_gate import data_dir
 
 logger = logging.getLogger(__name__)
@@ -806,6 +806,12 @@ class StoreReplicator:
             if st.get("halted_reason"):
                 m["status"] = "halted"
             m.update({
+                # the sync schema as read from this store (REL1, leader 7789): the
+                # deploy checks the replica URI and the trigger version against
+                # its configuration; these keys exist only after a successful read
+                "replica_uri": st.get("replica_uri"),
+                "trigger_version": int(st.get("trigger_version") or 0),
+                "trigger_version_expected": SYNC_TRIGGER_VERSION,
                 "mode": self.mode, "head_seq": max(int(head), cursor), "last_acked_seq": int(st["last_acked_seq"]),
                 "log_cursor_seq": int(st["log_cursor_seq"]), "lag_rows": int(lag),
                 "oldest_unacked_julianday": oldest, "last_ack_at": st.get("last_ack_at"),
@@ -888,11 +894,14 @@ class StoreReplicator:
             try:
                 started = time.monotonic()
                 outcome = self.run_once()
-                if outcome in ("sent", "logged"):
+                if outcome not in ("idle", "halted"):
+                    # a send, a reconcile read-back or resend: the next one waits
+                    # the interval (review 7787 P2: an uncertain outcome counts)
                     self._last_send_start = started
                 if outcome in ("sent", "logged", "reconciled-acked", "reconciled-resend"):
                     continue  # there may be more: no wait
             except Exception as exc:
+                self._last_send_start = started  # a failed attempt may have reached D1
                 self._backoff = min(BACKOFF_MAX_S, max(1.0, self._backoff * 2))
                 wait = self._backoff
                 self._set_error(f"{type(exc).__name__}: {exc}")

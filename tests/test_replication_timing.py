@@ -240,3 +240,35 @@ def test_a_later_valid_start_clears_the_refusal(configured, monkeypatch):
     monkeypatch.setenv("MEMORA_REPLICATION_POLL_S", "1")
     R.start_replicators(start=False)
     assert R.start_refusal("s1") is None and R.replicator_for("s1") is not None
+
+
+def test_an_uncertain_outcome_also_waits_the_interval(env):
+    """Review 7787 P2: a batch that reached D1 but failed before the ack is
+    reconciled no sooner than one interval after that send started."""
+    local, replica, sends = env
+    d1 = []  # monotonic time of every D1 request
+    post, read = replica.post_json, replica.reader_post
+    replica.post_json = lambda body: (d1.append(("write", time.monotonic())), post(body))[1]
+    replica.reader_post = lambda body: (d1.append(("read", time.monotonic())), read(body))[1]
+    replica.apply_then_raise = (10**6, RuntimeError("connection reset after the batch applied"))
+    rep = _rep(local, replica, interval_s=2.0, poll_s=0.05)
+    _insert(local, [1])
+    rep.start()
+    try:
+        assert _wait(lambda: any(k == "write" for k, _ in d1), 5)
+        failed_at = next(t for k, t in d1 if k == "write")
+        replica.apply_then_raise = None
+        assert _wait(lambda: sync_state(local)["last_acked_seq"] == _head(local), 10)
+    finally:
+        rep.stop()
+    after = [t for _, t in d1 if t > failed_at]
+    assert after and after[0] - failed_at >= 2.0 - 0.3, (after[0] - failed_at if after else None)
+
+
+def test_health_shows_the_sync_schema_it_read(env):
+    local, replica, _ = env
+    rep = _rep(local, replica)
+    rep._open()
+    st = rep.status()
+    assert st["replica_uri"] == URI
+    assert st["trigger_version"] == st["trigger_version_expected"] == R.SYNC_TRIGGER_VERSION

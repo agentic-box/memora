@@ -357,9 +357,10 @@ printf "MEMORA_DATABASES='%s'\nMEMORA_REPLICAS='%s'\nMEMORA_REPLICATION=log\nMEM
 if deploy > "$RH_ROOT/deploy-4.log" 2>&1; then pass "deploy with MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env"; \
   else fail "deploy 4 (exit $?; see deploy-4.log)"; tail -30 "$RH_ROOT/deploy-4.log"; fi
 adopt NEW4_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
-grep -q "store re: /health/db 200 ok, FROZEN (persisted freeze); memory_stats skipped" "$RH_ROOT/deploy-4.log" \
-  && pass "the deploy's store check accepts re frozen (its /health/db), not a tool call a frozen start refuses" \
-  || fail "deploy 4 did not report re as frozen"
+grep -q "store re: replicating (log) to d1://rh-acct/rh-db" "$RH_ROOT/deploy-4.log" \
+  && grep -q "store re: /health/db 200 ok, FROZEN .*memory_stats" "$RH_ROOT/deploy-4.log" \
+  && pass "the deploy checked re's replication and ran memory_stats on it while frozen (X2: frozen stores serve reads)" \
+  || fail "deploy 4 did not check re as a frozen replicated store"
 check "wait for /health after deploy 4" wait_health
 "$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q 'MEMORA_REPLICATION=log' \
   && pass "the container env carries the local-primary switches from all.env" || fail "MEMORA_REPLICATION not passed through"

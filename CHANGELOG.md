@@ -94,9 +94,22 @@ newest first, are the slices of the implementation plan
   reinstalls the triggers when the version is older or the columns changed
   (a column added by a migration). An empty outbox already made no D1
   call, so an idle store makes no D1 request.
-- The deploy's per-store check accepts a store that comes up frozen by its
-  `/health/db` 200. Such a store serves no tool call until it is thawed:
-  its first connection's schema pass is a write.
+- The deploy's per-store check runs `memory_stats` on a store that comes
+  up frozen too (X2: frozen stores serve reads), and fails a
+  frozen-unsafe one.
+- For every store in `MEMORA_REPLICAS`, frozen or not, the deploy also
+  requires `/health/db`'s replication block to show the configured mode
+  and `replica_uri`, a status neither refused nor halted, and the sync
+  schema at the current trigger version; otherwise it fails and names the
+  rollback. The replication block now carries `replica_uri`,
+  `trigger_version` and `trigger_version_expected`.
+- The deploy pins `MEMORA_DATA_DIR=/data` in the container (X3's service
+  lock, `/data/.service.lock`, must be the one memora-all holds). A
+  `MEMORA_DATA_DIR` in `credentials.mcp.json` is filtered out; one in
+  either source naming another directory is refused before the old
+  container is touched.
+- A send whose outcome is uncertain (a D1 error after the batch) also
+  starts the interval, so a reconcile or resend waits for it.
 - On an SELinux-enforcing host (the Fedora rehearsal host), the token
   directory is mounted `:ro,z`, a shared relabel.
 - The cutover runs the operator tool the image carries since X3

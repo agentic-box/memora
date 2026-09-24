@@ -400,7 +400,7 @@ def _nothing_done(deploy, proc, calls):
 @pytest.mark.parametrize("override", [
     {"RUNTIME": "podman"}, {"DEPLOY_PORT": "18920"}, {"DEPLOY_CONTAINER": "memora-rh"},
     {"DEPLOY_HOST": "localhost"}, {"DEPLOY_SKIP_CHECKOUT": "1"}, {"DEPLOY_TAG": "v9"},
-    {"DEPLOY_LABELS": "memora.rehearsal=x"}, {"DEPLOY_SECRETS_DIR": "/tmp/tokens"},
+    {"DEPLOY_LABELS": "memora.rehearsal=x"}, {"DEPLOY_SECRETS_DIR": "/tmp/tokens"}, {"DEPLOY_STORE_WAIT_S": "1"},
 ])
 def test_an_override_without_the_rehearsal_sentinel_is_refused(deploy, override):
     """7725 P1: a stray variable cannot re-target the production deploy."""
@@ -690,3 +690,178 @@ class TestReplicationTimingPassthrough:
         proc, calls, _ = deploy()
         _nothing_done(deploy, proc, calls)
         assert var in proc.stderr and "nothing was done" in proc.stderr
+
+
+# ---------------------------------------------------------------- REL1 review 7787 P1: replicated stores after the start
+
+class _FakeMemora:
+    """The HTTP surface the deploy's post-start check talks to: /health,
+    /health/db/<store>, /mcp/<store> (initialize, memory_semantic_search,
+    memory_stats) and /api/v1 (404). health_db maps a store to its body."""
+
+    def __init__(self, health_db):
+        import http.server
+        import threading
+
+        outer = self
+        self.health_db = health_db
+        self.tool_calls = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj, headers=()):
+                raw = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                for k, v in headers:
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def do_GET(self):
+                if self.path == "/health":
+                    return self._send(200, {"status": "ok", "version": "0.5.0"})
+                if self.path.startswith("/health/db/"):
+                    store = self.path.rsplit("/", 1)[1]
+                    return self._send(200, {"status": "ok", "stale": False, **outer.health_db.get(store, {})})
+                return self._send(404, {})
+
+            def do_POST(self):
+                store = self.path.rsplit("/", 1)[1]
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if body.get("method") == "initialize":
+                    return self._send(200, {"jsonrpc": "2.0", "id": 1, "result": {}}, [("mcp-session-id", "s1")])
+                if body.get("method") == "tools/call":
+                    name = body["params"]["name"]
+                    outer.tool_calls.append((store, name))
+                    out = {"results": [], "profile": {"total_requests": 1, "total_seconds": 0}}
+                    if name == "memory_stats":
+                        out = {**out, "database": store, "import_pending": 0, "total_memories": 1}
+                    return self._send(200, {"jsonrpc": "2.0", "id": body["id"],
+                                            "result": {"content": [{"type": "text", "text": json.dumps(out)}]}})
+                return self._send(202, {})
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+
+
+REPL_OK = {"mode": "write", "status": "running", "replica_uri": "d1://acct/db3", "head_seq": 0,
+           "last_acked_seq": 0, "lag_rows": 0, "trigger_version": 2, "trigger_version_expected": 2}
+FROZEN = {"freeze": {"state": "frozen", "in_flight": 0}}
+
+
+@pytest.fixture
+def poststart(deploy, tmp_path):
+    """A rehearsal-mode deploy against _FakeMemora: `re` replicated (write)."""
+    rcfg = tmp_path / "rcfg"
+    shutil.copytree(deploy.home / ".config" / "memora", rcfg)
+    (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
+    rsec = tmp_path / "rsec"
+    shutil.copytree(deploy.secrets, rsec)
+    envf = tmp_path / "rh.env"
+    envf.write_text(f"MEMORA_DATABASES='{json.dumps(LOCAL_REGISTRY)}'\n"
+                    f"MEMORA_REPLICAS='{json.dumps({'re': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n")
+    servers = []
+
+    def run(health_db):
+        fake = _FakeMemora(health_db)
+        servers.append(fake)
+        proc, calls, _ = deploy(runtime_env={
+            **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
+            "DEPLOY_LABELS": "memora.rehearsal=rh-t", "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SECRETS_DIR": str(rsec),
+            "DEPLOY_ENV_FILE": str(envf), "DEPLOY_PORT": str(fake.port), "DEPLOY_TAG": "v0.5.0",
+            "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_STORE_WAIT_S": "2"})
+        return proc, fake
+
+    yield run
+    for s in servers:
+        s.close()
+
+
+class TestReplicatedStoreAfterStart:
+    def test_a_frozen_replicating_store_passes(self, poststart):
+        proc, fake = poststart({"re": {**FROZEN, "replication": REPL_OK}})
+        assert "store re: replicating (write) to d1://acct/db3, status running, trigger version 2" in proc.stdout
+        assert "store re: /health/db 200 ok, FROZEN" in proc.stdout
+        assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
+        assert ("re", "memory_stats") in fake.tool_calls  # X2: a frozen store serves reads
+
+    def test_a_thawed_replicating_store_is_checked_and_called(self, poststart):
+        proc, fake = poststart({"re": {"replication": REPL_OK}})
+        assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
+        assert ("re", "memory_stats") in fake.tool_calls
+
+    @pytest.mark.parametrize("body, reason", [
+        ({"replication": {"status": "refused", "error": "ReplicatorConfigError: re: no sync_state (install_sync has not run)"}},
+         "replication refused: ReplicatorConfigError: re: no sync_state"),
+        ({"replication": {**REPL_OK, "status": "halted", "halted_reason": "foreign_writer"}}, "replication halted: foreign_writer"),
+        ({"replication": {**REPL_OK, "mode": "log"}}, "replication mode 'log', configured 'write'"),
+        ({"replication": {**REPL_OK, "replica_uri": "d1://acct/other"}}, "replica_uri 'd1://acct/other', configured 'd1://acct/db3'"),
+        ({"replication": {**REPL_OK, "trigger_version": 1}}, "sync trigger version 1, this build expects 2"),
+        ({"refused": "the /data check refused it", "replication": REPL_OK}, "the store is refused"),
+    ])
+    def test_a_frozen_store_fails_on_its_replication(self, poststart, body, reason):
+        proc, fake = poststart({"re": {**FROZEN, **body}})
+        assert proc.returncode != 0
+        assert "STORE CHECK FAILED — re: " + reason in proc.stderr, proc.stderr[-2000:]
+        assert "L6 runbook" in proc.stderr and "all 3 stores verified" not in proc.stdout
+
+    @pytest.mark.parametrize("body, reason", [
+        ({}, "no replication block (the replicator has not started)"),
+        ({"replication": {"mode": "write", "status": "disabled"}}, "the replicator has not read its sync state yet"),
+    ])
+    def test_http_200_alone_is_not_enough_for_a_frozen_replicated_store(self, poststart, body, reason):
+        # not terminal: waited for (DEPLOY_STORE_WAIT_S, 90 s in production), then failed
+        proc, _ = poststart({"re": {**FROZEN, **body}})
+        assert proc.returncode != 0 and f"STORE CHECK FAILED — re: {reason}" in proc.stderr, proc.stderr[-1500:]
+
+    def test_a_store_not_replicated_keeps_the_plain_check(self, poststart):
+        proc, fake = poststart({"re": {"replication": REPL_OK}, "ob1": {**FROZEN}})
+        assert "store ob1: /health/db 200 ok, FROZEN" in proc.stdout
+        assert "store ob1: replicating" not in proc.stdout
+        assert "all 3 stores verified" in proc.stdout, proc.stderr[-1500:]
+
+
+def test_a_frozen_unsafe_store_fails_the_deploy(poststart):
+    proc, _ = poststart({"re": {"replication": REPL_OK}, "ob1": {"freeze": {"state": "frozen-unsafe", "in_flight": 1}}})
+    assert proc.returncode != 0 and "STORE CHECK FAILED — ob1: frozen-unsafe after the restart" in proc.stderr
+
+
+class TestDataDirPinned:
+    """Leader 7834: MEMORA_DATA_DIR is /data in the container, whatever the
+    sources say; a source naming another dir is refused (X3's service lock)."""
+
+    def _data_dirs(self, calls):
+        return [e for e in _flag_values(_new_container_run(calls), "-e") if e.startswith("MEMORA_DATA_DIR=")]
+
+    def test_set_to_data(self, deploy):
+        _, calls, _ = deploy()
+        assert self._data_dirs(calls) == ["MEMORA_DATA_DIR=/data"]
+
+    def test_credentials_saying_data_are_not_duplicated(self, deploy):
+        _, calls, _ = deploy(cred_env={"MEMORA_DATA_DIR": "/data", "OPENAI_API_KEY": "k"})
+        assert self._data_dirs(calls) == ["MEMORA_DATA_DIR=/data"]
+
+    def test_credentials_naming_another_dir_are_refused_before_the_stop(self, deploy):
+        proc, calls, _ = deploy(cred_env={"MEMORA_DATA_DIR": "/elsewhere", "OPENAI_API_KEY": "k"})
+        assert proc.returncode != 0 and "sets MEMORA_DATA_DIR=/elsewhere" in proc.stderr
+        assert "pinned to /data" in proc.stderr
+        assert not any(c[0] in ("stop", "rename") or c[:2] == ["run", "-d"] for c in calls)
+
+    def test_all_env_naming_another_dir_is_refused_before_anything(self, deploy):
+        deploy.env_file.write_text(deploy.env_file.read_text() + "MEMORA_DATA_DIR=/srv/memora\n")
+        proc, calls, _ = deploy()
+        _nothing_done(deploy, proc, calls)
+        assert "sets MEMORA_DATA_DIR=/srv/memora" in proc.stderr
+
+    def test_all_env_saying_data_is_accepted(self, deploy):
+        deploy.env_file.write_text(deploy.env_file.read_text() + "MEMORA_DATA_DIR=/data\n")
+        _, calls, _ = deploy()
+        assert self._data_dirs(calls) == ["MEMORA_DATA_DIR=/data"]

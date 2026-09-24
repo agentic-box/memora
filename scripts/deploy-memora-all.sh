@@ -156,6 +156,7 @@ DEPLOY_SKIP_CHECKOUT="${DEPLOY_SKIP_CHECKOUT:-0}"            # 1: build DEPLOY_R
 DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed absorb in the smoke check
 DEPLOY_LABELS="${DEPLOY_LABELS:-}"                          # rehearsal only: k=v labels on what it creates
 DEPLOY_SECRETS_DIR="${DEPLOY_SECRETS_DIR:-~/.config/memora-lp}"  # token dir, mounted :ro (expanded on the target host)
+DEPLOY_STORE_WAIT_S="${DEPLOY_STORE_WAIT_S:-90}"            # per-store readiness wait after the start (s)
 # Production overrides (documented, no sentinel): token file NAMES inside
 # DEPLOY_SECRETS_DIR. The same file may serve both D1 roles (the pilot does).
 DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-cloudflare-api.token}"
@@ -194,6 +195,7 @@ DEPLOY_SMOKE_ABSORB|DEPLOY_SMOKE_ABSORB|1
 DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
 DEPLOY_LABELS|DEPLOY_LABELS|
 DEPLOY_SECRETS_DIR|DEPLOY_SECRETS_DIR|~/.config/memora-lp
+DEPLOY_STORE_WAIT_S|DEPLOY_STORE_WAIT_S|90
 DEFAULTS
 if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   RH_ROOT="${DEPLOY_REHEARSAL_ROOT:-}"
@@ -226,6 +228,13 @@ MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
 # runs: MEMORA_REPLICATION is log|write; MEMORA_REPLICAS maps stores of
 # MEMORA_DATABASES whose registry entry is LOCAL to d1://account/database.
 env_value() { { grep -E "^$1=" "$ENV_FILE" || true; } | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//"; }
+# MEMORA_DATA_DIR is pinned to /data in the container (leader 7834: X3's
+# service lock, /data/.service.lock, must be the one memora-all holds).
+DATA_DIR_SET="$(env_value MEMORA_DATA_DIR)"
+if [ -n "$DATA_DIR_SET" ] && [ "$DATA_DIR_SET" != /data ]; then
+  echo "refused: $ENV_FILE sets MEMORA_DATA_DIR=$DATA_DIR_SET; memora-all's data dir is pinned to /data (the service lock) — nothing was done" >&2
+  exit 1
+fi
 MEMORA_REPLICAS="$(env_value MEMORA_REPLICAS)"
 MEMORA_REPLICATION="$(env_value MEMORA_REPLICATION)"
 # The replicator's timing (leader 7762), the server's own ranges; unset = its default.
@@ -286,7 +295,7 @@ fi
   "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO" \
   "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR" \
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE" \
-  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" <<'REMOTE'
+  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S" <<'REMOTE'
 set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -445,12 +454,18 @@ for k, v in env.items():
         print(f'{k}={v}')
 ")" || { echo "credentials parser failed — aborting before touching the live container" >&2; exit 1; }
 [ -n "$ENV_LINES" ] || { echo "credentials parser produced no output — aborting before touching the live container" >&2; exit 1; }
+CRED_DATA_DIR="$(printf '%s\n' "$ENV_LINES" | sed -n 's/^MEMORA_DATA_DIR=//p' | head -1)"
+if [ -n "$CRED_DATA_DIR" ] && [ "$CRED_DATA_DIR" != /data ]; then
+  echo "refused: $CRED sets MEMORA_DATA_DIR=$CRED_DATA_DIR; memora-all's data dir is pinned to /data (the service lock) — aborting before touching the live container" >&2
+  exit 1
+fi
 
 ENV_ARGS=()
 while IFS='=' read -r key value; do
   [ -z "$key" ] && continue
   case "$key" in
     MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB|MEMORA_PROJECTS|MEMORA_DATA_VOLUME|MEMORA_ADMIN_TOKEN) continue ;;
+    MEMORA_DATA_DIR) continue ;;   # pinned below (checked above)
     # Cloudflare tokens come ONLY from the mounted files (REL1); the
     # local-primary switches ONLY from all.env.
     CLOUDFLARE_API_TOKEN|CF_API_TOKEN|MEMORA_D1_READ_TOKEN|MEMORA_D1_REPLICATOR_TOKEN) continue ;;
@@ -555,6 +570,7 @@ fi
   -v "$DATA_VOLUME:/data" \
   -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
   -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
+  -e "MEMORA_DATA_DIR=/data" \
   -e "MEMORA_TOOL_PROFILE=leader" \
   -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
   -e "MEMORA_ADMIN_TOKEN=$ADMIN_TOKEN" \
@@ -611,7 +627,7 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 
-python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" <<'PY'
+python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" "${21}" <<'PY'
 import json, sys, time, urllib.error, urllib.request
 
 EXPECTED_VERSION = sys.argv[1]
@@ -619,6 +635,11 @@ STORES = list(json.loads(sys.argv[2]))
 HEALTH_TOKEN = sys.argv[3]
 ROOT = f"http://127.0.0.1:{sys.argv[4]}"
 SMOKE_ABSORB = sys.argv[5] == "1"
+REPLICAS = json.loads(sys.argv[6] or "{}")   # the local-primary switches this deploy set
+REPLICATION = sys.argv[7]
+STORE_WAIT_S = float(sys.argv[8])   # 90 in production (DEPLOY_STORE_WAIT_S: rehearsals only)
+L6 = ("rollback: a store already cut over (in MEMORA_REPLICAS) follows docs/cutover-runbook.md \"Rollback\" "
+      "and the L6 runbook, docs/local-primary-implementation.md §5.3")
 BASE = f"{ROOT}/mcp/memora"
 
 # The version the RUNNING process reports -- a stale image or a failed
@@ -773,32 +794,68 @@ def _store_health(store):
     except (urllib.error.URLError, OSError, ValueError) as exc:
         return None, {"error": str(exc)}
 
+def _replication_problem(store, body):
+    """None when a store of MEMORA_REPLICAS replicates as configured (leader
+    7789): a replication block, the configured mode and replica URI, not
+    refused or halted, the sync schema read (sync_state present) at the
+    current trigger version. Otherwise (terminal, reason): terminal means
+    waiting will not fix it."""
+    if body.get("refused"):
+        return True, f"the store is refused: {body['refused']}"
+    rep = body.get("replication")
+    if not isinstance(rep, dict):
+        return False, "no replication block (the replicator has not started)"
+    if rep.get("status") == "refused":
+        return True, f"replication refused: {rep.get('error')}"
+    if rep.get("status") == "halted" or rep.get("halted_reason"):
+        return True, f"replication halted: {rep.get('halted_reason')}"
+    if "head_seq" not in rep or "trigger_version" not in rep:
+        return False, f"the replicator has not read its sync state yet (status {rep.get('status')!r})"
+    if rep.get("mode") != REPLICATION:
+        return True, f"replication mode {rep.get('mode')!r}, configured {REPLICATION!r}"
+    if rep.get("replica_uri") != REPLICAS[store]:
+        return True, f"replica_uri {rep.get('replica_uri')!r}, configured {REPLICAS[store]!r}"
+    if rep.get("trigger_version") != rep.get("trigger_version_expected"):
+        return True, (f"sync trigger version {rep.get('trigger_version')!r}, "
+                      f"this build expects {rep.get('trigger_version_expected')!r}")
+    return None
+
+
 failed = []
 for store in STORES:
-    deadline = time.time() + 90
+    deadline = time.time() + STORE_WAIT_S
     healthy = False
+    problem = None
     while not healthy:
         status, body = _store_health(store)
         healthy = status == 200 and body.get("status") == "ok" and body.get("stale") is False
+        if healthy and store in REPLICAS:
+            problem = _replication_problem(store, body)
+            healthy = problem is None
+            if problem and problem[0]:
+                break  # terminal: waiting will not fix it
         if not healthy and time.time() > deadline:
             break
         if not healthy:
             time.sleep(3)
+    if problem:
+        failed.append(f"{store}: {problem[1]} (/health/db/{store}: {json.dumps(body)[:400]}); {L6}")
+        continue
     if not healthy:
-        failed.append(f"{store}: /health/db/{store} not a current 200 ok after 90s "
+        failed.append(f"{store}: /health/db/{store} not a current 200 ok after {STORE_WAIT_S:g}s "
                       f"(last: HTTP {status}, {json.dumps(body)[:300]})")
         continue
+    if store in REPLICAS:
+        rep = body["replication"]
+        print(f"store {store}: replicating ({rep['mode']}) to {rep['replica_uri']}, status {rep.get('status')}, "
+              f"trigger version {rep['trigger_version']}, lag_rows {rep.get('lag_rows')}")
     # A store that comes up FROZEN (the persisted freeze of a cutover,
-    # scripts/cutover_store.sh step e) serves no tool call until it is
-    # thawed: a process's first connection runs the schema pass, a write the
-    # gate refuses. Its /health/db 200 (a schema-free probe) is the check.
+    # scripts/cutover_store.sh step e) serves reads (X2), so memory_stats
+    # below checks it like any other; a replicated one also passed the
+    # replication checks above. Frozen-UNSAFE (open intents) fails.
     freeze = (body.get("freeze") or {}).get("state")
-    if freeze in ("frozen", "frozen-unsafe"):
-        if freeze != "frozen":
-            failed.append(f"{store}: frozen-unsafe after the restart: {json.dumps(body.get('freeze'))[:300]}")
-            continue
-        print(f"store {store}: /health/db 200 ok, FROZEN (persisted freeze); memory_stats skipped "
-              "(a store that starts frozen serves no tool call until it is thawed)")
+    if freeze == "frozen-unsafe":
+        failed.append(f"{store}: frozen-unsafe after the restart: {json.dumps(body.get('freeze'))[:300]}")
         continue
     store_base = f"{ROOT}/mcp/{store}"
     store_sid = _initialize(store_base)
@@ -810,7 +867,8 @@ for store in STORES:
     if not isinstance(pending, int) or isinstance(pending, bool):
         failed.append(f"{store}: memory_stats has no integer import_pending")
         continue
-    print(f"store {store}: /health/db 200 ok (latency {body.get('latency_ms')} ms); memory_stats "
+    print(f"store {store}: /health/db 200 ok{', FROZEN' if freeze == 'frozen' else ''} "
+          f"(latency {body.get('latency_ms')} ms); memory_stats "
           f"{stats.get('total_memories')} memories, import_pending={pending} ({elapsed:.1f}s)")
 if failed:
     for line in failed:

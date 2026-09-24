@@ -242,6 +242,12 @@ def schema_pending(conn) -> List[str]:
         row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
         if row is not None and int(row[0]) < SYNC_TRIGGER_VERSION:
             pending.append(f"sync triggers v{row[0]} < v{SYNC_TRIGGER_VERSION}")
+        elif row is not None and "trigger_columns" in cols:
+            # REL1: the update triggers compare a fixed column list; the pass
+            # reinstalls them when the replicated tables' columns changed
+            fp = conn.execute("SELECT trigger_columns FROM sync_state WHERE id = 1").fetchone()[0]
+            if fp != _columns_fingerprint(sync_columns(conn)):
+                pending.append("sync triggers (the replicated tables' columns changed)")
     return pending
 
 

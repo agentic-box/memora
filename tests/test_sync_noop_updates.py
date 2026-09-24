@@ -193,3 +193,17 @@ def test_an_embedding_rewrite_without_a_new_writer_token_is_a_real_change(store)
     conn.close()
     assert tuple(row) == (None, None)
     assert ("memories_embeddings", "U", "[1]") in _outbox(local)[len(before):]
+
+
+def test_a_frozen_store_reports_stale_triggers_as_a_pending_upgrade(store):
+    """X2's read-only check (schema_pending) must list what ensure_schema
+    would do: a column added since the triggers were installed."""
+    local, _ = store
+    conn = local.connect()
+    assert schema.schema_pending(conn) == []
+    conn.execute("ALTER TABLE memories ADD COLUMN rel1_extra TEXT")
+    conn.commit()
+    assert schema.schema_pending(conn) == ["sync triggers (the replicated tables' columns changed)"]
+    schema.ensure_schema(conn)
+    assert schema.schema_pending(conn) == []
+    conn.close()

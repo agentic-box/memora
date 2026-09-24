@@ -105,14 +105,20 @@ MEMORA_REPLICATION_INTERVAL_S=60                             (--interval)
   name. `file:///data/<db>.db` also works.
 - `MEMORA_REPLICAS` is a JSON map. A bare store name does not work.
 
-**Between step e and the thaw, the store serves no tool call, reads
-included.** A process's first connection to a store runs the schema pass
-(`CREATE … IF NOT EXISTS`), and the write gate refuses it while the store
-is frozen. So after the redeploy, `memory_stats` or a search on `<db>`
-fails with "store '<db>' is frozen: writes are refused" until step h.
-- The deploy's own store check accepts a frozen store by its `/health/db`
-  200 (a schema-free probe) and says so.
-- Plan steps e to h close together, and tell the store's users.
+**Between step e and the thaw, the store serves reads, not writes.** It
+comes up frozen from the persisted freeze. Since X2 a frozen store skips
+the schema pass when a read-only check shows it would change nothing, so
+searches and `memory_stats` work; writes are refused until step h. If
+that check finds a pending upgrade, the store refuses even reads, and says
+so, until it is thawed.
+- The deploy's store check runs `memory_stats` on a frozen store too.
+- For a store in `MEMORA_REPLICAS`, frozen or not, the check also requires
+  (review 7787, leader 7789) a replication block; the configured mode and
+  `replica_uri`; a status neither `refused` nor `halted`; and the sync
+  schema read from the store at the current trigger version.
+  - A refused or halted replicator fails the deploy at once.
+  - A block that has not appeared is waited for (90 s), then fails.
+  - Each failure names the rollback.
 
 ### Runs
 
