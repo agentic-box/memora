@@ -44,6 +44,11 @@ FK_CHILDREN = ("memories_embeddings", "memories_crossrefs")
 DELETE_GUARD_ROWS = 50
 DELETE_GUARD_FRACTION = 0.01
 BACKOFF_MAX_S = 60.0
+# Timing (REL1, leader 7762), from the environment; see replication_timing().
+DEFAULT_INTERVAL_S = 0.0   # 0: send as soon as a commit wakes the replicator
+DEFAULT_POLL_S = 5.0       # the fallback wake when no commit event arrives
+DEFAULT_BATCH_ROWS = 100
+MAX_BATCH_ROWS = 1000
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -481,9 +486,11 @@ def _reader_for(replica_uri: str):
 
 
 def _writer_for(replica_uri: str) -> ReplicaD1Connection:
-    token = os.getenv("MEMORA_D1_REPLICATOR_TOKEN", "").strip()
+    from .secret_files import secret
+
+    token = secret("MEMORA_D1_REPLICATOR_TOKEN")
     if not token:
-        raise ReplicatorConfigError("write mode needs MEMORA_D1_REPLICATOR_TOKEN (never CLOUDFLARE_API_TOKEN)")
+        raise ReplicatorConfigError("write mode needs MEMORA_D1_REPLICATOR_TOKEN(_FILE) (never CLOUDFLARE_API_TOKEN)")
     account, database = _replica_ids(replica_uri)
     return ReplicaD1Connection(account, database, token)
 
@@ -510,7 +517,8 @@ class StoreReplicator:
     """One store's replicator thread (plan §2.1-§2.7)."""
 
     def __init__(self, name: str, local, replica_uri: str, *, mode: str, shadow: bool = False,
-                 batch_rows: int = 100, poll_s: float = 5.0,
+                 batch_rows: int = DEFAULT_BATCH_ROWS, poll_s: float = DEFAULT_POLL_S,
+                 interval_s: float = DEFAULT_INTERVAL_S,
                  writer_factory: Optional[Callable[[str], Any]] = None,
                  reader_factory: Optional[Callable[[str], Any]] = None,
                  broadcast: Optional[Callable[[], None]] = None):
@@ -525,6 +533,12 @@ class StoreReplicator:
         self.shadow = shadow
         self.batch_rows = batch_rows
         self.poll_s = poll_s
+        # The minimum time between the STARTS of consecutive sends (a D1
+        # batch in write mode, a log append in log mode). Commits made
+        # meanwhile accumulate into the next batch (at most batch_rows rows;
+        # a longer backlog drains one batch per interval).
+        self.interval_s = interval_s
+        self._last_send_start: Optional[float] = None
         self._writer_factory = writer_factory or _writer_for
         self._reader_factory = reader_factory or _reader_for
         self._broadcast = broadcast if broadcast is not None else _default_broadcast
@@ -537,7 +551,8 @@ class StoreReplicator:
         self._backoff = 0.0
         self._lock = threading.Lock()
         self._metrics: Dict[str, Any] = {"mode": mode, "status": "disabled", "last_error": None,
-                                         "d1_missing_vectors": None}
+                                         "d1_missing_vectors": None, "interval_s": interval_s,
+                                         "poll_s": poll_s, "batch_rows": batch_rows}
         # The H3 marker as the store's gate sees it (review 7599 P1-1): set in
         # the same critical section as the marker's commit, BEFORE the send,
         # and cleared only after the ack (or the reconcile) commits.
@@ -860,8 +875,21 @@ class StoreReplicator:
             return
         while not self._stop.is_set():
             wait = self.poll_s
+            if self.interval_s > 0 and self._last_send_start is not None:
+                # Hold the next send until the interval since the last one's
+                # start has elapsed; commits accumulate meanwhile. A freeze
+                # is not delayed by this (no send is in flight while it
+                # waits); a drain that waits for the acks (the barrier
+                # compare, the rollback's drain) waits at most one interval
+                # longer per batch.
+                remaining = self._last_send_start + self.interval_s - time.monotonic()
+                if remaining > 0 and self._stop.wait(remaining):
+                    break
             try:
+                started = time.monotonic()
                 outcome = self.run_once()
+                if outcome in ("sent", "logged"):
+                    self._last_send_start = started
                 if outcome in ("sent", "logged", "reconciled-acked", "reconciled-resend"):
                     continue  # there may be more: no wait
             except Exception as exc:
@@ -1088,6 +1116,45 @@ def _json_env(name: str) -> Dict[str, str]:
     return value
 
 
+_START_REFUSALS: Dict[str, str] = {}
+
+
+def start_refusal(name: str) -> Optional[str]:
+    """Why this process did not start the store's replicator (for health)."""
+    return _START_REFUSALS.get(name)
+
+
+def replication_timing() -> Dict[str, Any]:
+    """MEMORA_REPLICATION_INTERVAL_S (float >= 0, default 0),
+    MEMORA_REPLICATION_POLL_S (float > 0, default 5.0) and
+    MEMORA_REPLICATION_BATCH_ROWS (integer 1..1000, default 100). An unset
+    or empty variable takes the default; anything else that is not a valid
+    value raises ReplicatorConfigError -- never a silent default."""
+    import math
+
+    def number(var: str, default: float, *, positive: bool) -> float:
+        raw = os.getenv(var, "").strip()
+        if not raw:
+            return default
+        try:
+            v = float(raw)
+        except ValueError:
+            v = float("nan")
+        if not math.isfinite(v) or v < 0 or (positive and v == 0):
+            raise ReplicatorConfigError(f"{var}={raw!r}: must be a finite number {'> 0' if positive else '>= 0'}")
+        return v
+
+    raw = os.getenv("MEMORA_REPLICATION_BATCH_ROWS", "").strip()
+    rows = DEFAULT_BATCH_ROWS
+    if raw:
+        if not raw.isdigit() or not 1 <= int(raw) <= MAX_BATCH_ROWS:
+            raise ReplicatorConfigError(f"MEMORA_REPLICATION_BATCH_ROWS={raw!r}: must be an integer 1..{MAX_BATCH_ROWS}")
+        rows = int(raw)
+    return {"interval_s": number("MEMORA_REPLICATION_INTERVAL_S", DEFAULT_INTERVAL_S, positive=False),
+            "poll_s": number("MEMORA_REPLICATION_POLL_S", DEFAULT_POLL_S, positive=True),
+            "batch_rows": rows}
+
+
 def start_replicators(*, start: bool = True) -> Dict[str, Any]:
     """Start one replicator per configured store (plan §2.1). Dark unless
     MEMORA_REPLICATION is log|write and MEMORA_REPLICAS or MEMORA_SHADOW_LOCAL
@@ -1102,10 +1169,16 @@ def start_replicators(*, start: bool = True) -> Dict[str, Any]:
     replicas = _json_env("MEMORA_REPLICAS")
     shadows = _json_env("MEMORA_SHADOW_LOCAL")
     plans = [(n, uri, False) for n, uri in replicas.items()] + [(n, path, True) for n, path in shadows.items()]
+    try:
+        timing, timing_error = replication_timing(), None
+    except ReplicatorConfigError as exc:
+        timing, timing_error = None, exc
     for name, value, shadow in plans:
         try:
             if name in _REPLICATORS:
                 continue
+            if timing_error is not None:
+                raise timing_error
             if name in _store_refusals:
                 # The /data check refused this store (memora/data_volume.py).
                 # A shadow file is built from its path, not through
@@ -1119,7 +1192,7 @@ def start_replicators(*, start: bool = True) -> Dict[str, Any]:
                 local = backend_for(name)
                 store_mode = mode
                 if not isinstance(local, LocalSQLiteBackend):
-                    raise ReplicatorConfigError(f"{name}: a replicated store must be local (sqlite://)")
+                    raise ReplicatorConfigError(f"{name}: a replicated store must be local (a path or file:// in MEMORA_DATABASES)")
             conn = local.connect_replicator()
             try:
                 row = conn.execute("SELECT replica_uri FROM sync_state WHERE id = 1").fetchone()
@@ -1134,18 +1207,20 @@ def start_replicators(*, start: bool = True) -> Dict[str, Any]:
                 raise ReplicatorConfigError(f"{name}: MEMORA_REPLICAS {value!r} != sync_state {replica_uri!r}")
             if store_mode == MODE_WRITE:
                 _writer_for(replica_uri)  # fail early without the replicator token
-            rep = StoreReplicator(name, local, replica_uri, mode=store_mode, shadow=shadow)
+            rep = StoreReplicator(name, local, replica_uri, mode=store_mode, shadow=shadow, **timing)
             if not shadow:
                 gate = local.write_gate()
                 if gate.journal_status is None:
                     gate.journal_status = lambda rep=rep: (rep.open_marker(), None)
             _REPLICATORS[name] = rep
+            _START_REFUSALS.pop(name, None)
             if start:
                 rep.start()
             out[name] = {"mode": store_mode, "shadow": shadow}
         except Exception as exc:
             logger.error("replicator for %s not started: %s", name, exc)
             out[name] = {"error": f"{type(exc).__name__}: {exc}"}
+            _START_REFUSALS[name] = out[name]["error"]
     return out
 
 
@@ -1153,3 +1228,4 @@ def stop_replicators() -> None:
     for rep in list(_REPLICATORS.values()):
         rep.stop()
     _REPLICATORS.clear()
+    _START_REFUSALS.clear()

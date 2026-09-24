@@ -231,9 +231,12 @@ def test_nightly_excludes_keys_written_after_the_snapshot_and_reports_them_the_s
     local, replica = pair
     write(local, "UPDATE memories SET content = 'before S' WHERE id = 2")  # unacked when S is taken
 
+    nights = []
+
     def during_wait(_s):
         drain(local, replica)  # the acks pass H ...
-        write(local, "UPDATE memories SET content = 'after S' WHERE id = 3")  # ... then a hot write
+        nights.append(1)  # a new value each time: an unchanged value is no write (REL1, 7764)
+        write(local, f"UPDATE memories SET content = 'after S {len(nights)}' WHERE id = 3")  # ... then a hot write
         drain(local, replica)
 
     state = tmp_path / "nightly.json"

@@ -618,9 +618,11 @@ def start_shadow_appliers(*, reader_factory=None, replication_mode=None) -> Dict
             if not uri.startswith("d1://"):
                 raise ShadowConfigError(f"a shadowed store must be served from d1://, not {uri!r}")
             account, database = uri[len("d1://"):].split("/", 1)
-            token = os.getenv("MEMORA_D1_READ_TOKEN", "").strip()
+            from .secret_files import secret
+
+            token = secret("MEMORA_D1_READ_TOKEN")
             if not token:
-                raise ShadowConfigError("MEMORA_D1_READ_TOKEN is not set (the shadow reads D1 with it)")
+                raise ShadowConfigError("MEMORA_D1_READ_TOKEN(_FILE) is not set (the shadow reads D1 with it)")
             mode = (replication_mode or read_replication_mode)(account, database, token)
             if mode != "disabled":
                 raise ShadowConfigError(f"D1 read replication is {mode!r}; the shadow requires 'disabled'")

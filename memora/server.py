@@ -3596,6 +3596,17 @@ def main(argv: Optional[list[str]] = None) -> None:
         mcp.settings.host = args.host
         mcp.settings.port = args.port
 
+        # Credentials given as mounted files (*_FILE, memora/secret_files.py):
+        # an unusable file, or FOO and FOO_FILE both set, stops the server
+        # before anything connects. Values are never printed.
+        from .secret_files import SecretFileError, check_secret_files
+
+        try:
+            check_secret_files()
+        except SecretFileError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+
         # MEMORA_TOOL_PROFILE is resolved and validated BEFORE any side
         # effect (connect prewarm, graph server, mcp.run). An invalid
         # value must abort startup, not run DB/cloud work or start a

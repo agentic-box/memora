@@ -64,12 +64,18 @@ def _sha256_file(path: Path) -> str:
 # ------------------------------------------------------------------ credentials (§6.1)
 
 def read_token(token_file: Optional[str] = None) -> str:
-    """The D1 READ token: from a file when given, else MEMORA_D1_READ_TOKEN."""
+    """The D1 READ token: from a file when given, else MEMORA_D1_READ_TOKEN
+    (or MEMORA_D1_READ_TOKEN_FILE, as inside the deployed container)."""
+    from .secret_files import SecretFileError, secret
+
     if token_file:
         return load_credential_file(token_file)
-    token = os.getenv("MEMORA_D1_READ_TOKEN", "").strip()
+    try:
+        token = secret("MEMORA_D1_READ_TOKEN")
+    except SecretFileError as exc:
+        raise L5Refused(str(exc))
     if not token:
-        raise L5Refused("no D1 read token: set MEMORA_D1_READ_TOKEN or pass --read-token-file")
+        raise L5Refused("no D1 read token: set MEMORA_D1_READ_TOKEN(_FILE) or pass --read-token-file")
     return token
 
 
@@ -705,8 +711,13 @@ def load_receipt(path: str, db: str, *, account_id: str, database_id: str, now: 
     age = (now if now is not None else time.time()) - float(r.get("verified_at_epoch") or 0)
     if max_age_s is not None and age > max_age_s:
         raise L5Refused(f"receipt {path} is older than 24 h ({int(age)} s)")
-    if check_sql:
+    sql = Path(r["sql_path"])
+    if not sql.exists() and (p.parent / sql.name).exists():
+        # A receipt copied with its export (into memora-all's /data, REL1
+        # cutover) finds the SQL beside it; its sha256 still binds the content.
+        r = dict(r, sql_path=str(p.parent / sql.name))
         sql = Path(r["sql_path"])
+    if check_sql:
         if not sql.exists() or _sha256_file(sql) != r["sql_sha256"]:
             raise L5Refused(f"receipt {path}: the export file {sql} is missing or changed")
     return r

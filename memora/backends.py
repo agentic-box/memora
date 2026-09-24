@@ -2288,9 +2288,11 @@ class D1SelectOnlyConnection:
 
     @classmethod
     def from_env(cls, account_id: str, database_id: str) -> "D1SelectOnlyConnection":
-        token = os.getenv("MEMORA_D1_READ_TOKEN", "").strip()
+        from .secret_files import secret
+
+        token = secret("MEMORA_D1_READ_TOKEN")
         if not token:
-            raise RuntimeError("MEMORA_D1_READ_TOKEN is not set: no D1 read credential")
+            raise RuntimeError("MEMORA_D1_READ_TOKEN(_FILE) is not set: no D1 read credential")
         return cls(account_id, database_id, token)
 
     def _post(self, body: bytes) -> tuple:
@@ -2398,10 +2400,12 @@ def parse_backend_uri(uri: str) -> StorageBackend:
 
         account_id, database_id = parts
 
-        api_token = os.getenv("CLOUDFLARE_API_TOKEN") or os.getenv("CF_API_TOKEN")
+        from .secret_files import secret
+
+        api_token = secret("CLOUDFLARE_API_TOKEN") or os.getenv("CF_API_TOKEN")
         if not api_token:
             raise ValueError(
-                "D1 backend requires CLOUDFLARE_API_TOKEN or CF_API_TOKEN environment variable.\n"
+                "D1 backend requires CLOUDFLARE_API_TOKEN (or CLOUDFLARE_API_TOKEN_FILE, or CF_API_TOKEN).\n"
                 "Create a token at: https://dash.cloudflare.com/profile/api-tokens\n"
                 "Required permissions: D1 Edit"
             )

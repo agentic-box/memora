@@ -33,8 +33,17 @@
 #      restarted, written to) then a redeploy recopies;
 #   4. local_primary.py freeze / thaw through the live admin routes; the
 #      D1-dependent compare is only shown to refuse (no D1 here);
+#   4b. (REL1) the cutover mechanics inside the container: the operator
+#      tool at /app/scripts/local_primary.py with 0600 token files on its
+#      tmpfs, freeze / fk-audit; sync installed on the local "re" store
+#      (standing in for the seed, which needs D1); a deploy with
+#      MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env: the store comes
+#      up frozen, replicating in LOG mode (log mode sends nothing to D1;
+#      write mode is not rehearsed: its D1 endpoint is Cloudflare's);
 #   5. saves real `podman inspect` samples (token values redacted) into
 #      $RH_ROOT/fixtures for tests/fixtures.
+# The Cloudflare tokens (REL1) are throwaway files under $RH_ROOT/secrets,
+# mounted read-only; the checks prove no value reaches the container env.
 set -uo pipefail
 
 OLD_SRC="${1:?usage: rehearse_deploy.sh OLD_SRC}"
@@ -49,13 +58,14 @@ IMAGE="memora-$RUN_ID:latest"
 PORT=18920
 PY="${PYTHON:-python3}"
 CFG="$RH_ROOT/config"
+SECRETS="$RH_ROOT/secrets"
 ENVF="$RH_ROOT/all.env"
 RESULTS="$RH_ROOT/results.txt"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")"
 REG='{"memora": "/data/memora.db", "ob1": "/data/ob1.db", "bestation": "/data/bestation.db", "re": "/data/re.db"}'
 
 OBJECTS="$RH_ROOT/run-$RUN_ID.objects"
-mkdir -p "$RH_ROOT" "$CFG" "$RH_ROOT/fixtures"
+mkdir -p "$RH_ROOT" "$CFG" "$SECRETS" "$RH_ROOT/fixtures"
 echo "start $RUN_START $RUN_ID" > "$OBJECTS"
 . "$ROOT/scripts/rehearse_objects.sh"   # new_container/new_volume/new_image/adopt/once/teardown
 finish() {
@@ -110,7 +120,7 @@ admin() {  # admin TOKEN PATH -- the HTTP status of GET PATH with TOKEN
 deploy() {
   DEPLOY_REHEARSAL=1 DEPLOY_REHEARSAL_ROOT="$RH_ROOT" DEPLOY_LABELS="$RUN_LABEL" DEPLOY_HOST=localhost RUNTIME="$RT" DEPLOY_CONTAINER="$NAME" DEPLOY_DATA_VOLUME="$VOL" \
   DEPLOY_IMAGE="$IMAGE" DEPLOY_PORT="$PORT" DEPLOY_CONFIG_DIR="$CFG" DEPLOY_REPO="$ROOT" \
-  DEPLOY_SKIP_CHECKOUT=1 DEPLOY_SMOKE_ABSORB=0 DEPLOY_ENV_FILE="$ENVF" DEPLOY_TAG="v$VERSION" \
+  DEPLOY_SKIP_CHECKOUT=1 DEPLOY_SMOKE_ABSORB=0 DEPLOY_ENV_FILE="$ENVF" DEPLOY_TAG="v$VERSION" DEPLOY_SECRETS_DIR="$SECRETS" \
     bash "$ROOT/scripts/deploy-memora-all.sh"
 }
 
@@ -124,6 +134,12 @@ cat > "$CFG/credentials.mcp.json" <<JSON
 {"mcpServers": {"memora": {"env": {"MEMORA_EMBEDDING_MODEL": "tfidf", "MEMORA_LLM_MODEL": "none"}}}}
 JSON
 printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
+# Throwaway Cloudflare-shaped tokens (REL1): never valid anywhere, no store
+# is on d1://, so nothing uses them; the checks are about where they go.
+chmod 700 "$SECRETS"
+for f in cloudflare-api.token d1-read.token; do
+  ( umask 077; printf 'rh-%s-%s\n' "$f" "$(mint)" > "$SECRETS/$f" )
+done
 
 echo "== 1. the OLD image (production's memora:latest today) from $OLD_SRC"
 new_image OLD_IMAGE_ID "$IMAGE" "$OLD_SRC" && pass "build the old image from $OLD_SRC ($OLD_IMAGE_ID)"
@@ -221,6 +237,26 @@ code="$(admin "$HEALTH_TOKEN" /admin/data-volume)"
   || fail "/admin/data-volume answered $code to the health token"
 code="$(admin "" /admin/data-volume)"
 [ "$code" = 401 ] || [ "$code" = 403 ] && pass "/admin/data-volume refuses no token ($code)" || fail "no token: $code"
+# REL1: the Cloudflare tokens are files of a read-only mount; the container's
+# configuration carries only their paths.
+"$RT" inspect "$NAME" > "$RH_ROOT/inspect-tokens.json"
+"$PY" - "$RH_ROOT/inspect-tokens.json" "$SECRETS" <<'PY' && pass "the container env has only *_FILE paths, no token value; /run/secrets/memora is read-only" || fail "token env/mount: see commands.log"
+import json, os, sys
+info = json.load(open(sys.argv[1]))[0]
+env = info["Config"]["Env"]
+values = [open(os.path.join(sys.argv[2], f)).read().strip() for f in os.listdir(sys.argv[2])]
+assert not any(v in e for v in values for e in env), "a token value is in the env"
+for k in ("CLOUDFLARE_API_TOKEN_FILE", "MEMORA_D1_READ_TOKEN_FILE", "MEMORA_D1_REPLICATOR_TOKEN_FILE"):
+    assert any(e.startswith(k + "=/run/secrets/memora/") for e in env), k
+assert not any(e.startswith(("CLOUDFLARE_API_TOKEN=", "MEMORA_D1_READ_TOKEN=", "MEMORA_D1_REPLICATOR_TOKEN=")) for e in env)
+m = [m for m in info["Mounts"] if m["Destination"] == "/run/secrets/memora"]
+assert len(m) == 1 and m[0]["RW"] is False, m
+PY
+rm -f "$RH_ROOT/inspect-tokens.json"
+check "the server's rule reads every token file through the mount (rootless uid mapping)" "$RT" exec "$NAME" python -c '
+from memora.secret_files import check_secret_files
+assert all(check_secret_files().values())'
+check "the mount is read-only inside the container" "$RT" exec "$NAME" sh -c '! touch /run/secrets/memora/x 2>/dev/null'
 
 echo "== 3b. a second deploy copies nothing"
 MARK1="$(cat "$RH_ROOT/marker-1.txt")"
@@ -298,6 +334,75 @@ check "local_primary.py thaw memora" "${LP[@]}" thaw memora "${TOK[@]}"
 curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/memora" > "$RH_ROOT/health-db2.json"
 "$PY" -c 'import json,sys; assert json.load(open(sys.argv[1]))["freeze"]["state"]=="open"' "$RH_ROOT/health-db2.json" \
   && pass "thawed: /health/db/memora shows open" || fail "after thaw: $(cat "$RH_ROOT/health-db2.json")"
+
+echo "== 4b. the cutover mechanics in the container; a replicated local store in log mode"
+SHM=/dev/shm/memora-cutover
+IN_TOOL=("$RT" exec "$NAME" python /app/scripts/local_primary.py)
+IN_TOK=(--admin-token-file "$SHM/admin.token" --health-token-file "$SHM/health.token")
+tokens_in() {  # exactly scripts/cutover_store.sh's form: the container's shell writes its own env
+  "$RT" exec "$NAME" sh -c "umask 077 && mkdir -p $SHM && printf %s \"\$MEMORA_ADMIN_TOKEN\" > $SHM/admin.token && printf %s \"\$MEMORA_HEALTH_TOKEN\" > $SHM/health.token"
+}
+health_re() { curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/re"; }
+check "place the tool's token files on the container's tmpfs (0600)" tokens_in
+check "they are 0600 and on tmpfs" "$RT" exec "$NAME" sh -c \
+  "test \"\$(stat -c %a $SHM/admin.token)\" = 600 && test \"\$(stat -f -c %T $SHM)\" = tmpfs"
+check "the image carries the operator tool: freeze re from inside the container" "${IN_TOOL[@]}" freeze re "${IN_TOK[@]}"
+check "fk-audit re from inside the container (clean)" "${IN_TOOL[@]}" fk-audit re --store /data/re.db
+check "install sync on /data/re.db (standing in for the seed, which needs D1)" "$RT" exec "$NAME" python -c '
+import sqlite3
+from memora.schema import install_sync
+c = sqlite3.connect("/data/re.db"); install_sync(c, "d1://rh-acct/rh-db", 1); c.close()'
+printf "MEMORA_DATABASES='%s'\nMEMORA_REPLICAS='%s'\nMEMORA_REPLICATION=log\nMEMORA_REPLICATION_INTERVAL_S=2\nMEMORA_REPLICATION_BATCH_ROWS=50\n" \
+  "$REG" '{"re": "d1://rh-acct/rh-db"}' > "$ENVF"
+if deploy > "$RH_ROOT/deploy-4.log" 2>&1; then pass "deploy with MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env"; \
+  else fail "deploy 4 (exit $?; see deploy-4.log)"; tail -30 "$RH_ROOT/deploy-4.log"; fi
+adopt NEW4_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
+grep -q "store re: /health/db 200 ok, FROZEN (persisted freeze); memory_stats skipped" "$RH_ROOT/deploy-4.log" \
+  && pass "the deploy's store check accepts re frozen (its /health/db), not a tool call a frozen start refuses" \
+  || fail "deploy 4 did not report re as frozen"
+check "wait for /health after deploy 4" wait_health
+"$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q 'MEMORA_REPLICATION=log' \
+  && pass "the container env carries the local-primary switches from all.env" || fail "MEMORA_REPLICATION not passed through"
+sleep 5
+health_re > "$RH_ROOT/health-re.json"
+"$PY" -c '
+import json, sys
+h = json.load(open(sys.argv[1]))
+assert h["freeze"]["state"] == "frozen", h["freeze"]
+r = h["replication"]
+assert r["mode"] == "log" and r["status"] == "running" and not r.get("halted_reason"), r
+assert (r["interval_s"], r["poll_s"], r["batch_rows"]) == (2.0, 5.0, 50), r
+' "$RH_ROOT/health-re.json" && pass "re came up frozen (persisted freeze), replicating in log mode, not halted; timing 2 s / 5 s / 50 rows from all.env" \
+  || fail "/health/db/re after deploy 4: $(cat "$RH_ROOT/health-re.json")"
+check "token files again in the new container" tokens_in
+check "thaw re from inside the container" "${IN_TOOL[@]}" thaw re "${IN_TOK[@]}"
+"$PY" - "$PORT" <<'PY' >> "$RH_ROOT/commands.log" 2>&1 && pass "a write to re through /mcp/re" || fail "write to re (see commands.log)"
+import json, sys, urllib.request
+base = f"http://127.0.0.1:{sys.argv[1]}/mcp/re"
+H = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+def post(body, sid=None):
+    h = dict(H, **({"mcp-session-id": sid} if sid else {}))
+    with urllib.request.urlopen(urllib.request.Request(base, json.dumps(body).encode(), h), timeout=30) as r:
+        return r.headers.get("mcp-session-id"), r.read().decode()
+sid, _ = post({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05",
+              "capabilities": {}, "clientInfo": {"name": "rehearsal", "version": "0"}}})
+post({"jsonrpc": "2.0", "method": "notifications/initialized"}, sid)
+_, raw = post({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+               "params": {"name": "memory_create", "arguments": {"content": "rehearsal write under log mode", "tags": ["rehearsal"]}}}, sid)
+assert '"isError":true' not in raw.replace(" ", "") and '"error"' not in raw[:200], raw[:500]
+print(raw[:300])
+PY
+LOGGED=0
+for _ in $(seq 1 20); do
+  health_re > "$RH_ROOT/health-re2.json"
+  "$PY" -c 'import json,sys; r=json.load(open(sys.argv[1]))["replication"]; sys.exit(0 if r["lag_rows"] == 0 and r["log_cursor_seq"] > 0 else 1)' \
+    "$RH_ROOT/health-re2.json" && { LOGGED=1; break; }
+  sleep 2
+done
+[ "$LOGGED" = 1 ] && pass "the write was logged: lag_rows 0, log cursor moved (no D1 involved)" \
+  || fail "log mode did not catch up: $(cat "$RH_ROOT/health-re2.json")"
+check "remove the tool's token files" "$RT" exec "$NAME" rm -rf "$SHM"
+printf "MEMORA_DATABASES='%s'\n" "$REG" > "$ENVF"
 
 echo "== 5. podman inspect samples (token values redacted)"
 for f in old new; do

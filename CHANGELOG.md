@@ -14,6 +14,100 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.0
+
+The local-primary release. A store can be served from a seeded local SQLite
+file on memora-all's `/data` volume and replicated to its D1 database. Every
+store stays on `d1://` until it is cut over, one at a time
+(`docs/cutover-runbook.md`); with `MEMORA_REPLICAS` and `MEMORA_REPLICATION`
+absent, memora-all runs as before. The first store is `re`. The entries below,
+newest first, are the slices of the implementation plan
+(`docs/local-primary-implementation.md`).
+
+### Release prep (REL1): tokens as mounted files, the cutover script
+
+- **Credentials from files.** `MEMORA_D1_READ_TOKEN_FILE`,
+  `MEMORA_D1_REPLICATOR_TOKEN_FILE` and `CLOUDFLARE_API_TOKEN_FILE` name a
+  file that holds the token (`memora/secret_files.py`). The D1 backend,
+  the D1 readers, the replicator, the shadow and the operator tool read the
+  file.
+  - The rule: an absolute path; not a symlink; a regular file; no group or
+    other permission bits; readable by the server; not empty after
+    whitespace is stripped. The owner is not checked, because a container
+    maps the host uid to another uid.
+  - `FOO` and `FOO_FILE` both set is refused, and so is
+    `CLOUDFLARE_API_TOKEN_FILE` with `CF_API_TOKEN`.
+  - `memora-server` checks all three at startup and exits 2 on a refusal.
+    No value is ever printed.
+- **`scripts/deploy-memora-all.sh` → v0.5.0.**
+  - It mounts `~/.config/memora-lp` (`DEPLOY_SECRETS_DIR`) read-only at
+    `/run/secrets/memora` and sets only the `*_FILE` paths:
+    `cloudflare-api.token`, and `d1-read.token` for both D1 roles in this
+    pilot. `DEPLOY_CLOUDFLARE_TOKEN_FILE`, `DEPLOY_D1_READ_TOKEN_FILE` and
+    `DEPLOY_D1_REPLICATOR_TOKEN_FILE` choose other file names in that
+    directory.
+  - `CLOUDFLARE_API_TOKEN`, `CF_API_TOKEN` and the D1 token variables in
+    `credentials.mcp.json` are no longer passed through. The header gives
+    the one-time command that writes the Cloudflare token file.
+  - Each token file must be a regular file owned by the deploying user,
+    mode 0600 and not empty. This is checked before anything is fetched,
+    built or stopped. The new image then reads the files through the
+    read-only mount before the old container is stopped. After the start,
+    the container's env is checked to carry no token value, and the mount
+    to be read-only.
+  - `MEMORA_REPLICAS` and `MEMORA_REPLICATION` are passed through from
+    `instances/all.env` when present (absent means dark). They are
+    validated first:
+    - `MEMORA_REPLICATION` is `log` or `write`;
+    - `MEMORA_REPLICAS` is a JSON map of stores of `MEMORA_DATABASES`,
+      each served locally, to `d1://account/database`.
+- **`scripts/cutover_store.sh <db>`** runs one store's cutover from the
+  Mac, and `docs/cutover-runbook.md` is its runbook. The steps: freeze;
+  recheck the newest export under the freeze (a fresh export when D1 moved
+  or the receipt is older than 24 h); seed `/data/<db>.db` inside
+  memora-all; fk audit; the `all.env` edits (only with `--apply-env`,
+  after a 0600 backup); redeploy; health; barrier compare; thaw (only with
+  `--thaw`).
+  - Dry run is the default. Every boundary is checked, and every failure
+    names the rollback.
+  - The operator tool gets the admin and health tokens as 0600 tmpfs files
+    written inside the container.
+- **Replicator timing** (leader 7762), from the environment:
+  - `MEMORA_REPLICATION_INTERVAL_S` (≥ 0, default 0): the minimum time
+    between the starts of consecutive sends. Commits made in between
+    accumulate into the next batch; the wait is stop-aware, and a freeze
+    is not delayed by it.
+  - `MEMORA_REPLICATION_POLL_S` (> 0, default 5.0): the fallback wake.
+  - `MEMORA_REPLICATION_BATCH_ROWS` (1–1000, default 100).
+
+  An invalid value refuses replication for the store, and `/health/db`
+  shows `replication: {status: refused, error}`; there is never a silent
+  default. The health block shows the effective values. The deploy passes
+  all three from `instances/all.env`, validated first. The `re` pilot runs
+  with `MEMORA_REPLICATION_INTERVAL_S=60` (`cutover_store.sh --interval`,
+  default 60), and the cutover's ack and drain waits allow
+  2 × interval + 30 s.
+- **Nothing is sent to D1 when nothing changed** (leader 7764). The sync
+  update triggers (version 2) enqueue only when a column's value changed:
+  `OLD."c" IS NOT NEW."c"` over every column. The column lists are
+  fingerprinted in `sync_state.trigger_columns`, and `ensure_schema`
+  reinstalls the triggers when the version is older or the columns changed
+  (a column added by a migration). An empty outbox already made no D1
+  call, so an idle store makes no D1 request.
+- The deploy's per-store check accepts a store that comes up frozen by its
+  `/health/db` 200. Such a store serves no tool call until it is thawed:
+  its first connection's schema pass is a write.
+- On an SELinux-enforcing host (the Fedora rehearsal host), the token
+  directory is mounted `:ro,z`, a shared relabel.
+- The cutover runs the operator tool the image carries since X3
+  (`/app/scripts/local_primary.py`) inside memora-all with `docker exec`.
+  The named volume is root-owned on the host, so seeding must run inside
+  the container.
+- A receipt copied together with its export finds the `.sql` beside it.
+  Its sha256 still binds the content.
+- The rehearsal (`docs/deploy-rehearsal.md`) adds the token mount, the
+  in-container tool, and a replicated local store in log mode.
+
 ### Local-primary X3: a maintenance venue on nuc8, and the primary lock as a barrier
 - `scripts/lp_container.sh <local_primary.py arguments>`: runs the operator tool in a one-off container of memora-all's current image (its image ID). It mounts `memora-all-data` at `/data` and `$LP_TOKEN_DIR` read-only at `/run/secrets/memora`, uses no docker socket and no `--rm`, and removes only its own container `memora-lp-<ts>-<pid>`, by name and while it carries this run's label. Exit 64 when the image predates the tool, 65 on a usage error (including `--service-stopped`), 66 when memora-all's image cannot be read.
 - The image now carries `scripts/local_primary.py` (Dockerfile).

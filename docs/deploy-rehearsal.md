@@ -76,7 +76,8 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
 | `DEPLOY_CONFIG_DIR` | `~/.config/memora` | `~/rehearsal-r1/config` (throwaway 0600 tokens) |
 | `DEPLOY_ENV_FILE` | `instances/all.env` | `~/rehearsal-r1/all.env` (four local SQLite stores) |
 | `DEPLOY_REPO` / `DEPLOY_SKIP_CHECKOUT` | the nuc8 checkout / `0` | this checkout / `1` (build it as it is) |
-| `DEPLOY_TAG` | `v0.4.6` | `v<pyproject version>` |
+| `DEPLOY_TAG` | `v0.5.0` | `v<pyproject version>` |
+| `DEPLOY_SECRETS_DIR` | `~/.config/memora-lp` | `~/rehearsal-r1/secrets` (throwaway 0600 token files, mounted read-only) |
 | `DEPLOY_SMOKE_ABSORB` | `1` | `0` (the dry-run absorb needs the LLM) |
 
 ## What it checks
@@ -116,12 +117,36 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
    renamed back, started and written to. A redeploy then copies again: the
    marker records the old volume's new digest, and the replaced content is
    kept in `.memora-previous-*`.
+   - (REL1) The container's env has only the `*_FILE` paths of the
+     Cloudflare tokens, and no token value. `/run/secrets/memora` is
+     mounted read-only (`RW: false`, and a write inside fails). The
+     server's rule (`memora/secret_files.py`) reads every file through the
+     mount under rootless podman's uid mapping.
 6. `local_primary.py freeze` and `thaw` go through the live admin routes.
    `/health/db` shows `frozen` with 0 in flight, and a write is refused.
    `compare --mode barrier` reaches the live store and refuses because
    replication is not installed. The D1 steps are skipped because there is
    no D1 here.
-7. `podman inspect` output of the old and the new container is saved, with
+7. (REL1) The cutover mechanics, run inside the container the way
+   `scripts/cutover_store.sh` runs them:
+   - the operator tool at `/app/scripts/local_primary.py`;
+   - the admin and health tokens as 0600 files on the container's tmpfs,
+     written by the container's own shell;
+   - `freeze re` and `fk-audit re`.
+
+   Sync is then installed on `/data/re.db`, standing in for the seed,
+   which needs D1. A deploy follows, with `MEMORA_REPLICAS={"re": …}` and
+   `MEMORA_REPLICATION=log` in `all.env`. Checked after it:
+   - `re` comes up frozen, from the persisted freeze;
+   - it replicates in **log** mode, not halted;
+   - after `thaw`, a write through `/mcp/re` is logged: `lag_rows` 0, and
+     the log cursor moved.
+
+   Log mode sends nothing to D1. **Write mode is not rehearsed**: the
+   replicator's D1 endpoint is fixed to Cloudflare's, and no fake D1 HTTP
+   server exists. Write mode against real D1 first runs in the live
+   cutover (`docs/cutover-runbook.md`).
+8. `podman inspect` output of the old and the new container is saved, with
    token values redacted. The copies in `tests/fixtures/` check the
    launchers' inspect parsing against the real shape.
 
@@ -147,6 +172,8 @@ the nuc8 deploy; `tests/test_deploy_memora_all.py` pins both.
 - **The version check cannot tell old from new here.** v0.4.6 and this
   branch both report 0.4.6. The rehearsal proves the new code serves with
   the admin route and the startup check instead, since v0.4.6 has neither.
+  From v0.5.0 (REL1) the versions differ, and the `/health` version check
+  tells the two images apart.
   A release deploy with a new tag distinguishes them.
 - **`compare` on a store without replication raised a raw SQLite error**
   (`no such table: sync_state`). It now refuses cleanly: "replication is not

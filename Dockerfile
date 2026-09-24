@@ -8,7 +8,11 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY memora/ memora/
 # The operator tool, so scripts/lp_container.sh can run it in a one-off
-# container of THIS image (the tool must match the image's memora).
+# container of THIS image (the tool must match the image's memora), and
+# scripts/cutover_store.sh with `docker exec memora-all python
+# /app/scripts/local_primary.py ...` (seeding /data/<db>.db must run inside
+# the container: the named volume is root-owned on the host). Code only; no
+# token or data is in the image.
 COPY scripts/local_primary.py scripts/local_primary.py
 
 RUN pip install --no-cache-dir .

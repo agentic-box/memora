@@ -1,6 +1,7 @@
 """Database schema management and connection helpers."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import weakref
@@ -568,7 +569,8 @@ def _ensure_import_lease_table(conn: sqlite3.Connection) -> None:
 # only on a LOCAL store that install_sync() enabled (the seed script, L5);
 # they are never created on D1, and ensure_schema only maintains them.
 
-SYNC_TRIGGER_VERSION = 1
+# 2 (REL1, leader 7764): an UPDATE enqueues only when a column changed.
+SYNC_TRIGGER_VERSION = 2
 
 # table -> primary-key columns, in pk order
 SYNC_TABLES = {
@@ -629,6 +631,9 @@ _SYNC_STATE_ADDED = (
     # Log-mode delete-guard events (L9a, leader 7699): counted, never halting.
     ("would_halt_count", "INTEGER NOT NULL DEFAULT 0"),
     ("last_would_halt", "TEXT"),
+    # The column lists the update triggers compare (REL1): a migration that
+    # adds a column changes this fingerprint, and ensure_schema reinstalls.
+    ("trigger_columns", "TEXT"),
 )
 # One row per batch the P3 delete guard WOULD have halted in log mode (it
 # sends nothing to D1, so it records and keeps logging; write mode halts).
@@ -655,14 +660,24 @@ CREATE TABLE IF NOT EXISTS shadow_state (
 """
 
 
-def sync_trigger_ddl() -> list:
+def sync_trigger_ddl(columns: Dict[str, List[str]]) -> list:
     """The 28 CREATE TRIGGER statements (7 tables x insert/update/delete,
-    plus one update_pk trigger per table)."""
+    plus one update_pk trigger per table). `columns` is each table's column
+    list (sync_columns): an UPDATE enqueues only when at least one column
+    changed (OLD.c IS NOT NEW.c over every column), so a no-op UPDATE never
+    reaches D1 (REL1, leader 7764). The lists are fixed when the triggers
+    are installed; ensure_schema reinstalls them when they change."""
     out = []
     excluded = ", ".join(f"'{k}'" for k in SYNC_META_EXCLUDED)
     for table, pk in SYNC_TABLES.items():
+        any_change = " OR ".join(f'OLD."{c}" IS NOT NEW."{c}"' for c in columns[table])
         for action, ref, op in (("insert", "NEW", "U"), ("update", "NEW", "U"), ("delete", "OLD", "D")):
-            when = f"WHEN {ref}.key NOT IN ({excluded}) " if table == "memories_meta" else ""
+            conds = []
+            if action == "update":
+                conds.append(f"({any_change})")
+            if table == "memories_meta":
+                conds.append(f"{ref}.key NOT IN ({excluded})")
+            when = f"WHEN {' AND '.join(conds)} " if conds else ""
             cols = ", ".join(f"{ref}.{c}" for c in pk)
             out.append(
                 f"CREATE TRIGGER trg_sync_{table}_{action} AFTER {action.upper()} ON {table} {when}"
@@ -679,6 +694,17 @@ def sync_trigger_ddl() -> list:
     return out
 
 
+def sync_columns(conn: sqlite3.Connection) -> Dict[str, List[str]]:
+    """Each replicated table's columns, in table order."""
+    return {t: [r[1] for r in conn.execute(f'PRAGMA table_info("{t}")').fetchall()] for t in SYNC_TABLES}
+
+
+def _columns_fingerprint(columns: Dict[str, List[str]]) -> str:
+    import hashlib
+
+    return hashlib.sha256(json.dumps(columns, sort_keys=True).encode()).hexdigest()
+
+
 def _sync_trigger_names(conn: sqlite3.Connection) -> list:
     return [r[0] for r in conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'trg_sync_%'"
@@ -690,8 +716,10 @@ def _install_sync_triggers_locked(conn: sqlite3.Connection) -> None:
     holds a BEGIN IMMEDIATE transaction."""
     for name in _sync_trigger_names(conn):
         conn.execute(f'DROP TRIGGER IF EXISTS "{name}"')
-    for ddl in sync_trigger_ddl():
+    columns = sync_columns(conn)
+    for ddl in sync_trigger_ddl(columns):
         conn.execute(ddl)
+    conn.execute("UPDATE sync_state SET trigger_columns = ? WHERE id = 1", (_columns_fingerprint(columns),))
 
 
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
@@ -714,14 +742,17 @@ def _ensure_sync_outbox(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE sync_state ADD COLUMN {col} {decl}")
     conn.execute(_SYNC_WOULD_HALT_DDL)
     conn.commit()
-    row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
-    if row is None or int(row[0]) >= SYNC_TRIGGER_VERSION:
+    def stale(row) -> bool:  # an older trigger version, or column lists that changed since
+        return row is not None and (int(row[0]) < SYNC_TRIGGER_VERSION
+                                    or row[1] != _columns_fingerprint(sync_columns(conn)))
+
+    query = "SELECT trigger_version, trigger_columns FROM sync_state WHERE id = 1"
+    if not stale(conn.execute(query).fetchone()):
         return
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
-        if row is not None and int(row[0]) < SYNC_TRIGGER_VERSION:
+        if stale(conn.execute(query).fetchone()):
             _install_sync_triggers_locked(conn)
             conn.execute("UPDATE sync_state SET trigger_version = ? WHERE id = 1", (SYNC_TRIGGER_VERSION,))
         conn.commit()

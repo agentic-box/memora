@@ -257,11 +257,14 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
             sh = {"enabled": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
         if sh is not None:
             out["shadow"] = sh
-        from .replicator import replicator_for
+        from .replicator import replicator_for, start_refusal
 
         rep = replicator_for(name)
         if rep is not None:
             out["replication"] = rep.status()
+        elif start_refusal(name):
+            # configured but not started (e.g. an invalid timing value): say why
+            out["replication"] = {"status": "refused", "error": start_refusal(name)}
         return out
     except Exception as exc:
         return {"freeze": {"state": "unknown", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}}

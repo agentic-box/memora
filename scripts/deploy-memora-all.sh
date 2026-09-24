@@ -1,8 +1,42 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.4.6: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.5.0: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
-# What v0.4.6 changes (see CHANGELOG.md "0.4.6"):
+# v0.5.0 (CHANGELOG.md "0.5.0") is the local-primary release. What THIS
+# deploy changes on memora-all:
+#  - CLOUDFLARE TOKENS AS MOUNTED FILES (REL1, review 7758). The token
+#    directory ~/.config/memora-lp on nuc8 (DEPLOY_SECRETS_DIR) is mounted
+#    READ-ONLY at /run/secrets/memora, and the container gets only the paths:
+#      CLOUDFLARE_API_TOKEN_FILE       <- cloudflare-api.token  (DEPLOY_CLOUDFLARE_TOKEN_FILE)
+#      MEMORA_D1_READ_TOKEN_FILE       <- d1-read.token         (DEPLOY_D1_READ_TOKEN_FILE)
+#      MEMORA_D1_REPLICATOR_TOKEN_FILE <- d1-read.token         (DEPLOY_D1_REPLICATOR_TOKEN_FILE)
+#    The three DEPLOY_*_TOKEN_FILE overrides are file NAMES inside that
+#    directory (the only directory the container sees). No token value is on
+#    a command line, in the container's configuration (docker inspect) or in
+#    this repo; CLOUDFLARE_API_TOKEN, CF_API_TOKEN and the D1 token variables
+#    in credentials.mcp.json are NOT passed through any more. Each file must
+#    be a regular file (not a symlink) owned by the deploying user, mode
+#    0600, not empty -- checked before anything is built or stopped, and
+#    again by the NEW image through the read-only mount (memora/secret_files.py)
+#    before the old container is stopped. After the start, the container's
+#    env is checked to carry no token value and the mount to be read-only.
+#    ONE-TIME, before the first v0.5.0 deploy (the user runs it on nuc8; the
+#    value is never printed):
+#      ( umask 077; python3 -c 'import json,os; e=json.load(open(os.path.expanduser("~/.config/memora/credentials.mcp.json")))["mcpServers"]["memora"]["env"]; print(e.get("CLOUDFLARE_API_TOKEN") or e["CF_API_TOKEN"])' > ~/.config/memora-lp/cloudflare-api.token )
+#    Everything in ~/.config/memora-lp is visible (read-only) to the
+#    container: keep only token files there. The deploy lists its entries.
+#  - LOCAL-PRIMARY SWITCHES from instances/all.env, passed through when
+#    present: MEMORA_REPLICAS (a JSON map store -> d1://account/database; its
+#    stores must be local in MEMORA_DATABASES) and MEMORA_REPLICATION
+#    (log|write), and the replicator's timing MEMORA_REPLICATION_INTERVAL_S,
+#    MEMORA_REPLICATION_POLL_S, MEMORA_REPLICATION_BATCH_ROWS (validated
+#    with the server's ranges). Absent = dark / the server's defaults.
+#    scripts/cutover_store.sh sets them, one store at a time
+#    (docs/cutover-runbook.md).
+#
+# Unchanged from the v0.4.6 deploy (the text below): the named /data volume
+# and its migration, --memory 960m, the health/admin token files, the smoke
+# checks. What v0.4.6 changed (CHANGELOG.md "0.4.6"):
 #  - Absorb never supersedes across memory types (a plain fact can no longer
 #    retire an open todo or issue); a reused supersede verdict is re-checked
 #    when the leaf's type, project or stored vector changed.
@@ -24,7 +58,7 @@
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.4.6 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.5.0 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
@@ -41,7 +75,7 @@
 #     as memora-all-grok-<ts> (the name predates the model switch being a
 #     no-op; it still means "the container before this deploy", and the
 #     rollback commands below depend on it).
-#  5. Wait for GET /health, check it reports version 0.4.6 (proves the new
+#  5. Wait for GET /health, check it reports version 0.5.0 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
 #     dry-run memory_absorb call, one memory_semantic_search call and one
 #     memory_stats call, asserting no JSON-RPC error and a real session id at
@@ -99,13 +133,14 @@
 # NOT RUN by this repo or any agent — review and run it yourself:
 #   scripts/deploy-memora-all.sh
 #
-# Rollback:
+# Rollback (for a store already cut over to local primary, follow the L6
+# runbook in docs/local-primary-implementation.md instead):
 #   ssh nuc8 'docker rm -f memora-all && docker rename memora-all-grok-<ts> memora-all && docker start memora-all'
 #   ssh nuc8 'docker tag memora:rollback-<ts> memora:latest'   # only if the image itself needs reverting too
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="${DEPLOY_TAG:-v0.4.6}"
+TAG="${DEPLOY_TAG:-v0.5.0}"
 # Rehearsal parameters (R1): every default is the production value, so an
 # unparameterised run is exactly the nuc8 deploy. scripts/rehearse_deploy.sh
 # sets them to run the same steps against a local podman on server2.
@@ -120,6 +155,16 @@ DEPLOY_REPO="${DEPLOY_REPO:-~/repos/agentic-box/memora}"     # expanded on the t
 DEPLOY_SKIP_CHECKOUT="${DEPLOY_SKIP_CHECKOUT:-0}"            # 1: build DEPLOY_REPO as it is
 DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed absorb in the smoke check
 DEPLOY_LABELS="${DEPLOY_LABELS:-}"                          # rehearsal only: k=v labels on what it creates
+DEPLOY_SECRETS_DIR="${DEPLOY_SECRETS_DIR:-~/.config/memora-lp}"  # token dir, mounted :ro (expanded on the target host)
+# Production overrides (documented, no sentinel): token file NAMES inside
+# DEPLOY_SECRETS_DIR. The same file may serve both D1 roles (the pilot does).
+DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-cloudflare-api.token}"
+DEPLOY_D1_READ_TOKEN_FILE="${DEPLOY_D1_READ_TOKEN_FILE:-d1-read.token}"
+DEPLOY_D1_REPLICATOR_TOKEN_FILE="${DEPLOY_D1_REPLICATOR_TOKEN_FILE:-d1-read.token}"
+for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE; do
+  printf '%s' "${!v}" | grep -Eqx '[A-Za-z0-9_-][A-Za-z0-9._-]*' \
+    || { echo "refused: $v must be a plain file name inside DEPLOY_SECRETS_DIR (got '${!v}') — nothing was done" >&2; exit 1; }
+done
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
@@ -135,7 +180,7 @@ OVERRIDDEN=()
 while IFS='|' read -r var label default; do
   [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
 done <<DEFAULTS
-TAG|DEPLOY_TAG|v0.4.6
+TAG|DEPLOY_TAG|v0.5.0
 DEPLOY_HOST|DEPLOY_HOST|nuc8
 RUNTIME|RUNTIME|docker
 DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
@@ -148,6 +193,7 @@ DEPLOY_SKIP_CHECKOUT|DEPLOY_SKIP_CHECKOUT|0
 DEPLOY_SMOKE_ABSORB|DEPLOY_SMOKE_ABSORB|1
 DEPLOY_ENV_FILE_EFFECTIVE|DEPLOY_ENV_FILE|$ROOT/instances/all.env
 DEPLOY_LABELS|DEPLOY_LABELS|
+DEPLOY_SECRETS_DIR|DEPLOY_SECRETS_DIR|~/.config/memora-lp
 DEFAULTS
 if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   RH_ROOT="${DEPLOY_REHEARSAL_ROOT:-}"
@@ -161,6 +207,7 @@ if [ "${DEPLOY_REHEARSAL:-}" = 1 ]; then
   under() { python3 -c 'import os, sys; r, p = map(os.path.realpath, sys.argv[1:]); sys.exit(0 if os.path.commonpath([r, p]) == r else 1)' "$1" "$2"; }
   under "$RH_ROOT" "$DEPLOY_CONFIG_DIR" || refuse "DEPLOY_CONFIG_DIR is not under $RH_ROOT"
   under "$RH_ROOT" "$ENV_FILE" || refuse "DEPLOY_ENV_FILE is not under $RH_ROOT"
+  under "$RH_ROOT" "$DEPLOY_SECRETS_DIR" || refuse "DEPLOY_SECRETS_DIR is not under $RH_ROOT"
   case "$DEPLOY_LABELS" in *memora.rehearsal=?*) ;; *) refuse "DEPLOY_LABELS must carry memora.rehearsal=<run-id>" ;; esac
 elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
   echo "refused: ${OVERRIDDEN[*]} differ(s) from the production deploy; overrides are for rehearsals only" \
@@ -168,13 +215,64 @@ elif [ "${#OVERRIDDEN[@]}" -gt 0 ]; then
   exit 1
 fi
 echo "deploy target: host=$DEPLOY_HOST runtime=$RUNTIME container=$DEPLOY_CONTAINER volume=$DEPLOY_DATA_VOLUME" \
-     "image=$DEPLOY_IMAGE port=$DEPLOY_PORT tag=$TAG${DEPLOY_REHEARSAL:+ (REHEARSAL)}"
+     "image=$DEPLOY_IMAGE port=$DEPLOY_PORT tag=$TAG secrets=$DEPLOY_SECRETS_DIR${DEPLOY_REHEARSAL:+ (REHEARSAL)}"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — need MEMORA_DATABASES for memora-all" >&2; exit 1; }
 MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//")"
 [ -n "$MEMORA_DATABASES" ] || { echo "$ENV_FILE has no MEMORA_DATABASES" >&2; exit 1; }
 # base64 over the wire: the JSON has embedded quotes that ssh's remote
 # command re-join would otherwise mangle.
 MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
+# The local-primary switches (absent = dark). Checked here, before anything
+# runs: MEMORA_REPLICATION is log|write; MEMORA_REPLICAS maps stores of
+# MEMORA_DATABASES whose registry entry is LOCAL to d1://account/database.
+env_value() { { grep -E "^$1=" "$ENV_FILE" || true; } | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//"; }
+MEMORA_REPLICAS="$(env_value MEMORA_REPLICAS)"
+MEMORA_REPLICATION="$(env_value MEMORA_REPLICATION)"
+# The replicator's timing (leader 7762), the server's own ranges; unset = its default.
+REPL_TIMING=""
+for v in MEMORA_REPLICATION_INTERVAL_S MEMORA_REPLICATION_POLL_S MEMORA_REPLICATION_BATCH_ROWS; do
+  val="$(env_value "$v")"
+  [ -z "$val" ] || REPL_TIMING="$REPL_TIMING $v=$val"
+done
+python3 - "$MEMORA_DATABASES" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" $REPL_TIMING <<'PY' || { echo "refused: $ENV_FILE's MEMORA_REPLICAS / MEMORA_REPLICATION / MEMORA_REPLICATION_* — nothing was done" >&2; exit 1; }
+import json, math, re, sys
+dbs, replicas, mode = sys.argv[1:4]
+registry = json.loads(dbs)
+for kv in sys.argv[4:]:
+    k, v = kv.split("=", 1)
+    if k == "MEMORA_REPLICATION_BATCH_ROWS":
+        if not v.isdigit() or not 1 <= int(v) <= 1000:
+            sys.exit(f"{k}={v!r}: must be an integer 1..1000")
+    else:
+        try:
+            f = float(v)
+        except ValueError:
+            f = float("nan")
+        if not math.isfinite(f) or f < 0 or (k == "MEMORA_REPLICATION_POLL_S" and f == 0):
+            sys.exit(f"{k}={v!r}: must be a finite number {'> 0' if k.endswith('POLL_S') else '>= 0'}")
+    print(f"local-primary: {k}={v}")
+if mode and mode not in ("log", "write"):
+    sys.exit(f"MEMORA_REPLICATION must be log or write, not {mode!r}")
+if replicas:
+    rep = json.loads(replicas)
+    if not isinstance(rep, dict) or not rep:
+        sys.exit("MEMORA_REPLICAS must be a non-empty JSON object {store: d1://account/database}")
+    for name, uri in rep.items():
+        if name not in registry:
+            sys.exit(f"MEMORA_REPLICAS names {name!r}, not a store of MEMORA_DATABASES")
+        if not re.fullmatch(r"d1://[^/\s]+/[^/\s]+", str(uri)):
+            sys.exit(f"MEMORA_REPLICAS[{name!r}] must be d1://account/database, not {uri!r}")
+        entry = str(registry[name])
+        if "://" in entry and not entry.startswith("file://"):
+            sys.exit(f"MEMORA_REPLICAS names {name!r}, but MEMORA_DATABASES serves it from {entry!r}: "
+                     "a replicated store must be a local path")
+    print(f"local-primary: MEMORA_REPLICAS={sorted(rep)} MEMORA_REPLICATION={mode or '(unset: dark)'}")
+elif mode:
+    print(f"local-primary: MEMORA_REPLICATION={mode} with no MEMORA_REPLICAS (no store replicated)")
+else:
+    print("local-primary: MEMORA_REPLICAS / MEMORA_REPLICATION absent (dark)")
+PY
+MEMORA_REPLICAS_B64="$(printf '%s' "$MEMORA_REPLICAS" | base64 | tr -d '\n')"
 # The /data migration program (shared with memora-instance.sh), sent from
 # THIS checkout: the nuc8 checkout is at $TAG and may predate it.
 MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
@@ -186,7 +284,9 @@ else
 fi
 "${TARGET[@]}" "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER" \
   "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO" \
-  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" <<'REMOTE'
+  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR" \
+  "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE" \
+  "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" <<'REMOTE'
 set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -196,7 +296,61 @@ CONFIG_DIR="${9/#\~/$HOME}"; REPO_DIR="${10/#\~/$HOME}"; SKIP_CHECKOUT="${11}"; 
 LABEL_ARGS=()   # rehearsal only (the guard allows DEPLOY_LABELS under DEPLOY_REHEARSAL=1 alone)
 for l in ${13:-}; do LABEL_ARGS+=(--label "$l"); done
 [ -n "$MIGRATE_SCRIPT" ] || { echo "empty /data migration program" >&2; exit 1; }
+SECRETS_DIR="${14/#\~/$HOME}"
+CF_TOKEN_NAME="${15}"; READ_TOKEN_NAME="${16}"; REPL_TOKEN_NAME="${17}"
+MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
+SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
+
+# Token files (REL1, review 7758), checked BEFORE anything is fetched, built
+# or stopped: the directory is a real directory (not a symlink) owned by this
+# user; each file a regular file (not a symlink) owned by this user, mode
+# exactly 0600, not empty. Refused otherwise, never chmod-ed. Values are
+# never read into this shell.
+python3 - "$SECRETS_DIR" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" <<'PY' || exit 1
+import os, stat, sys
+d, names = sys.argv[1], sys.argv[2:]
+hint = ("  write it on this host first, e.g. for the Cloudflare token (value never printed):\n"
+        "  ( umask 077; python3 -c 'import json,os; e=json.load(open(os.path.expanduser(\"~/.config/memora/credentials.mcp.json\")))"
+        "[\"mcpServers\"][\"memora\"][\"env\"]; print(e.get(\"CLOUDFLARE_API_TOKEN\") or e[\"CF_API_TOKEN\"])' > FILE )")
+def refuse(msg):
+    sys.exit(f"refused: {msg} — nothing was stopped")
+try:
+    st = os.lstat(d)
+except OSError:
+    refuse(f"token directory {d} is missing\n{hint}")
+if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+    refuse(f"token directory {d} must be a directory (not a symlink) owned by this user")
+for name in dict.fromkeys(names):
+    p = os.path.join(d, name)
+    try:
+        st = os.lstat(p)
+    except OSError:
+        refuse(f"token file {p} is missing\n{hint.replace('FILE', p)}")
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) != 0o600:
+        refuse(f"token file {p} must be a regular file owned by this user with mode 0600; it may have been exposed")
+    if not open(p).read().strip():
+        refuse(f"token file {p} is empty")
+print(f"token files ok in {d} (mounted read-only at /run/secrets/memora); entries visible to the container: "
+      f"{', '.join(sorted(os.listdir(d)))}")
+PY
+# SELinux (enforcing, e.g. the Fedora rehearsal host): a home directory's
+# label is unreadable from a container, so the mount relabels the token
+# directory SHARED (:z) -- still read-only, and still readable by the old
+# container kept for rollback (a private :Z would cut it off). Elsewhere
+# (nuc8) the options are plain ro.
+SECRETS_OPTS=ro
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+  SECRETS_OPTS=ro,z
+  echo "SELinux is enforcing on $(hostname): $SECRETS_DIR is mounted :ro,z (relabelled container-readable, shared)"
+fi
+TOKEN_FILE_ARGS=(-e "CLOUDFLARE_API_TOKEN_FILE=$SECRETS_MOUNT/$CF_TOKEN_NAME"
+                 -e "MEMORA_D1_READ_TOKEN_FILE=$SECRETS_MOUNT/$READ_TOKEN_NAME"
+                 -e "MEMORA_D1_REPLICATOR_TOKEN_FILE=$SECRETS_MOUNT/$REPL_TOKEN_NAME")
+LP_ARGS=()   # the local-primary switches, only when all.env sets them (absent = dark)
+[ -z "$MEMORA_REPLICAS" ] || LP_ARGS+=(-e "MEMORA_REPLICAS=$MEMORA_REPLICAS")
+[ -z "$MEMORA_REPLICATION" ] || LP_ARGS+=(-e "MEMORA_REPLICATION=$MEMORA_REPLICATION")
+for kv in ${20:-}; do LP_ARGS+=(-e "$kv"); done   # MEMORA_REPLICATION_{INTERVAL_S,POLL_S,BATCH_ROWS}, validated above
 # Keyed by registry store name (MEMORA_DATABASES); see the header for why.
 MEMORA_PROJECTS='{"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],"bestation":["bestation"],"re":["re"]}'
 
@@ -297,6 +451,12 @@ while IFS='=' read -r key value; do
   [ -z "$key" ] && continue
   case "$key" in
     MEMORA_STORAGE_URI|MEMORA_DB_PATH|MEMORA_DATABASES|MEMORA_DEFAULT_DB|MEMORA_PROJECTS|MEMORA_DATA_VOLUME|MEMORA_ADMIN_TOKEN) continue ;;
+    # Cloudflare tokens come ONLY from the mounted files (REL1); the
+    # local-primary switches ONLY from all.env.
+    CLOUDFLARE_API_TOKEN|CF_API_TOKEN|MEMORA_D1_READ_TOKEN|MEMORA_D1_REPLICATOR_TOKEN) continue ;;
+    CLOUDFLARE_API_TOKEN_FILE|CF_API_TOKEN_FILE|MEMORA_D1_READ_TOKEN_FILE|MEMORA_D1_REPLICATOR_TOKEN_FILE) continue ;;
+    MEMORA_REPLICAS|MEMORA_REPLICATION|MEMORA_SHADOW_LOCAL) continue ;;
+    MEMORA_REPLICATION_INTERVAL_S|MEMORA_REPLICATION_POLL_S|MEMORA_REPLICATION_BATCH_ROWS) continue ;;
   esac
   ENV_ARGS+=(-e "$key=$value")
 done <<< "$ENV_LINES"
@@ -314,6 +474,17 @@ if not isinstance(projects, dict) or set(projects) != stores:
     sys.exit(f"MEMORA_PROJECTS stores {sorted(projects or [])} != MEMORA_DATABASES stores {sorted(stores)}")
 print("MEMORA_PROJECTS ok:", json.dumps(projects, sort_keys=True))
 ' || { echo "MEMORA_PROJECTS preflight failed — aborting before touching the live container" >&2; exit 1; }
+
+# Preflight 1b: the NEW image reads every token file through the read-only
+# mount, under the server's own rule (memora/secret_files.py) -- this is
+# where a uid mapping that cannot read the files shows up, with the old
+# container still serving. Only "ok" is printed, never a value.
+"$RT" run --rm -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" "${TOKEN_FILE_ARGS[@]}" "$IMAGE" python -c '
+from memora.secret_files import check_secret_files
+missing = [k for k, ok in check_secret_files().items() if not ok]
+assert not missing, missing
+print("token files readable by the new image through the read-only mount")
+' || { echo "token-file preflight failed — aborting before touching the live container" >&2; exit 1; }
 
 # Preflight 2 (READ-ONLY): the startup sweep (since v0.4.5) completes or removes
 # rows whose metadata carries an import_attempt marker. None should exist
@@ -382,6 +553,7 @@ fi
   --memory 960m --cpus 4 \
   -p "0.0.0.0:$PORT:8000" \
   -v "$DATA_VOLUME:/data" \
+  -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
   -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
   -e "MEMORA_TOOL_PROFILE=leader" \
   -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
@@ -394,8 +566,31 @@ fi
   -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
   -e "MEMORA_DEFAULT_DB=memora" \
   -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" \
+  "${TOKEN_FILE_ARGS[@]}" \
+  ${LP_ARGS[@]+"${LP_ARGS[@]}"} \
   "${ENV_ARGS[@]}" \
   "$IMAGE"
+
+# The new container's configuration carries no token VALUE, and the token
+# mount is read-only. Checked against the files themselves; prints no value.
+# The inspect output reaches python through its environment (it holds other
+# credentials, so not argv; stdin is the program's heredoc).
+EXPOSED="the new $CONTAINER exposes a token or mounts the tokens writable — remove it: $RT rm -f $CONTAINER, then roll back (below)"
+NEW_INSPECT="$("$RT" inspect "$CONTAINER")" || { echo "cannot inspect the new $CONTAINER. $EXPOSED" >&2; exit 1; }
+NEW_INSPECT="$NEW_INSPECT" python3 - "$SECRETS_DIR" "$SECRETS_MOUNT" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" <<'PY' \
+  || { echo "$EXPOSED" >&2; exit 1; }
+import json, os, sys
+d, mount, names = sys.argv[1], sys.argv[2], sys.argv[3:]
+info = json.loads(os.environ.pop("NEW_INSPECT"))[0]
+values = {open(os.path.join(d, n)).read().strip() for n in names}
+env = "\n".join(info["Config"].get("Env") or [])
+if any(v and v in env for v in values):
+    sys.exit("a token value is in the container's environment")
+ro = [m for m in info.get("Mounts") or [] if m.get("Destination") == mount]
+if len(ro) != 1 or ro[0].get("RW") is not False:
+    sys.exit(f"{mount} is not mounted exactly once read-only")
+print(f"container env carries no token value; {mount} is mounted read-only")
+PY
 
 echo "$CONTAINER recreated from $TAG (MEMORA_PROJECTS set; MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
 echo "old container kept stopped as $CONTAINER-grok-$TS; old image kept as ${IMAGE%%:*}:rollback-$TS"
@@ -524,9 +719,9 @@ def _require_profile(name, out):
 # The dry-run absorb needs the configured LLM; a rehearsal without one skips it.
 if SMOKE_ABSORB:
     facts = [
-        "deploy-check fact one about the v0.4.6 rollout",
-        "deploy-check fact two about the v0.4.6 rollout",
-        "deploy-check fact three about the v0.4.6 rollout",
+        "deploy-check fact one about the v0.5.0 rollout",
+        "deploy-check fact two about the v0.5.0 rollout",
+        "deploy-check fact three about the v0.5.0 rollout",
     ]
     absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
     # Not one decision per fact: near-identical facts may be consolidated.
@@ -592,6 +787,18 @@ for store in STORES:
     if not healthy:
         failed.append(f"{store}: /health/db/{store} not a current 200 ok after 90s "
                       f"(last: HTTP {status}, {json.dumps(body)[:300]})")
+        continue
+    # A store that comes up FROZEN (the persisted freeze of a cutover,
+    # scripts/cutover_store.sh step e) serves no tool call until it is
+    # thawed: a process's first connection runs the schema pass, a write the
+    # gate refuses. Its /health/db 200 (a schema-free probe) is the check.
+    freeze = (body.get("freeze") or {}).get("state")
+    if freeze in ("frozen", "frozen-unsafe"):
+        if freeze != "frozen":
+            failed.append(f"{store}: frozen-unsafe after the restart: {json.dumps(body.get('freeze'))[:300]}")
+            continue
+        print(f"store {store}: /health/db 200 ok, FROZEN (persisted freeze); memory_stats skipped "
+              "(a store that starts frozen serves no tool call until it is thawed)")
         continue
     store_base = f"{ROOT}/mcp/{store}"
     store_sid = _initialize(store_base)

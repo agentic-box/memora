@@ -138,6 +138,22 @@ it last, after `_ensure_import_lease_table`.
 - When `trigger_version < SYNC_TRIGGER_VERSION` (starting at 1), it runs one
   `BEGIN IMMEDIATE` that drops every `trg_sync_*` trigger, recreates them
   and bumps the version.
+- **Version 2 (REL1, leader 7764): no-op updates enqueue nothing.** The
+  `update` trigger's WHEN is `(OLD."c" IS NOT NEW."c" OR …)` over every
+  column of the table (`memories_meta` keeps its excluded-keys condition),
+  so an UPDATE that changes no value never reaches D1. An idle store makes
+  no D1 request.
+  - The column lists are read when the triggers are installed.
+    `sync_state.trigger_columns` stores their fingerprint, and
+    `ensure_schema` reinstalls the triggers (one `BEGIN IMMEDIATE`) when the
+    version is older OR the fingerprint differs.
+  - So a migration that adds a column to a replicated table refreshes the
+    triggers on the next `ensure_schema`; until then a change to only that
+    column is not enqueued. Migrations run inside `ensure_schema`, before
+    this check.
+  - Rewriting `memories_embeddings.embedding` under the same
+    `writer_token` is not a no-op: `trg_embedding_external_update` clears
+    the representation, and the row replicates.
 - Replication is enabled only by `install_sync(conn, replica_uri, d1_epoch)`,
   which only the seed script calls (§4).
 
