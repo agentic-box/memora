@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.2
+
 ### Reconcile: the evidence digest covers what was read, not when (RC1)
 
 - `reconcile --accept` could never accept an open D1 write intent

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (nuc8) to v0.5.1: fetch +
+# Full deploy of the live memora-all container (nuc8) to v0.5.2: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
 # v0.5.0 (CHANGELOG.md "0.5.0") is the local-primary release. What THIS
@@ -68,7 +68,7 @@
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
 # Steps, all on nuc8:
-#  1. git fetch + checkout the v0.5.1 tag in the nuc8 checkout, docker build.
+#  1. git fetch + checkout the v0.5.2 tag in the nuc8 checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
@@ -85,7 +85,7 @@
 #     as memora-all-grok-<ts> (the name predates the model switch being a
 #     no-op; it still means "the container before this deploy", and the
 #     rollback commands below depend on it).
-#  5. Wait for GET /health, check it reports version 0.5.1 (proves the new
+#  5. Wait for GET /health, check it reports version 0.5.2 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
 #     dry-run memory_absorb call, one memory_semantic_search call and one
 #     memory_stats call, asserting no JSON-RPC error and a real session id at
@@ -150,7 +150,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="${DEPLOY_TAG:-v0.5.1}"
+TAG="${DEPLOY_TAG:-v0.5.2}"
 # Rehearsal parameters (R1): every default is the production value, so an
 # unparameterised run is exactly the nuc8 deploy. scripts/rehearse_deploy.sh
 # sets them to run the same steps against a local podman on server2.
@@ -195,7 +195,7 @@ OVERRIDDEN=()
 while IFS='|' read -r var label default; do
   [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
 done <<DEFAULTS
-TAG|DEPLOY_TAG|v0.5.1
+TAG|DEPLOY_TAG|v0.5.2
 DEPLOY_HOST|DEPLOY_HOST|nuc8
 RUNTIME|RUNTIME|docker
 DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
