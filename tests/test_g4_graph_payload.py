@@ -26,9 +26,9 @@ from memora.graph import data, payload
 FIXTURE = Path(__file__).parent / "fixtures" / "g4_pages_payloads.json"
 QUERIES = ["", "&docs=1", "&limit=12", "&docs=1&limit=25"]
 SCENARIOS = ["lineage", "content", "docs", "corrupt_row", "no_crossrefs_table", "retirement_fails", "random",
-             "unicode_times"]
+             "unicode_times", "odd_values"]
 # Inputs on which graph.ts itself fails (leader 8135): no parity owed, a correct payload here.
-DEFECT_SCENARIOS = ["prototype_keys", "prototype_fragment"]
+DEFECT_SCENARIOS = ["prototype_keys", "prototype_fragment", "malformed_throws"]
 
 
 def _meta(**kw):
@@ -187,6 +187,45 @@ def _rows_unicode_times():
     return mem, refs, [], []
 
 
+# (metadata, tags, is_fragment): odd JSON values graph.ts handles (probed with the bundle)
+_ODD_OK = [
+    ('{"hierarchy": {"path": "X"}}', '["a"]'),                                   # review 8153: section "X"
+    ('{"hierarchy": {"path": ""}, "section": "S"}', '["a"]'),
+    ('{"hierarchy": {"path": {"length": 0}}, "section": "S2"}', '["a"]'),
+    ('{"hierarchy": {"path": 5}, "section": "S3"}', '["a"]'),
+    ('{"hierarchy": ["x"], "section": "S4"}', '["a"]'),
+    ('{"hierarchy": {"path": ["T", ["a", null], {"k": 1}]}}', '["a"]'),
+    ('"a json string"', '["a"]'),
+    ('7', '["a"]'),
+    ('{}', '"hello"'),
+    ('{}', '[{"k": 1}, ["p", "q"], null]'),
+    ('{"type": "issue", "status": {"a": 1}}', '["a"]'),
+    ('{"type": "todo", "status": "closed", "closed_reason": ["x", "y"]}', '["a"]'),
+    ('{"section": 5}', '["a"]'),
+    ('{"section": "S", "subsection": ""}', '["a"]'),
+    ('{"type": "document_fragment", "document_key": "k"}', '{"0": "z"}'),       # fragments are never mapped
+    ('{"type": "document_fragment", "document_key": "k", "section_heading": 5}', '5'),
+]
+# values graph.ts throws on: one per memory, a Pages defect each
+_ODD_THROWS = [
+    ('{"hierarchy": {"path": "XY"}}', '["a"]'),
+    ('{"hierarchy": {"path": {"length": 1, "0": "A"}}}', '["a"]'),
+    ('{"section": "S", "subsection": 5}', '["a"]'),
+    ('null', '["a"]'),
+    ('{}', 'null'),
+    ('{}', '{"0": "z"}'),
+    ('{}', '5'),
+    ('{"type": "document_fragment", "document_key": "k"}', 'null'),
+]
+
+
+def _rows_odd(cases):
+    mem = [(1, "plain", _meta(), '["b"]', "2026-09-30 00:00:00")]
+    for i, (meta, tags) in enumerate(cases, start=2):
+        mem.append((i, f"odd {i}", meta, tags, f"2026-09-{29 - i:02d} 00:00:00"))
+    return mem, {1: [{"id": 2, "score": 0.9}]}, [], []
+
+
 def _rows_prototype_keys():
     """Object.prototype names as keys: graph.ts throws (a Pages defect)."""
     mem = [
@@ -223,6 +262,10 @@ def build_store(path, scenario):
         mem, refs, tomb, comp = _rows_random()
     elif scenario == "unicode_times":
         mem, refs, tomb, comp = _rows_unicode_times()
+    elif scenario == "odd_values":
+        mem, refs, tomb, comp = _rows_odd(_ODD_OK)
+    elif scenario == "malformed_throws":
+        mem, refs, tomb, comp = _rows_odd(_ODD_THROWS)
     elif scenario == "prototype_keys":
         mem, refs, tomb, comp = _rows_prototype_keys()
     elif scenario == "prototype_fragment":
@@ -320,6 +363,24 @@ def test_prototype_named_keys_throw_in_pages_and_are_mapped_correctly_here(query
     if 7 in ids:
         assert got["statusToNodes"]["isPrototypeOf"] == [7]
         assert next(n for n in got["nodes"] if n["id"] == 7)["color"] == "#ff7b72"  # the open colour
+
+
+@pytest.mark.parametrize("query", QUERIES)
+def test_values_graph_ts_throws_on_are_named_and_answered_here(query):
+    """Pages defect (leader 8135): each of these makes graph.ts throw."""
+    assert "__pages_throws__" in json.loads(FIXTURE.read_text())["malformed_throws"][query]
+    conn = build_store(":memory:", "malformed_throws")
+    defects = _defects(conn, query)
+    selected = {n["id"] for n in _payload(conn, query)["nodes"]}
+    expected = ["#2 hierarchy.path str not sliceable", "#3 hierarchy.path dict not sliceable",
+                "#4 subsection not a string", "#5 metadata null", "#6 tags null", "#7 tags not iterable",
+                "#8 tags not iterable", "#9 tags null"]
+    assert defects == [d for d in expected if int(d.split()[0][1:]) in selected]
+    got = _payload(conn, query)
+    if 2 in selected:  # the unsliceable path is treated as absent: no section from it
+        assert "X" not in got["sectionToNodes"] and 2 in got["sectionToNodes"]["Uncategorized"]
+    if 4 in selected:
+        assert got["sectionToNodes"]["S"] == [4] and not any(k.startswith("S/") for k in got["subsectionToNodes"])
 
 
 def test_a_prototype_named_fragment_tag_is_dropped_by_pages_and_kept_here():

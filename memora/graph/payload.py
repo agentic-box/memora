@@ -30,9 +30,11 @@ Parity means identical output for every input on which Pages itself works
     fragment's tag (?docs=1), which is never mapped, it does not throw but
     silently leaves the tag out of tagColors (and shifts later tags'
     colours).
-  * Malformed values where graph.ts throws (metadata ``null`` on a plain
-    memory, tags that are an object or null, a non-string subsection): this
-    port treats the value as absent.
+  * Values graph.ts throws on (a 500): tags ``null``; on a mapped memory,
+    tags that are not iterable (an object, a number), metadata ``null``, a
+    ``hierarchy.path`` string of two or more code units or an object with a
+    length, a non-string ``subsection``. This port treats the value as
+    absent.
 """
 from __future__ import annotations
 
@@ -651,6 +653,29 @@ def _parse_int(s: str) -> float:
     return int(m.group(1)) if m else math.nan
 
 
+def _hierarchy_path(meta: Any) -> Tuple[bool, Any]:
+    """(taken, path): graph.ts takes ``hierarchy.path`` when its .length is
+    truthy -- a non-empty array, or a string (path[0] is its first code
+    unit, path.slice(1) the rest)."""
+    path = _get(_get(meta, "hierarchy"), "path")
+    return _truthy(_get(path, "length")), path
+
+
+def _section_and_parts(meta: Any) -> Tuple[Any, List[Any]]:
+    """graph.ts's section and subsection path for a mapped memory. Where it
+    throws (a path string of 2+ code units, an object path with a length, a
+    truthy non-string subsection: pages_defects) the value is treated as
+    absent."""
+    taken, path = _hierarchy_path(meta)
+    if taken and isinstance(path, list):
+        return path[0], path[1:]
+    if taken and isinstance(path, str) and _u16len(path) == 1:
+        return path, []  # "X": section "X", parts "" (no subsections)
+    section = _or(_get(meta, "section"), "Uncategorized")
+    subsection = _get(meta, "subsection")
+    return section, (subsection.split("/") if isinstance(subsection, str) and subsection else [])
+
+
 # ------------------------------------------------------------------ Pages defects
 
 # Object.prototype's own property names: graph.ts finds these "in" any plain
@@ -664,8 +689,13 @@ OBJECT_PROTOTYPE_KEYS = frozenset({
 
 def pages_defects(memory_rows: List[Dict[str, Any]], *, include_docs: bool, limit: int) -> List[str]:
     """The inputs on which graph.ts itself misbehaves (so no parity is
-    owed): each selected memory whose tag, section, status, component or
-    category is an Object.prototype name. Empty for every other input."""
+    owed), per selected memory: a tag, section, status, component or
+    category that is an Object.prototype name; and the values graph.ts
+    throws on -- tags null (any memory); on a mapped memory (not a section
+    or fragment) tags that are not iterable, metadata null, a
+    hierarchy.path it takes but cannot slice/join (a string of 2+ code
+    units, an object with a truthy length), a truthy non-string
+    subsection. Empty for every other input."""
     found: List[str] = []
 
     def check(mid, what, key):
@@ -685,9 +715,22 @@ def pages_defects(memory_rows: List[Dict[str, Any]], *, include_docs: bool, limi
     for m in selected:
         meta = parse_json(m.get("metadata"), {})
         tags = parse_json(m.get("tags"), [])
+        if tags is None:
+            found.append(f"#{js_str(m['id'])} tags null")
         check(m["id"], "primary tag", _or(_index(tags, 0), "untagged"))
         if _is_type(meta, "document_fragment"):
             continue
+        if tags is not None and not isinstance(tags, (list, str)):
+            found.append(f"#{js_str(m['id'])} tags not iterable")
+        if meta is None:
+            found.append(f"#{js_str(m['id'])} metadata null")
+        if not _is_type(meta, "issue") and not _is_type(meta, "todo"):
+            taken, path = _hierarchy_path(meta)
+            if taken and not (isinstance(path, list) or (isinstance(path, str) and _u16len(path) == 1)):
+                found.append(f"#{js_str(m['id'])} hierarchy.path {type(path).__name__} not sliceable")
+            subsection = _get(meta, "subsection")
+            if not taken and _truthy(subsection) and not isinstance(subsection, str):
+                found.append(f"#{js_str(m['id'])} subsection not a string")
         for tag in _iter(tags):
             check(m["id"], "tag", tag)
         if _is_type(meta, "issue"):
@@ -697,9 +740,7 @@ def pages_defects(memory_rows: List[Dict[str, Any]], *, include_docs: bool, limi
             check(m["id"], "todo status", _todo_status(meta))
             check(m["id"], "category", _or(_get(meta, "category"), "uncategorized"))
         else:
-            path = _get(_get(meta, "hierarchy"), "path")
-            section = path[0] if isinstance(path, list) and path else _or(_get(meta, "section"), "Uncategorized")
-            check(m["id"], "section", section)
+            check(m["id"], "section", _section_and_parts(meta)[0])
     return found
 
 
@@ -991,16 +1032,7 @@ def build_graph_payload(
             _push(todo_status_to_nodes, _todo_status(meta), m["id"])
             _push(todo_category_to_nodes, _or(_get(meta, "category"), "uncategorized"), m["id"])
         if not issue and not todo:
-            path = _get(_get(meta, "hierarchy"), "path")
-            parts: List[Any] = []
-            if isinstance(path, list) and path:
-                section = path[0]
-                parts = path[1:]
-            else:
-                section = _or(_get(meta, "section"), "Uncategorized")
-                subsection = _get(meta, "subsection")
-                if isinstance(subsection, str) and subsection:
-                    parts = subsection.split("/")
+            section, parts = _section_and_parts(meta)
             _push(section_to_nodes, section, m["id"])
             for i in range(len(parts)):
                 # parts.slice(0, i + 1).join("/"): null/undefined join as ""
