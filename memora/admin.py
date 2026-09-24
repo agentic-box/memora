@@ -261,7 +261,12 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
 
         repair = embedding_repair_status(name)
         if repair is not None:
-            out["embeddings"] = {"repair_needed": repair}  # E1: repaired only by an explicit action
+            out.setdefault("embeddings", {})["repair_needed"] = repair  # E1: repaired only by an explicit action
+        from .storage import embedding_model_unrecorded_status
+
+        unrecorded = embedding_model_unrecorded_status(name)
+        if unrecorded is not None:
+            out.setdefault("embeddings", {})["model_unrecorded"] = unrecorded  # E1b: served, not yet recorded
         from .replicator import replicator_for, start_refusal
 
         rep = replicator_for(name)

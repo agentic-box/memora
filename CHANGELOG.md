@@ -30,6 +30,12 @@ Graph viewer with a store selector served by memora-all (G1): every graph route 
 - The store's model is recorded by the write path: the first vector the current model computes records the fingerprint once (`record_embedding_model_once`, `INSERT OR IGNORE`, only when the vector's kind matches the backend). The per-process cache holds only a committed record (a rolled-back first write does not stop the next one). A store never audited, or with rows missing a vector, is searched without a warning.
 - The warning names the actual integrity reason instead of always "Embedding model changed".
 
+### E1b: stores with no recorded embedding model (written before E1)
+- A store with no recorded embedding model (e.g. written by v0.4.6) is searched when its vectors are what the current model produces: the same kind (sparse for tfidf, dense otherwise) and, for a dense model, the same single dimension, checked against the query vector. A search logs this once and shows it in `/health/db/<name>` (`embeddings.model_unrecorded`); it records nothing.
+- Vectors that do not match are a genuine mismatch: `SearchUnavailable` "embedding_model_unrecorded", repaired by the explicit `memory_rebuild_embeddings`.
+- `memory_verify_integrity(record_model=true)` is the explicit step that records the current model on such a store (one `memories_meta` row; refused when the vectors do not match).
+- Deploy preflight: `python -m memora.embedding_preflight`, run in the new image with memora-all's environment and data volume, reads each store's recorded model and vectors read-only (local stores via `connect_read_only()`, d1:// via the read token; no lock taken). A dense backend makes one probe embedding. Exit 2, naming the store and the fix, when any store would refuse searches under the new image; `deploy-memora-all.sh` runs it before the old container is stopped.
+
 ### Graph UI with a store selector, served by memora-all (G1)
 
 - memora's graph server reads and edits the store `?db=<store>` selects

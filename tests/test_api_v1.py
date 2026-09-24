@@ -570,9 +570,20 @@ def test_search_on_a_model_mismatch_is_503_and_writes_nothing(api, statements):
 @pytest.mark.parametrize("api", ["fake_d1"], indirect=True)
 def test_search_on_a_store_with_no_recorded_model_is_503_and_writes_nothing(api, statements):
     with _connect_store() as conn:
-        storage.add_memory(conn, content="a memory on a store never searched", tags=["x"])
+        mid = storage.add_memory(conn, content="a memory on a store never searched", tags=["x"])["id"]
         # A store written before E1: the write path now records the model, so remove it.
         conn.execute("DELETE FROM memories_meta WHERE key = 'embedding_model'")
+        conn.commit()
+    _fresh_caches()
+    statements.clear()
+    # E1b: its vectors are what the current (tfidf) model makes -> served, nothing written.
+    r = api.post("/api/v1/memora/search", headers=AUTH, json={"query": "memory"})
+    assert r.status_code == 200 and r.json()["count"] == 1
+    assert _writes(statements) == []
+    # Dense vectors under a tfidf server: a genuine mismatch -> 503, still nothing written.
+    with _connect_store() as conn:
+        conn.execute("UPDATE memories_embeddings SET embedding = ?, representation = 'dense', dimension = 2, "
+                     "writer_token = 'w' WHERE memory_id = ?", ('{"0": 0.5, "1": 0.5}', mid))
         conn.commit()
     _fresh_caches()
     statements.clear()

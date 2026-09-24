@@ -1229,6 +1229,26 @@ def current_embedding_fingerprint(
     return f"{current_model}|unknown|unset"
 
 
+def unrecorded_compatibility(reps: Dict[str, int], current_model: str) -> Tuple[bool, Optional[int], str]:
+    """E1b (leader 7981): a store with NO recorded model (written before E1,
+    e.g. v0.4.6) is compatible with the current model when its vectors'
+    representation -- and, for a dense model, their single dimension --
+    match what the current model produces. Returns (compatible, dimension
+    the query vector must have or None, why). The dimension of the CURRENT
+    dense model is checked against the query vector by the caller."""
+    kinds = {k for k, n in (reps or {}).items() if n and k != "empty"}
+    if not kinds:
+        return True, None, "no vectors"
+    if current_model == "tfidf":
+        return (kinds == {"sparse"}), None, f"vectors {sorted(kinds)} for tfidf"
+    if current_model in ("openai", "sentence-transformers"):
+        dims = sorted(k for k in kinds if k.startswith("dense:"))
+        if kinds != set(dims) or len(dims) != 1:
+            return False, None, f"vectors {sorted(kinds)} for a dense model"
+        return True, int(dims[0].split(":", 1)[1]), f"vectors {dims[0]}"
+    return False, None, f"unknown backend {current_model!r}"
+
+
 def normalize_fingerprint(fp: Optional[str]) -> Optional[str]:
     """backend|model|repr. A stamp written before E1 carries the endpoint
     host as a third field (backend|model|host|repr): the host is dropped, so

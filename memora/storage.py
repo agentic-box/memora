@@ -9525,6 +9525,28 @@ def _clear_embedding_repair_needed() -> None:
     _EMBEDDING_REPAIR_NEEDED.pop(effective_database_name() or "(default)", None)
 
 
+_EMBEDDING_MODEL_UNRECORDED: Dict[str, Dict[str, Any]] = {}
+
+
+def _note_model_unrecorded(why: str) -> None:
+    """E1b: log once per store; /health/db shows it until recorded."""
+    name = effective_database_name() or "(default)"
+    if name in _EMBEDDING_MODEL_UNRECORDED:
+        return
+    _EMBEDDING_MODEL_UNRECORDED[name] = {
+        "since": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"), "vectors": why,
+        "action": "memory_verify_integrity(record_model=true) records the current model (explicit, one row)",
+    }
+    logger.warning(
+        "store %s has no recorded embedding model (written before E1); its %s are compatible with %s, so it is "
+        "searched. Record it explicitly with memory_verify_integrity(record_model=true).", name, why, EMBEDDING_MODEL)
+
+
+def embedding_model_unrecorded_status(name: str) -> Optional[Dict[str, Any]]:
+    entry = _EMBEDDING_MODEL_UNRECORDED.get(name)
+    return dict(entry) if entry else None
+
+
 def embedding_repair_status(name: str) -> Optional[Dict[str, Any]]:
     """For health: the repair a search found needed on this store, or None."""
     entry = _EMBEDDING_REPAIR_NEEDED.get(name)
@@ -9546,14 +9568,24 @@ def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) 
     reason = str(integrity.get("reason") or "unknown")
     if not integrity.get("repairable"):
         raise SearchUnavailable("integrity_fault", reason)
-    if reason in ("missing_embeddings", "integrity_uninitialized"):
-        from .embeddings import _model_mismatch_for_reps, get_stored_embedding_model
+    from .embeddings import _model_mismatch_for_reps, get_stored_embedding_model, unrecorded_compatibility
 
-        stored = get_stored_embedding_model(conn)
+    stored = get_stored_embedding_model(conn)
+    if stored is not None:
+        _EMBEDDING_MODEL_UNRECORDED.pop(effective_database_name() or "(default)", None)
+    if stored is None and not audit.get("mixed"):
+        # E1b: written before E1 (no model recorded). Serve it when its
+        # vectors are what the current model produces -- a search never
+        # records the model (an explicit memory_verify_integrity(record_model)
+        # does); say so once (log + health). Otherwise a genuine mismatch.
+        ok, dim, why = unrecorded_compatibility(audit.get("reps") or {}, EMBEDDING_MODEL)
+        if not ok:
+            raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
+        integrity["unrecorded_dimension"] = dim
+        _note_model_unrecorded(why)
+        return
+    if reason in ("missing_embeddings", "integrity_uninitialized"):
         if stored is None:
-            # Never searched or rebuilt: no record of which model made the
-            # vectors, so a query vector cannot be proven comparable. A normal
-            # (MCP) search records it.
             raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
         if not audit.get("mixed") and not _model_mismatch_for_reps(
             audit.get("reps") or {}, stored, EMBEDDING_MODEL,
@@ -9638,11 +9670,16 @@ def semantic_search(
         _clear_embedding_repair_needed()
     else:
         _clear_embedding_repair_needed()
+        _EMBEDDING_MODEL_UNRECORDED.pop(effective_database_name() or "(default)", None)
 
     with absorb_phase("query_embedding"):
         vector_query = _query_embedding(query)
     if not vector_query:
         return []
+    want_dim = integrity.get("unrecorded_dimension")
+    if want_dim is not None and len(vector_query) != want_dim:
+        # E1b: an unrecorded dense store is only compatible at its own dimension.
+        raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
     candidate_top_k = _follow_candidate_limit(top_k, follow)
     fresh_empty: List[_CorpusEntry] = []
     with absorb_phase("corpus"):

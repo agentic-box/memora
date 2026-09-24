@@ -2186,12 +2186,19 @@ async def memory_hierarchy(
 
 
 @mcp.tool()
-async def memory_verify_integrity() -> Dict[str, Any]:
-    """Read-only embedding integrity doctor with bounded offending ids."""
+async def memory_verify_integrity(record_model: bool = False) -> Dict[str, Any]:
+    """Read-only embedding integrity doctor with bounded offending ids.
+
+    record_model=true (explicit, E1b): on a store with NO recorded embedding
+    model (written before E1) whose vectors are what the current model
+    produces, record the current model -- one memories_meta row (on a live
+    primary it replicates). Refused when the vectors do not match; nothing
+    else is written. A search never records it."""
     def _run() -> Dict[str, Any]:
         from .embeddings import get_embedding_integrity_status, verify_embedding_integrity
         conn = connect()
         try:
+            recorded = _record_model_if_unrecorded(conn) if record_model else None
             audit = verify_embedding_integrity(conn, stamp=False)
             status = get_embedding_integrity_status(conn, os.getenv("MEMORA_EMBEDDING_MODEL", "tfidf"))
             inflight = list_absorb_inflight(conn)
@@ -2207,6 +2214,8 @@ async def memory_verify_integrity() -> Dict[str, Any]:
                     "silently deleting a slow-but-live absorb. Investigate the "
                     "owned_memory_ids and the writer; do not assume they are dead."
                 )
+            if recorded is not None:
+                response["record_model"] = recorded
             if status["mismatch"]:
                 response["remediation"] = (
                     "Repair or remove named orphan/unknown writer rows, then run an explicit "
@@ -2220,6 +2229,33 @@ async def memory_verify_integrity() -> Dict[str, Any]:
             conn.close()
 
     return await _in_worker(_run)
+
+
+def _record_model_if_unrecorded(conn) -> Dict[str, Any]:
+    """The explicit E1b step behind memory_verify_integrity(record_model)."""
+    from . import storage as _st
+    from .embeddings import (audit_embedding_integrity, compute_embedding, current_embedding_fingerprint,
+                             get_stored_embedding_model, invalidate_embedding_integrity_cache,
+                             set_stored_embedding_model, unrecorded_compatibility)
+
+    stored = get_stored_embedding_model(conn)
+    if stored is not None:
+        return {"recorded": False, "reason": "already recorded", "model": stored}
+    audit = audit_embedding_integrity(conn)
+    if audit.get("mixed"):
+        return {"recorded": False, "reason": "mixed vectors: run memory_rebuild_embeddings"}
+    ok, dim, why = unrecorded_compatibility(audit.get("reps") or {}, _st.EMBEDDING_MODEL)
+    if ok and dim is not None:
+        vec = compute_embedding("memora record-model probe", None, [], _st.EMBEDDING_MODEL)
+        if len(vec or {}) != dim:
+            ok, why = False, f"{why}, but {_st.EMBEDDING_MODEL} now produces dense:{len(vec or {})}"
+    if not ok:
+        return {"recorded": False, "reason": f"incompatible: {why}; run memory_rebuild_embeddings"}
+    fp = current_embedding_fingerprint(_st.EMBEDDING_MODEL, observed_dim=dim)
+    set_stored_embedding_model(conn, fp)  # commits; the one explicit write
+    invalidate_embedding_integrity_cache(conn)
+    _st._EMBEDDING_MODEL_UNRECORDED.pop(_st.effective_database_name() or "(default)", None)
+    return {"recorded": True, "model": fp, "vectors": why}
 
 
 @mcp.tool()
