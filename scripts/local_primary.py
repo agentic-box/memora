@@ -20,8 +20,9 @@ this file only parses arguments and builds the dependencies.
   restamp <db> --receipt R --credential-file C          write path 4: one embedding_integrity row on D1
   thaw    <db>              lift the freeze -- the only command that does
   shadow-init --shadow /data/shadow/<db>.db      §2.9: a seeded store becomes a clean shadow file
-  shadow-night <db> --shadow S --seed-export SQL --account A --database-id D
-                            §2.9 nightly: shadow vs D1 and the log rebuild; exit 5 when not clean
+  shadow-night <db> --shadow S --seed-export SQL --account A --database-id D --health-token-file H
+                            §2.9 nightly: shadow vs D1 and the log rebuild; exit 5 when not clean,
+                            6 when deferred (the applier in memora-all did not drain and stay stable)
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
   check-endpoint            F4a: authenticated round trip to memora-all through a
@@ -32,7 +33,7 @@ on it (seed, sequence-highwater) run under one freeze, lifted by `thaw`
 when the procedure is done.
 
 Exit codes: 0 done, 2 refused (nothing changed), 3 halted (see the message),
-4 volume alert, 5 shadow night not clean.
+4 volume alert, 5 shadow night not clean or compare diff, 6 shadow night deferred or compare skipped.
 Every run prints one JSON line on stdout with the outcome.
 """
 
@@ -173,6 +174,11 @@ def _parser() -> argparse.ArgumentParser:
     sg.add_argument("--account", required=True)
     sg.add_argument("--database-id", required=True)
     sg.add_argument("--read-token-file", help="0600 file with the D1 READ token (default: MEMORA_D1_READ_TOKEN)")
+    sg.add_argument("--memora-url", default="http://127.0.0.1:8000")
+    sg.add_argument("--health-token-file", required=True,
+                    help="the health token: /health/db/<db> shows the applier's queue and generation")
+    sg.add_argument("--stable-wait-s", type=float, default=300.0,
+                    help="how long to wait for a drained, stable applier before deferring (exit 6)")
     si = sub.add_parser("shadow-init", help="§2.9 make a SEEDED store a shadow file (clean shadow_state)")
     si.add_argument("--shadow", required=True, help="the seeded file, e.g. /data/shadow/<db>.db")
     sn = sub.add_parser("snapshot", help="§4 nightly snapshot of a local store to R2")
@@ -408,11 +414,15 @@ def main(argv=None) -> int:
             return 0
         if args.cmd == "shadow-night":
             from memora.backends import D1SelectOnlyConnection
-            from memora.shadow_night import run_night
+            from memora.shadow_night import ShadowHealthProbe, run_night
 
             reader = D1SelectOnlyConnection(args.account, args.database_id, lp.read_token(args.read_token_file))
-            out = run_night(args.db, Path(args.shadow), reader, Path(args.seed_export))
+            probe = ShadowHealthProbe(args.memora_url, lp.load_credential_file(args.health_token_file), args.db)
+            out = run_night(args.db, Path(args.shadow), reader, Path(args.seed_export), probe=probe,
+                            stable_wait_s=args.stable_wait_s)
             print(json.dumps({"ok": out["clean"], **out}, default=str))
+            if out.get("deferred"):
+                return 6
             return 0 if out["clean"] else 5
         if args.cmd == "shadow-init":
             from memora.shadow import ShadowConfigError, init_shadow_file

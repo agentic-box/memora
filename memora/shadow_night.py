@@ -19,6 +19,21 @@ the source.
     after the cursor are not yet in the log and are left out. A diff is a
     statement-builder bug.
 
+    A log key with no outbox row is a defect, except a memories parent the
+    replicator adds to a child upsert (replicator._add_parents; review 7701
+    P1-1): allowed only when every log record of it is an upsert in the same
+    attempt and seq as an upsert of a child (memories_embeddings,
+    memories_crossrefs) keyed by that memory id.
+
+Stability (review 7701 P1-2). (a) is meaningful only when the shadow has
+caught up with D1. The check first waits, up to a bound, for the applier in
+the running server (the `shadow` block of /health/db/<db>, read with the
+health token) to be drained and stable: alive, queue_depth 0, pending_keys 0,
+no shadowed mutation in flight. It runs (a) and then requires the same
+applier instance and generation (no shadowed mutation started meanwhile) and
+still drained. Otherwise it retries within the bound and then DEFERS: exit
+6, shadow_state untouched (nothing marked dirty, nothing counted).
+
 A night is clean when (a) and (b) show zero diffs and shadow_state.dirty is 0.
 A clean night increments clean_nights once per UTC day (last_clean_night); a
 failed one resets it to 0 and, for a diff, marks the shadow dirty (it must be
@@ -37,7 +52,52 @@ from .schema import SYNC_META_EXCLUDED, SYNC_TABLES
 from .shadow import _norm, rows_equal
 
 REQUIRED_CLEAN_NIGHTS = 7
+STABLE_WAIT_S = 300.0
+STABLE_POLL_S = 1.0
 Key = Tuple[str, Tuple[Any, ...]]
+
+
+def unstable_reason(block: Optional[Dict[str, Any]]) -> Optional[str]:
+    """None when the applier's health block shows it drained and stable."""
+    if not block:
+        return "no shadow block (not a shadowed store, the server is down, or the health token is not accepted)"
+    if block.get("error") or block.get("refused"):
+        return f"the applier is not running: {block.get('error') or block.get('refused')}"
+    if not block.get("applier_alive"):
+        return "the applier is not alive"
+    if "generation" not in block or "instance" not in block:
+        return "the health block has no applier generation"
+    busy = {k: block.get(k) for k in ("queue_depth", "unfinished", "pending_keys", "inflight") if block.get(k)}
+    if busy:
+        return f"the applier is not drained: {busy}"
+    return None
+
+
+class ShadowHealthProbe:
+    """GET /health/db/<db> with the health token; returns the shadow block
+    (or None when the server does not answer with one)."""
+
+    def __init__(self, base_url: str, health_token: str, db: str, *, timeout: float = 30.0):
+        self.url = f"{base_url.rstrip('/')}/health/db/{db}"
+        self.health_token = health_token
+        self.timeout = timeout
+
+    def __call__(self) -> Optional[Dict[str, Any]]:
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(self.url, headers={"Authorization": f"Bearer {self.health_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                body = json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read() or b"{}")
+            except ValueError:
+                return None
+        except (urllib.error.URLError, OSError, ValueError):
+            return None
+        return body.get("shadow") if isinstance(body, dict) else None
 
 
 def _ro(path: Path):
@@ -160,7 +220,7 @@ def builder_check(name: str, shadow_path: Path, seed_sql: Path, *,
                    if int(r["seq"]) <= cursor]
         log_keys = {(r["tbl"], tuple(_norm(v) for v in r["pk"])) for r in records}
         missing_in_log = sorted(set(logged_upto) - log_keys, key=str)
-        extra_in_log = sorted(log_keys - set(logged_upto), key=str)
+        extra_in_log = sorted((k for k in log_keys - set(logged_upto) if not replicator.is_added_parent(k, records)), key=str)
         scratch = work / "replayed.db"
         load_sql(seed_sql, scratch)
         rdb = _scratch(scratch)
@@ -221,16 +281,46 @@ def _record(db, st: Dict[str, Any], clean: bool, reason: Optional[str], day: str
                    (reason, time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
 
 
+def _stable_compare(shadow_path: Path, reader, probe: Callable[[], Optional[Dict[str, Any]]], *,
+                    pause_s: float, sleep: Callable[[float], None], wait_s: float, poll_s: float,
+                    clock: Callable[[], float]) -> Tuple[Optional[Dict[str, List[str]]], str]:
+    """(a) under a drained, stable applier: (diffs, "") or (None, why not)."""
+    deadline = clock() + wait_s
+    why = "not tried"
+    while True:
+        before = probe()
+        why = unstable_reason(before)
+        if why is None:
+            a = compare_with_d1(shadow_path, reader, pause_s=pause_s, sleep=sleep)
+            after = probe()
+            why = unstable_reason(after)
+            if why is None and (after["instance"], after["generation"]) != (before["instance"], before["generation"]):
+                why = "a shadowed mutation started during the compare"
+            if why is None:
+                return a, ""
+            why = f"after the compare: {why}"
+        if clock() >= deadline:
+            return None, why
+        sleep(poll_s)
+
+
 def run_night(name: str, shadow_path: Path, reader, seed_sql: Path, *, today: Optional[str] = None,
               pause_s: float = 2.0, sleep: Callable[[float], None] = time.sleep,
-              log_records: Optional[Iterable[Dict[str, Any]]] = None) -> Dict[str, Any]:
+              log_records: Optional[Iterable[Dict[str, Any]]] = None,
+              probe: Callable[[], Optional[Dict[str, Any]]], stable_wait_s: float = STABLE_WAIT_S,
+              poll_s: float = STABLE_POLL_S, clock: Callable[[], float] = time.monotonic) -> Dict[str, Any]:
     shadow_path = Path(shadow_path)
     db = _ro(shadow_path)
     try:
         reported = int(db.execute("SELECT would_halt_reported_id FROM shadow_state WHERE id = 1").fetchone()[0])
     finally:
         db.close()
-    a = compare_with_d1(shadow_path, reader, pause_s=pause_s, sleep=sleep)
+    a, why = _stable_compare(shadow_path, reader, probe, pause_s=pause_s, sleep=sleep,
+                             wait_s=stable_wait_s, poll_s=poll_s, clock=clock)
+    if a is None:
+        # Review 7701 P1-2: not a failed night and not a shadow defect;
+        # shadow_state is left exactly as it was.
+        return {"store": name, "clean": False, "deferred": True, "deferred_reason": why}
     # Would-halt events (log-mode delete guard, §9 (n)) are reported for the
     # night, never a failure of it: the week's count sets the per-table
     # limits before write mode.

@@ -14,6 +14,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary L9a round 2 (review 7701)
+- `shadow-night` needs a drained, stable applier: it reads the `shadow` block of `/health/db/<db>` (new `--health-token-file`, `--memora-url`) and waits up to `--stable-wait-s` (300 s) for `applier_alive`, with `queue_depth`, `unfinished`, `pending_keys` and `inflight` all 0. After the D1 compare, the applier `instance` and `generation` must be unchanged and the block still drained. Otherwise the night is DEFERRED: exit 6, `shadow_state` untouched, nothing marked dirty, nothing counted.
+- The `shadow` health block adds `inflight`, `unfinished`, `generation` and `instance`.
+- Check (b) allows a log key with no outbox row only for a `memories` parent the replicator added to a child upsert (`replicator.is_added_parent`): every record of it must be an upsert with the same attempt and seq as an upsert of that memory's `memories_embeddings`/`memories_crossrefs` row. Any other extra key is still a defect. The case also relies on L6's `iter_log` dedup fix, which landed first, and a test covers it.
+- Copy-back: the local equalisation rechecks the generation after its writes, holding the applier lock that a shadowed mutation's start needs, and commits under it. If the generation moved, the transaction is rolled back and the keys stay pending.
+- Typo in `docs/local-primary-credentials.md` ("Then Then").
+
 ### Local-primary L3/L9a: the delete guard records would-halt events in log mode
 - In log mode the P3 delete guard no longer halts the replicator (log mode sends nothing to D1; leader 7699, plan §9 (n)). A batch over the limit (> 50 net deletes, or > 1% of the table, so any delete from a table under 100 rows) adds a `sync_would_halt` row (table, deletes, row count, threshold, attempt id; once per attempt), increments `sync_state.would_halt_count`, sets `last_would_halt`, logs a warning, and is logged as usual. Write mode still halts before sending.
 - The replication health block (`/health/db/<name>`, `replication`) gets `would_halt_count` and `last_would_halt`.

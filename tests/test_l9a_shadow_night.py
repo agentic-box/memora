@@ -43,11 +43,18 @@ def night(world, monkeypatch):
             replicator.stop_replicators()
         return out
 
-    def run(day="2026-09-24", sleep=lambda s: None):
+    def health_probe():  # what ShadowHealthProbe reads from /health/db/s1
+        return (admin.gate_health("s1") or {}).get("shadow")
+
+    def run(day="2026-09-24", sleep=lambda s: None, probe=health_probe, **kw):
         log_all()
-        return shadow_night.run_night("s1", world.shadow_path, world.replica.reader(), seed,
-                                      today=day, sleep=sleep)
+        _drain(world.app)
+        kw.setdefault("stable_wait_s", 2.0)  # drained above: an unstable block here is a failure, not a wait
+        return shadow_night.run_night("s1", world.shadow_path, world.replica.reader(), world.seed,
+                                      today=day, sleep=sleep, probe=probe, **kw)
+    world.seed = seed
     world.run = run
+    world.health_probe = health_probe
     return world
 
 
@@ -249,3 +256,192 @@ def test_an_extra_log_key_fails_the_key_set_check_alone(night):
     out = night.run("2026-09-25")
     assert out["builder"]["diffs"] == {} and out["builder"]["key_set"]["extra_in_log"]
     assert not out["clean"]
+
+
+# ------------------------------------------------------------ review 7701 P1-1
+
+def test_a_parent_the_replicator_adds_to_a_child_upsert_is_not_an_extra_key(night):
+    """A memory in the seed (no outbox row ever) whose embedding alone is
+    updated: the replicator sends the parent's current row with the child
+    (replicator._add_parents). That log key is allowed; the night is clean."""
+    db = night.replica._db()
+    db.execute("INSERT INTO memories (id, content) VALUES (500, 'seeded')")
+    db.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (500, '[]')")
+    db.commit()
+    db.close()
+    sh = sqlite3.connect(night.shadow_path)  # as `seed` would have copied them: no outbox rows
+    sh.execute("INSERT INTO memories (id, content) VALUES (500, 'seeded')")
+    sh.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (500, '[]')")
+    sh.execute("DELETE FROM sync_outbox")
+    sh.commit()
+    sh.close()
+    _export(night.replica.path, night.seed)
+    conn = night.backend.connect()
+    conn.execute("UPDATE memories_embeddings SET embedding = ? WHERE memory_id = ?", ('[[\"0\", 1.0]]', 500))
+    conn.close()
+    out = night.run()
+    logged = {(r["tbl"], tuple(r["pk"])) for r in replicator.iter_log("s1")}
+    assert ("memories", (500,)) in logged, "the replicator added the parent"
+    assert out["builder"]["key_set"] == {"missing_in_log": [], "extra_in_log": []}
+    assert out["clean"], out
+
+
+@pytest.mark.parametrize("variant", ["other seq", "other attempt", "a delete", "child of another memory"])
+def test_an_extra_memories_key_that_is_not_an_added_parent_is_a_defect(night, variant):
+    _app_writes(night)
+    night.run()
+    path = sorted(replicator.log_dir("s1").glob("*.jsonl"))[0]
+    recs = [json.loads(ln) for ln in path.read_text().splitlines()]
+    child = next(r for r in recs if r["tbl"] == "memories_embeddings" and not r["sql"].startswith("DELETE"))
+    parent_pk = 99999 if variant == "child of another memory" else child["pk"][0] + 1000
+    fake_child = {**child, "index": 98, "pk": [parent_pk], "params": [parent_pk],
+                  "sql": "UPDATE memories_embeddings SET embedding = embedding WHERE memory_id = ?"}
+    extra = {**child, "index": 99, "tbl": "memories", "pk": [parent_pk],
+             "sql": "UPDATE memories SET content = content WHERE id = ?", "params": [parent_pk]}
+    if variant == "other seq":
+        extra["seq"] = next(r["seq"] for r in recs if r["seq"] != child["seq"])
+    elif variant == "other attempt":
+        extra["attempt_id"] = "0" * 16
+    elif variant == "a delete":
+        extra["sql"] = "DELETE FROM memories WHERE id = ?"
+    add = [extra] if variant == "child of another memory" else [fake_child, extra]
+    with open(path, "a") as fh:
+        for r in add:
+            fh.write(json.dumps(r) + "\n")
+    out = night.run("2026-09-25")
+    assert f"('memories', ({parent_pk},))" in out["builder"]["key_set"]["extra_in_log"], out["builder"]
+    assert not out["clean"]
+
+
+# ------------------------------------------------------------ review 7701 P1-2
+
+def _block(**kw):
+    b = {"enabled": True, "applier_alive": True, "queue_depth": 0, "unfinished": 0, "pending_keys": 0,
+         "inflight": 0, "generation": 7, "instance": "i1", "dirty": False}
+    b.update(kw)
+    return b
+
+
+def _foreign_write(night):
+    db = night.replica._db()
+    db.execute("UPDATE memories SET content = 'foreign' WHERE id = 1")
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize("busy", [{"queue_depth": 3}, {"unfinished": 1}, {"pending_keys": 2}, {"inflight": 1},
+                                  {"applier_alive": False}, {"refused": "no D1 reader"}, None,
+                                  {"generation": None, "_drop": "generation"}])
+def test_an_unstable_applier_defers_the_night_and_touches_nothing(night, busy):
+    """A backlog (or any not-drained state) never marks the shadow dirty and
+    never counts a night: exit 6, shadow_state as it was -- even when D1
+    differs, as it does while the shadow is behind."""
+    _app_writes(night)
+    assert night.run("2026-09-24")["clean_nights"] == 1
+    before = _state(night.shadow_path)
+    _foreign_write(night)
+    if busy is None:
+        block = None
+    else:
+        block = _block(**{k: v for k, v in busy.items() if k != "_drop"})
+        if "_drop" in busy:
+            del block[busy["_drop"]]
+    slept = []
+
+    def sleep(s):
+        assert len(slept) < 50, "the wait did not stop at its bound"
+        slept.append(s)
+    out = night.run("2026-09-25", probe=lambda: block, stable_wait_s=0, sleep=sleep)
+    assert out["deferred"] is True and out["clean"] is False and out["deferred_reason"]
+    assert "compare" not in out and "builder" not in out
+    assert _state(night.shadow_path) == before
+
+
+def test_the_generation_moving_during_the_compare_defers(night):
+    _app_writes(night)
+    blocks = iter([_block(generation=7), _block(generation=8)])
+    out = night.run(probe=lambda: next(blocks), stable_wait_s=0)
+    assert out["deferred"] and "started during the compare" in out["deferred_reason"]
+    assert _state(night.shadow_path)["clean_nights"] == 0
+
+
+def test_a_restarted_applier_during_the_compare_defers(night):
+    """A new server process starts its generation at 0 again: the instance
+    tells them apart."""
+    _app_writes(night)
+    blocks = iter([_block(instance="i1"), _block(instance="i2")])
+    out = night.run(probe=lambda: next(blocks), stable_wait_s=0)
+    assert out["deferred"]
+
+
+def test_a_backlog_after_the_compare_defers(night):
+    _app_writes(night)
+    blocks = iter([_block(), _block(queue_depth=1)])
+    out = night.run(probe=lambda: next(blocks), stable_wait_s=0)
+    assert out["deferred"] and out["deferred_reason"].startswith("after the compare")
+
+
+def test_the_check_waits_for_the_applier_then_counts(night):
+    _app_writes(night)
+    blocks = iter([_block(queue_depth=4), _block(pending_keys=1), _block(), _block()])
+    now = [0.0]
+    polls = []
+
+    def sleep(s):
+        polls.append(s)
+        now[0] += s
+    out = night.run(probe=lambda: next(blocks), stable_wait_s=10, sleep=sleep, poll_s=1.0,
+                    clock=lambda: now[0])
+    assert out["clean"] and out["clean_nights"] == 1 and polls == [1.0, 1.0]
+
+
+def test_the_wait_is_bounded(night):
+    _app_writes(night)
+    now = [0.0]
+    polls = []
+
+    def sleep(s):
+        polls.append(s)
+        now[0] += s
+    def bounded_sleep(s):
+        assert len(polls) < 50, "the wait did not stop at its bound"
+        sleep(s)
+    out = night.run(probe=lambda: _block(queue_depth=1), stable_wait_s=3, sleep=bounded_sleep, poll_s=1.0,
+                    clock=lambda: now[0])
+    assert out["deferred"] and len(polls) == 3
+
+
+def test_the_real_health_block_carries_the_stability_fields(night):
+    _app_writes(night)
+    _drain(night.app)
+    block = night.health_probe()
+    assert shadow_night.unstable_reason(block) is None
+    assert block["instance"] == night.app.instance and block["generation"] == night.app._generation
+    night.app.begin_mutation()
+    try:
+        assert "inflight" in shadow_night.unstable_reason(night.health_probe())
+    finally:
+        night.app.end_mutation()
+
+
+def test_the_cli_exits_6_when_deferred(night, monkeypatch, capsys):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("lp_cli", REPO / "scripts" / "local_primary.py")
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    tok = night.tmp / "health"
+    tok.write_text("h" * 32)
+    tok.chmod(0o600)
+    seen = {}
+
+    def fake_run_night(*a, **kw):
+        seen.update(kw)
+        return {"store": "s1", "clean": False, "deferred": True, "deferred_reason": "busy"}
+    monkeypatch.setattr(shadow_night, "run_night", fake_run_night)
+    code = cli.main(["shadow-night", "s1", "--shadow", str(night.shadow_path), "--seed-export", str(night.seed),
+                     "--account", "a", "--database-id", "d", "--health-token-file", str(tok),
+                     "--stable-wait-s", "12"])
+    assert code == 6 and seen["stable_wait_s"] == 12.0
+    assert isinstance(seen["probe"], shadow_night.ShadowHealthProbe)
+    assert json.loads(capsys.readouterr().out)["deferred"] is True

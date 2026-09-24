@@ -48,7 +48,10 @@ embedding DELETE+INSERT does that.) At the quiescent point:
   4. in one store_write, make each local row equal to D1's (the replicator's
      statement shapes: upsert, delete+insert for embeddings, delete), then
      re-read it: it must equal D1's row column for column, and a key absent
-     on D1 must be absent locally.
+     on D1 must be absent locally. The generation is rechecked inside that
+     store_write, after the writes and just before the commit (review 7701
+     P2): if a shadowed mutation started since the reads, the transaction is
+     rolled back and the keys stay pending for the next quiescent point.
 
 Dirty rule (plan §2.9, every failure point sets shadow_state.dirty with a
 reason; D1 is never touched and nothing retries into D1; a dirty shadow is
@@ -81,6 +84,7 @@ import os
 import queue
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -101,6 +105,10 @@ LAST_ROW_ID_TABLES = ("memories", "memories_actions")
 
 class ShadowConfigError(RuntimeError):
     """MEMORA_SHADOW_LOCAL is unusable. Raised at startup (exit 2)."""
+
+
+class _GenerationMoved(Exception):
+    """A shadowed mutation started during a copy-back: discard, retry later."""
 
 
 class ShadowDirty(Exception):
@@ -266,6 +274,9 @@ class ShadowApplier:
         # started while it read (module docstring).
         self._inflight = 0
         self._generation = 0
+        # Names this applier's generation counter: a restarted server starts
+        # a new one at 0, which the nightly check must not take as unchanged.
+        self.instance = uuid.uuid4().hex[:12]
         # Keys replayed but not yet copied back, with the written values
         # expected where the last statement on the key was its own write.
         self._pending_keys: Dict[Tuple[str, tuple], Optional[Dict[str, Any]]] = {}
@@ -366,8 +377,12 @@ class ShadowApplier:
         self.queue.put_nowait(item)
 
     def status(self) -> Dict[str, Any]:
+        with self._lock:
+            inflight, generation = self._inflight, self._generation
         out: Dict[str, Any] = {"enabled": True, "queue_depth": self.queue.qsize(), "applier_alive": self.alive,
-                               "pending_keys": len(self._pending_keys),
+                               "pending_keys": len(self._pending_keys), "inflight": inflight,
+                               "unfinished": self.queue.unfinished_tasks,
+                               "generation": generation, "instance": self.instance,
                                "dirty": self.dirty_reason is not None, "dirty_reason": self.dirty_reason}
         if self.refused:
             out["refused"] = self.refused
@@ -476,6 +491,7 @@ class ShadowApplier:
             return  # D1 may have moved while we read: read again at the next quiet point
         from .replicator import _build_statements
 
+        held = moved = False
         try:
             with store_write(conn):
                 columns: Dict[str, List[str]] = {}
@@ -489,15 +505,33 @@ class ShadowApplier:
                     local = dict(local) if local is not None else None
                     if not rows_equal(row, local):
                         raise ShadowDirty(f"row 6: after copy-back {tbl} {list(pk)} differs from D1")
+                # Review 7701 P2: recheck and commit under the applier lock,
+                # which begin_mutation needs -- no shadowed mutation can start
+                # between this check and the commit. Moved: roll back.
+                self._lock.acquire()
+                held = True
+                if self._inflight or self.queue.unfinished_tasks or self._generation != generation:
+                    raise _GenerationMoved()
+        except _GenerationMoved:
+            moved = True  # the keys stay pending: read again at the next quiet point
         except ShadowDirty as exc:
+            if held:
+                self._lock.release()
+                held = False
             self.mark_dirty(str(exc))
         except Exception as exc:
+            if held:
+                self._lock.release()
+                held = False
             self.mark_dirty(f"row 6: copy-back could not be applied locally ({type(exc).__name__}: {str(exc)[:160]})")
         finally:
-            with self._lock:
-                for key in order:
-                    if self._pending_keys.get(key, "absent") == pending[key]:
-                        self._pending_keys.pop(key, None)
+            if held:
+                self._lock.release()
+            if not moved:
+                with self._lock:
+                    for key in order:
+                        if self._pending_keys.get(key, "absent") == pending[key]:
+                            self._pending_keys.pop(key, None)
 
     def _read_back(self, tbl: str, pk: tuple, expect: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         where = " AND ".join(f"{c} = ?" for c in SYNC_TABLES[tbl])

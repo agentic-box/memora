@@ -255,6 +255,26 @@ def _add_parents(conn, batch: _Batch) -> None:
     batch.keys.extend(extra)
 
 
+def _is_delete_record(record: Dict[str, Any]) -> bool:
+    return str(record["sql"]).lstrip().upper().startswith("DELETE")
+
+
+def is_added_parent(key: Tuple[str, Tuple[Any, ...]], records: List[Dict[str, Any]]) -> bool:
+    """A memories key the replicator added as the FK parent of a child upsert
+    (_add_parents; review 7701 P1-1): every log record of it is an upsert in
+    the same attempt and seq as an upsert of a child keyed by that memory id.
+    `key` is (table, pk tuple) with pk values as read back from the log."""
+    from .shadow import _norm
+
+    tbl, pk = key
+    if tbl != FK_PARENT:
+        return False
+    children = {(r["attempt_id"], int(r["seq"])) for r in records
+                if r["tbl"] in FK_CHILDREN and tuple(_norm(v) for v in r["pk"]) == pk and not _is_delete_record(r)}
+    mine = [r for r in records if r["tbl"] == tbl and tuple(_norm(v) for v in r["pk"]) == pk]
+    return bool(mine) and all(not _is_delete_record(r) and (r["attempt_id"], int(r["seq"])) in children for r in mine)
+
+
 def delete_guard_detail(conn, batch: _Batch) -> Optional[Dict[str, Any]]:
     """P3: None when the batch's net deletes are within bounds, else the
     first table over them: {tbl, deletes, total, threshold, attempt_id}. A

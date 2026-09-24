@@ -174,6 +174,27 @@ def test_log_key_set_equals_outbox_key_set(tmp_path):
     assert logged == {(t, json.dumps(json.loads(pk), separators=(",", ":"))) for t, pk in outbox}
 
 
+def test_an_added_parent_and_its_child_share_a_seq_and_both_survive_the_log_read(tmp_path):
+    """_add_parents gives the parent the child's seq; iter_log's dedup must
+    not collapse the parent's statement 0 and the child's statement 0
+    (the embedding DELETE), or the log no longer replays (review 7701)."""
+    b = local_store(tmp_path / "l.db")
+    conn = b.connect()
+    conn.execute("INSERT INTO memories (id, content) VALUES (7, 'seeded')")
+    conn.execute("INSERT INTO memories_embeddings (memory_id, embedding) VALUES (7, '[]')")
+    conn.execute("DELETE FROM sync_outbox")  # both rows came with the seed
+    conn.execute("UPDATE memories_embeddings SET embedding = '[1]' WHERE memory_id = 7")
+    conn.commit()
+    conn.close()
+    rep = _rep(b)
+    assert rep.run_once() == "logged"
+    recs = [(r["seq"], r["tbl"], r["index"], r["sql"].split(" ")[0]) for r in R.iter_log("s1")]
+    seq = recs[0][0]
+    assert sorted(recs) == sorted([(seq, "memories", 0, "INSERT"), (seq, "memories_embeddings", 0, "DELETE"),
+                                   (seq, "memories_embeddings", 1, "INSERT")])
+    assert rep.run_once() == "idle"
+
+
 def test_log_crash_between_fsync_and_cursor(tmp_path):
     """A real process dies after the log fsync and before the cursor commit;
     the next cycle appends the same range again and readers deduplicate."""

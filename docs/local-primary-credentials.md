@@ -169,7 +169,7 @@ last, only after nothing but memora-all uses D1.
      `memory_stats` (step 3);
    - memora-all is healthy on (a) (step 7).
 
-   Then Then delete every
+   Then delete every
    `*.bak-repoint-*` backup: each still holds it (the audit reports them
    until they are gone). A stale client now gets
    401/403 from Cloudflare; memora-all stays healthy on (a).

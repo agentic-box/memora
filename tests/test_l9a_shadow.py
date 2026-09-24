@@ -178,9 +178,15 @@ def test_a_different_local_id_is_corrected_by_copy_back(world):
     assert world.app.dirty_reason is None
 
 
-def test_a_copy_back_interrupted_by_a_new_mutation_is_redone(world):
+def test_a_copy_back_interrupted_by_a_new_mutation_is_redone(world, monkeypatch):
     """The reads are taken only at a quiet point; a mutation that starts
-    while they run voids them, and they are taken again later."""
+    while they run voids them, and they are taken again later -- without a
+    local equalisation from the voided reads."""
+    from memora import replicator
+
+    real_build = replicator._build_statements
+    built = []
+    monkeypatch.setattr(replicator, "_build_statements", lambda *a, **kw: (built.append(a[:2]), real_build(*a, **kw))[1])
     real = world.app.reader.execute
     calls = []
 
@@ -194,6 +200,7 @@ def test_a_copy_back_interrupted_by_a_new_mutation_is_redone(world):
     _write(world)
     _drain(world.app)
     assert len(calls) >= 2, "the first reads were discarded and taken again"
+    assert len(built) == len({(t, tuple(pk)) for t, pk in built}), "no equalisation from the voided reads"
     assert world.app.dirty_reason is None
     _assert_mirrored(world)
 
@@ -422,6 +429,39 @@ def test_row_5_a_stale_replica_read_is_retried_then_accepted(world):
     _write(world)
     _drain(world.app)
     assert world.app.dirty_reason is None and world.sleeps == [0.2, 0.2]
+    _assert_mirrored(world)
+
+
+def test_a_mutation_starting_during_the_local_equalisation_rolls_it_back_and_retries(world, monkeypatch):
+    """Review 7701 P2: the generation is rechecked, under the applier lock,
+    after the local writes and before the commit; a shadowed mutation that
+    started meanwhile rolls the equalisation back and the keys stay pending."""
+    from memora import replicator
+
+    real = replicator._build_statements
+    calls = []
+
+    def build(*a, **kw):
+        calls.append(a[0])
+        if len(calls) == 1:
+            world.app.begin_mutation()
+            world.app.end_mutation()
+        return real(*a, **kw)
+    monkeypatch.setattr(replicator, "_build_statements", build)
+    seen_pending = []
+    real_copy = world.app._copy_back_if_quiet
+
+    def copy(conn):
+        n = len(calls)
+        real_copy(conn)
+        if n == 0 and calls:
+            seen_pending.append(len(world.app._pending_keys))
+    monkeypatch.setattr(world.app, "_copy_back_if_quiet", copy)
+    _write(world)
+    _drain(world.app)
+    assert seen_pending and seen_pending[0] > 0, "the first equalisation was discarded, its keys kept"
+    assert len(calls) > len(set(calls)), "the equalisation ran again"
+    assert world.app.dirty_reason is None
     _assert_mirrored(world)
 
 

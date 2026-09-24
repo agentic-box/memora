@@ -714,7 +714,11 @@ a false written-value mismatch (row 5), and it made a later replay conflict
 with the future row copy-back had installed (row 4). The app's own embedding
 DELETE+INSERT triggers the latter. The written-value check applies where the
 last statement on a key was that key's own parameterised write. Rows 1–10
-are unchanged.
+are unchanged. The local equalisation (step 4) rechecks the generation after
+its writes, holding the applier lock that every shadowed mutation's start
+needs, and commits under that lock: no shadowed mutation can start between
+the check and the commit. If the generation moved, the transaction is rolled
+back and the keys stay pending (review 7701 P2).
 
 **Read consistency (P1-4).** D1's Sessions API (bookmarks) "is only
 available via the D1 Worker Binding and not yet available via the REST
@@ -798,19 +802,36 @@ CREATE TABLE shadow_state (   -- in the shadow file only
 - A clean night means (a) and (b) show zero diffs and `dirty = 0`. Either
   failure resets `clean_nights`.
 - **As built (L9a):** `local_primary.py shadow-night <db> --shadow S
-  --seed-export SQL --account A --database-id D` (`memora/shadow_night.py`)
-  runs both checks. (a) re-reads each diffed key once after a pause. (b)
+  --seed-export SQL --account A --database-id D --health-token-file H`
+  (`memora/shadow_night.py`) runs both checks. Before (a) it waits, up to
+  `--stable-wait-s` (300 s), for the applier in memora-all to be drained and
+  stable, read from the `shadow` block of `/health/db/<db>`: alive,
+  `queue_depth`, `unfinished`, `pending_keys` and `inflight` all 0. After (a)
+  the block must show the same `instance` and `generation` and still be
+  drained. Otherwise it retries within the bound, then DEFERS: exit 6,
+  `shadow_state` untouched (nothing dirty, nothing counted). So a backlog
+  never marks the shadow dirty, and a night counts only when (a) ran with
+  every key verified (review 7701 P1-2). (a) re-reads each diffed key once
+  after a pause. (b)
   also fails while the replicator's log is halted (any L3 halt cause), until
   `resume` is run; the shadow itself is not marked dirty for that. The
   delete guard (P3) does not halt log mode: the night reports the would-halt
   events recorded since the previous night (`would_halt`, tracked by
   `shadow_state.would_halt_reported_id`), and they do not fail the night.
+  In (b) a log key with no outbox row is a defect, except a `memories`
+  parent the replicator adds to a child upsert: allowed only when every log
+  record of it is an upsert with the same attempt and seq as an upsert of
+  `memories_embeddings`/`memories_crossrefs` for that memory id (review
+  7701 P1-1; `replicator.is_added_parent`). Such a parent shares its
+  child's seq, which is why the log reader deduplicates by (seq, table,
+  key, index) (the L6 fix).
   A diff in (a) or (b) marks the shadow dirty.
   A clean night counts once per UTC day, and the command reports
   `ready_for_cutover` at 7. Exit 5 when the night is not clean.
 - `/health/db/<name>` carries the `shadow` block (`enabled`, `dirty`,
   `dirty_reason`, `queue_depth`, `pending_keys`, `applier_alive`,
-  `clean_nights`, and `refused` when the applier could not start).
+  `clean_nights`, `inflight`, `unfinished`, `generation`, `instance`, and
+  `refused` when the applier could not start).
 
 **Metrics.** `/health/db/<name>` gets a `shadow` block with `queue_depth`,
 `applier_alive`, `dirty`, `dirty_reason` and `clean_nights`.
