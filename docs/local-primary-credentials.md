@@ -96,7 +96,8 @@ last, only after nothing but memora-all uses D1.
    source `memora-instance.sh` reads, and the containers would lose their
    LLM, embedding and AWS keys. The preview prints keys and
    routing only; every value is shown as `<redacted:LENGTH>`, and a URL as
-   `scheme://host[:port]/path` (never userinfo or a query string). A 0600 backup
+   `scheme://host[:port]` plus the number of path segments (never a path
+   segment, userinfo, query or fragment). A 0600 backup
    `FILE.bak-repoint-<timestamp>` is written first. With the check
    flags, step 2's endpoint check runs first against the URL's server,
    through the scratch store (`--check-store`, default `scratch`), and a
@@ -138,8 +139,10 @@ last, only after nothing but memora-all uses D1.
    files of the user running the audit, under the given roots, and only the
    containers that user's runtimes can see. Another user's rootless
    docker/podman is invisible: run the audit as each user that runs
-   containers. An explicitly empty `MEMORA_AUDIT_RUNTIMES` audits no
-   containers at all, so never set it for the revoke gate. Nothing ssh or
+   containers. An explicitly empty `MEMORA_AUDIT_RUNTIMES`, or one that
+   leaves out a runtime installed on the host, makes the host NOT clean
+   ("no container runtime audited"): the revoke gate needs at least one
+   runtime queried on every host that has one, as the coverage line shows. Nothing ssh or
    a runtime prints is copied into a report (only command names and exit
    status).
    Exit 0 only when no host has a direct-D1 client except memora-all itself
@@ -156,8 +159,9 @@ last, only after nothing but memora-all uses D1.
 8. **Revoke the OLD token** in the dashboard, only when ALL of these hold
    (the revoke gate):
    - the file audit is clean on every host (step 5);
-   - the container audit (running and stopped) is clean on every host
-     (step 5);
+   - the container audit (running and stopped) is clean on every host,
+     and every host with a container runtime shows it queried in its
+     coverage line (step 5);
    - every `memora-instance.sh` container was recreated after the repoint
      (step 4);
    - check-endpoint is green from every client host (step 6), and a real

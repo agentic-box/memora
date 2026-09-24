@@ -85,8 +85,9 @@ def reaches_d1(entry: Any) -> bool:
 
 
 def safe_url(value: Any) -> str:
-    """A URL as scheme://host[:port]/path: never userinfo, query or
-    fragment, which can carry credentials (review 7680 P1-2a)."""
+    """A URL as scheme://host[:port] only (review 7689 P1-1): a path segment,
+    userinfo, a query or a fragment can each carry a credential, so none is
+    printed -- a path is shown as its segment count."""
     if not isinstance(value, str):
         return _redacted(value)
     try:
@@ -97,8 +98,15 @@ def safe_url(value: Any) -> str:
         return _redacted(value)
     if not parts.scheme or not host:
         return _redacted(value)
-    extra = " (userinfo/query withheld)" if (parts.username or parts.password or parts.query or parts.fragment) else ""
-    return f"{parts.scheme}://{host}{port}{parts.path}{extra}"
+    out = f"{parts.scheme}://{host}{port}"
+    segments = [p for p in parts.path.split("/") if p]
+    if segments:
+        out += f"/<redacted path:{len(segments)} segment{'s' if len(segments) != 1 else ''}>"
+    withheld = [w for w, present in (("userinfo", parts.username or parts.password), ("query", parts.query),
+                                     ("fragment", parts.fragment)) if present]
+    if withheld:
+        out += f" ({'/'.join(withheld)} withheld)"
+    return out
 
 
 ROUTING_FIELDS = ("type",)  # printed as they are; url through safe_url; everything else is redacted

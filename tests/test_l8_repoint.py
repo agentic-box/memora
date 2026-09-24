@@ -164,7 +164,7 @@ def test_no_value_is_ever_printed(tmp_path):
             assert value not in out, (extra, value)
         for key in SECRETS:
             assert key in out, "keys are shown so the operator sees what is kept"
-        assert "<redacted:" in out and "--no-graph" in out and URL in out
+        assert "<redacted:" in out and "--no-graph" in out and "http://nuc8:8920/<redacted path:2 segments>" in out
         if extra:
             break
         p.write_text(json.dumps(doc))
@@ -209,12 +209,21 @@ def test_a_url_with_userinfo_or_query_is_never_printed(tmp_path):
         "other": {"type": "http", "url": "https://admin:hunter2secret@example.com:8443/mcp?token=q-" + "Leak9"},
         "memora": {"command": "x", "env": {"CF_API_TOKEN": TOKEN}}}}
     p = _write(tmp_path, ".mcp.json", doc)
-    for url in (URL, "http://user:pw-" + "Leak7@nuc8:8920/mcp/memora"):
-        r = _run(str(p), "--url", url)
+    doc["mcpServers"]["third"] = {"type": "http", "url": "https://h.example/api/pathsecret-" + "Leak5/mcp#frag-" + "Leak6"}
+    p.write_text(json.dumps(doc))
+    for url, extra in ((URL, ["--apply"]), ("http://user:pw-" + "Leak7@nuc8:8920/mcp/memora", []),
+                       ("ftp://x/path-" + "Leak8", [])):
+        before = p.read_text()
+        r = _run(str(p), "--url", url, *extra)
         out = r.stdout + r.stderr
-        assert "hunter2secret" not in out and "q-Leak9" not in out and "pw-Leak7" not in out
+        for secret in ("hunter2secret", "q-Leak9", "pw-Leak7", "pathsecret-Leak5", "frag-Leak6", "path-Leak8", "/mcp/memora"):
+            assert secret not in out, (url, secret)
         assert TOKEN not in out
+        if extra:
+            p.write_text(before)
     from scripts.repoint_mcp_config import safe_url
-    assert safe_url("https://a:b@h.example:8443/p/q?x=1#f") == "https://h.example:8443/p/q (userinfo/query withheld)"
-    assert safe_url("http://nuc8:8920/mcp/memora") == "http://nuc8:8920/mcp/memora"
+    assert safe_url("https://a:b@h.example:8443/p/q?x=1#f") == \
+        "https://h.example:8443/<redacted path:2 segments> (userinfo/query/fragment withheld)"
+    assert safe_url("http://nuc8:8920/mcp") == "http://nuc8:8920/<redacted path:1 segment>"
+    assert safe_url("http://nuc8:8920") == "http://nuc8:8920"
     assert safe_url("not a url").startswith("<redacted:")

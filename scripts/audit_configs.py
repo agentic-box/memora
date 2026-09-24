@@ -12,8 +12,9 @@ or stopped (docker/podman `ps -a`, Apple's `container list --all`): a
 container keeps the environment it was created with, and a stopped one can
 be started again. --containers-only re-checks just those. Each host's
 report starts with its coverage: only what that user can see (another
-user's rootless runtime is invisible; an empty MEMORA_AUDIT_RUNTIMES audits
-no containers). Nothing ssh or a runtime prints is copied into a report.
+user's rootless runtime is invisible). A host where no runtime was queried
+although one is installed, or where MEMORA_AUDIT_RUNTIMES is set and empty,
+is NOT clean. Nothing ssh or a runtime prints is copied into a report.
 
 Each remote host is audited by piping memora/config_audit.py (standard
 library only) to `ssh -o BatchMode=yes HOST python3 - --json`, with the host
@@ -105,10 +106,10 @@ def main(argv=None) -> int:
         print(json.dumps({"clean": clean, "hosts": results}))
     else:
         for r in results:
+            # Coverage first (review 7689 P2): what the verdict below covers.
+            print(f"coverage {r['host']}: {r.get('coverage') or 'unknown (the host could not be audited)'}")
             for f in r["findings"]:
                 print(config_audit.format_finding(f))
-            if r.get("coverage"):
-                print(f"coverage {r['host']}: {r['coverage']}")
             for e in r["errors"]:
                 print(f"ERROR      {r['host']}: {e}")
             print(f"{r['host']}: {'clean' if r['clean'] else 'NOT clean'} ({r['blocking']} direct-D1 finding(s))")

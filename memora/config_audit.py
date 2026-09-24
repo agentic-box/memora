@@ -35,10 +35,11 @@ or not, until the container is recreated or removed. A runtime that is
 installed but cannot list or inspect its containers makes the host NOT
 clean. --containers-only skips the files.
 
-Coverage limits (printed with every text report): only this user's files
-under the given roots, and only the containers this user's runtimes can
-see -- another user's rootless docker/podman is invisible; an explicitly
-empty MEMORA_AUDIT_RUNTIMES audits no containers at all.
+Coverage limits (the first line of every text report): only this user's
+files under the given roots, and only the containers this user's runtimes
+can see -- another user's rootless docker/podman is invisible. An explicitly
+empty MEMORA_AUDIT_RUNTIMES, or one that leaves out a runtime installed on
+the host, is NOT clean ("no container runtime audited").
 
 Nothing a runtime or ssh prints is ever copied into a report: failures
 carry the command name and exit status only (review 7680 P1-2b).
@@ -258,7 +259,17 @@ def container_env(runtime: str, name: str) -> List[str]:
 def audit_containers(host: str) -> Dict[str, List]:
     findings: List[Dict[str, object]] = []
     errors: List[str] = []
-    for runtime in _runtimes():
+    runtimes = _runtimes()
+    # Review 7689 P1-2: an audit that queried no runtime is not evidence.
+    # An explicitly empty MEMORA_AUDIT_RUNTIMES, or a runtime installed on
+    # this host but left out of it, makes the host NOT clean.
+    present = [r for r in RUNTIMES if shutil.which(r)]
+    if os.environ.get("MEMORA_AUDIT_RUNTIMES") is not None and not runtimes:
+        errors.append("no container runtime audited: MEMORA_AUDIT_RUNTIMES is set and empty")
+    skipped = [r for r in present if r not in runtimes]
+    if skipped:
+        errors.append(f"no container runtime audited for {', '.join(skipped)}: installed here but not queried")
+    for runtime in runtimes:
         try:
             listed = all_containers(runtime)
         except RuntimeQueryFailed as exc:
@@ -287,7 +298,7 @@ def coverage(roots: List[Path], files: bool, runtimes: List[str]) -> str:
         parts.append(f"every container of {', '.join(runtimes)} visible to this user "
                      "(another user's rootless runtime is not visible)")
     elif os.environ.get("MEMORA_AUDIT_RUNTIMES") is not None:
-        parts.append("NO containers: MEMORA_AUDIT_RUNTIMES is set and empty")
+        parts.append("NO containers: MEMORA_AUDIT_RUNTIMES is set and empty (not clean)")
     else:
         parts.append("no container runtime installed")
     return "; ".join(parts)

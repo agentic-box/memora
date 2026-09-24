@@ -16,10 +16,16 @@ CLI = REPO / "scripts" / "audit_configs.py"
 MODULE = REPO / "memora" / "config_audit.py"
 
 @pytest.fixture(autouse=True)
-def _no_real_runtimes(monkeypatch):
-    """No test may query the host's real docker/podman/container; the
-    container tests below install fakes explicitly."""
-    monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "")
+def _no_real_runtimes(tmp_path, monkeypatch):
+    """No test may query the host's real docker/podman/container: every
+    runtime name resolves to an EMPTY fake first on PATH (review 7689 P1-2:
+    an empty MEMORA_AUDIT_RUNTIMES is not clean, so it is not the way to
+    isolate tests). The container tests below overwrite individual fakes."""
+    bindir = tmp_path / "rtbin"
+    for rt in ("docker", "podman", "container"):
+        _fake_runtime(bindir, rt, {})
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.delenv("MEMORA_AUDIT_RUNTIMES", raising=False)
 
 
 # Assembled so the D1 write guard's own scan of this repo stays quiet.
@@ -59,7 +65,7 @@ def _tree(root: Path):
 
 def test_finds_every_kind_and_masks_every_value(tmp_path):
     root = _tree(tmp_path)
-    result = config_audit.audit([root], host="mac")
+    result = config_audit.audit([root], host="mac", containers=False)
     kinds = {(Path(f["file"]).name, f["kind"]) for f in result["findings"]}
     assert ("credentials.mcp.json", "storage_uri") in kinds
     assert ("credentials.mcp.json", "cloudflare_token") in kinds
@@ -82,7 +88,7 @@ def test_finds_every_kind_and_masks_every_value(tmp_path):
 
 def test_line_numbers_point_at_the_value(tmp_path):
     root = _tree(tmp_path)
-    result = config_audit.audit([root], host="mac")
+    result = config_audit.audit([root], host="mac", containers=False)
     f = next(f for f in result["findings"] if f["kind"] == "storage_uri")
     lines = Path(f["file"]).read_text().splitlines()
     assert "MEMORA_STORAGE_URI" in lines[f["line"] - 1]
@@ -92,7 +98,7 @@ def test_memora_all_is_reported_but_does_not_fail(tmp_path):
     root = tmp_path / "home"
     (root / "repo" / "instances").mkdir(parents=True)
     (root / "repo" / "instances" / "all.env").write_text(f"MEMORA_DATABASES='{{\"m\":\"{D1}{ACCT}/{DB}\"}}'\n")
-    result = config_audit.audit([root], host="mac")
+    result = config_audit.audit([root], host="mac", containers=False)
     assert result["findings"] and all(f["memora_all"] for f in result["findings"])
     assert result["clean"] and result["blocking"] == 0
 
@@ -103,8 +109,8 @@ def test_nuc8_credentials_are_memora_alls_only_on_nuc8(tmp_path, monkeypatch):
     for f in (tmp_path / ".zshrc", tmp_path / "repo" / "instances" / "re.env",
               tmp_path / "Library" / "LaunchAgents" / "com.x.plist"):
         f.unlink()
-    on_mac = config_audit.audit([tmp_path], host="mac")
-    on_nuc8 = config_audit.audit([tmp_path], host="nuc8")
+    on_mac = config_audit.audit([tmp_path], host="mac", containers=False)
+    on_nuc8 = config_audit.audit([tmp_path], host="nuc8", containers=False)
     assert not on_mac["clean"], "on the Mac the credential file is a direct-D1 client (F4)"
     assert on_nuc8["clean"], "on nuc8 it is memora-all's own credential source"
 
@@ -112,7 +118,7 @@ def test_nuc8_credentials_are_memora_alls_only_on_nuc8(tmp_path, monkeypatch):
 def test_extra_memora_all_paths(tmp_path):
     root = _tree(tmp_path)
     everything = str(tmp_path) + "/*"
-    assert config_audit.audit([root], host="x", memora_all=[everything])["clean"]
+    assert config_audit.audit([root], host="x", memora_all=[everything], containers=False)["clean"]
 
 
 def test_an_unreadable_candidate_is_not_clean(tmp_path):
@@ -122,7 +128,7 @@ def test_an_unreadable_candidate_is_not_clean(tmp_path):
     f.write_text("{}")
     f.chmod(0)
     try:
-        result = config_audit.audit([tmp_path], host="x")
+        result = config_audit.audit([tmp_path], host="x", containers=False)
     finally:
         f.chmod(0o600)
     assert not result["clean"] and result["errors"]
@@ -131,7 +137,7 @@ def test_an_unreadable_candidate_is_not_clean(tmp_path):
 def test_repoint_backups_are_found(tmp_path):
     (tmp_path / ".claude.json.bak-repoint-20260924T000000Z").write_text(
         json.dumps({"mcpServers": {"m": {"env": {"CLOUDFLARE_API_TOKEN": TOKEN}}}}))
-    result = config_audit.audit([tmp_path], host="x")
+    result = config_audit.audit([tmp_path], host="x", containers=False)
     assert not result["clean"], "a backup still holds the old token until it is deleted"
 
 
@@ -144,6 +150,7 @@ def test_cli_exit_codes_and_no_secret_on_stdout(tmp_path):
     root = _tree(tmp_path / "dirty")
     r = _cli("--local", str(root))
     assert r.returncode == 1 and "DIRECT-D1" in r.stdout and "NOT CLEAN" in r.stdout
+    assert r.stdout.startswith("coverage "), "the coverage line comes before the findings"
     assert TOKEN not in r.stdout + r.stderr and ACCT not in r.stdout
     clean = tmp_path / "clean"
     clean.mkdir()
@@ -197,7 +204,7 @@ def test_the_module_runs_standalone_from_stdin(tmp_path):
     root = _tree(tmp_path / "h")
     r = subprocess.run([sys.executable, "-", "--json", "--host-label", "bestation", str(root)],
                        input=MODULE.read_text(), capture_output=True, text=True, cwd="/", timeout=60,
-                       env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "MEMORA_AUDIT_RUNTIMES": ""})
+                       env={"PATH": os.environ["PATH"], "HOME": str(tmp_path)})
     assert r.returncode == 1, r.stderr
     assert json.loads(r.stdout)["host"] == "bestation"
 
@@ -246,17 +253,15 @@ elif verb == "inspect":
 
 
 @pytest.fixture
-def runtimes(tmp_path, monkeypatch):
+def runtimes(tmp_path):
+    """Overwrite individual fakes (the autouse fixture put all three, empty,
+    first on PATH); every runtime is auto-detected and queried."""
     bindir = tmp_path / "rtbin"
 
     def install(**by_runtime):
-        names = []
         for rt, spec in by_runtime.items():
-            containers, fail = spec if isinstance(spec, tuple) else (spec, "")
+            containers, fail = spec if isinstance(spec, tuple) and isinstance(spec[1], str) and not isinstance(spec[0], list) else (spec, "")
             _fake_runtime(bindir, rt, containers, fail=fail)
-            names.append(rt)
-        monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
-        monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", ",".join(names))
     return install
 
 
@@ -387,7 +392,9 @@ def test_the_report_states_its_coverage(tmp_path, runtimes, monkeypatch):
     assert "coverage" in r.stdout and "rootless" in r.stdout and "docker" in r.stdout
     monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "")
     r = _cli("--local", str(empty))
-    assert "NO containers: MEMORA_AUDIT_RUNTIMES is set and empty" in r.stdout
+    assert r.returncode == 1, "an audit that queried no runtime is not clean"
+    assert "no container runtime audited" in r.stdout
+    assert r.stdout.startswith("coverage "), "the coverage line comes first"
 
 
 def test_the_module_report_states_its_coverage(tmp_path):
@@ -395,7 +402,41 @@ def test_the_module_report_states_its_coverage(tmp_path):
     empty = tmp_path / "home"
     empty.mkdir()
     r = subprocess.run([sys.executable, str(MODULE), "--host-label", "ob1", str(empty)],
-                       capture_output=True, text=True, timeout=60,
-                       env={**os.environ, "MEMORA_AUDIT_RUNTIMES": ""})
-    assert r.returncode == 0
-    assert r.stdout.startswith("coverage ob1: ") and "NO containers" in r.stdout
+                       capture_output=True, text=True, timeout=60, env=dict(os.environ))
+    assert r.returncode == 0, r.stdout
+    assert r.stdout.startswith("coverage ob1: ") and "docker" in r.stdout
+    r = subprocess.run([sys.executable, str(MODULE), "--host-label", "ob1", str(empty)],
+                       capture_output=True, text=True, timeout=60, env={**os.environ, "MEMORA_AUDIT_RUNTIMES": ""})
+    assert r.returncode == 1 and r.stdout.startswith("coverage ob1: ") and "no container runtime audited" in r.stdout
+
+
+
+def test_a_runtime_left_out_of_the_override_is_not_clean(tmp_path, monkeypatch):
+    """Review 7689 P1-2: podman is installed but MEMORA_AUDIT_RUNTIMES names
+    only docker -- its containers were never looked at."""
+    monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "docker")
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert not result["clean"]
+    assert any("no container runtime audited for" in e and "podman" in e for e in result["errors"])
+
+
+def test_file_only_audits_do_not_need_a_runtime(tmp_path):
+    root = tmp_path / "clean"
+    root.mkdir()
+    assert config_audit.audit([root], host="x", containers=False)["clean"]
+
+
+def test_an_empty_override_is_not_clean_even_with_no_runtime_installed(tmp_path, monkeypatch):
+    """The empty override alone is the finding: nothing else would flag a
+    host whose runtimes happen not to be on PATH."""
+    monkeypatch.setattr(config_audit.shutil, "which", lambda name: None)
+    monkeypatch.setenv("MEMORA_AUDIT_RUNTIMES", "")
+    empty = tmp_path / "home"
+    empty.mkdir()
+    result = config_audit.audit([empty], host="mac")
+    assert not result["clean"]
+    assert result["errors"] == ["no container runtime audited: MEMORA_AUDIT_RUNTIMES is set and empty"]
+    monkeypatch.delenv("MEMORA_AUDIT_RUNTIMES")
+    assert config_audit.audit([empty], host="mac")["clean"], "no runtime installed and no override: clean"
