@@ -158,7 +158,7 @@ def test_the_preflight_names_each_store_that_would_refuse_searches(reg, monkeypa
     assert s["old"]["ok"] and s["old"]["state"] == "model unrecorded (compatible)"
     assert s["fine"]["ok"] and s["fine"]["state"] == "recorded model matches"
     assert not s["dense"]["ok"] and "memory_rebuild_embeddings" in s["dense"]["fix"]
-    assert not s["other"]["ok"] and s["other"]["state"] == "recorded model differs from tfidf"
+    assert not s["other"]["ok"] and s["other"]["state"].startswith("search would refuse: model_mismatch")
 
 
 def test_the_preflight_probes_the_dense_dimension(reg, monkeypatch):
@@ -225,3 +225,68 @@ def test_the_cli_contract(reg, tmp_path):
     r = subprocess.run([sys.executable, "-m", "memora.embedding_preflight"], cwd=REPO, env=env,
                        capture_output=True, text=True, timeout=120)
     assert r.returncode == 2 and "store 'other' would refuse semantic search" in r.stderr
+
+
+
+# ------------------------------------------------------------------ review 8010
+
+def _raw(path, *sql):
+    db = sqlite3.connect(path)
+    try:
+        for stmt, params in sql:
+            db.execute(stmt, params)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_an_unrecorded_store_with_an_unknown_encoding_is_refused_not_served(reg):
+    """P1-1: the unrecorded exception only covers the comparable reasons."""
+    _raw(reg["old"], ("INSERT INTO memories (id, content) VALUES (99, 'legacy')", ()),
+         ("INSERT INTO memories_embeddings (memory_id, embedding, representation, writer_token) "
+          "VALUES (99, ?, NULL, 'w')", ('{"w": 1.0}',)))
+    with pytest.raises(storage.SearchUnavailable):
+        _search("old")
+    assert ep.run("tfidf", registry={"old": reg["old"]})["stores"]["old"]["ok"] is False
+
+
+@pytest.mark.parametrize("backend", ["local", "d1"])
+def test_the_preflight_is_never_green_where_the_search_refuses_orphans(reg, tmp_path, monkeypatch, backend):
+    """P1-2: a recorded tfidf store plus an orphan sparse embedding row."""
+    orphan = ("INSERT INTO memories_embeddings (memory_id, embedding, representation, writer_token) "
+              "VALUES (4242, ?, 'sparse', 'w')", ('{"w": 1.0}',))
+    if backend == "local":
+        _raw(reg["fine"], ("PRAGMA foreign_keys = OFF", ()), orphan)
+        with pytest.raises((storage.SearchUnavailable, embeddings.EmbeddingIntegrityFault)):
+            _search("fine")
+        s = ep.run("tfidf", registry={"fine": reg["fine"]})["stores"]["fine"]
+    else:
+        from tests.l3_fakes import FakeReplica
+
+        replica = FakeReplica(tmp_path / "d1.db")
+        db = replica._db()
+        db.execute("PRAGMA foreign_keys = OFF")
+        db.execute("INSERT INTO memories (id, content) VALUES (1, 'x')")
+        db.execute("INSERT INTO memories_embeddings (memory_id, embedding, representation, writer_token) "
+                   "VALUES (1, ?, 'sparse', 'w')", ('{"w": 1.0}',))
+        db.execute(orphan[0], orphan[1])
+        db.execute("INSERT INTO memories_meta (key, value) VALUES ('embedding_model', 'tfidf|tfidf|sparse')")
+        db.commit()
+        db.close()
+        monkeypatch.setattr(backends.D1SelectOnlyConnection, "_post", lambda self, body: replica.reader_post(body))
+        monkeypatch.setenv("MEMORA_D1_READ_TOKEN", "read-token")
+        s = ep.run("tfidf", registry={"bestation": "d1://acct/db1"})["stores"]["bestation"]
+    assert s["ok"] is False and s["integrity"] == "orphan_embeddings" and "search would refuse" in s["state"], s
+
+
+def test_a_blank_legacy_embedding_row_does_not_make_the_preflight_refuse_a_searchable_store(reg):
+    """P2: the preflight uses the audit's own vector predicate."""
+    _raw(reg["fine"], ("INSERT INTO memories (id, content) VALUES (77, 'blank')", ()),
+         ("INSERT INTO memories_embeddings (memory_id, embedding, representation, dimension, writer_token) "
+          "VALUES (77, '', 'dense', 1024, 'w')", ()))
+    searchable = True
+    try:
+        _search("fine")
+    except (storage.SearchUnavailable, embeddings.EmbeddingIntegrityFault):
+        searchable = False
+    assert ep.run("tfidf", registry={"fine": reg["fine"]})["stores"]["fine"]["ok"] is searchable

@@ -9553,7 +9553,14 @@ def embedding_repair_status(name: str) -> Optional[Dict[str, Any]]:
     return dict(entry) if entry else None
 
 
-def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) -> None:
+# The repairable reasons under which a store's comparable vectors may be
+# searched (the gate's own rule); an unrecorded model is only excused under
+# these -- never an unknown encoding or a rebuild state (E1b review 8010).
+_COMPARABLE_OK_REASONS = ("missing_embeddings", "integrity_uninitialized", "model_or_representation_mismatch")
+
+
+def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any],
+                           current_model: Optional[str] = None) -> None:
     """Decide, from the (read-only) integrity status, whether a read-only
     search can run. Missing vectors (or a store never audited) are fine as
     long as the vectors present match the current model: those rows are just
@@ -9570,15 +9577,16 @@ def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) 
         raise SearchUnavailable("integrity_fault", reason)
     from .embeddings import _model_mismatch_for_reps, get_stored_embedding_model, unrecorded_compatibility
 
+    current_model = current_model or EMBEDDING_MODEL
     stored = get_stored_embedding_model(conn)
     if stored is not None:
         _EMBEDDING_MODEL_UNRECORDED.pop(effective_database_name() or "(default)", None)
-    if stored is None and not audit.get("mixed"):
+    if stored is None and not audit.get("mixed") and reason in _COMPARABLE_OK_REASONS:
         # E1b: written before E1 (no model recorded). Serve it when its
         # vectors are what the current model produces -- a search never
         # records the model (an explicit memory_verify_integrity(record_model)
         # does); say so once (log + health). Otherwise a genuine mismatch.
-        ok, dim, why = unrecorded_compatibility(audit.get("reps") or {}, EMBEDDING_MODEL)
+        ok, dim, why = unrecorded_compatibility(audit.get("reps") or {}, current_model)
         if not ok:
             raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
         integrity["unrecorded_dimension"] = dim
@@ -9588,7 +9596,7 @@ def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) 
         if stored is None:
             raise SearchUnavailable("model_mismatch", "embedding_model_unrecorded")
         if not audit.get("mixed") and not _model_mismatch_for_reps(
-            audit.get("reps") or {}, stored, EMBEDDING_MODEL,
+            audit.get("reps") or {}, stored, current_model,
         ):
             return
         reason = "model_or_representation_mismatch"

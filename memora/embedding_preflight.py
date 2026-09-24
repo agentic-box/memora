@@ -3,18 +3,15 @@
     python -m memora.embedding_preflight
 
 Run in the NEW image, with memora-all's environment and data volume, before
-the old container is stopped. For every store in MEMORA_DATABASES it reads
--- read-only -- the recorded embedding model and the representations of the
-stored vectors, and decides whether semantic search would work under this
-image's embedding model (MEMORA_EMBEDDING_MODEL):
-
-- recorded model, same backend/model/representation (the endpoint host is
-  ignored, E1): ok;
-- no recorded model (written before E1) and vectors of the kind -- and, for
-  a dense model, the dimension -- the current model produces: ok (served,
-  reported "model unrecorded"; memory_verify_integrity(record_model=true)
-  records it);
-- anything else: the store would refuse searches -> the deploy refuses.
+the old container is stopped. For every store in MEMORA_DATABASES it runs,
+read-only, the SAME decision the server's search makes under this image's
+embedding model (MEMORA_EMBEDDING_MODEL): the embedding integrity status
+(orphan rows, unknown encodings, a rebuild in progress, a model or
+representation mismatch, a missing model record) and the search gate
+(review 8010: no separate re-implementation that could say ok where the
+search refuses). A store whose search would refuse fails the preflight;
+an unrecorded store with compatible vectors passes (reported "model
+unrecorded"; memory_verify_integrity(record_model=true) records it).
 
 Local stores are opened with connect_read_only() ONLY (never connect(): a
 live primary's lock belongs to the running memora-all, and its WAL is read
@@ -38,78 +35,104 @@ REBUILD_FIX = ("after the deploy, run the explicit memory_rebuild_embeddings too
                "vectors were made with")
 
 
-def _local_rows(backend) -> Callable[[str], List[Dict[str, Any]]]:
-    def rows(sql: str) -> List[Dict[str, Any]]:
-        conn = backend.connect_read_only()
-        try:
-            cur = conn.execute(sql)
-            cols = [c[0] for c in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
-        finally:
-            conn.close()
-    return rows
+class _Row(tuple):
+    """A result row readable by position and by column name, as sqlite3.Row
+    is -- what the integrity code expects."""
+
+    def __new__(cls, cols: List[str], values: List[Any]):
+        row = super().__new__(cls, values)
+        row._index = {c: i for i, c in enumerate(cols)}
+        return row
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return tuple.__getitem__(self, self._index[key])
+        return tuple.__getitem__(self, key)
+
+    def keys(self):
+        return list(self._index)
 
 
-def _d1_rows(account_id: str, database_id: str) -> Callable[[str], List[Dict[str, Any]]]:
-    from .backends import D1SelectOnlyConnection
-    from .local_primary import D1Reader, read_token
+class _Cursor:
+    def __init__(self, rows: List[_Row]):
+        self._rows = rows
 
-    reader = D1Reader(D1SelectOnlyConnection(account_id, database_id, read_token()))
-    return lambda sql: reader.rows(sql)
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+    def fetchall(self):
+        return list(self._rows)
 
 
-def store_reader(spec: str) -> Callable[[str], List[Dict[str, Any]]]:
-    """A read-only SELECT function for one registry entry."""
+class D1ReadConnection:
+    """A read-only, DB-API-shaped view of a D1 database through the read
+    token (D1SelectOnlyConnection refuses anything but a SELECT), so the
+    SAME integrity status and search gate the server runs can run here."""
+
+    def __init__(self, account_id: str, database_id: str):
+        from .backends import D1SelectOnlyConnection
+        from .local_primary import D1Reader, read_token
+
+        self.account_id, self.database_id = account_id, database_id
+        self._reader = D1Reader(D1SelectOnlyConnection(account_id, database_id, read_token()))
+
+    def execute(self, sql: str, params=()):
+        rows = self._reader.rows(sql, list(params or ()))
+        out = []
+        for r in rows:
+            cols = list(r.keys())
+            out.append(_Row(cols, [r[c] for c in cols]))
+        return _Cursor(out)
+
+    def close(self) -> None:
+        return None
+
+
+def open_read_only(spec: str):
+    """A read-only connection for one registry entry: connect_read_only()
+    for a local store (never connect()), the read token for d1://."""
     from .backends import LocalSQLiteBackend
 
     if spec.startswith("d1://"):
         account_id, database_id = spec[len("d1://"):].split("/", 1)
-        return _d1_rows(account_id, database_id)
+        return D1ReadConnection(account_id, database_id)
     if "://" in spec and not spec.startswith("file://"):
         raise ValueError(f"cannot check a {spec.split('://', 1)[0]}:// store read-only")
     path = spec[len("file://"):] if spec.startswith("file://") else spec
-    return _local_rows(LocalSQLiteBackend(path))
+    return LocalSQLiteBackend(path).connect_read_only()
 
 
-def vector_reps(rows: Callable[[str], List[Dict[str, Any]]]) -> Dict[str, int]:
-    """The audit's representation keys (dense:N, dense, sparse, other) with counts."""
-    out: Dict[str, int] = {}
-    for r in rows("SELECT representation, dimension, COUNT(*) AS n FROM memories_embeddings "
-                  "WHERE embedding IS NOT NULL GROUP BY representation, dimension"):
-        rep, dim, n = r["representation"], r["dimension"], int(r["n"])
-        key = f"dense:{dim}" if rep == "dense" and dim is not None else (rep or "unknown")
-        out[key] = out.get(key, 0) + n
-    return out
+def check_store(conn, current_model: str, probe_dim: Callable[[], Optional[int]]) -> Dict[str, Any]:
+    """Would semantic search on this store work under current_model? The
+    SAME decision the server makes (review 8010): the integrity status
+    (orphans, unknown encodings, a rebuild in progress, a model or
+    representation mismatch, a missing model) and the search gate; for an
+    unrecorded dense store, the query dimension via one probe."""
+    from .embeddings import get_embedding_integrity_status, get_stored_embedding_model, invalidate_embedding_integrity_cache
+    from .storage import SearchUnavailable, _read_only_search_gate
 
-
-def recorded_model(rows: Callable[[str], List[Dict[str, Any]]]) -> Optional[str]:
-    got = rows("SELECT value FROM memories_meta WHERE key = 'embedding_model'")
-    return got[0]["value"] if got else None
-
-
-def check_store(reps: Dict[str, int], stored: Optional[str], current_model: str,
-                probe_dim: Callable[[], Optional[int]]) -> Dict[str, Any]:
-    """Would semantic search on this store work under current_model?"""
-    from .embeddings import _model_mismatch_for_reps, unrecorded_compatibility
-
-    kinds = sorted(k for k, n in reps.items() if n and k != "empty")
-    out: Dict[str, Any] = {"recorded": stored, "vectors": {k: reps[k] for k in kinds}}
-    if not kinds:
-        return {**out, "ok": True, "state": "no vectors"}
-    if len(kinds) > 1 or any(k not in ("sparse",) and not k.startswith("dense") for k in kinds):
-        return {**out, "ok": False, "state": "mixed or unknown vectors", "fix": REBUILD_FIX}
+    invalidate_embedding_integrity_cache(conn)
+    integrity = dict(get_embedding_integrity_status(conn, current_model))
+    audit = integrity.get("audit") or {}
+    stored = get_stored_embedding_model(conn)
+    out: Dict[str, Any] = {"recorded": stored, "vectors": dict(audit.get("reps") or {}),
+                           "integrity": integrity.get("reason")}
+    try:
+        _read_only_search_gate(conn, integrity, current_model)
+    except SearchUnavailable as exc:
+        fix = REBUILD_FIX if "model_mismatch" in str(exc) else (
+            "repair the store's embedding integrity first (memory_verify_integrity names the rows), then "
+            "rebuild explicitly if needed")
+        return {**out, "ok": False, "state": f"search would refuse: {exc}", "fix": fix}
+    dim = integrity.get("unrecorded_dimension")
+    if dim is not None and probe_dim() != dim:
+        return {**out, "ok": False, "fix": REBUILD_FIX,
+                "state": f"model unrecorded: vectors dense:{dim}, but {current_model} now produces dense:{probe_dim()}"}
+    if not integrity.get("mismatch"):
+        return {**out, "ok": True, "state": "recorded model matches" if stored else "searchable"}
     if stored is None:
-        ok, dim, why = unrecorded_compatibility(reps, current_model)
-        if ok and dim is not None:
-            current = probe_dim()
-            if current != dim:
-                ok, why = False, f"{why}, but {current_model} now produces dense:{current}"
-        if ok:
-            return {**out, "ok": True, "state": "model unrecorded (compatible)",
-                    "fix": "optional: memory_verify_integrity(record_model=true) records the current model"}
-        return {**out, "ok": False, "state": f"model unrecorded and incompatible: {why}", "fix": REBUILD_FIX}
-    if _model_mismatch_for_reps(reps, stored, current_model):
-        return {**out, "ok": False, "state": f"recorded model differs from {current_model}", "fix": REBUILD_FIX}
+        return {**out, "ok": True, "state": "model unrecorded (compatible)",
+                "fix": "optional: memory_verify_integrity(record_model=true) records the current model"}
     return {**out, "ok": True, "state": "recorded model matches"}
 
 
@@ -127,7 +150,7 @@ def _probe_dim(current_model: str) -> Callable[[], Optional[int]]:
 
 
 def run(current_model: Optional[str] = None, registry: Optional[Dict[str, str]] = None,
-        reader_for: Callable[[str], Callable[[str], List[Dict[str, Any]]]] = store_reader) -> Dict[str, Any]:
+        opener: Callable[[str], Any] = open_read_only) -> Dict[str, Any]:
     from . import storage
 
     current_model = current_model or storage.EMBEDDING_MODEL
@@ -135,12 +158,18 @@ def run(current_model: Optional[str] = None, registry: Optional[Dict[str, str]] 
     probe = _probe_dim(current_model)
     stores: Dict[str, Any] = {}
     for name in sorted(registry):
+        token = storage.CURRENT_DB.set(name)
+        conn = None
         try:
-            rows = reader_for(registry[name])
-            stores[name] = check_store(vector_reps(rows), recorded_model(rows), current_model, probe)
+            conn = opener(registry[name])
+            stores[name] = check_store(conn, current_model, probe)
         except Exception as exc:  # fail closed: an unchecked store refuses the deploy
             stores[name] = {"ok": False, "state": f"could not be checked: {type(exc).__name__}: {str(exc)[:200]}",
                             "fix": "make the store readable to this image (read token, data volume), then retry"}
+        finally:
+            if conn is not None:
+                conn.close()
+            storage.CURRENT_DB.reset(token)
     return {"ok": all(s["ok"] for s in stores.values()), "model": current_model, "stores": stores}
 
 
