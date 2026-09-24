@@ -169,6 +169,8 @@ EXPECTED_SQLITE_CONNECT_SITES = {
     # L5 operator tool: scratch files only (export verification, a seed
     # before it becomes a store); never a live store.
     ("local_primary.py", "_scratch_connect"),
+    # X2: the in-memory reference schema (":memory:"), never a store file.
+    ("schema.py", "_reference_schema"),
 }
 # Every storage backend class; each one's connect() is the only way a
 # connection to its store is made (storage.connect, schema.connect, the graph

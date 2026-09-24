@@ -270,6 +270,17 @@ Not replicated:
       calls `thaw()`.
     - At startup, a store with a freeze file, or named in
       `MEMORA_READONLY_DBS`, starts `frozen`.
+    - X2: a store that starts frozen still serves reads. The schema pass
+      is DDL, and the gate refused it on the first connect, so such a store
+      used to serve nothing. Now, while the gate is not `open`, the first
+      connect checks read-only what the pass would still do
+      (`schema.schema_pending`: the store compared with `ensure_schema` run
+      on an in-memory database: missing tables, indexes, triggers,
+      additive columns, the epoch meta row, the sync_state columns and the
+      sync trigger version). If nothing is pending it skips the pass; reads
+      work and writes are refused as before. Otherwise every connect raises
+      `store <db> is frozen; schema upgrade pending (...)` until a thaw lets
+      the pass run.
     - `/health/db/<name>` reports `freeze: {state, in_flight}`.
     - `local_primary.py` export, seed, recheck and repoint call the endpoint
       and re-read `/health/db/<name>` at every step boundary. They refuse

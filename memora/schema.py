@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import weakref
+from typing import Any, Dict, List, Optional
 
 from .backends import D1Connection
 
@@ -98,9 +99,100 @@ def connect(storage_backend, *, check_same_thread: bool = True) -> sqlite3.Conne
     if not _backend_schema_ensured(storage_backend):
         with _schema_lock:
             if not _backend_schema_ensured(storage_backend):
-                ensure_schema(conn)
+                state = _gate_state(storage_backend)
+                if state not in (None, "open"):
+                    # A frozen (or read-only) store refuses the schema pass's
+                    # DDL, which used to make it serve nothing, reads
+                    # included. Skip the pass when a read-only check shows
+                    # it would change nothing; otherwise refuse clearly.
+                    try:
+                        pending = schema_pending(conn)
+                    except BaseException:
+                        conn.close()
+                        raise
+                    if pending:
+                        conn.close()
+                        from .write_gate import StoreReadOnlyError
+
+                        raise StoreReadOnlyError(
+                            f"store {getattr(storage_backend, 'store_name', None) or '(default)'!s} is {state}; "
+                            f"schema upgrade pending ({', '.join(pending[:8])}"
+                            f"{', ...' if len(pending) > 8 else ''}): thaw it to let the upgrade run")
+                else:
+                    ensure_schema(conn)
                 _mark_backend_schema_ensured(storage_backend)
     return conn
+
+
+def _gate_state(storage_backend) -> Optional[str]:
+    gate_of = getattr(storage_backend, "write_gate", None)
+    if gate_of is None:
+        return None
+    try:
+        return gate_of().state
+    except Exception:
+        return None
+
+
+def _reference_schema() -> Dict[str, Any]:
+    """What ensure_schema builds on an empty database: every object's (type,
+    name), and the columns it adds to existing tables (_add_column_if_missing:
+    a column in a CREATE TABLE is never added later, so it cannot be
+    pending). An in-memory scratch database, never a store; built once per
+    process."""
+    global _REFERENCE
+    if _REFERENCE is None:
+        ref = sqlite3.connect(":memory:")
+        try:
+            ensure_schema(ref)
+            objects = {(t, n) for t, n in ref.execute(
+                "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+        finally:
+            ref.close()
+        _REFERENCE = {"objects": frozenset(objects), "added_columns": frozenset(_ADDED_COLUMNS)}
+    return _REFERENCE
+
+
+_REFERENCE: Optional[Dict[str, Any]] = None
+_ADDED_COLUMNS: set = set()
+
+
+def schema_pending(conn) -> List[str]:
+    """What ensure_schema would still do on this store, read-only ([] when
+    the schema is current). ensure_schema only adds -- tables, indexes and
+    triggers IF NOT EXISTS, missing columns, one INSERT OR IGNORE meta row,
+    and on a replicated store its sync_state columns and trigger version --
+    so comparing the store with _reference_schema() answers exactly that."""
+    ref = _reference_schema()
+    d1 = isinstance(conn, D1Connection)
+    have = {(r[0], r[1]) for r in conn.execute("SELECT type, name FROM sqlite_master").fetchall()}
+    pending: List[str] = []
+    for typ, name in sorted(ref["objects"]):
+        if d1 and name.startswith("memories_fts"):
+            continue  # _ensure_fts skips D1
+        if (typ, name) not in have:
+            pending.append(f"{typ} {name}")
+    for table in sorted({t for t, _ in ref["added_columns"]}):
+        if ("table", table) not in have:
+            continue  # the table itself is listed above
+        cols = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()}
+        missing = sorted(c for t, c in ref["added_columns"] if t == table and c not in cols)
+        if missing:
+            pending.append(f"columns {table}.{'/'.join(missing)}")
+    if ("table", "memories_meta") in have and conn.execute(
+            "SELECT 1 FROM memories_meta WHERE key = 'embedding_change_epoch'").fetchone() is None:
+        pending.append("row memories_meta.embedding_change_epoch")
+    if not d1 and ("table", "sync_state") in have:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(sync_state)").fetchall()}
+        missing = [c for c, _ in _SYNC_STATE_ADDED if c not in cols]
+        if missing:
+            pending.append(f"columns sync_state.{'/'.join(missing)}")
+        if ("table", "sync_would_halt") not in have:
+            pending.append("table sync_would_halt")
+        row = conn.execute("SELECT trigger_version FROM sync_state WHERE id = 1").fetchone()
+        if row is not None and int(row[0]) < SYNC_TRIGGER_VERSION:
+            pending.append(f"sync triggers v{row[0]} < v{SYNC_TRIGGER_VERSION}")
+    return pending
 
 
 def sync_to_cloud(storage_backend) -> None:
@@ -205,6 +297,7 @@ def _ensure_embeddings_table(conn: sqlite3.Connection) -> None:
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, name: str, sql_type: str) -> None:
     """Race-safe additive migration: tolerate only a verified duplicate winner."""
+    _ADDED_COLUMNS.add((table, name))  # what the schema pass can add (schema_pending)
     columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if name in columns:
         return
