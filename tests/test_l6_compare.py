@@ -837,3 +837,19 @@ def test_the_admin_route_refuses_a_store_that_is_not_local(monkeypatch):
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"remote": "d1://acct/remote-db"}))
     status, body = admin.compare_action("remote", "begin", {})
     assert (status, body["error"]) == (400, "not_a_local_store")
+
+
+def test_a_store_without_replication_is_refused_cleanly(tmp_path):
+    """Found by the R1 rehearsal: a plain local store (no sync_state) is a
+    refusal, not a raw sqlite error."""
+    from memora import schema
+
+    path = tmp_path / "plain.db"
+    conn = LocalSQLiteBackend(path).connect()
+    schema.ensure_schema(conn)
+    conn.close()
+    replica = FakeReplica(tmp_path / "d1.db")
+    e = cmp.Env(store=path, reader=lp.D1Reader(replica.reader()), work=tmp_path / "w",
+                barrier=FakeBarrier(frozen=True), sleep=lambda s: None, poll_s=0)
+    with pytest.raises(cmp.CompareRefused, match="replication is not installed"):
+        cmp.barrier_compare(e)

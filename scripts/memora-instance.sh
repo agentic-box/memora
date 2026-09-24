@@ -292,8 +292,16 @@ print(found[0])
 migrate_data() {  # migrate_data OLD NEW -- staged, verified copy while stopped
   # scripts/migrate_data_volume.sh (shared with deploy-memora-all.sh): skips
   # when NEW already holds a verified copy of OLD's current content.
-  "$CONTAINER_BIN" run --rm -v "$1:/from:ro" -v "$2:/to" "$IMAGE" \
-    sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" migrate_data_volume migrate "$1"
+  # NOT `run --rm`: podman's --rm deletes an ANONYMOUS volume mounted with -v
+  # once no container references it -- the old data (R1 rehearsal). A plain
+  # `rm` never removes volumes, on either runtime. (No --tmpfs here, unlike
+  # deploy-memora-all.sh: not verified on Apple's `container`; the cost is
+  # one empty anonymous /data volume per one-time migration.)
+  local migrator="$2-migrate-$$" rc=0
+  "$CONTAINER_BIN" run --name "$migrator" -v "$1:/from:ro" -v "$2:/to" "$IMAGE" \
+    sh -c "$(cat "$ROOT/scripts/migrate_data_volume.sh")" migrate_data_volume migrate "$1" || rc=$?
+  "$CONTAINER_BIN" rm "$migrator" >/dev/null 2>&1 || echo "note: migration container $migrator was not removed" >&2
+  return "$rc"
 }
 
 cmd_up() {

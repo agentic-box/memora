@@ -1,0 +1,324 @@
+[
+  {
+    "AppArmorProfile": "",
+    "Args": [
+      "memora-server"
+    ],
+    "BoundingCaps": [
+      "CAP_CHOWN",
+      "CAP_DAC_OVERRIDE",
+      "CAP_FOWNER",
+      "CAP_FSETID",
+      "CAP_KILL",
+      "CAP_NET_BIND_SERVICE",
+      "CAP_SETFCAP",
+      "CAP_SETGID",
+      "CAP_SETPCAP",
+      "CAP_SETUID",
+      "CAP_SYS_CHROOT"
+    ],
+    "Config": {
+      "Annotations": {
+        "io.container.manager": "libpod",
+        "org.opencontainers.image.stopSignal": "15",
+        "org.systemd.property.KillSignal": "15",
+        "org.systemd.property.TimeoutStopUSec": "uint64 10000000"
+      },
+      "AttachStderr": false,
+      "AttachStdin": false,
+      "AttachStdout": false,
+      "Cmd": [
+        "memora-server"
+      ],
+      "CreateCommand": [
+        "podman",
+        "run",
+        "-d",
+        "--name",
+        "memora-rh",
+        "--restart",
+        "unless-stopped",
+        "-p",
+        "0.0.0.0:18920:8000",
+        "-e",
+        "MEMORA_DATABASES={\"memora\": \"/data/memora.db\", \"ob1\": \"/data/ob1.db\", \"bestation\": \"/data/bestation.db\", \"re\": \"/data/re.db\"}",
+        "-e",
+        "MEMORA_DEFAULT_DB=memora",
+        "-e",
+        "MEMORA_HEALTH_TOKEN=<redacted>",
+        "-e",
+        "MEMORA_EMBEDDING_MODEL=tfidf",
+        "-e",
+        "MEMORA_ALLOW_ANY_TAG=1",
+        "memora-rh:latest"
+      ],
+      "Domainname": "",
+      "Entrypoint": null,
+      "Env": [
+        "MEMORA_HOST=0.0.0.0",
+        "MEMORA_TRANSPORT=streamable-http",
+        "MEMORA_EMBEDDING_MODEL=tfidf",
+        "PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "PYTHON_SHA256=5c8462af5790baf43a321a1559dbe0db06d1be4300fb85fb53c40060668e548a",
+        "MEMORA_DEFAULT_DB=memora",
+        "MEMORA_PORT=8000",
+        "LANG=C.UTF-8",
+        "GPG_KEY=<redacted>",
+        "MEMORA_DATABASES={\"memora\": \"/data/memora.db\", \"ob1\": \"/data/ob1.db\", \"bestation\": \"/data/bestation.db\", \"re\": \"/data/re.db\"}",
+        "container=podman",
+        "MEMORA_DB_PATH=/data/memora.db",
+        "PYTHON_VERSION=3.12.14",
+        "MEMORA_HEALTH_TOKEN=<redacted>",
+        "MEMORA_ALLOW_ANY_TAG=1",
+        "HOME=/root",
+        "HOSTNAME=f7b7617f5621"
+      ],
+      "ExposedPorts": {
+        "8000/tcp": {}
+      },
+      "HealthLogDestination": "local",
+      "HealthcheckMaxLogCount": 5,
+      "HealthcheckMaxLogSize": 500,
+      "HealthcheckOnFailureAction": "none",
+      "Hostname": "f7b7617f5621",
+      "Image": "localhost/memora-rh:latest",
+      "Labels": {
+        "io.buildah.version": "1.43.2"
+      },
+      "OnBuild": null,
+      "OpenStdin": false,
+      "Passwd": true,
+      "StdinOnce": false,
+      "StopSignal": "SIGTERM",
+      "StopTimeout": 10,
+      "Timeout": 0,
+      "Tty": false,
+      "Umask": "0022",
+      "User": "",
+      "Volumes": null,
+      "WorkingDir": "/app",
+      "sdNotifyMode": "container"
+    },
+    "ConmonPidFile": "/run/user/1001/containers/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/conmon.pid",
+    "Created": "2026-09-24T05:17:08.30395553+03:00",
+    "Dependencies": [],
+    "Driver": "overlay",
+    "EffectiveCaps": [
+      "CAP_CHOWN",
+      "CAP_DAC_OVERRIDE",
+      "CAP_FOWNER",
+      "CAP_FSETID",
+      "CAP_KILL",
+      "CAP_NET_BIND_SERVICE",
+      "CAP_SETFCAP",
+      "CAP_SETGID",
+      "CAP_SETPCAP",
+      "CAP_SETUID",
+      "CAP_SYS_CHROOT"
+    ],
+    "ExecIDs": [
+      "9a3e2c56f38116927bff2b4c6ba25fd4194149ca44556653e36c2342edc37a33"
+    ],
+    "GraphDriver": {
+      "Data": {
+        "LowerDir": "/home/rehearsal/.local/share/containers/storage/overlay/339763543f8761c99931c3a60e4fb51a9c8f607cba78528c4d9e03f432bb0c6a/diff:/home/rehearsal/.local/share/containers/storage/overlay/2fafce758aae5e39d8c044685a86f6636451038db1859aef9f37e2bfde92457a/diff:/home/rehearsal/.local/share/containers/storage/overlay/348436b85879bf0a6514f4aaf291e7066c0ff4229eb4da13808ba7fc748e2e1c/diff:/home/rehearsal/.local/share/containers/storage/overlay/52a7e6e1c74a68ff8b98ec6dbb568c249470334d28153b902cc2739ef2c90840/diff:/home/rehearsal/.local/share/containers/storage/overlay/424fba04e3d7c38f621eb39eb3552a06ae61817c7f2546f3102d4cf7474d6951/diff:/home/rehearsal/.local/share/containers/storage/overlay/dfdf08d48a909444039952e93369abd99e175a35f2480fdc63bb0f0f76e528f7/diff:/home/rehearsal/.local/share/containers/storage/overlay/a6dc765193a52cbaede3c93a9ff48b9540948dd0774bbe7031fcb5847606f9ac/diff",
+        "MergedDir": "/home/rehearsal/.local/share/containers/storage/overlay/5da5bed4c97d4e865301addd9cbdee61c595bbf062e420ecc333b13c090b0bf3/merged",
+        "UpperDir": "/home/rehearsal/.local/share/containers/storage/overlay/5da5bed4c97d4e865301addd9cbdee61c595bbf062e420ecc333b13c090b0bf3/diff",
+        "WorkDir": "/home/rehearsal/.local/share/containers/storage/overlay/5da5bed4c97d4e865301addd9cbdee61c595bbf062e420ecc333b13c090b0bf3/work"
+      },
+      "Name": "overlay"
+    },
+    "HostConfig": {
+      "Annotations": {
+        "io.container.manager": "libpod",
+        "org.opencontainers.image.stopSignal": "15",
+        "org.systemd.property.KillSignal": "15",
+        "org.systemd.property.TimeoutStopUSec": "uint64 10000000"
+      },
+      "AutoRemove": false,
+      "AutoRemoveImage": false,
+      "Binds": [
+        "df51f8c1e27ea92912bdd29939499e7155004710780a1204d925f800564af085:/data:rprivate,rw,nodev,exec,nosuid,rbind"
+      ],
+      "BlkioDeviceReadBps": null,
+      "BlkioDeviceReadIOps": null,
+      "BlkioDeviceWriteBps": null,
+      "BlkioDeviceWriteIOps": null,
+      "BlkioWeight": 0,
+      "BlkioWeightDevice": null,
+      "CapAdd": [],
+      "CapDrop": [],
+      "Cgroup": "",
+      "CgroupConf": null,
+      "CgroupManager": "systemd",
+      "CgroupMode": "private",
+      "CgroupParent": "user.slice",
+      "Cgroups": "default",
+      "ConsoleSize": [
+        0,
+        0
+      ],
+      "ContainerIDFile": "",
+      "CpuCount": 0,
+      "CpuPercent": 0,
+      "CpuPeriod": 0,
+      "CpuQuota": 0,
+      "CpuRealtimePeriod": 0,
+      "CpuRealtimeRuntime": 0,
+      "CpuShares": 0,
+      "CpusetCpus": "",
+      "CpusetMems": "",
+      "Devices": [],
+      "DiskQuota": 0,
+      "Dns": [],
+      "DnsOptions": [],
+      "DnsSearch": [],
+      "ExtraHosts": [],
+      "GroupAdd": [],
+      "HostsFile": "",
+      "IOMaximumBandwidth": 0,
+      "IOMaximumIOps": 0,
+      "IpcMode": "shareable",
+      "Isolation": "",
+      "KernelMemory": 0,
+      "Links": null,
+      "LogConfig": {
+        "Config": null,
+        "Path": "",
+        "Size": "-1B",
+        "Tag": "",
+        "Type": "journald"
+      },
+      "Memory": 0,
+      "MemoryReservation": 0,
+      "MemorySwap": 0,
+      "MemorySwappiness": 0,
+      "NanoCpus": 0,
+      "NetworkMode": "pasta",
+      "OomKillDisable": false,
+      "OomScoreAdj": 0,
+      "PidMode": "private",
+      "PidsLimit": 2048,
+      "PortBindings": {
+        "8000/tcp": [
+          {
+            "HostIp": "0.0.0.0",
+            "HostPort": "18920"
+          }
+        ]
+      },
+      "Privileged": false,
+      "PublishAllPorts": false,
+      "ReadonlyRootfs": false,
+      "RestartPolicy": {
+        "MaximumRetryCount": 0,
+        "Name": "unless-stopped"
+      },
+      "Runtime": "oci",
+      "SecurityOpt": [],
+      "ShmSize": 65536000,
+      "Tmpfs": {},
+      "UTSMode": "private",
+      "Ulimits": [
+        {
+          "Hard": 524288,
+          "Name": "RLIMIT_NOFILE",
+          "Soft": 524288
+        },
+        {
+          "Hard": 63108,
+          "Name": "RLIMIT_NPROC",
+          "Soft": 63108
+        }
+      ],
+      "UsernsMode": "",
+      "VolumeDriver": "",
+      "VolumesFrom": null
+    },
+    "HostnamePath": "/run/user/1001/containers/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/hostname",
+    "HostsPath": "/run/user/1001/containers/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/hosts",
+    "Id": "f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6",
+    "Image": "1274fceda0f3b515334d665d000be4e240b6d7b06fd0b37598cf5ff555dce537",
+    "ImageDigest": "sha256:4fb13a02da97277b18a5c3a5d30878e6c8cebef7f6852003d1d91a425572cd5e",
+    "ImageName": "localhost/memora-rh:latest",
+    "IsInfra": false,
+    "IsService": false,
+    "KubeExitCodePropagation": "invalid",
+    "MountLabel": "system_u:object_r:container_file_t:s0:c583,c968",
+    "Mounts": [
+      {
+        "Destination": "/data",
+        "Driver": "local",
+        "Mode": "",
+        "Name": "df51f8c1e27ea92912bdd29939499e7155004710780a1204d925f800564af085",
+        "Options": [
+          "nodev",
+          "exec",
+          "nosuid",
+          "rbind"
+        ],
+        "Propagation": "rprivate",
+        "RW": true,
+        "Source": "/home/rehearsal/.local/share/containers/storage/volumes/df51f8c1e27ea92912bdd29939499e7155004710780a1204d925f800564af085/_data",
+        "Type": "volume"
+      }
+    ],
+    "Name": "memora-rh",
+    "Namespace": "",
+    "NetworkSettings": {
+      "Bridge": "",
+      "EndpointID": "",
+      "Gateway": "",
+      "GlobalIPv6Address": "",
+      "GlobalIPv6PrefixLen": 0,
+      "HairpinMode": false,
+      "IPAddress": "",
+      "IPPrefixLen": 0,
+      "IPv6Gateway": "",
+      "LinkLocalIPv6Address": "",
+      "LinkLocalIPv6PrefixLen": 0,
+      "MacAddress": "",
+      "Ports": {
+        "8000/tcp": [
+          {
+            "HostIp": "0.0.0.0",
+            "HostPort": "18920"
+          }
+        ]
+      },
+      "SandboxID": "",
+      "SandboxKey": "/run/user/1001/netns/netns-364bcf30-59f5-5846-ebc1-638bcb241567"
+    },
+    "OCIConfigPath": "/home/rehearsal/.local/share/containers/storage/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/config.json",
+    "OCIRuntime": "crun",
+    "Path": "memora-server",
+    "PidFile": "/run/user/1001/containers/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/pidfile",
+    "Pod": "",
+    "ProcessLabel": "system_u:system_r:container_t:s0:c583,c968",
+    "ResolvConfPath": "/run/user/1001/containers/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata/resolv.conf",
+    "RestartCount": 0,
+    "Rootfs": "",
+    "State": {
+      "CgroupPath": "/user.slice/user-1001.slice/user@1001.service/user.slice/libpod-f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6.scope",
+      "CheckpointedAt": "0001-01-01T00:00:00Z",
+      "ConmonPid": 534959,
+      "Dead": false,
+      "Error": "",
+      "ExitCode": 0,
+      "FinishedAt": "0001-01-01T00:00:00Z",
+      "OOMKilled": false,
+      "OciVersion": "1.2.1",
+      "Paused": false,
+      "Pid": 534961,
+      "Restarting": false,
+      "RestoredAt": "0001-01-01T00:00:00Z",
+      "Running": true,
+      "StartedAt": "2026-09-24T05:17:08.409767932+03:00",
+      "Status": "running"
+    },
+    "StaticDir": "/home/rehearsal/.local/share/containers/storage/overlay-containers/f7b7617f56210377da734db03be8765a304efcc15319db1a346dd4ec726245c6/userdata",
+    "UseImageHostname": false,
+    "UseImageHosts": false,
+    "lockNumber": 0
+  }
+]

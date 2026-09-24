@@ -62,9 +62,11 @@ def deploy(tmp_path):
 
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _exe(bin_dir / "ssh", '#!/bin/bash\nshift\nexec "$@"\n')
+    tool_log = tmp_path / "tools.txt"
+    _exe(bin_dir / "ssh", f'#!/bin/bash\necho "ssh $1" >> "{tool_log}"\nshift\nexec "$@"\n')
     os.symlink(FAKE_RUNTIME, bin_dir / "docker")
-    _exe(bin_dir / "git", "#!/bin/bash\nexit 0\n")
+    os.symlink(FAKE_RUNTIME, bin_dir / "podman")
+    _exe(bin_dir / "git", f'#!/bin/bash\necho "git $*" >> "{tool_log}"\nexit 0\n')
     _exe(bin_dir / "curl", "#!/bin/bash\nexit 0\n")
     log = tmp_path / "calls.txt"
 
@@ -87,6 +89,10 @@ def deploy(tmp_path):
 
     run.old = old
     run.new = volroot / "memora-all-data"
+    run.volroot = volroot
+    run.tools = tool_log
+    run.home = home
+    run.bin = bin_dir
     return run
 
 
@@ -101,7 +107,7 @@ def _index(calls, pred):
 
 
 def _is_copy(c):
-    return c[:2] == ["run", "--rm"] and "migrate_data_volume" in c
+    return c[0] == "run" and "migrate_data_volume" in c
 
 
 def _flag_values(argv, flag):
@@ -129,6 +135,9 @@ def test_first_deploy_copies_the_anonymous_volume_into_the_named_one(deploy):
     assert create < stop < copy < rename < new, \
         "the volume is made before the stop; the copy runs while memora-all is stopped"
     assert f"{ANON}:/from:ro" in calls[copy] and "memora-all-data:/to" in calls[copy]
+    assert "--rm" not in calls[copy], "podman's --rm deletes an anonymous volume mounted with -v (R1)"
+    migrator = calls[copy][calls[copy].index("--name") + 1]
+    assert calls[copy + 1] == ["rm", migrator], "the migration container is removed with a plain rm"
     assert _files(deploy.new) == _files(deploy.old)
     assert f"source={ANON}" in (deploy.new / MARKER).read_text()
 
@@ -300,3 +309,48 @@ def test_memory_limit_is_the_measured_gate(deploy):
 
     _, calls, _ = deploy()
     assert _flag_values(_new_container_run(calls), "--memory") == [MEASURED_DEFAULT_MEMORY.lower()]
+
+
+# ---------------------------------------------------------------- R1: rehearsal parameters
+
+def test_the_defaults_are_the_production_deploy(deploy):
+    """Unparameterised: ssh to nuc8, docker, the v0.4.6 checkout, memora-all
+    on 8920 with memora-all-data and memora:latest."""
+    proc, calls, cfg = deploy()
+    tools = deploy.tools.read_text().splitlines()
+    assert tools[0] == "ssh nuc8"
+    assert any(t.startswith("git ") and "checkout v0.4.6" in t for t in tools)
+    run = _new_container_run(calls)
+    assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
+    assert "0.0.0.0:8920:8000" in _flag_values(run, "-p")
+
+
+def test_a_rehearsal_runs_locally_on_another_runtime_with_its_own_names(deploy, tmp_path):
+    """DEPLOY_HOST=localhost runs the same steps without ssh; RUNTIME picks
+    the binary (every call goes through it); the names, port, image, config
+    dir and checkout are parameters."""
+    (deploy.bin / "docker").unlink()  # RUNTIME=podman: any docker call is recorded and fails
+    _exe(deploy.bin / "docker", f'#!/bin/bash\necho "docker $*" >> "{deploy.tools}"\nexit 97\n')
+    rcfg = tmp_path / "rehearsal-config"
+    shutil.copytree(deploy.home / ".config" / "memora", rcfg)
+    (rcfg / "credentials.mcp.json").write_text(json.dumps({"mcpServers": {"memora": {"env": {"X": "1"}}}}))
+    proc, calls, cfg = deploy(runtime_env={
+        "DEPLOY_HOST": "localhost", "RUNTIME": "podman", "DEPLOY_CONTAINER": "memora-rh",
+        "DEPLOY_DATA_VOLUME": "memora-rh-data", "DEPLOY_IMAGE": "memora-rh:latest", "DEPLOY_PORT": "18920",
+        "DEPLOY_CONFIG_DIR": str(rcfg), "DEPLOY_SKIP_CHECKOUT": "1", "DEPLOY_SMOKE_ABSORB": "0",
+        "DEPLOY_REPO": str(deploy.home / "repos" / "agentic-box" / "memora"), "DEPLOY_TAG": "v9.9.9"})
+    tools = deploy.tools.read_text().splitlines() if deploy.tools.exists() else []
+    assert calls, proc.stderr[-2000:]
+    assert not [t for t in tools if t.startswith(("ssh", "git", "docker"))], tools
+    assert ["inspect", "memora-rh", "--format"] == calls[_index(calls, lambda c: c[0] == "inspect")][:3]
+    assert ["stop", "memora-rh"] in calls
+    assert ["build", "-t", "memora-rh:latest"] == calls[_index(calls, lambda c: c[0] == "build")][:3]
+    run = _new_container_run(calls)
+    assert run[run.index("--name") + 1] == "memora-rh" and run[-1] == "memora-rh:latest"
+    assert _flag_values(run, "-v") == ["memora-rh-data:/data"]
+    assert "0.0.0.0:18920:8000" in _flag_values(run, "-p")
+    assert "MEMORA_DATA_VOLUME=memora-rh-data" in _flag_values(run, "-e")
+    rename = calls[_index(calls, lambda c: c[0] == "rename")]
+    assert rename[1] == "memora-rh" and rename[2].startswith("memora-rh-grok-")
+    assert (rcfg / "all.admin-token").exists() and not (cfg / "all.admin-token").exists()
+    assert _files(deploy.volroot / "memora-rh-data") == _files(deploy.old)

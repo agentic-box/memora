@@ -14,6 +14,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Deploy rehearsal (R1): the L2a deploy on a real runtime
+- New `scripts/rehearse_deploy.sh` and `docs/deploy-rehearsal.md` run the real `deploy-memora-all.sh` against rootless podman on a rehearsal host, with local stores only. It covers: the production-shaped old container (anonymous `/data`, WAL sidecars, an intent journal); the migration; the new container (960m, tokens); a no-op second deploy; rollback and recopy; freeze/thaw through the live admin routes. 46 checks, all passing on server2.
+- `deploy-memora-all.sh` takes rehearsal parameters, all defaulting to production: `DEPLOY_HOST` (`localhost` runs without ssh), `RUNTIME`, `DEPLOY_CONTAINER`, `DEPLOY_DATA_VOLUME`, `DEPLOY_IMAGE`, `DEPLOY_PORT`, `DEPLOY_CONFIG_DIR`, `DEPLOY_ENV_FILE`, `DEPLOY_REPO`, `DEPLOY_SKIP_CHECKOUT`, `DEPLOY_TAG`, `DEPLOY_SMOKE_ABSORB`.
+- Fix, found on real podman: `podman run --rm -v <anonymous volume>:/from` deletes that volume when the container exits if nothing else references it (docker keeps it). Both launchers now run the `/data` migration as a named container and remove it with a plain `rm`, never `--rm`. `deploy-memora-all.sh` also mounts `--tmpfs /data` on the migration container so no empty anonymous volume is left behind.
+- `compare` on a store without replication now refuses cleanly instead of raising a raw SQLite error.
+- `tests/fixtures/podman_inspect_{old,new}.json` hold real `podman inspect` output, with token values redacted and paths anonymised. The instance launcher's `/data` parser is tested against them.
+
 ### Local-primary X1: local foreign-key parity (plan §9 x)
 - `local_primary.py fk-audit <db> --store P`: read-only audit (`PRAGMA foreign_key_check` over every table that declares a foreign key, which today is `memories_embeddings`, `memories_crossrefs` and `memories_events`). Reports each child table's orphan count and the missing `memories.id` values; exit 5 when there are orphans, 2 when the store cannot be read.
 - A live primary enforces foreign keys like D1: `PRAGMA foreign_keys = ON` in `writer_setup_pragmas`, so a raw parent DELETE cascades locally as it does on D1. Before the first writer in a process, the store's data is audited once. Orphans refuse the store (every open raises, `fence_live_primaries` reports it, health shows `refused`, a refused default store stops startup with exit 2). Nothing is repaired automatically.

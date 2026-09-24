@@ -179,6 +179,10 @@ def _live(store: Path, fn: Callable[[sqlite3.Connection], Any]) -> Any:
     conn = LocalSQLiteBackend(Path(store)).connect_read_only()
     try:
         return fn(conn)
+    except sqlite3.OperationalError as exc:
+        if "no such table: sync_" in str(exc):  # found by the R1 rehearsal: a plain store, not a primary
+            raise CompareRefused(f"{store}: replication is not installed on this store ({exc})")
+        raise
     finally:
         conn.close()
 

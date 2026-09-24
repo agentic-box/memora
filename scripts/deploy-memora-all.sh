@@ -105,12 +105,25 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="v0.4.6"
+TAG="${DEPLOY_TAG:-v0.4.6}"
+# Rehearsal parameters (R1): every default is the production value, so an
+# unparameterised run is exactly the nuc8 deploy. scripts/rehearse_deploy.sh
+# sets them to run the same steps against a local podman on server2.
+DEPLOY_HOST="${DEPLOY_HOST:-nuc8}"            # "localhost": run here, no ssh
+RUNTIME="${RUNTIME:-docker}"                  # the container runtime binary
+DEPLOY_CONTAINER="${DEPLOY_CONTAINER:-memora-all}"
+DEPLOY_DATA_VOLUME="${DEPLOY_DATA_VOLUME:-memora-all-data}"
+DEPLOY_IMAGE="${DEPLOY_IMAGE:-memora:latest}"
+DEPLOY_PORT="${DEPLOY_PORT:-8920}"
+DEPLOY_CONFIG_DIR="${DEPLOY_CONFIG_DIR:-~/.config/memora}"   # expanded on the target host
+DEPLOY_REPO="${DEPLOY_REPO:-~/repos/agentic-box/memora}"     # expanded on the target host
+DEPLOY_SKIP_CHECKOUT="${DEPLOY_SKIP_CHECKOUT:-0}"            # 1: build DEPLOY_REPO as it is
+DEPLOY_SMOKE_ABSORB="${DEPLOY_SMOKE_ABSORB:-1}"              # 0: no LLM-backed absorb in the smoke check
 
 # MEMORA_DATABASES names a Cloudflare account + database ids — read from the
 # git-ignored instance config rather than written into this (public) script.
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="$ROOT/instances/all.env"
+ENV_FILE="${DEPLOY_ENV_FILE:-$ROOT/instances/all.env}"
 [ -f "$ENV_FILE" ] || { echo "missing $ENV_FILE — need MEMORA_DATABASES for memora-all" >&2; exit 1; }
 MEMORA_DATABASES="$(grep -E "^MEMORA_DATABASES=" "$ENV_FILE" | head -1 | cut -d= -f2- | sed "s/^'//;s/'\$//")"
 [ -n "$MEMORA_DATABASES" ] || { echo "$ENV_FILE has no MEMORA_DATABASES" >&2; exit 1; }
@@ -121,26 +134,37 @@ MEMORA_DATABASES_B64="$(printf '%s' "$MEMORA_DATABASES" | base64 | tr -d '\n')"
 # THIS checkout: the nuc8 checkout is at $TAG and may predate it.
 MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 
-ssh nuc8 bash -s -- "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" <<'REMOTE'
+if [ "$DEPLOY_HOST" = localhost ]; then
+  TARGET=(bash -s --)
+else
+  TARGET=(ssh "$DEPLOY_HOST" bash -s --)
+fi
+"${TARGET[@]}" "$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER" \
+  "$DEPLOY_DATA_VOLUME" "$DEPLOY_IMAGE" "$DEPLOY_PORT" "$DEPLOY_CONFIG_DIR" "$DEPLOY_REPO" \
+  "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" <<'REMOTE'
 set -euo pipefail
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
 MIGRATE_SCRIPT="$(printf '%s' "$3" | base64 -d)"
+RT="$4"; CONTAINER="$5"; DATA_VOLUME="$6"; IMAGE="$7"; PORT="$8"
+CONFIG_DIR="${9/#\~/$HOME}"; REPO_DIR="${10/#\~/$HOME}"; SKIP_CHECKOUT="${11}"; SMOKE_ABSORB="${12}"
 [ -n "$MIGRATE_SCRIPT" ] || { echo "empty /data migration program" >&2; exit 1; }
 TS=$(date +%s)
 # Keyed by registry store name (MEMORA_DATABASES); see the header for why.
 MEMORA_PROJECTS='{"memora":["memora","clmux","acebar","pi"],"ob1":["ob1"],"bestation":["bestation"],"re":["re"]}'
 
-REPO=~/repos/agentic-box/memora
-[ -d "$REPO" ] || { echo "missing $REPO checkout on nuc8" >&2; exit 1; }
-git -C "$REPO" fetch origin
-git -C "$REPO" checkout "$TAG"
+REPO="$REPO_DIR"
+[ -d "$REPO" ] || { echo "missing $REPO checkout on $(hostname)" >&2; exit 1; }
+if [ "$SKIP_CHECKOUT" != 1 ]; then
+  git -C "$REPO" fetch origin
+  git -C "$REPO" checkout "$TAG"
+fi
 
 # Keep the currently-running image for rollback before building over it.
-docker tag memora:latest "memora:rollback-$TS" 2>/dev/null || true
-docker build -t memora:latest "$REPO"
+"$RT" tag "$IMAGE" "${IMAGE%%:*}:rollback-$TS" 2>/dev/null || true
+"$RT" build -t "$IMAGE" "$REPO"
 
-CRED=~/.config/memora/credentials.mcp.json
+CRED=$CONFIG_DIR/credentials.mcp.json
 [ -f "$CRED" ] || { echo "missing $CRED" >&2; exit 1; }
 cp -p "$CRED" "$CRED.bak-llm-$TS"
 
@@ -155,7 +179,7 @@ json.dump(d, open(p, "w"), indent=2)
 print(f"MEMORA_LLM_MODEL: {before!r} -> 'openai/gpt-4o-mini' (backup kept alongside)")
 PY
 
-HEALTH_TOKEN_FILE=~/.config/memora/all.health-token
+HEALTH_TOKEN_FILE=$CONFIG_DIR/all.health-token
 { [ -e "$HEALTH_TOKEN_FILE" ] || [ -L "$HEALTH_TOKEN_FILE" ]; } || { echo "missing $HEALTH_TOKEN_FILE — refusing to mint a new one for a live container" >&2; exit 1; }
 # Same rule as the admin token below: regular file, not a symlink, owned by
 # this user, mode 0600; otherwise refuse, never chmod (review 7636).
@@ -170,9 +194,9 @@ HEALTH_TOKEN=$(cat "$HEALTH_TOKEN_FILE")
 # Admin token: read, or mint once. Same shape as the health token (48
 # alphanumerics, no newline); an unusable existing file is refused, not
 # replaced, because a script may already hold it.
-ADMIN_TOKEN_FILE=~/.config/memora/all.admin-token
+ADMIN_TOKEN_FILE=$CONFIG_DIR/all.admin-token
 if [ ! -e "$ADMIN_TOKEN_FILE" ] && [ ! -L "$ADMIN_TOKEN_FILE" ]; then
-  tmp="$(mktemp ~/.config/memora/.admin-token.XXXXXX)"
+  tmp="$(mktemp "$CONFIG_DIR/.admin-token.XXXXXX")"
   chmod 600 "$tmp"
   ( set +o pipefail; LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48 ) > "$tmp"
   mv -f "$tmp" "$ADMIN_TOKEN_FILE"
@@ -194,13 +218,12 @@ ADMIN_TOKEN=$(cat "$ADMIN_TOKEN_FILE")
 
 # /data: the NAMED volume memora-all-data (see the header). OLD_VOLUME is what
 # the running container mounts at /data today; it is copied after the stop.
-DATA_VOLUME=memora-all-data
-OLD_VOLUME=$(docker inspect memora-all --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')
-[ -n "$OLD_VOLUME" ] || { echo "could not read memora-all's /data volume" >&2; exit 1; }
+OLD_VOLUME=$("$RT" inspect "$CONTAINER" --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}')
+[ -n "$OLD_VOLUME" ] || { echo "could not read $CONTAINER's /data volume" >&2; exit 1; }
 # Created and checked BEFORE the stop, so a runtime that cannot create or
 # name it fails with memora-all still serving.
-docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || docker volume create "$DATA_VOLUME" >/dev/null
-MOUNTED=$(docker volume inspect "$DATA_VOLUME" --format '{{.Name}}')
+"$RT" volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || "$RT" volume create "$DATA_VOLUME" >/dev/null
+MOUNTED=$("$RT" volume inspect "$DATA_VOLUME" --format '{{.Name}}')
 if [ "$MOUNTED" != "$DATA_VOLUME" ] || printf '%s' "$MOUNTED" | grep -Eqx '[0-9a-f]{64}'; then
   echo "volume $DATA_VOLUME resolved to '$MOUNTED' — refusing to mount it at /data" >&2; exit 1
 fi
@@ -234,8 +257,8 @@ done <<< "$ENV_LINES"
 # Preflight 1: MEMORA_PROJECTS parses with the NEW image's own validator
 # (the server refuses to start on a malformed value), and names exactly the
 # registry's stores.
-docker run --rm -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
-  memora:latest python -c '
+"$RT" run --rm -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" -e "MEMORA_DATABASES=$MEMORA_DATABASES" \
+  "$IMAGE" python -c '
 import json, os, sys
 from memora.storage import load_projects_config
 projects = load_projects_config()
@@ -252,7 +275,7 @@ print("MEMORA_PROJECTS ok:", json.dumps(projects, sort_keys=True))
 # of real markers), through the running (previous) container: a raw backend
 # connection, so no schema pass -- one SELECT per store. Any hit, or a
 # failed check, aborts before anything is stopped.
-docker exec -i memora-all python - <<'PY' || { echo "import_attempt preflight failed — aborting before touching the live container" >&2; exit 1; }
+"$RT" exec -i "$CONTAINER" python - <<'PY' || { echo "import_attempt preflight failed — aborting before touching the live container" >&2; exit 1; }
 import json, os, sys
 from memora import storage
 bad = {}
@@ -272,7 +295,7 @@ if bad:
     sys.exit(f"rows the startup sweep could complete or remove: {bad} -- inspect them first")
 PY
 
-docker stop memora-all
+"$RT" stop "$CONTAINER"
 
 # Copy the old /data into the named volume while memora-all is stopped
 # (scripts/migrate_data_volume.sh: staged into /to/.memora-staging, verified
@@ -285,23 +308,32 @@ docker stop memora-all
 if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
   # The status is captured on its own: a FAILED query must refuse, never read
   # as "nothing uses it" (review 7637 P1-2).
-  IN_USE="$(docker ps -q --filter "volume=$OLD_VOLUME")" \
-    || { echo "cannot tell whether a container uses $OLD_VOLUME (docker ps failed) — refusing to copy it; memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
+  IN_USE="$("$RT" ps -q --filter "volume=$OLD_VOLUME")" \
+    || { echo "cannot tell whether a container uses $OLD_VOLUME ($RT ps failed) — refusing to copy it; $CONTAINER is stopped, restart it with: $RT start $CONTAINER" >&2; exit 1; }
   if [ -n "$IN_USE" ]; then
-    echo "a running container still uses $OLD_VOLUME — refusing to copy it; memora-all is stopped, restart it with: docker start memora-all" >&2
+    echo "a running container still uses $OLD_VOLUME — refusing to copy it; $CONTAINER is stopped, restart it with: $RT start $CONTAINER" >&2
     exit 1
   fi
-  docker run --rm -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" memora:latest \
-    sh -c "$MIGRATE_SCRIPT" migrate_data_volume migrate "$OLD_VOLUME" \
-    || { echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — memora-all is stopped, restart it with: docker start memora-all" >&2; exit 1; }
+  # NOT `run --rm`: podman's --rm deletes an ANONYMOUS volume mounted with -v
+  # once no container references it -- the old data (found by the R1
+  # rehearsal on server2). A plain `rm` never removes volumes, on either runtime;
+  # --tmpfs /data keeps the image's VOLUME /data from leaving an anonymous one.
+  MIGRATOR="$CONTAINER-migrate-$TS"
+  if ! "$RT" run --name "$MIGRATOR" --tmpfs /data -v "$OLD_VOLUME:/from:ro" -v "$DATA_VOLUME:/to" "$IMAGE" \
+       sh -c "$MIGRATE_SCRIPT" migrate_data_volume migrate "$OLD_VOLUME"; then
+    "$RT" rm "$MIGRATOR" >/dev/null 2>&1 || true
+    echo "copy $OLD_VOLUME -> $DATA_VOLUME failed — $CONTAINER is stopped, restart it with: $RT start $CONTAINER" >&2
+    exit 1
+  fi
+  "$RT" rm "$MIGRATOR" >/dev/null || echo "note: the finished migration container $MIGRATOR was not removed" >&2
 fi
 
-docker rename memora-all "memora-all-grok-$TS"
+"$RT" rename "$CONTAINER" "$CONTAINER-grok-$TS"
 
-docker run -d --name memora-all \
+"$RT" run -d --name "$CONTAINER" \
   --restart unless-stopped \
   --memory 960m --cpus 4 \
-  -p 0.0.0.0:8920:8000 \
+  -p "0.0.0.0:$PORT:8000" \
   -v "$DATA_VOLUME:/data" \
   -e "MEMORA_DATA_VOLUME=$DATA_VOLUME" \
   -e "MEMORA_TOOL_PROFILE=leader" \
@@ -316,16 +348,16 @@ docker run -d --name memora-all \
   -e "MEMORA_DEFAULT_DB=memora" \
   -e "MEMORA_PROJECTS=$MEMORA_PROJECTS" \
   "${ENV_ARGS[@]}" \
-  memora:latest
+  "$IMAGE"
 
-echo "memora-all recreated from $TAG (MEMORA_PROJECTS set; MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
-echo "old container kept stopped as memora-all-grok-$TS; old image kept as memora:rollback-$TS"
-echo "rollback: docker rm -f memora-all && docker rename memora-all-grok-$TS memora-all && docker start memora-all"
+echo "$CONTAINER recreated from $TAG (MEMORA_PROJECTS set; MEMORA_LLM_MODEL=openai/gpt-4o-mini unchanged, MEMORA_LOG_LEVEL=INFO, corpus cache budget default 384 MB)"
+echo "old container kept stopped as $CONTAINER-grok-$TS; old image kept as ${IMAGE%%:*}:rollback-$TS"
+echo "rollback: $RT rm -f $CONTAINER && $RT rename $CONTAINER-grok-$TS $CONTAINER && $RT start $CONTAINER"
 
 echo "waiting for /health..."
 healthy=0
 for ((i = 1; i <= 30; i++)); do
-  if curl -sf -m 3 http://127.0.0.1:8920/health >/dev/null 2>&1; then
+  if curl -sf -m 3 http://127.0.0.1:$PORT/health >/dev/null 2>&1; then
     healthy=1
     echo "healthy after about $((i * 2))s"
     break
@@ -333,22 +365,23 @@ for ((i = 1; i <= 30; i++)); do
   sleep 2
 done
 if [ "$healthy" -ne 1 ]; then
-  echo "still not healthy after ~60s — check: docker logs memora-all" >&2
+  echo "still not healthy after ~60s — check: $RT logs $CONTAINER" >&2
   exit 1
 fi
 
-python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" <<'PY'
+python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" <<'PY'
 import json, sys, time, urllib.error, urllib.request
 
 EXPECTED_VERSION = sys.argv[1]
 STORES = list(json.loads(sys.argv[2]))
 HEALTH_TOKEN = sys.argv[3]
-ROOT = "http://127.0.0.1:8920"
+ROOT = f"http://127.0.0.1:{sys.argv[4]}"
+SMOKE_ABSORB = sys.argv[5] == "1"
 BASE = f"{ROOT}/mcp/memora"
 
 # The version the RUNNING process reports -- a stale image or a failed
 # rebuild would still answer /health, just with the old version.
-with urllib.request.urlopen("http://127.0.0.1:8920/health", timeout=10) as resp:
+with urllib.request.urlopen(f"{ROOT}/health", timeout=10) as resp:
     health = json.loads(resp.read().decode())
 if health.get("version") != EXPECTED_VERSION:
     print(f"/health reports version {health.get('version')!r}, expected {EXPECTED_VERSION!r}", file=sys.stderr)
@@ -441,21 +474,25 @@ def _require_profile(name, out):
     return profile
 
 
-facts = [
-    "deploy-check fact one about the v0.4.6 rollout",
-    "deploy-check fact two about the v0.4.6 rollout",
-    "deploy-check fact three about the v0.4.6 rollout",
-]
-absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
-# Not one decision per fact: near-identical facts may be consolidated.
-if not isinstance(absorb.get("decisions"), list) or not absorb["decisions"]:
-    print(f"memory_absorb result has no decisions: {json.dumps(absorb)[:2000]}", file=sys.stderr)
-    sys.exit(1)
-profile = _require_profile("memory_absorb", absorb)
-print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s "
-      f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
-      f"server-side {profile['total_seconds']}s)")
-print("actions:", [d.get("action") for d in absorb["decisions"]])
+# The dry-run absorb needs the configured LLM; a rehearsal without one skips it.
+if SMOKE_ABSORB:
+    facts = [
+        "deploy-check fact one about the v0.4.6 rollout",
+        "deploy-check fact two about the v0.4.6 rollout",
+        "deploy-check fact three about the v0.4.6 rollout",
+    ]
+    absorb, elapsed = _call_tool(2, "memory_absorb", {"facts": facts, "dry_run": True})
+    # Not one decision per fact: near-identical facts may be consolidated.
+    if not isinstance(absorb.get("decisions"), list) or not absorb["decisions"]:
+        print(f"memory_absorb result has no decisions: {json.dumps(absorb)[:2000]}", file=sys.stderr)
+        sys.exit(1)
+    profile = _require_profile("memory_absorb", absorb)
+    print(f"3-fact dry-run absorb via memory store: {elapsed:.1f}s "
+          f"({profile['total_requests']} {profile.get('request_unit', 'requests')}, "
+          f"server-side {profile['total_seconds']}s)")
+    print("actions:", [d.get("action") for d in absorb["decisions"]])
+else:
+    print("memory_absorb smoke check skipped (DEPLOY_SMOKE_ABSORB=0)")
 
 search, elapsed = _call_tool(3, "memory_semantic_search", {"query": "memora deploy", "top_k": 3})
 if not isinstance(search.get("results"), list):

@@ -223,6 +223,11 @@ def _up(tmp_path, env_lines, cred_env=None, volume_exists=True, runtime_env=None
     return proc, calls, argv
 
 
+def _removals(calls):
+    """`rm` calls other than the migration container's own removal."""
+    return [c for c in calls if c[0] == "rm" and not any("-migrate-" in a for a in c[1:])]
+
+
 def _mounts(argv):
     return [argv[i + 1] for i, a in enumerate(argv) if a == "-v"]
 
@@ -430,8 +435,12 @@ class TestUpgradeFromAnAnonymousVolume:
         rename = verbs.index("rename")
         assert stop < copy < rename < len(calls) - 1, "copy while stopped, keep the old one, then run"
         assert calls[rename][1] == "memora-t" and calls[rename][2].startswith("memora-t-pre-data-volume-")
-        assert "rm" not in verbs, "the old container is kept for rollback"
+        assert not _removals(calls), "the old container is kept for rollback"
         assert _mounts(argv) == ["memora-t-data:/data"]
+        run = calls[copy]
+        assert "--rm" not in run, "podman's --rm deletes an anonymous volume mounted with -v (R1)"
+        migrator = run[run.index("--name") + 1]
+        assert ["rm", migrator] in calls, "the finished migration container is removed with a plain rm"
 
     def test_a_second_up_is_a_no_op(self, tmp_path):
         old, conns = self._old_volume(tmp_path)
@@ -455,7 +464,8 @@ class TestUpgradeFromAnAnonymousVolume:
         assert proc.returncode != 0
         assert "container start memora-t" in proc.stderr.replace(FAKE_RUNTIME, "container")
         verbs = [c[0] for c in calls]
-        assert "rm" not in verbs and "rename" not in verbs and argv == []
+        assert not _removals(calls) and "rename" not in verbs and argv == []
+        assert any(c[0] == "rm" and "-migrate-" in c[1] for c in calls), "the failed migrator is cleaned up"
         assert (old / "re.db").exists(), "the old volume is untouched"
 
     def test_a_still_running_container_is_not_copied(self, tmp_path):
@@ -539,3 +549,43 @@ def test_default_memory_is_the_measured_gate():
     proc = subprocess.run(["bash", "-c", f'unset MEMORA_MEMORY; source "{SCRIPT}"; echo "$DEFAULT_MEMORY"'],
                           capture_output=True, text=True)
     assert proc.stdout.strip() == MEASURED_DEFAULT_MEMORY
+
+
+class TestRealPodmanInspectShape:
+    """R1: the parser reads `podman inspect` output recorded on server2 (token
+    values redacted, paths anonymised): the production-shaped old container
+    (an anonymous /data volume) and the deployed one (the named volume)."""
+
+    REG = TestUpgradeFromAnAnonymousVolume.REG
+    FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
+
+    def _inspect(self, which):
+        with open(os.path.join(self.FIXTURES, f"podman_inspect_{which}.json")) as fh:
+            return fh.read()
+
+    def _copy_source(self, tmp_path, which):
+        import json as _json
+        raw = self._inspect(which)
+        name = next(m["Name"] for m in _json.loads(raw)[0]["Mounts"] if m["Destination"] == "/data")
+        src = tmp_path / "volumes" / name
+        src.mkdir(parents=True, exist_ok=True)
+        (src / "x.db").write_bytes(b"data")
+        proc, calls, argv = _up(tmp_path, self.REG, volume_exists=False,
+                                runtime_env={"INSPECT_OUT": raw, "EXISTING": "memora-t"})
+        assert proc.returncode == 0, proc.stderr
+        copy = next(c for c in calls if c[0] == "run" and "migrate_data_volume" in c)
+        return name, next(a.split(":")[0] for a in copy if a.endswith(":/from:ro"))
+
+    def test_the_anonymous_volume_of_a_real_podman_container_is_found(self, tmp_path):
+        name, source = self._copy_source(tmp_path, "old")
+        assert len(name) == 64 and source == name
+
+    def test_the_named_volume_of_a_real_podman_container_is_found(self, tmp_path):
+        name, source = self._copy_source(tmp_path, "new")
+        assert name == "memora-rh-data" and source == name
+
+    def test_the_fixtures_hold_no_secret(self):
+        import re
+        for which in ("old", "new"):
+            raw = self._inspect(which)
+            assert not re.search(r"TOKEN[A-Z_]*=(?!<redacted>)", raw), which
