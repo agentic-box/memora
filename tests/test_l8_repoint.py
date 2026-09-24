@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from memora import config_audit
+from tests.test_l8_config_audit import _fake_runtime
 from tests.test_l8_endpoint_check import ADMIN, HEALTH, FakeMemoraAll, _token_file
 
 REPO = Path(__file__).resolve().parent.parent
@@ -32,6 +33,21 @@ CLAUDE_JSON = {"numStartups": 7, "projects": {"/x": {"allowedTools": []}},
                                          "env": {"MEMORA_DATABASES": json.dumps({"m": f"{D1}a/b"}),
                                                  "CLOUDFLARE_API_TOKEN": TOKEN}}},
                "zeta": True}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_runtimes(tmp_path, monkeypatch):
+    """config_audit.audit() also audits every container of every runtime on
+    the host. Without this, the round trip queried the build host's real
+    podman: a concurrent container with a token in its env (a rehearsal's
+    memora, say), or a slow runtime under load, made the repointed file
+    look unclean -- the full-suite flake FLK2. Same isolation as
+    tests/test_l8_config_audit.py: empty fake runtimes first on PATH."""
+    bindir = tmp_path / "rtbin"
+    for rt in ("docker", "podman", "container"):
+        _fake_runtime(bindir, rt, {})
+    monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
+    monkeypatch.delenv("MEMORA_AUDIT_RUNTIMES", raising=False)
 
 
 def _run(*args):
