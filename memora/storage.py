@@ -56,7 +56,8 @@ from .embeddings import (
     rebuild_all_embeddings as _rebuild_all_embeddings,
 )
 from .embeddings import (
-    upsert_embedding as _upsert_embedding,
+    upsert_embedding as _upsert_embedding_row,
+    record_embedding_model_once as _record_embedding_model_once,
 )
 from .schema import ensure_schema as _ensure_schema
 from .absorb_profile import absorb_count, absorb_phase, absorb_profile
@@ -1887,6 +1888,13 @@ def _enforce_tag_whitelist(tags: List[str], exempt: Iterable[str] = ()) -> None:
         if tag in exempt or tag_matches_policy(tag, TAG_WHITELIST):
             continue
         raise ValueError(f"Tag '{tag}' is not in the allowed tag list")
+
+
+def _upsert_embedding(conn: sqlite3.Connection, memory_id: int, vector: Dict[str, float], **kw) -> None:
+    """Store a vector THIS process computed with EMBEDDING_MODEL, and record
+    the store's model once if it has none (E1: searches no longer do)."""
+    _upsert_embedding_row(conn, memory_id, vector, **kw)
+    _record_embedding_model_once(conn, vector, EMBEDDING_MODEL)
 
 
 def _compute_embedding(
@@ -9486,6 +9494,39 @@ class SearchUnavailable(RuntimeError):
         self.detail = detail
 
 
+# E1: stores whose embeddings need an explicit repair, as the last search
+# saw them (name -> {"reason", "since", "action"}); /health/db/<name> shows it.
+_EMBEDDING_REPAIR_NEEDED: Dict[str, Dict[str, Any]] = {}
+
+
+def _report_embedding_repair_needed(integrity: Dict[str, Any]) -> None:
+    """Log once per store and reason (never per search) and record it for health."""
+    name = effective_database_name() or "(default)"
+    reason = str(integrity.get("reason"))
+    prior = _EMBEDDING_REPAIR_NEEDED.get(name)
+    if prior is not None and prior.get("reason") == reason:
+        return
+    _EMBEDDING_REPAIR_NEEDED[name] = {
+        "reason": reason, "since": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "action": "memory_rebuild_embeddings (explicit; rewrites every embedding -- on a live primary each one "
+                  "replicates to D1)",
+    }
+    logger.warning(
+        "embedding integrity %s on %s: NOT rebuilt from a search. Searching with the stored vectors where "
+        "they are comparable; repair explicitly with the memory_rebuild_embeddings tool (it rewrites every "
+        "embedding, and on a live primary each one replicates to D1).", reason, name)
+
+
+def _clear_embedding_repair_needed() -> None:
+    _EMBEDDING_REPAIR_NEEDED.pop(effective_database_name() or "(default)", None)
+
+
+def embedding_repair_status(name: str) -> Optional[Dict[str, Any]]:
+    """For health: the repair a search found needed on this store, or None."""
+    entry = _EMBEDDING_REPAIR_NEEDED.get(name)
+    return dict(entry) if entry else None
+
+
 def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) -> None:
     """Decide, from the (read-only) integrity status, whether a read-only
     search can run. Missing vectors (or a store never audited) are fine as
@@ -9496,8 +9537,8 @@ def _read_only_search_gate(conn: sqlite3.Connection, integrity: Dict[str, Any]) 
     if not integrity.get("mismatch"):
         return
     audit = integrity.get("audit") or {}
-    if not audit.get("memory_count") and not audit.get("embedding_count"):
-        return  # an empty store: nothing to score, nothing to mismatch
+    if not audit.get("embedding_count"):
+        return  # no vector at all: nothing to score, nothing a query vector could mismatch
     reason = str(integrity.get("reason") or "unknown")
     if not integrity.get("repairable"):
         raise SearchUnavailable("integrity_fault", reason)
@@ -9551,7 +9592,8 @@ def semantic_search(
         metadata_filters: Optional metadata filters
         top_k: Maximum number of results
         min_score: Minimum similarity score threshold
-        auto_rebuild: If True, automatically rebuild embeddings on model mismatch
+        auto_rebuild: ignored since E1 -- a search never rebuilds embeddings (the
+            memory_rebuild_embeddings tool is the explicit repair); kept for callers
         date_from: Optional ISO date or relative ("7d", "1m") lower bound
         date_to: Optional ISO date or relative upper bound
         tags_any: Match memories with ANY of these tags (OR)
@@ -9574,20 +9616,24 @@ def semantic_search(
         integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL, meta=meta)
     if read_only:
         _read_only_search_gate(conn, integrity)
-        auto_rebuild = False
     elif integrity["mismatch"] and not integrity["repairable"]:
         raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
-    if auto_rebuild and integrity["mismatch"]:
-        import sys
-        print(
-            f"[memora] Embedding model changed: rebuilding embeddings with '{EMBEDDING_MODEL}'...",
-            file=sys.stderr,
-        )
-        rebuild_embeddings(conn)
-        integrity = _get_embedding_integrity_status(conn, EMBEDDING_MODEL)
-        if integrity["mismatch"]:
-            raise EmbeddingIntegrityFault(integrity["reason"], integrity["fault_ids"])
-        meta = None  # the rebuild wrote; let the corpus check read fresh
+    elif integrity["mismatch"]:
+        # E1: a search NEVER rebuilds embeddings, on any backend. A rebuild
+        # rewrites every embedding row (on D1 directly; on a live primary
+        # each one replicates to D1) and must be an explicit operator action
+        # (the memory_rebuild_embeddings tool). Search as a read-only search
+        # would: comparable vectors are used (a store never audited, rows
+        # missing a vector); only a search that must be refused needs a
+        # repair, and that is reported once (log + health).
+        try:
+            _read_only_search_gate(conn, integrity)
+        except SearchUnavailable:
+            _report_embedding_repair_needed(integrity)
+            raise
+        _clear_embedding_repair_needed()
+    else:
+        _clear_embedding_repair_needed()
 
     with absorb_phase("query_embedding"):
         vector_query = _query_embedding(query)
@@ -9707,7 +9753,8 @@ def hybrid_search_scored(
         tags_any: Match memories with ANY of these tags
         tags_all: Match memories with ALL of these tags
         tags_none: Exclude memories with ANY of these tags
-        auto_rebuild: If True, automatically rebuild embeddings on model mismatch
+        auto_rebuild: ignored since E1 -- a search never rebuilds embeddings (the
+            memory_rebuild_embeddings tool is the explicit repair); kept for callers
 
     Returns:
         List of memories with combined scores, sorted by relevance
@@ -9815,7 +9862,11 @@ def _check_embedding_model_mismatch(conn: sqlite3.Connection) -> bool:
 
 
 def rebuild_embeddings(conn: sqlite3.Connection) -> int:
-    return _rebuild_all_embeddings(conn, EMBEDDING_MODEL)
+    """The explicit operator repair (memory_rebuild_embeddings); searches
+    never call it (E1)."""
+    updated = _rebuild_all_embeddings(conn, EMBEDDING_MODEL)
+    _clear_embedding_repair_needed()
+    return updated
 
 
 def calculate_importance(

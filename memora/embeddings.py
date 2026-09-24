@@ -997,6 +997,34 @@ def upsert_embedding(
         raise EmbeddingIntegrityFault("integrity_rebuild_lease_lost", [])
 
 
+_MODEL_RECORDED: Set[str] = set()
+
+
+def record_embedding_model_once(conn: sqlite3.Connection, vector: Dict[str, float], current_model: str) -> None:
+    """E1: a search no longer rebuilds, so it no longer records which model
+    made a store's vectors. The write path does, once: when a vector the
+    CURRENT model just computed is stored and the store has no recorded
+    model, record the current fingerprint (INSERT OR IGNORE, part of the
+    caller's transaction, no commit). Only when the vector's kind matches the
+    backend (sparse for tfidf, dense otherwise): a fallback vector never
+    certifies a model. One meta read per store per process."""
+    key = _store_cache_key(conn)
+    if key in _MODEL_RECORDED:
+        return
+    rep = _vector_representation(vector)
+    if rep == "empty":
+        return
+    dense = rep.startswith("dense")
+    if (current_model == "tfidf") == dense:
+        return  # the vector does not match the configured backend: record nothing
+    if get_stored_embedding_model(conn) is None:
+        dim = int(rep.split(":", 1)[1]) if rep.startswith("dense:") else None
+        conn.execute("INSERT OR IGNORE INTO memories_meta (key, value) VALUES ('embedding_model', ?)",
+                     (current_embedding_fingerprint(current_model, observed_dim=dim),))
+        invalidate_embedding_integrity_cache(conn)
+    _MODEL_RECORDED.add(key)
+
+
 def upsert_embeddings_batch(
     conn: sqlite3.Connection,
     items: List[Tuple[int, Dict[str, float]]],
@@ -1165,45 +1193,41 @@ def set_stored_embedding_model(
     conn.commit()
 
 
-def _embedding_endpoint_host() -> str:
-    """Host-only identity of the embedding endpoint (NEVER the API key)."""
-    try:
-        _key, base = resolve_embedding_credentials()
-    except EmbeddingCredentialError:
-        base = os.getenv("MEMORA_EMBEDDING_BASE_URL") or os.getenv("OPENAI_BASE_URL") or ""
-    base = (base or "").strip()
-    if not base:
-        return "default-host"
-    # strip scheme and path
-    host = base
-    if "://" in host:
-        host = host.split("://", 1)[1]
-    host = host.split("/", 1)[0]
-    return host or "default-host"
-
-
 def current_embedding_fingerprint(
     current_model: str,
     *,
     observed_dim: Optional[int] = None,
 ) -> str:
-    """Fingerprint: backend|model|host|repr (N5/N7 + endpoint identity).
-
-    Includes host (not key) so switching providers with the same model string
-    still forces rebuild. observed_dim fills dense:N when known.
+    """Fingerprint: backend|model|repr -- the MODEL and the REPRESENTATION,
+    never the endpoint host (E1, leader decision 7917). A host move alone
+    (same model behind another address) must not invalidate a store; stamps
+    written with the host (backend|model|host|repr) are normalised on read
+    (normalize_fingerprint). observed_dim fills dense:N when known.
     """
-    host = _embedding_endpoint_host()
     if current_model == "openai":
         model_name = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
         kind = f"dense:{observed_dim}" if observed_dim else "dense"
-        return f"openai|{model_name}|{host}|{kind}"
+        return f"openai|{model_name}|{kind}"
     if current_model == "sentence-transformers":
         model_name = os.getenv("SENTENCE_TRANSFORMERS_MODEL", "all-MiniLM-L6-v2")
         kind = f"dense:{observed_dim}" if observed_dim else "dense"
-        return f"sentence-transformers|{model_name}|{host}|{kind}"
+        return f"sentence-transformers|{model_name}|{kind}"
     if current_model == "tfidf":
-        return f"tfidf|tfidf|{host}|sparse"
-    return f"{current_model}|unknown|{host}|unset"
+        return "tfidf|tfidf|sparse"
+    return f"{current_model}|unknown|unset"
+
+
+def normalize_fingerprint(fp: Optional[str]) -> Optional[str]:
+    """backend|model|repr. A stamp written before E1 carries the endpoint
+    host as a third field (backend|model|host|repr): the host is dropped, so
+    such a stamp compares equal when backend, model and representation
+    match. Nothing is rewritten; anything else is returned unchanged."""
+    if not fp:
+        return fp
+    parts = fp.split("|")
+    if len(parts) == 4:
+        return "|".join((parts[0], parts[1], parts[3]))
+    return fp
 
 
 def _is_numeric_gap_vector(vector: Dict[str, float]) -> bool:
@@ -1342,7 +1366,8 @@ def _snapshot_matches_live(stamp: Dict[str, Any], audit: Dict[str, Any], stored:
     """A stamp detects bypasses; it never decides live integrity by itself."""
     if stamp.get("schema_version") != _INTEGRITY_SCHEMA_VERSION:
         return False
-    if stamp.get("state") != "initialized" or stamp.get("fingerprint") != stored:
+    if stamp.get("state") != "initialized" or (
+            normalize_fingerprint(stamp.get("fingerprint")) != normalize_fingerprint(stored)):
         return False
     if sum(int(n) for n in (stamp.get("reps") or {}).values()) != audit["embedding_count"]:
         return False
@@ -1385,6 +1410,7 @@ def integrity_stamp_value(stamped: Dict[str, Any]) -> str:
 def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], current_model: str) -> bool:
     if stored is None or "|" not in stored:
         return True
+    stored = normalize_fingerprint(stored)
     if current_model in ("openai", "sentence-transformers"):
         if "sparse" in reps:
             return True
@@ -1392,7 +1418,7 @@ def _model_mismatch_for_reps(reps: Dict[str, int], stored: Optional[str], curren
         observed_dim = int(dense_dims[0].split(":")[1]) if dense_dims else None
         current_fp = current_embedding_fingerprint(current_model, observed_dim=observed_dim)
         stored_parts, current_parts = stored.split("|"), current_fp.split("|")
-        if len(stored_parts) < 3 or len(current_parts) < 3 or stored_parts[:3] != current_parts[:3]:
+        if len(stored_parts) != 3 or len(current_parts) != 3 or stored_parts[:2] != current_parts[:2]:
             return True
         stored_kind, current_kind = stored_parts[-1], current_parts[-1]
         if stored_kind.startswith("dense:") and current_kind.startswith("dense:"):

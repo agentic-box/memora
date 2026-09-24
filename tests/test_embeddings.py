@@ -443,7 +443,7 @@ def test_n5_matching_dense_fingerprint_no_mismatch(tmp_path, monkeypatch):
     _seed_memory(conn, 1)
     dense = {str(i): 0.1 for i in range(8)}
     emb.upsert_embedding(conn, 1, dense)
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:8")
     emb.verify_embedding_integrity(conn)
     conn.commit()
@@ -458,7 +458,7 @@ def test_n7_mixed_dense_sparse_forces_rebuild(tmp_path, monkeypatch):
     conn = _meta_conn(tmp_path)
     _seed_memory(conn, 1)
     _seed_memory(conn, 2)
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(8)})
     emb.upsert_embedding(conn, 2, {"ure": 0.2, "xdg": 0.3, "zig": 0.5})
     emb.set_stored_embedding_model(conn, f"openai|@cf/baai/bge-m3|{host}|dense:8")
@@ -473,7 +473,7 @@ def test_n7_model_change_same_backend_name_forces_rebuild(tmp_path, monkeypatch)
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
     _seed_memory(conn, 1)
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     emb.upsert_embedding(conn, 1, {str(i): 0.01 for i in range(8)})
     emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:8")
     conn.commit()
@@ -486,7 +486,7 @@ def test_p1_integrity_audit_tracks_mixed_then_caches_result(tmp_path, monkeypatc
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.cloudflare.com/client/v4/accounts/x/ai/v1")
     conn = _meta_conn(tmp_path)
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     for i in range(1, 51):
         _seed_memory(conn, i)
         emb.upsert_embedding(conn, i, {"0": 0.1, "1": 0.2})
@@ -511,7 +511,7 @@ def test_p1_missing_embedding_is_mismatch(tmp_path, monkeypatch):
     _seed_memory(conn, 1)
     _seed_memory(conn, 2)
     emb.upsert_embedding(conn, 1, {"0": 0.1, "1": 0.2})
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     emb.set_stored_embedding_model(conn, f"openai|text-embedding-3-small|{host}|dense:2")
     # memory 2 has no embedding row
     conn.commit()
@@ -525,7 +525,7 @@ def test_p1_4_mismatch_is_fast_no_payload_scan(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     conn = _meta_conn(tmp_path)
-    host = emb._embedding_endpoint_host()
+    host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
     for i in range(1, 201):
         _seed_memory(conn, i)
         emb.upsert_embedding(conn, i, {str(j): 0.01 for j in range(32)})
@@ -643,7 +643,7 @@ def test_d1_interleaved_representation_writes_cannot_lose_a_rep(absorb_backend):
         sparse = storage.add_memory(conn, content="concurrent sparse")
         emb.upsert_embedding(conn, dense["id"], {"0": 0.5, "1": 0.5})
         emb.upsert_embedding(conn, sparse["id"], {"word": 1.0})
-        host = emb._embedding_endpoint_host()
+        host = "old-host:11434"  # a pre-E1 stamp carried the endpoint host (normalised on read)
         stored = f"openai|text-embedding-3-small|{host}|dense:2"
         emb.set_stored_embedding_model(conn, stored)
         # Simulate concurrent RMW metadata writes where the final writer drops

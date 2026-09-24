@@ -14,9 +14,20 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### E1: no implicit embedding rebuild; the fingerprint no longer includes the endpoint host
+- Production finding (nuc8 v0.5.0). After the M1 moved hosts (same Ollama bge-m3), every store's stored fingerprint mismatched, because it carried the embedding endpoint's host (`backend|model|host|repr`).
+  - The first search on the seeded local `re` rebuilt all 238 embeddings.
+  - A search on the D1 store `ob1` rebuilt all 615 on D1.
+  - The D1 store `bestation` re-tried a rebuild on every search behind a leftover rebuild lease, logging "Embedding model changed" each time.
+- The fingerprint is now `backend|model|repr`. A stamp written with the host compares equal when backend, model and representation match (`embeddings.normalize_fingerprint`, on read; nothing is rewritten).
+- A search never rebuilds embeddings, on any backend. It searches as a read-only search would: comparable vectors are used; otherwise it raises `SearchUnavailable`, logs once and shows `embeddings.repair_needed` in `/health/db/<name>`. The repair is the explicit `memory_rebuild_embeddings` tool (it rewrites every embedding; on a live primary each one replicates to D1).
+- The store's model is recorded by the write path: the first vector the current model computes records the fingerprint once (`record_embedding_model_once`, `INSERT OR IGNORE`, only when the vector's kind matches the backend). A store never audited, or with rows missing a vector, is searched without a warning.
+- The warning names the actual integrity reason instead of always "Embedding model changed".
+
 ## 0.5.1
 
 Graph viewer with a store selector served by memora-all (G1): every graph route takes ?db=<store>, reads and edits go through the registry backend (a local primary is read and edited locally and replicates), published only on the Tailscale address behind a graph token.
+
 
 ### Graph UI with a store selector, served by memora-all (G1)
 
@@ -46,6 +57,7 @@ Graph viewer with a store selector served by memora-all (G1): every graph route 
   the health and admin tokens) and passes it as `MEMORA_GRAPH_TOKEN_FILE`.
   The smoke check requires 401 without the token and the store list with
   it.
+
 
 ## 0.5.0
 

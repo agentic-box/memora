@@ -571,6 +571,8 @@ def test_search_on_a_model_mismatch_is_503_and_writes_nothing(api, statements):
 def test_search_on_a_store_with_no_recorded_model_is_503_and_writes_nothing(api, statements):
     with _connect_store() as conn:
         storage.add_memory(conn, content="a memory on a store never searched", tags=["x"])
+        # A store written before E1: the write path now records the model, so remove it.
+        conn.execute("DELETE FROM memories_meta WHERE key = 'embedding_model'")
         conn.commit()
     _fresh_caches()
     statements.clear()

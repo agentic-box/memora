@@ -2495,7 +2495,12 @@ async def memory_digest(
 
 @mcp.tool()
 async def memory_rebuild_embeddings() -> Dict[str, Any]:
-    """Recompute embeddings for all memories. Rate limited: 300s cooldown."""
+    """Recompute embeddings for all memories. Rate limited: 300s cooldown.
+
+    The ONLY way embeddings are rebuilt: a search never does (it reports a
+    needed repair once, in the log and in /health/db). It rewrites every
+    embedding row -- on a D1 store directly on D1, on a replicated local
+    primary each rewritten row replicates to D1."""
     if msg := _check_tool_cooldown("memory_rebuild_embeddings"):
         return {"error": "rate_limited", "message": msg}
     try:

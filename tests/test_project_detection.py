@@ -1411,12 +1411,13 @@ def test_lease_expiring_during_the_rebuild_stops_it_incomplete(fake_d1_backend, 
 
 
 def test_a_normal_d1_import_rebuilds_and_restores_the_stamp_under_its_lease(fake_d1_backend, monkeypatch):
-    from memora.embeddings import get_embedding_integrity, invalidate_embedding_integrity_cache
+    from memora.embeddings import (get_embedding_integrity, invalidate_embedding_integrity_cache,
+                                   verify_embedding_integrity)
 
     monkeypatch.setattr(memora, "TAG_WHITELIST", set())
     with storage.connect() as conn:
         _setup_previous(conn)
-        storage.semantic_search(conn, "old row")  # the audit writes a stamp
+        verify_embedding_integrity(conn, stamp=True)  # the explicit audit writes a stamp (E1: a search no longer does)
         invalidate_embedding_integrity_cache(conn)
         stamp = get_embedding_integrity(conn)
         fences = {"n": 0}

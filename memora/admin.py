@@ -257,6 +257,11 @@ def gate_health(name: str) -> Optional[Dict[str, Any]]:
             sh = {"enabled": True, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
         if sh is not None:
             out["shadow"] = sh
+        from .storage import embedding_repair_status
+
+        repair = embedding_repair_status(name)
+        if repair is not None:
+            out["embeddings"] = {"repair_needed": repair}  # E1: repaired only by an explicit action
         from .replicator import replicator_for, start_refusal
 
         rep = replicator_for(name)
