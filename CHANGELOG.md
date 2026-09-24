@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.5
+
 ### The Pages viewer's graph no longer fails on unusual stored values (PG1)
 
 - The Pages `/api/graph` (`memora-graph/functions/api/graph.ts`) answered
