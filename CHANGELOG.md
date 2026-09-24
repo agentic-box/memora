@@ -28,7 +28,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   and "Cluster N" labels. As in Pages, a corrupt crossref row means no
   clusters at all. On copies of the production stores the cluster output
   (clusterToNodes, clusterColors, clusterMeta) is identical to what the Pages
-  code computes. The build now takes 0.16 s (memora), 0.13 s (ob1) and
+  code computes. The build now takes 0.16 s (memora), 0.13 s (alpha) and
   0.04 s (re).
 - The `memory_clusters` tool's `louvain` pass still builds the all-pairs
   similarity graph. It now computes each vector's norm once and dots dense
