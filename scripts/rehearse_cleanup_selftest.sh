@@ -36,8 +36,11 @@ cleanup_decoys() {  # by captured ID, after checking the decoy-of label
                    && "$RT" rm -f "$id" >/dev/null ;;
       volume) [ "$("$RT" volume inspect "$id" --format '{{index .Labels "memora.rehearsal.decoy-of"}}' 2>/dev/null)" = "$RUN_ID" ] \
                    && "$RT" volume rm "$id" >/dev/null ;;
-      image) [ "$("$RT" image inspect "$id" --format '{{index .Labels "memora.rehearsal.decoy-of"}}' 2>/dev/null)" = "$RUN_ID" ] \
-               && for t in $("$RT" image inspect "$id" --format '{{range .RepoTags}}{{.}} {{end}}'); do "$RT" rmi "$t" >/dev/null; done ;;
+      exttag) set -- $id; [ "$("$RT" image inspect "$2" --format '{{.Id}}' 2>/dev/null)" = "$1" ] \
+                && [ "$(label_of image "$1")" = "$RUN_ID" ] && "$RT" rmi "$2" >/dev/null ;;
+      dtag) set -- $id; [ "$("$RT" image inspect "$2" --format '{{.Id}}' 2>/dev/null)" = "$1" ] \
+              && [ "$("$RT" image inspect "$1" --format '{{index .Labels "memora.rehearsal.decoy-of"}}' 2>/dev/null)" = "$RUN_ID" ] \
+              && "$RT" rmi "$2" >/dev/null ;;   # only the one tag this test created
       anon) [ "$("$RT" volume inspect "$id" --format '{{.Anonymous}}' 2>/dev/null)" = true ] \
               && [ -z "$("$RT" ps -a -q --filter "volume=$id")" ] && "$RT" volume rm "$id" >/dev/null ;;
     esac
@@ -55,9 +58,18 @@ tiny_image() {  # tiny_image VAR TAG LABEL... -- a labelled one-line image (no l
 new_container C1 --name "$RUN_ID-c1" --tmpfs /data "${SL[@]}"
 new_volume V1 "$RUN_ID-v1"
 new_container C2 --name "$RUN_ID-c2" "${AN[@]}" "${SL[@]}"; anon_of A2 "$C2"
-tiny_image I1 "$RUN_ID-img1:t" --label "$RUN_LABEL"; track image "$I1"
+tiny_image I1 "$RUN_ID-img1:t" --label "$RUN_LABEL"; track image "$I1"; track tag "$I1" "$RUN_ID-img1:t"
+EXT_TAG="ext-$RUN_ID-kept:x"                       # a tag this run did NOT record, on this run's image
+"$RT" tag "$I1" "$EXT_TAG" || die "tag failed: $EXT_TAG"
+echo "exttag $I1 $EXT_TAG" >> "$DECOYS"
+tiny_image I2 "$RUN_ID-img2:t" --label "$RUN_LABEL" --label memora.selftest.n=2; track image "$I2"
+[ "$I2" != "$I1" ] || die "the two test images must differ"
+"$RT" tag "$I1" "$RUN_ID-img1b:t" || die "tag failed"   # names I1 but is recorded under I2: it must stay
+# recorded BEFORE I2's own tag, so I2 (labelled, still present) is what it is checked against
+track tag "$I2" "$RUN_ID-img1b:t"; echo "exttag $I1 $RUN_ID-img1b:t" >> "$DECOYS"
+track tag "$I2" "$RUN_ID-img2:t"
 tiny_image DI_OTHER "$RUN_ID-imgother:t" --label memora.rehearsal=other-run --label "$DECOY"
-echo "image $DI_OTHER" >> "$DECOYS"; track image "$DI_OTHER"
+echo "dtag $DI_OTHER $RUN_ID-imgother:t" >> "$DECOYS"; track image "$DI_OTHER"; track tag "$DI_OTHER" "$RUN_ID-imgother:t"
 # decoys, all deliberately on this run's object list: kept
 decoy_c D_OTHER other --label memora.rehearsal=other-run --tmpfs /data "${SL[@]}"; track container "$D_OTHER"
 decoy_c D_NOLBL nolabel --tmpfs /data "${SL[@]}"; track container "$D_NOLBL"
@@ -81,7 +93,12 @@ v "$DV_OTHER" && ok "a volume labelled by another run kept" || bad "another run'
 v "$DV_NOLBL" && ok "an unlabelled volume kept" || bad "an unlabelled volume removed"
 v "$DV_HEX" && ok "a named volume with a 64-hex name kept (not flagged anonymous)" || bad "a named 64-hex volume removed"
 v "$AV_USED" && ok "an anonymous volume in use by another container kept" || bad "an in-use anonymous volume removed"
-! "$RT" image exists "$I1" && ok "this run's image removed (all its tags)" || bad "this run's image kept"
+"$RT" image exists "$I1" && ok "this run's image kept while an unrecorded tag remains" || bad "the image was removed despite an external tag"
+[ "$("$RT" image inspect "$EXT_TAG" --format '{{.Id}}' 2>/dev/null)" = "$I1" ] && ok "the external tag survived" || bad "the external tag was removed"
+! "$RT" image exists "$RUN_ID-img1:t" 2>/dev/null && ok "the recorded tag was removed" || bad "the recorded tag stayed"
+[ "$("$RT" image inspect "$RUN_ID-img1b:t" --format '{{.Id}}' 2>/dev/null)" = "$I1" ] \
+  && ok "a recorded tag that names another image than the recorded one is kept" || bad "a mismatched tag was removed"
+! "$RT" image exists "$I2" && ok "an image whose only tag was recorded is gone with that tag" || bad "image 2 kept"
 "$RT" image exists "$DI_OTHER" && ok "an image labelled by another run kept" || bad "another run's image removed"
 # adopt refuses an object under a per-run name that another run labelled
 decoy_c D_ADOPT adoptme --label memora.rehearsal=other-run --tmpfs /data "${SL[@]}"

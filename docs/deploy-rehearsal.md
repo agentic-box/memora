@@ -32,11 +32,17 @@ object is created and removed through `scripts/rehearse_objects.sh`:
   `scripts/rehearse_teardown.sh <run-objects file>`).
   - It removes only the recorded objects, by ID, after re-checking the
     label.
-  - An image is un-tagged tag by tag, never with `-f`.
+  - An image is never removed by ID (review 7751). Only the tags the run
+    created and recorded are untagged, each while it still resolves to the
+    captured, labelled image:
+    - its per-run build tag, recorded at creation;
+    - the deploy's `memora-<RUN_ID>:latest` and `rollback-<ts>` tags,
+      recorded at adoption.
+    Any other tag stays, and so does the image while such a tag remains.
   - An anonymous `/data` volume goes only when it is flagged anonymous,
     unused, and created during the run.
   - Nothing is ever removed by name or pruned.
-- **Self-test.** `scripts/rehearse_cleanup_selftest.sh IMAGE` checks 17
+- **Self-test.** `scripts/rehearse_cleanup_selftest.sh IMAGE` checks 23
   rules against the real runtime; its decoys carry per-run names and a
   `decoy-of` label.
 - **Survival check.** `scripts/rehearse_survival_check.sh OLD_SRC IMAGE`

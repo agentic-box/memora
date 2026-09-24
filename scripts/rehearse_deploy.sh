@@ -66,6 +66,7 @@ finish() {
   ( adopt _ container "$NAME" ) >/dev/null 2>&1
   ( adopt _ volume "$VOL" ) >/dev/null 2>&1
   ( adopt _ image "$IMAGE" ) >/dev/null 2>&1
+  adopt_run_tags
   teardown "$OBJECTS"
 }
 trap finish EXIT
@@ -167,7 +168,7 @@ check "the WAL sidecars exist" "$RT" exec "$NAME" sh -c 'test -s /data/wal-probe
 echo "== 3. deploy (scripts/deploy-memora-all.sh in rehearsal mode)"
 if deploy > "$RH_ROOT/deploy-1.log" 2>&1; then pass "first deploy (log: deploy-1.log)"; \
   else fail "first deploy (exit $?; see deploy-1.log)"; tail -30 "$RH_ROOT/deploy-1.log"; fi
-adopt NEW_IMAGE_ID image "$IMAGE"; adopt VOL_ID volume "$VOL"; adopt NEW1_ID container "$NAME"
+adopt NEW_IMAGE_ID image "$IMAGE"; adopt VOL_ID volume "$VOL"; adopt NEW1_ID container "$NAME"; adopt_run_tags
 GROK1="$("$RT" inspect "$OLD_ID" --format '{{.Name}}')"   # the old container, by its ID
 [[ "$GROK1" == "$NAME-grok-"* ]] && pass "the old container is kept as $GROK1 (same ID)" || fail "the old container is named '$GROK1'"
 [ "$("$RT" inspect "$OLD_ID" --format '{{.State.Running}}' 2>/dev/null)" = false ] \
@@ -227,7 +228,7 @@ if deploy > "$RH_ROOT/deploy-2.log" 2>&1; then pass "second deploy"; else fail "
 grep -q migrate_data_volume "$RH_ROOT/deploy-2.log" && fail "the second deploy ran a copy" || pass "the second deploy ran no copy"
 once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-2.txt" 2>&1
 GROK2="$("$RT" inspect "$NEW1_ID" --format '{{.Name}}')"   # the first new container, renamed by the second deploy
-adopt NEW2_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"
+adopt NEW2_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
 [ "$(cat "$RH_ROOT/marker-2.txt")" = "$MARK1" ] && pass "the marker is unchanged" || fail "the marker changed"
 "$RT" inspect "$NAME" > "$RH_ROOT/fixtures/inspect-new.raw.json"
 
@@ -244,7 +245,7 @@ storage.add_memory(conn, content="written after the rollback", tags=["rehearsal"
 PY
 remove_one container "$NEW1_ID" >> "$RH_ROOT/commands.log"   # the second deploy's leftover ($GROK2), by ID
 if deploy > "$RH_ROOT/deploy-3.log" 2>&1; then pass "redeploy after the rollback"; else fail "redeploy (exit $?; see deploy-3.log)"; fi
-adopt NEW3_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"
+adopt NEW3_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
 once -v "$VOL:/v:ro" --entrypoint sh "$IMAGE" -c 'cat /v/.memora-volume-source' > "$RH_ROOT/marker-3.txt" 2>&1
 NEW_OLD_DIGEST="$(mig_digest "$OLD_VOL")"
 [ "$NEW_OLD_DIGEST" != "$OLD_DIGEST" ] && grep -q "digest=$NEW_OLD_DIGEST" "$RH_ROOT/marker-3.txt" \
