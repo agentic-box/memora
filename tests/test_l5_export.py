@@ -521,6 +521,7 @@ class FreezeServer:
         self.reconcile_bodies = []                              # POST /admin/reconcile/<db>/<id>
         self.reconcile_status = 200
         self.health_extra = {}  # merged into /health/db (e.g. {"journal": ...} for a d1:// store)
+        self.data_volume = None  # GET /admin/data-volume body (None: 404)
         self.health = list(health or [])
         self.post_status = post_status
         self.delete_status = delete_status
@@ -552,6 +553,8 @@ class FreezeServer:
                     if server.post_status == 200:
                         server.state = "frozen"
                     return self._reply(server.post_status, {"state": server.state})
+                if path == "/admin/data-volume" and self.command == "GET" and server.data_volume is not None:
+                    return self._reply(200, server.data_volume)
                 if path == f"/admin/intents/{server.db}" and self.command == "GET":
                     return self._reply(200, server.intents)
                 if path.startswith(f"/admin/reconcile/{server.db}/") and self.command == "POST":

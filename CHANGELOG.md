@@ -19,7 +19,12 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - **`local_primary.py rollback <db> --phase drain|verify|finish --store P`** (`memora/rollback.py`):
   - `drain` (live): freeze, then wait for the replicator to ack the whole outbox.
   - `verify` (memora-all stopped, checked at every boundary): verified export; barrier compare (any diff halts; D1-only keys are reported, never deleted); the D1 sequence high-water; a read-only D1 integrity audit that must equal the local store's; recheck (only the sequence counters may move). It then prints the repoint.
-  - `finish` (repointed): the store must be served from D1 and still frozen, then the freeze is lifted.
+  - `finish` (repointed), still under the freeze:
+    - `/health/db` 200 ok with the store's journal;
+    - `/admin/data-volume` reports the store's live backend identity (new `identity` field), which must be the verified `d1://<account>/<database>`;
+    - a recheck of verify's final receipt must show no drift.
+    Any failure keeps the freeze; then the freeze is lifted.
+  - Each phase run has a generation id: a new drain or verify clears the later phases, a failure clears its own phase, and finish needs the verify that followed the current drain.
 - **`restamp <db> --receipt R`** (write path 4, never automatic): under a freeze and a rechecked receipt, a read-only D1 audit, then exactly one allow-listed `embedding_integrity` UPSERT carrying `verify_embedding_integrity(stamp=True)`'s stamp, read back.
 - §9 (w): conflict groups list their inbound crossrefs, and the R2 restore apply and `--dry-run` warn of `dangling_references`.
 - A test drains a store named in `MEMORA_READONLY_DBS` through the replicator's exempt writer.

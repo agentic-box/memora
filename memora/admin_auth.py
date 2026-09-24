@@ -94,6 +94,18 @@ def _store_kind(uri: str) -> str:
     return "sqlite"
 
 
+def _store_identity(uri: str) -> Dict[str, Any]:
+    """Which backend a store name serves (review 7712 P1-1): a D1 database's
+    account and id, or a local file's canonical path. No credentials."""
+    if uri.startswith("d1://"):
+        account, _, database = uri[len("d1://"):].partition("/")
+        return {"d1_uri": f"d1://{account}/{database}", "account_id": account, "database_id": database}
+    if uri.startswith("s3://"):
+        return {}
+    path = uri[len("file://"):] if uri.startswith("file://") else uri
+    return {"path": os.path.realpath(os.path.expanduser(path))}
+
+
 def data_volume_status() -> Result:
     """GET /admin/data-volume: what the startup /data check decided per store,
     and each store's kind -- "d1", "s3" or "sqlite" (a local file) -- which
@@ -114,6 +126,7 @@ def data_volume_status() -> Result:
         "stores": {
             (name or "(default)"): {
                 "kind": _store_kind(uri),
+                "identity": _store_identity(uri),
                 "needs_data_volume": uri_needs_data_volume(uri),
                 "refused": refusals.get(name),
             }

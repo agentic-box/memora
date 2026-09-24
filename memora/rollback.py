@@ -86,9 +86,49 @@ def load_state(deps: RollbackDeps, *, need: Optional[str] = None) -> Dict[str, A
     if need is not None:
         if st.get("identity") != _identity(deps):
             raise lp.L5Refused(f"no rollback in progress for {_identity(deps)} ({_state_path(deps)})")
-        if need not in st.get("phases", {}):
+        ph = st.get("phases", {}).get(need)
+        if not ph or ph.get("running"):
             raise lp.L5Refused(f"the rollback phase {need!r} has not completed ({_state_path(deps)})")
     return st
+
+
+PHASES = ("drain", "verify", "finish")
+
+
+def _run_phase(deps: RollbackDeps, name: str, body) -> Dict[str, Any]:
+    """Run one phase with a fresh generation id (review 7712 P1-3):
+    starting it clears every later phase; it is marked running while it
+    runs; a failure clears it; verify records the drain generation it
+    followed, and finish requires that pairing."""
+    import uuid
+
+    if name == "drain":
+        st = {"identity": _identity(deps), "phases": {}}
+    else:
+        st = load_state(deps, need=PHASES[PHASES.index(name) - 1])
+    phases = st.setdefault("phases", {})
+    for later in PHASES[PHASES.index(name):]:
+        phases.pop(later, None)
+    if name != "finish":
+        phases.pop("verify_failed", None)
+    if name == "finish" and phases["verify"].get("drain_gen") != phases["drain"].get("gen"):
+        raise lp.L5Refused("the completed verify does not follow the current drain: re-run the verify phase")
+    rec: Dict[str, Any] = {"gen": uuid.uuid4().hex, "running": True, "started_at": _now(deps)}
+    if name == "verify":
+        rec["drain_gen"] = phases["drain"]["gen"]
+    phases[name] = rec
+    _save_state(deps, st)
+    try:
+        result, record = body(deps, st)
+    except BaseException:
+        failed = load_state(deps)  # the body may have added verify_failed
+        failed.setdefault("phases", {}).pop(name, None)
+        _save_state(deps, failed)
+        raise
+    st = load_state(deps)
+    st["phases"][name] = {**rec, **record, "running": False, "at": _now(deps)}
+    _save_state(deps, st)
+    return result
 
 
 def _save_state(deps: RollbackDeps, st: Dict[str, Any]) -> None:
@@ -108,6 +148,10 @@ def _now(deps: RollbackDeps) -> str:
 def phase_drain(deps: RollbackDeps) -> Dict[str, Any]:
     """§5.3 steps 1-2: freeze ingress (the replicator keeps draining through
     connect_replicator), wait for lag_rows = 0."""
+    return _run_phase(deps, "drain", _drain)
+
+
+def _drain(deps: RollbackDeps, st: Dict[str, Any]):
     deps.admin.freeze()  # places it, or keeps the operator's; checked
     deadline = deps.clock() + deps.drain_timeout_s
     while True:
@@ -120,9 +164,9 @@ def phase_drain(deps: RollbackDeps) -> Dict[str, Any]:
                                "the freeze stays -- see the replicator's health (halted?)")
         deps.sleep(deps.poll_s)
     deps.admin.check("after the drain")
-    _save_state(deps, {"identity": _identity(deps), "phases": {"drain": {"at": _now(deps), "head": head}}})
-    return {"phase": "drain", "drained_head": head,
-            "next": f"stop memora-all (docker stop {deps.container}), then run: rollback {deps.db} --phase verify"}
+    return ({"phase": "drain", "drained_head": head,
+             "next": f"stop memora-all (docker stop {deps.container}), then run: rollback {deps.db} --phase verify"},
+            {"head": head})
 
 
 # ------------------------------------------------------------------ phase 2: verify (stopped)
@@ -152,7 +196,10 @@ def _audit_d1(deps: RollbackDeps) -> Dict[str, Any]:
 def phase_verify(deps: RollbackDeps) -> Dict[str, Any]:
     """§5.3 steps 3-7 with memora-all stopped (docker State.Running=false at
     every boundary). Any failure stops the rollback before the repoint."""
-    st = load_state(deps, need="drain")
+    return _run_phase(deps, "verify", _verify)
+
+
+def _verify(deps: RollbackDeps, st: Dict[str, Any]):
     stopped = deps.stopped
     stopped.check("before the rollback verify")
     acked, head = cmp.live_acked(deps.store), cmp.live_head(deps.store)
@@ -196,32 +243,57 @@ def phase_verify(deps: RollbackDeps) -> Dict[str, Any]:
             _save_state(deps, st)
             raise lp.L5Halt(f"D1 changed during the rollback beyond the sequence step: {moved}")
     phase["final_receipt"] = str(final)
-    st["phases"]["verify"] = phase
-    st["phases"].pop("verify_failed", None)
-    _save_state(deps, st)
     uri = lp.d1_uri(deps.account_id, deps.database_id)
-    return {"phase": "verify", "receipt": str(final), "compare_report": str(path), **phase,
-            "repoint": {"MEMORA_DATABASES": {deps.db: uri}, "MEMORA_REPLICAS": f"remove {deps.db!r}"},
-            "next": f"set MEMORA_DATABASES[{deps.db!r}] = {uri!r}, remove {deps.db!r} from MEMORA_REPLICAS, "
-                    f"start memora-all, then run: rollback {deps.db} --phase finish"}
+    return ({"phase": "verify", "receipt": str(final), "compare_report": str(path), **phase,
+             "repoint": {"MEMORA_DATABASES": {deps.db: uri}, "MEMORA_REPLICAS": f"remove {deps.db!r}"},
+             "next": f"set MEMORA_DATABASES[{deps.db!r}] = {uri!r}, remove {deps.db!r} from MEMORA_REPLICAS, "
+                     f"start memora-all, then run: rollback {deps.db} --phase finish"},
+            phase)
 
 
 # ------------------------------------------------------------------ phase 3: finish (repointed, live)
 
 def phase_finish(deps: RollbackDeps) -> Dict[str, Any]:
-    """§5.3 step 9: the repointed store is served from D1, still frozen with
-    nothing in flight; then lift the freeze (the only automatic thaw here)."""
-    st = load_state(deps, need="verify")
-    deps.admin.check("before lifting the freeze")
+    """§5.3 step 9, under the freeze still in place (review 7712):
+    - the store is ready (/health/db 200 ok) and served from THE D1 database
+      this rollback verified: /admin/data-volume (admin token) reports its
+      live backend identity, which must be d1://<account>/<database>;
+    - D1 has not drifted since the verify: `recheck` against its final
+      receipt (full per-table hashes, read token); any change HALTS;
+    then the freeze is lifted (the only automatic thaw here)."""
+    return _run_phase(deps, "finish", _finish)
+
+
+def _finish(deps: RollbackDeps, st: Dict[str, Any]):
+    deps.admin.check("before the finish")
     status, body = deps.admin._request("GET", f"/health/db/{deps.db}")
+    if status != 200 or body.get("status") != "ok":
+        raise lp.L5Refused(f"{deps.db} is not ready (/health/db answered {status}, status {body.get('status')!r})")
     if "journal" not in body or "replication" in body:
         raise lp.L5Refused(f"{deps.db} is not served from D1 yet (health shows "
                            f"{sorted(k for k in body if k in ('journal', 'replication'))}): repoint and restart first")
+    status, dv = deps.admin._request("GET", "/admin/data-volume")
+    entry = (dv.get("stores") or {}).get(deps.db) if status == 200 else None
+    want = lp.d1_uri(deps.account_id, deps.database_id)
+    live = ((entry or {}).get("identity") or {}).get("d1_uri")
+    if not entry or entry.get("kind") != "d1" or live != want or entry.get("refused"):
+        raise lp.L5Refused(f"{deps.db} is served from {live or (entry or {}).get('kind') or 'unknown'} "
+                           f"(/admin/data-volume {status}), not the verified {want}; the freeze stays")
+    final = st["phases"]["verify"]["final_receipt"]
+    fresh = lp.recheck(deps.db, final, deps.lp_deps(deps.admin), deps.out_dir)
+    if Path(fresh) != Path(final):
+        a = lp.load_receipt(final, deps.db, account_id=deps.account_id, database_id=deps.database_id,
+                            max_age_s=None)["tables"]
+        b = lp.load_receipt(str(fresh), deps.db, account_id=deps.account_id,
+                            database_id=deps.database_id)["tables"]
+        moved = sorted(t for t in set(a) | set(b) if a.get(t) != b.get(t))
+        raise lp.L5Halt(f"D1 changed since the rollback verify in {moved}; the freeze stays -- find the "
+                        "writer, then re-run the rollback from the drain phase")
+    deps.admin.check("before lifting the freeze")
     deps.admin.thaw()
-    st["phases"]["finish"] = {"at": _now(deps)}
-    _save_state(deps, st)
-    return {"phase": "finish", "thawed": True,
-            "next": f"optional, operator-run: restamp {deps.db} --receipt <a fresh receipt> (under a freeze)"}
+    return ({"phase": "finish", "thawed": True, "served_from": live,
+             "next": f"optional, operator-run: restamp {deps.db} --receipt <a fresh receipt> (under a freeze)"},
+            {"served_from": live})
 
 
 # ------------------------------------------------------------------ restamp (write path 4)

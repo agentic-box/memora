@@ -33,16 +33,32 @@ REPO = Path(__file__).resolve().parent.parent
 HARNESS = REPO / "tests" / "l5_cli_harness.py"
 
 
+def served_from(uri=URI, kind="d1", refused=None):
+    account, _, database = uri[len("d1://"):].partition("/")
+    ident = {"d1_uri": uri, "account_id": account, "database_id": database} if kind == "d1" else {"path": uri}
+    return {"stores": {DB: {"kind": kind, "identity": ident, "refused": refused}}}
+
+
 class FakeAdmin(FakeBarrier):
-    """memora-all live: freeze/check/thaw and /health/db's body."""
+    """memora-all live: freeze/check/thaw, /health/db and /admin/data-volume."""
 
     def __init__(self, frozen=False, health=None):
         super().__init__(frozen=frozen)
         self.db = DB
         self.health = health or {}
+        self.health_status = 200
+        self.data_volume = None
 
     def _request(self, method, path):
-        return 200, {"status": "ok", **self.health, "freeze": {"state": "frozen" if self.frozen else "open"}}
+        if path == "/admin/data-volume":
+            return (200, self.data_volume) if self.data_volume is not None else (404, {})
+        return self.health_status, {"status": "ok" if self.health_status == 200 else "unknown", **self.health,
+                                    "freeze": {"state": "frozen" if self.frozen else "open"}}
+
+
+def repointed(admin, **kw):
+    admin.health = {"journal": {"path": "/data/intent/s1"}}
+    admin.data_volume = served_from(**kw)
 
 
 class Stopped(FakeBarrier):
@@ -136,11 +152,13 @@ def test_the_rollback_runbook_end_to_end(pair, tmp_path):
     assert Path(out["receipt"]).is_file() and Path(out["compare_report"]).is_file()
     assert all(c.startswith("check") for c in stopped.calls) and len(stopped.calls) >= 6
     assert sync_state(local)["last_compare_clean"] == 1
-    admin.health = {"journal": {"path": "/data/intent/s1"}}  # repointed: a d1:// store, no replicator
+    repointed(admin)  # a d1:// store (its journal), no replicator, served from THE verified database
     out = rb.phase_finish(d)
-    assert out["thawed"] is True and not admin.frozen
+    assert out["thawed"] is True and not admin.frozen and out["served_from"] == URI
     st = rb.load_state(d, need="verify")
     assert set(st["phases"]) == {"drain", "verify", "finish"}
+    assert st["phases"]["verify"]["drain_gen"] == st["phases"]["drain"]["gen"]
+    assert not any(p.get("running") for p in st["phases"].values())
 
 
 # ---------------------------------------------------------------- boundary refusals
@@ -154,7 +172,7 @@ def test_drain_refuses_when_the_replicator_does_not_drain_and_keeps_the_freeze(p
     with pytest.raises(lp.L5Refused, match="not drained after 300 s"):
         rb.phase_drain(d)
     assert admin.frozen and "thaw" not in admin.calls
-    assert not rb.load_state(d)  # nothing recorded
+    assert rb.load_state(d).get("phases") == {}  # the failed drain cleared itself
 
 
 def test_drain_rechecks_the_freeze_while_waiting(pair, tmp_path):
@@ -252,6 +270,116 @@ def test_finish_needs_the_repoint(pair, tmp_path):
     assert admin.frozen and "thaw" not in admin.calls
 
 
+@pytest.mark.parametrize("setup, match", [
+    (lambda a: setattr(a, "health_status", 503), "is not ready"),
+    (lambda a: repointed(a, uri="d1://acct/other-db"), "not the verified d1://acct/replica-db"),
+    (lambda a: repointed(a, uri="d1://other/replica-db"), "not the verified"),
+    (lambda a: repointed(a, uri="/data/s1.db", kind="sqlite"), "not the verified"),
+    (lambda a: repointed(a, refused="data volume missing"), "not the verified"),
+    (lambda a: (repointed(a), setattr(a, "data_volume", None)), "not the verified"),
+])
+def test_finish_binds_the_live_backend_identity_and_keeps_the_freeze(pair, tmp_path, setup, match):
+    """7712 P1-1: a journal and no replication block is not enough; the live
+    store must be the verified D1 database."""
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    repointed(admin)
+    setup(admin)
+    with pytest.raises(lp.L5Refused, match=match):
+        rb.phase_finish(d)
+    assert admin.frozen and "thaw" not in admin.calls
+    assert "finish" not in rb.load_state(d)["phases"]
+
+
+def test_finish_halts_on_d1_drift_since_the_verify_and_keeps_the_freeze(pair, tmp_path):
+    """7712 P1-2: an external D1 client wrote between verify and finish."""
+    local, replica = pair
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    repointed(admin)
+    replica_exec(replica, "UPDATE memories SET content = 'external writer' WHERE id = 2")
+    with pytest.raises(lp.L5Halt, match=r"D1 changed since the rollback verify in \['memories', 'memories_meta'\]"):
+        rb.phase_finish(d)
+    assert admin.frozen and "thaw" not in admin.calls
+
+
+def test_a_failed_verify_rerun_invalidates_the_earlier_verify(pair, tmp_path, monkeypatch):
+    """7712 P1-3: a rerun that fails must not leave the old verify usable."""
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    monkeypatch.setattr(rb, "_audit_d1", lambda deps: {"missing_ids": [9]})
+    with pytest.raises(lp.L5Halt):
+        rb.phase_verify(d)
+    repointed(admin)
+    with pytest.raises(lp.L5Refused, match="phase 'verify' has not completed"):
+        rb.phase_finish(d)
+    st = rb.load_state(d)
+    assert "verify" not in st["phases"] and "verify_failed" in st["phases"]
+
+
+def test_a_new_drain_clears_the_later_phases(pair, tmp_path):
+    """7712 P1-3: finish needs the verify that followed the CURRENT drain."""
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    first = rb.load_state(d)["phases"]["drain"]["gen"]
+    rb.phase_drain(d)
+    st = rb.load_state(d)
+    assert st["phases"]["drain"]["gen"] != first and "verify" not in st["phases"]
+    repointed(admin)
+    with pytest.raises(lp.L5Refused, match="phase 'verify' has not completed"):
+        rb.phase_finish(d)
+    rb.phase_verify(d)
+    assert rb.phase_finish(d)["thawed"]
+
+
+def test_a_verify_left_running_by_a_crash_does_not_count(pair, tmp_path):
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    st = rb.load_state(d)
+    st["phases"]["verify"]["running"] = True  # a crash mid-rerun (the process died)
+    rb._save_state(d, st)
+    repointed(admin)
+    with pytest.raises(lp.L5Refused, match="phase 'verify' has not completed"):
+        rb.phase_finish(d)
+
+
+def test_finish_refuses_a_verify_that_followed_another_drain(pair, tmp_path):
+    admin = FakeAdmin()
+    d = deps(pair, tmp_path, admin=admin)
+    rb.phase_drain(d)
+    rb.phase_verify(d)
+    st = rb.load_state(d)
+    st["phases"]["drain"]["gen"] = "another"
+    rb._save_state(d, st)
+    repointed(admin)
+    with pytest.raises(lp.L5Refused, match="does not follow the current drain"):
+        rb.phase_finish(d)
+
+
+def test_data_volume_reports_each_stores_backend_identity(tmp_path, monkeypatch):
+    from memora import admin_auth
+
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "edit-token")
+    link = tmp_path / "alias.db"
+    link.symlink_to(tmp_path / "real.db")
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"r": "d1://acct/db-9", "l": str(link)}))
+    status, body = admin_auth.data_volume_status()
+    assert status == 200
+    assert body["stores"]["r"]["identity"] == {"d1_uri": "d1://acct/db-9", "account_id": "acct",
+                                               "database_id": "db-9"}
+    assert body["stores"]["l"]["identity"] == {"path": os.path.realpath(tmp_path / "real.db")}
+
+
 def test_rollback_state_is_bound_to_the_store_and_d1_identity(pair, tmp_path):
     d = deps(pair, tmp_path)
     rb.phase_drain(d)
@@ -267,7 +395,7 @@ def _rolled_back(pair, tmp_path):
     d = deps(pair, tmp_path, admin=admin)
     rb.phase_drain(d)
     rb.phase_verify(d)
-    admin.health = {"journal": {}}
+    repointed(admin)
     rb.phase_finish(d)
     return d, admin
 
@@ -435,6 +563,7 @@ def test_cli_rollback_phases_and_restamp(pair, tmp_path):
         code, out, _ = _cli(replica, "rollback", *common, "--phase", "finish")
         assert code == 2 and "not served from D1" in out["refused"]
         srv.health_extra = {"journal": {}}
+        srv.data_volume = served_from()
         code, out, err = _cli(replica, "rollback", *common, "--phase", "finish")
         assert code == 0 and out["thawed"] and srv.state == "open", err
         code, out, err = _cli(replica, "freeze", DB, "--memora-url", srv.url, *token_args(tmp_path))

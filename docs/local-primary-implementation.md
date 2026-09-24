@@ -1276,11 +1276,25 @@ identity.
     d1://<account>/<database>`, and the store removed from `MEMORA_REPLICAS`
     in memora-all's own configuration. (L8's `repoint_mcp_config.py` is for
     client configurations, not this.)
-- **`finish`** (repointed and started), step 9:
-  - The store must be served from D1: `/health/db` shows its intent
-    journal and no replication block.
+- **`finish`** (repointed and started), step 9 (after review 7712):
   - The freeze must be in place with nothing in flight.
-  - Then it lifts the freeze.
+  - `/health/db` must answer 200 ok, show the store's intent journal and
+    show no replication block.
+  - `/admin/data-volume` (admin token) must report the store's live backend
+    identity as exactly the verified `d1://<account>/<database>`, not
+    refused. Each store now carries `identity`: `d1_uri`, `account_id`,
+    `database_id`, or a local store's canonical path.
+  - `recheck` runs against the verify phase's final receipt (full per-table
+    hashes, read token). Any drift HALTS and names the changed tables.
+  - Any failure keeps the freeze. Only then is the freeze lifted.
+- **Phase generations** (7712 P1-3):
+  - Each phase run gets a generation id and is marked running while it
+    runs.
+  - Starting drain or verify clears every later phase, and a failure clears
+    the phase it was running.
+  - verify records the drain generation it followed, and finish requires
+    that pairing. A stale or crashed verify can therefore never let finish
+    through.
 - **`restamp <db> --receipt R --store P --credential-file C`** (write
   path 4, never automatic):
   - It requires the rollback's verify phase and a freeze.

@@ -63,8 +63,10 @@ class TestAdminAuth:
         _, client = _app()
         r = _get(client, ADMIN)
         assert r.status_code == 200
-        assert r.json()["stores"]["local"] == {"kind": "sqlite", "needs_data_volume": True,
-                                               "refused": "/data is not a mount point"}
+        entry = r.json()["stores"]["local"]
+        identity = entry.pop("identity")  # L6 7712: the live backend identity (a local store's canonical path)
+        assert entry == {"kind": "sqlite", "needs_data_volume": True, "refused": "/data is not a mount point"}
+        assert set(identity) == {"path"} and os.path.isabs(identity["path"])
 
     @pytest.mark.parametrize("presented", [None, "", "wrong" * 10, HEALTH, ADMIN + "x", ADMIN[:-1]])
     def test_anything_else_is_401_without_detail(self, registry, monkeypatch, presented):
