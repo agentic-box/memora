@@ -473,6 +473,54 @@ class ServiceStopped:
         return None  # nothing to lift: memora-all is started by the operator
 
 
+class LockBarrier:
+    """The barrier inside a one-off maintenance container, where docker is
+    not available (X3, scripts/lp_container.sh): the store's primary lock
+    (flock on <db>.primary-lock, the canonical path of L2). memora-all holds
+    it for as long as it serves the store, so holding it proves memora-all
+    is not serving it. Taken at the first check (before any D1 call: the CLI
+    checks at once) and held for the WHOLE run: steps inside that take and
+    release the same lock do not release it (backends.pin_primary_lock).
+    Every boundary re-verifies that the lock is still ours, on the lock file
+    that is at the path now."""
+
+    stopped_service = True  # the steps that need memora-all stopped accept it
+
+    def __init__(self, store: Path):
+        self.store = Path(store)
+        self.placed = False
+
+    def freeze(self) -> None:
+        self.check("at the start")
+
+    def require(self, where: str) -> None:
+        self.check(where)
+
+    def check(self, where: str) -> None:
+        from .backends import StoreLockedError, pin_primary_lock, primary_lock_problem
+
+        if not self.placed:
+            try:
+                pin_primary_lock(self.store)
+            except StoreLockedError as exc:
+                raise L5Refused(f"--lock-barrier {where}: {exc} -- memora-all (or another run) is serving "
+                                f"{self.store}; stop it first")
+            self.placed = True
+        problem = primary_lock_problem(self.store)
+        if problem:
+            raise L5Refused(f"--lock-barrier lost {where}: {problem}")
+
+    def thaw(self) -> None:
+        return None  # held for the whole run; release() when the process is done
+
+    def release(self) -> None:
+        from .backends import unpin_primary_lock
+
+        if self.placed:
+            unpin_primary_lock(self.store)
+            self.placed = False
+
+
 # ------------------------------------------------------------------ receipts (P1)
 
 @dataclass
@@ -1565,7 +1613,7 @@ def reconcile_accept(db: str, client: AdminClient, *, intent_id: int, receipt_pa
 
 
 def resume_store(db_path: Path, reader: D1Reader, *, accept_d1_epoch: Optional[int] = None,
-                 allow_deletes: Optional[str] = None) -> Dict[str, Any]:
+                 allow_deletes: Optional[str] = None, barrier: Any = None) -> Dict[str, Any]:
     """`resume` (§2.6, P3): clear a replicator halt on a local store. Holds
     the store's primary lock (memora-all must be stopped). An accepted D1
     epoch must be D1's epoch now."""
@@ -1575,6 +1623,8 @@ def resume_store(db_path: Path, reader: D1Reader, *, accept_d1_epoch: Optional[i
     db_path = Path(db_path)
     if not db_path.is_file():
         raise L5Refused(f"no store at {db_path}")
+    if barrier is not None:
+        barrier.check("before reading D1's epoch")
     if accept_d1_epoch is not None:
         now = reader.epoch()
         if int(accept_d1_epoch) != now:
@@ -1584,6 +1634,8 @@ def resume_store(db_path: Path, reader: D1Reader, *, accept_d1_epoch: Optional[i
     except StoreLockedError as exc:
         raise L5Refused(f"cannot resume {db_path}: {exc} (stop memora-all first)")
     try:
+        if barrier is not None:
+            barrier.check("before clearing the halt")
         conn = LocalSQLiteBackend(db_path).connect()
         try:
             cleared = resume(conn, accept_d1_epoch=accept_d1_epoch, allow_deletes=allow_deletes)
@@ -1593,4 +1645,4 @@ def resume_store(db_path: Path, reader: D1Reader, *, accept_d1_epoch: Optional[i
             conn.close()
     finally:
         release_primary_lock(db_path)
-    return {"store": str(db_path), "cleared": cleared}
+    return {"store": str(db_path), "cleared": cleared, "lock_barrier": barrier is not None}

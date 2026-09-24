@@ -66,6 +66,9 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("--health-token-file", help="0600 file with MEMORA_HEALTH_TOKEN (required with the freeze)")
         sp.add_argument("--service-stopped", action="store_true",
                         help="the barrier is memora-all being stopped (docker), not the freeze")
+        sp.add_argument("--lock-barrier", action="store_true",
+                        help="the barrier is the store's primary lock, held for the whole run (no docker: "
+                             "scripts/lp_container.sh); for rollback, restore, sequence-highwater")
         sp.add_argument("--container", default="memora-all")
         r2 = sp.add_mutually_exclusive_group(required=True)
         r2.add_argument("--r2-bucket", help="R2 bucket (S3 API)")
@@ -135,6 +138,8 @@ def _parser() -> argparse.ArgumentParser:
     g = rm.add_mutually_exclusive_group()
     g.add_argument("--accept-d1-epoch", type=int)
     g.add_argument("--allow-deletes")
+    rm.add_argument("--lock-barrier", action="store_true",
+                    help="hold the store's primary lock for the whole run and re-verify it at every step")
     cp = sub.add_parser("compare", help="§5.2 compare a local store with D1 (or its log, in log mode)")
     cp.add_argument("db")
     cp.add_argument("--mode", required=True, choices=("barrier", "nightly", "log"))
@@ -210,9 +215,12 @@ def _freeze_client(args) -> lp.FreezeClient:
 def _deps(args) -> lp.Deps:
     from memora.backends import D1SelectOnlyConnection
 
+    lock = _lock_barrier(args)  # before the token is read or D1 is touched
     token = lp.read_token(args.read_token_file)
     reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, token))
-    if args.service_stopped:
+    if lock is not None:
+        barrier = lock
+    elif args.service_stopped:
         barrier = lp.ServiceStopped(args.container)
     else:
         if not args.admin_token_file:
@@ -228,6 +236,30 @@ def _deps(args) -> lp.Deps:
                    native_export=args.native_export, writer_factory=writer_factory)
 
 
+# The --lock-barrier of this run, released when main() returns (X3).
+_LOCK_BARRIERS: list = []
+LOCK_BARRIER_STORE = {"rollback": "store", "restore": "out", "sequence-highwater": "local", "resume": "store"}
+
+
+def _lock_barrier(args) -> "lp.LockBarrier | None":
+    """X3: --lock-barrier takes the store's primary lock NOW -- before any D1
+    call -- and holds it until the process ends."""
+    if not getattr(args, "lock_barrier", False):
+        return None
+    if getattr(args, "service_stopped", False):
+        raise lp.L5Refused("--lock-barrier and --service-stopped are two barriers: pass one")
+    attr = LOCK_BARRIER_STORE.get(args.cmd)
+    if attr is None:
+        raise lp.L5Refused(f"--lock-barrier applies to {', '.join(sorted(LOCK_BARRIER_STORE))}, not {args.cmd}")
+    store = getattr(args, attr, None)
+    if not store:
+        raise lp.L5Refused(f"--lock-barrier needs --{attr} (the store whose primary lock is the barrier)")
+    barrier = lp.LockBarrier(Path(store))
+    _LOCK_BARRIERS.append(barrier)
+    barrier.check("at the start, before any D1 call")
+    return barrier
+
+
 def _r2(args):
     return lp.FsR2(Path(args.r2_dir)) if args.r2_dir else lp.S3R2(args.r2_bucket)
 
@@ -240,6 +272,8 @@ def _recovery(args) -> dict:
     P1-2); say how to lift it if the procedure is abandoned (7630 v)."""
     if args.cmd not in FROZEN_STEPS or getattr(args, "service_stopped", False):
         return {}
+    if getattr(args, "lock_barrier", False) and args.cmd != "rollback":
+        return {"lock_barrier": "released when the run ended; no freeze was placed by this step"}
     return {"freeze": "left in place (a failed step never lifts it)",
             "recovery": f"to abandon the procedure: local_primary.py thaw {args.db} "
                         f"--memora-url {args.memora_url} --admin-token-file <file> --health-token-file <file>"}
@@ -252,6 +286,11 @@ def _rollback(args) -> dict:
     from memora import rollback as rb
     from memora.backends import D1SelectOnlyConnection
 
+    if getattr(args, "lock_barrier", False) and (args.cmd != "rollback" or args.phase == "drain"):
+        raise lp.L5Refused("--lock-barrier applies to rollback --phase verify|finish (the drain runs while "
+                           "memora-all serves the store), not " + (f"{args.cmd} --phase drain"
+                                                                   if args.cmd == "rollback" else args.cmd))
+    lock = _lock_barrier(args)
     token = lp.read_token(args.read_token_file)
     if not (args.admin_token_file and args.health_token_file):
         raise lp.L5Refused("rollback/restamp need --admin-token-file and --health-token-file (the freeze)")
@@ -265,7 +304,7 @@ def _rollback(args) -> dict:
     deps = rb.RollbackDeps(
         db=args.db, store=Path(args.store), account_id=args.account, database_id=args.database_id,
         reader=lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, token)), admin=admin,
-        stopped=lp.ServiceStopped(args.container), r2=_r2(args), out_dir=Path(args.out_dir),
+        stopped=lock or lp.ServiceStopped(args.container), r2=_r2(args), out_dir=Path(args.out_dir),
         d1_audit_conn=lambda: rb.d1_audit_connection(args.account, args.database_id, token),
         writer_factory=writer_factory, container=args.container,
         drain_timeout_s=getattr(args, "drain_timeout", 600.0))
@@ -410,10 +449,11 @@ def main(argv=None) -> int:
         if args.cmd == "resume":
             from memora.backends import D1SelectOnlyConnection
 
+            lock = _lock_barrier(args)
             reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id,
                                                         lp.read_token(args.read_token_file)))
             out = {"ok": True, **lp.resume_store(Path(args.store), reader, accept_d1_epoch=args.accept_d1_epoch,
-                                                 allow_deletes=args.allow_deletes)}
+                                                 allow_deletes=args.allow_deletes, barrier=lock)}
             print(json.dumps(out))
             return 0
         if args.cmd == "shadow-night":
@@ -481,6 +521,9 @@ def main(argv=None) -> int:
     except lp.L5Refused as exc:
         print(json.dumps({"ok": False, "refused": str(exc), **_recovery(args)}))
         return 2
+    finally:
+        while _LOCK_BARRIERS:
+            _LOCK_BARRIERS.pop().release()
     print(json.dumps(out))
     return 0
 

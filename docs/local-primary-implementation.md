@@ -1310,6 +1310,29 @@ lines.
 
 ### 5.3 Rollback (H6)
 
+**Venue (X3).** On nuc8 the operator tool runs in a one-off container of
+the image memora-all runs now: `LP_TOKEN_DIR=<dir> scripts/lp_container.sh
+<local_primary.py arguments>`. It mounts `memora-all-data` at `/data` and
+the token directory read-only at `/run/secrets/memora`, and never mounts the
+host's docker socket. The container is named `memora-lp-<ts>-<pid>` and
+labelled with that name; it is not run with `--rm`, and the script removes
+only that container, by name and only while it carries the label. With no
+docker inside, the barrier is `--lock-barrier`, not `--service-stopped`:
+the run acquires the store's primary lock (flock on `<db>.db.primary-lock`,
+the L2 canonical path) before any D1 call and holds it for the whole run.
+Steps inside that take and release the same lock do not release it. Every
+boundary re-verifies that the lock is still ours, on the lock file at that
+path now. memora-all holds the lock while it serves the store, so holding
+it proves memora-all is not serving it.
+- It is accepted by `rollback --phase verify|finish`, `restore` (including
+  the `--from-r2` apply), `resume` and `sequence-highwater`.
+- In `finish` (memora-all up, serving D1) it also shows that memora-all no
+  longer serves the local store.
+- It is refused for `drain` (memora-all serves the store then), for other
+  commands, and together with `--service-stopped`.
+- The image carries `scripts/local_primary.py`. An older image makes the
+  wrapper exit 64.
+
 1. Freeze ingress (the §1 barrier). The replicator keeps draining
    through `connect_replicator()`.
 2. Wait for `lag_rows = 0`, then stop the service.

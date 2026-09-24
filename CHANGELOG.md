@@ -14,8 +14,14 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+### Local-primary X3: a maintenance venue on nuc8, and the primary lock as a barrier
+- `scripts/lp_container.sh <local_primary.py arguments>`: runs the operator tool in a one-off container of memora-all's current image (its image ID). It mounts `memora-all-data` at `/data` and `$LP_TOKEN_DIR` read-only at `/run/secrets/memora`, uses no docker socket and no `--rm`, and removes only its own container `memora-lp-<ts>-<pid>`, by name and while it carries this run's label. Exit 64 when the image predates the tool, 65 on a usage error (including `--service-stopped`), 66 when memora-all's image cannot be read.
+- The image now carries `scripts/local_primary.py` (Dockerfile).
+- `--lock-barrier` (rollback `--phase verify|finish`, `restore` including the `--from-r2` apply, `resume`, `sequence-highwater`): the store's primary lock, taken before any D1 call and held for the whole run. Nested steps' releases are no-ops while it is pinned (`backends.pin_primary_lock`). Every boundary re-verifies that the lock is ours on the lock file at the canonical path (`backends.primary_lock_problem`). Refused for `rollback --phase drain`, other commands, and with `--service-stopped`.
+
 ### Local-primary X2: a store that starts frozen serves reads
 - A store frozen at startup (freeze file or `MEMORA_READONLY_DBS`) served nothing, reads included: the first connect ran the schema pass and the gate refused its DDL. While the gate is not `open`, `schema.connect` now checks the schema read-only (`schema.schema_pending`) and skips the pass when it is current. Reads work and writes are refused as before. A schema that still needs work refuses every connect with `store <db> is frozen; schema upgrade pending (...)`; after a thaw the pass runs as usual. The frozen check has its own mark, valid until the gate thaws (`_WriteGate.thaw_generation`); it is never the "schema ensured" mark, so the first connect on an open gate runs the full pass (review 7767). Every frozen connect re-reads `PRAGMA schema_version` (local SQLite; now a read for the gate in its bare form), and any DDL makes the check run again. D1 stores re-check on every frozen connect (review 7771).
+
 
 ### Deploy rehearsal (R1): the L2a deploy on a real runtime
 - New `scripts/rehearse_deploy.sh` and `docs/deploy-rehearsal.md` run the real `deploy-memora-all.sh` against rootless podman on a rehearsal host, with local stores only. It covers: the production-shaped old container (anonymous `/data`, WAL sidecars, an intent journal); the migration; the new container (960m, tokens); a no-op second deploy; rollback and recopy; freeze/thaw through the live admin routes. 47 checks, all passing on server2.

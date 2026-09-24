@@ -20,7 +20,20 @@ def main() -> int:
     replica = FakeReplica.__new__(FakeReplica)  # an existing file: do not re-run the schema
     replica.path = Path(os.environ["L5_TEST_FAKE_D1"])
     replica.reads = []
-    backends.D1SelectOnlyConnection._post = lambda self, body: replica.reader_post(body)
+    calls_log = os.environ.get("L5_TEST_D1_CALLS")  # X3: every D1 call, one line each
+
+    def log_call(kind, sql):
+        if calls_log:
+            with open(calls_log, "a") as fh:
+                fh.write(f"{kind}\t{sql}\n")
+
+    def reader_post(self, body):
+        import json
+
+        log_call("read", json.loads(body).get("sql", ""))
+        return replica.reader_post(body)
+
+    backends.D1SelectOnlyConnection._post = reader_post
 
     mode = os.environ.get("L5_TEST_D1_WRITES", "")
 
@@ -39,6 +52,7 @@ def main() -> int:
             db.close()
 
     def d1_send(self, sql, params=None):
+        log_call("send", sql)
         # A D1Connection read (the read-only integrity audit, L6) is served
         # from the FakeReplica. A write only when a test asks: "apply" runs
         # it, "reject" fails like D1 would; otherwise it is a test failure.

@@ -264,7 +264,15 @@ def phase_finish(deps: RollbackDeps) -> Dict[str, Any]:
     return _run_phase(deps, "finish", _finish)
 
 
+def _lock_check(deps: RollbackDeps, where: str) -> None:
+    """--lock-barrier (X3): during finish memora-all is up but serving D1, so
+    it must not hold the LOCAL store's primary lock; this run holds it."""
+    if isinstance(deps.stopped, lp.LockBarrier):
+        deps.stopped.check(where)
+
+
 def _finish(deps: RollbackDeps, st: Dict[str, Any]):
+    _lock_check(deps, "before the finish")
     deps.admin.check("before the finish")
     status, body = deps.admin._request("GET", f"/health/db/{deps.db}")
     if status != 200 or body.get("status") != "ok":
@@ -280,6 +288,7 @@ def _finish(deps: RollbackDeps, st: Dict[str, Any]):
         raise lp.L5Refused(f"{deps.db} is served from {live or (entry or {}).get('kind') or 'unknown'} "
                            f"(/admin/data-volume {status}), not the verified {want}; the freeze stays")
     final = st["phases"]["verify"]["final_receipt"]
+    _lock_check(deps, "before the D1 recheck")
     fresh = lp.recheck(deps.db, final, deps.lp_deps(deps.admin), deps.out_dir)
     if Path(fresh) != Path(final):
         a = lp.load_receipt(final, deps.db, account_id=deps.account_id, database_id=deps.database_id,
@@ -289,6 +298,7 @@ def _finish(deps: RollbackDeps, st: Dict[str, Any]):
         moved = sorted(t for t in set(a) | set(b) if a.get(t) != b.get(t))
         raise lp.L5Halt(f"D1 changed since the rollback verify in {moved}; the freeze stays -- find the "
                         "writer, then re-run the rollback from the drain phase")
+    _lock_check(deps, "before lifting the freeze")
     deps.admin.check("before lifting the freeze")
     deps.admin.thaw()
     return ({"phase": "finish", "thawed": True, "served_from": live,

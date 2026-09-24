@@ -2364,6 +2364,8 @@ def acquire_primary_lock(db_path: Path) -> int:
 def release_primary_lock(db_path: Path) -> None:
     key = str(primary_lock_path(db_path))  # the same canonical identity as acquire
     with _PRIMARY_LOCKS_GUARD:
+        if key in _PINNED_PRIMARY_LOCKS:
+            return  # held for a whole operator run (--lock-barrier): a nested step's release is a no-op
         fd = _PRIMARY_LOCKS.pop(key, None)
     if fd is not None:
         os.close(fd)  # releases the flock
@@ -2428,3 +2430,49 @@ def parse_backend_uri(uri: str) -> StorageBackend:
     else:
         # Assume local path
         return LocalSQLiteBackend(Path(uri))
+
+
+# Locks an operator run holds from start to end (local_primary --lock-barrier,
+# X3): the steps inside take and release the same lock, and those releases
+# must not open a window in which memora-all could start serving the store.
+_PINNED_PRIMARY_LOCKS: set = set()
+
+
+def pin_primary_lock(db_path: Path) -> int:
+    """Acquire the store's primary lock (StoreLockedError when another
+    process holds it) and keep it until unpin_primary_lock."""
+    fd = acquire_primary_lock(db_path)
+    with _PRIMARY_LOCKS_GUARD:
+        _PINNED_PRIMARY_LOCKS.add(str(primary_lock_path(db_path)))
+    return fd
+
+
+def unpin_primary_lock(db_path: Path) -> None:
+    with _PRIMARY_LOCKS_GUARD:
+        _PINNED_PRIMARY_LOCKS.discard(str(primary_lock_path(db_path)))
+    release_primary_lock(db_path)
+
+
+def primary_lock_problem(db_path: Path) -> Optional[str]:
+    """None while THIS process holds the store's primary lock on the lock
+    file that is at its canonical path now; otherwise why not (not held, the
+    lock file was removed or replaced -- a flock on a replaced file proves
+    nothing -- or the flock is no longer ours)."""
+    import fcntl
+
+    path = primary_lock_path(db_path)
+    with _PRIMARY_LOCKS_GUARD:
+        fd = _PRIMARY_LOCKS.get(str(path))
+    if fd is None:
+        return f"{path} is not held by this process"
+    try:
+        held, now = os.fstat(fd), os.stat(path)
+    except FileNotFoundError:
+        return f"{path} was removed"
+    if (held.st_ino, held.st_dev) != (now.st_ino, now.st_dev):
+        return f"{path} was replaced by another file"
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # re-asserting our own lock always succeeds
+    except OSError as exc:
+        return f"{path}: the lock is no longer ours ({exc})"
+    return None

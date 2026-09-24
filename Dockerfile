@@ -7,6 +7,9 @@ WORKDIR /app
 # which makes `pip install .` fail.
 COPY pyproject.toml README.md ./
 COPY memora/ memora/
+# The operator tool, so scripts/lp_container.sh can run it in a one-off
+# container of THIS image (the tool must match the image's memora).
+COPY scripts/local_primary.py scripts/local_primary.py
 
 RUN pip install --no-cache-dir .
 
