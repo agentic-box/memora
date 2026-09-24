@@ -29,8 +29,12 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 - Evidence is gathered on every GET, and the accept (`POST
   /admin/reconcile/<db>/<id>`) reads D1 again itself. The decision is
   judged against D1 as it is when accepted, even on a direct POST: an
-  unchanged D1 matches, while a real change between show and accept, or a
-  failed read, is refused.
+  unchanged D1 matches, while a real change between show and accept is
+  refused. A read at accept time that failed, or that D1's primary did not
+  serve, refuses the accept (409 `evidence_unusable`), even when the GET
+  showed the same. An intent with no derivable query (`no-evidence`) or
+  still before its read-back bound (`waiting`) is accepted as before, on
+  the receipt.
 - Digests shown before this change do not match: show the intents again.
 
 ## 0.5.1

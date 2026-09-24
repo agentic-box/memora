@@ -114,19 +114,56 @@ def test_a_direct_post_after_a_d1_change_is_refused_without_another_get(registry
     assert storage.backend_for("remote").journal().status()[0] == [1]
 
 
+class _Broken:
+    def execute(self, sql, params=None):
+        raise ConnectionError("D1 unreachable")
+
+
 def test_a_failed_read_at_accept_time_is_refused(registry, read_now, tmp_path):
     _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
     digest = admin.list_intents("remote", reader=_Reader([(ROWS, {"served_by_primary": True})]))[1][
         "open_intents"][0]["evidence_sha256"]
-
-    class Broken:
-        def execute(self, sql, params=None):
-            raise ConnectionError("D1 unreachable")
-
     status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
-                                       decision="applied", evidence_digest=digest, reader=Broken())
-    assert status == 409 and body["error"] == "evidence_changed"
+                                       decision="applied", evidence_digest=digest, reader=_Broken())
+    assert status == 409 and body["error"] == "evidence_unusable"
     assert storage.backend_for("remote").journal().status()[0] == [1]
+
+
+def test_the_same_error_on_get_and_post_is_refused(registry, read_now, tmp_path):
+    """Review 8075: an error shown by the GET and repeated at the POST has the
+    same digest -- it must still refuse, since no D1 read succeeded."""
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    shown = admin.list_intents("remote", reader=_Broken())[1]["open_intents"][0]
+    assert shown["evidence"]["status"] == "error"
+    status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                       decision="applied", evidence_digest=shown["evidence_sha256"],
+                                       reader=_Broken())
+    assert status == 409 and body["error"] == "evidence_unusable" and body["status"] == "error"
+    assert storage.backend_for("remote").journal().status()[0] == [1]
+
+
+def test_a_read_never_served_by_the_primary_is_refused(registry, read_now, tmp_path, monkeypatch):
+    monkeypatch.setattr(reconcile, "PRIMARY_RETRY_DELAY_S", 0)
+    _open_intent(registry, "INSERT INTO memories (content) VALUES (?)", ("x",))
+    replica = _Reader([(ROWS, {"served_by_primary": False})])
+    shown = admin.list_intents("remote", reader=replica)[1]["open_intents"][0]
+    assert shown["evidence"]["served_by_primary"] is False
+    status, body = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                       decision="applied", evidence_digest=shown["evidence_sha256"],
+                                       reader=replica)
+    assert status == 409 and body["error"] == "evidence_unusable"
+    assert storage.backend_for("remote").journal().status()[0] == [1]
+
+
+def test_no_evidence_intents_stay_acceptable_on_the_receipt(registry, read_now, tmp_path):
+    """No query can be derived (a DELETE with no key): accepted as before."""
+    _open_intent(registry, "DELETE FROM memories", ())
+    shown = admin.list_intents("remote", reader=_Broken())[1]["open_intents"][0]
+    assert shown["evidence"]["status"] == "no-evidence"
+    status, _ = admin.accept_intent("remote", 1, _receipt(tmp_path), operator="spok", body_intent_id=1,
+                                    decision="not-applied", evidence_digest=shown["evidence_sha256"],
+                                    reader=_Broken())
+    assert status == 200
 
 
 def test_a_direct_post_with_d1_unchanged_is_accepted(registry, read_now, tmp_path):

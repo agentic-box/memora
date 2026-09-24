@@ -207,7 +207,18 @@ def accept_intent(name: str, intent_id: int, receipt: Any, *, operator: Any = No
     from .reconcile import gather_evidence
 
     current = gather_evidence(backend, journal, reader=reader).get(intent_id)
-    if current is None or evidence_digest != evidence_sha256(current):
+    if current is None:
+        return 409, {"error": "evidence_changed", "message": "the evidence is not the one this decision quotes"}
+    # Fail closed on a read that did not succeed (review 8075): an error, or
+    # a read never served by D1's primary, proves nothing -- even when the GET
+    # showed the same. Accepted without a D1 read, as before and explicitly:
+    # "no-evidence" (no query can be derived from the statement; the decision
+    # rests on the receipt) and "waiting" (before the read-back bound).
+    status = current.get("status")
+    if status == "error" or (status == "read" and current.get("served_by_primary") is not True):
+        return 409, {"error": "evidence_unusable", "status": status,
+                     "message": "D1 could not be read from its primary now; retry the accept later"}
+    if evidence_digest != evidence_sha256(current):
         return 409, {"error": "evidence_changed", "message": "the evidence is not the one this decision quotes"}
     extra = {**extra, "operator": operator.strip(), "decision": decision,
              "evidence_sha256": evidence_digest}
