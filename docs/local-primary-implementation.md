@@ -694,6 +694,21 @@ one local `store_write`:
    absent locally. A mismatch means dirty (row 6). D1's `rows_written` is
    not compared: it counts index and trigger writes.
 
+**As built (L9a): copy-back at a quiescent point.** Steps 1–2 run per item,
+in order. Steps 3–4 run for the accumulated touched keys only when no
+mutation of the store is in flight through a shadowed connection and every
+enqueued item has been replayed, so D1 holds exactly the state after the
+last replayed statement. A generation counter bumped at the start of every
+shadowed mutation is read before and after the copy-back reads; if it moved,
+the reads are discarded and taken again at the next quiet point. The reads
+are never made inside a `store_write`. Reason: the applier runs behind D1,
+so a per-item copy-back reads D1 state that LATER writes produced. That gave
+a false written-value mismatch (row 5), and it made a later replay conflict
+with the future row copy-back had installed (row 4). The app's own embedding
+DELETE+INSERT triggers the latter. The written-value check applies where the
+last statement on a key was that key's own parameterised write. Rows 1–10
+are unchanged.
+
 **Read consistency (P1-4).** D1's Sessions API (bookmarks) "is only
 available via the D1 Worker Binding and not yet available via the REST
 API", and read replication is opt-in

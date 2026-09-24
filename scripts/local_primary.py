@@ -19,6 +19,7 @@ this file only parses arguments and builds the dependencies.
   rollback <db> --phase drain|verify|finish --store P   §5.3 runbook (stop memora-all before verify)
   restamp <db> --receipt R --credential-file C          write path 4: one embedding_integrity row on D1
   thaw    <db>              lift the freeze -- the only command that does
+  shadow-init --shadow /data/shadow/<db>.db      §2.9: a seeded store becomes a clean shadow file
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
   check-endpoint            F4a: authenticated round trip to memora-all through a
@@ -163,6 +164,8 @@ def _parser() -> argparse.ArgumentParser:
     rs2.add_argument("--receipt", required=True, help="a fresh verified export receipt")
     rs2.add_argument("--store", required=True, help="the (former) local store file: its rollback state")
     rs2.add_argument("--credential-file", required=True, help="0600 operator D1 edit token")
+    si = sub.add_parser("shadow-init", help="§2.9 make a SEEDED store a shadow file (clean shadow_state)")
+    si.add_argument("--shadow", required=True, help="the seeded file, e.g. /data/shadow/<db>.db")
     sn = sub.add_parser("snapshot", help="§4 nightly snapshot of a local store to R2")
     sn.add_argument("db")
     sn.add_argument("--store", required=True)
@@ -393,6 +396,15 @@ def main(argv=None) -> int:
             out = {"ok": True, **lp.resume_store(Path(args.store), reader, accept_d1_epoch=args.accept_d1_epoch,
                                                  allow_deletes=args.allow_deletes)}
             print(json.dumps(out))
+            return 0
+        if args.cmd == "shadow-init":
+            from memora.shadow import ShadowConfigError, init_shadow_file
+
+            try:
+                state = init_shadow_file(args.shadow)
+            except ShadowConfigError as exc:
+                raise lp.L5Refused(str(exc))
+            print(json.dumps({"ok": True, "shadow": args.shadow, "shadow_state": state}))
             return 0
         if args.cmd == "volume-check":
             out = lp.volume_check([Path(s) for s in args.store], min_free_pct=args.min_free_pct)

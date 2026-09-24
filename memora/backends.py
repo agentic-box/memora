@@ -1791,9 +1791,20 @@ class D1Connection:
                 raise
             # Any other exception: unknown outcome, the intent stays open.
             journal.resolve(iid, "ok")
+            # Still inside the gate: a shadowed connection enqueues its mirror
+            # here, so a completed freeze also means every admitted write has
+            # been enqueued (plan §1: enter, D1 request, shadow enqueue,
+            # leave; §2.9). A no-op on a plain connection.
+            self._after_mutation(c, sql, params, result)
             return result
         finally:
             gate.leave(token)
+
+    def _after_mutation(self, classified, sql: str, params, result: dict) -> None:
+        """Called once per mutating statement D1 answered successfully, before
+        the write gate is left. Must not raise and must not change `result`:
+        the app sees D1's answer as it was. ShadowingD1Connection (memora/
+        shadow.py) overrides it; nothing else does."""
 
     def _send(self, sql: str, params: tuple = None) -> dict:
         """Execute SQL via D1 HTTP API with session affinity for read-your-writes."""
@@ -2164,7 +2175,11 @@ class D1Backend(StorageBackend):
         journal = self.journal()
         unusable = journal.fatal or journal.broken
         self.write_gate()
-        conn = D1Connection(self.account_id, self.database_id, self.api_token)
+        from .shadow import shadow_connection_class
+
+        # MEMORA_SHADOW_LOCAL names this store: its connections mirror every
+        # successful write into the shadow file (plan §2.9).
+        conn = shadow_connection_class(self.store_name)(self.account_id, self.database_id, self.api_token)
         if unusable:
             # Single writer, but reads stay available: this process gets a
             # read-only connection (leader 7583, review 7584 P1-2).

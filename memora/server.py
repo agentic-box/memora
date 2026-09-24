@@ -3625,6 +3625,27 @@ def main(argv: Optional[list[str]] = None) -> None:
         except Exception as e:
             logger.error("write gate initialisation failed: %s", e)
 
+        # Shadow appliers (plan §2.9): dark unless MEMORA_SHADOW_LOCAL names a
+        # store. A malformed value is fatal, like any routing configuration.
+        # Each applier is stopped (drained) at exit; only then is its
+        # shadow_state.clean_shutdown set, so a crash marks the shadow dirty.
+        try:
+            from .shadow import ShadowConfigError, shadow_config, start_shadow_appliers, stop_shadow_appliers
+
+            shadow_config()
+        except ShadowConfigError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+        try:
+            for _name, _st in start_shadow_appliers().items():
+                if not _st.get("started"):
+                    logger.error("shadow applier %s: %s", _name, _st.get("refused"))
+            import atexit
+
+            atexit.register(stop_shadow_appliers)
+        except Exception as e:
+            logger.error("shadow applier startup failed: %s", e)
+
         # Replicators (plan §2.1): dark unless MEMORA_REPLICATION is log|write
         # and MEMORA_REPLICAS / MEMORA_SHADOW_LOCAL name a store.
         try:
