@@ -245,11 +245,16 @@ GRAPH_TOKEN="$(cat "$SECRETS/graph.token")"
 graph_code() {  # graph_code PATH [TOKEN] -- the HTTP status, no redirect followed
   curl -s -o "$RH_ROOT/graph-body.txt" -w '%{http_code}' ${2:+-H "Authorization: Bearer $2"} "$GRAPH_URL$1"
 }
-for path in /force-graph.html /graph/force /api/graph; do
+# pages answer an unauthenticated browser with the login form (HTML); the
+# API answers JSON carrying memora_graph -- both 401 (review 8049)
+for path in /force-graph.html /graph/force; do
   code="$(graph_code "$path")"
-  [ "$code" = 401 ] && grep -q memora_graph "$RH_ROOT/graph-body.txt" \
-    && pass "graph $path refuses without the graph token (401)" || fail "graph $path without the token answered $code"
+  [ "$code" = 401 ] && grep -q 'action="/login"' "$RH_ROOT/graph-body.txt" \
+    && pass "graph $path refuses without the graph token (401, the login form)" || fail "graph $path without the token answered $code"
 done
+code="$(graph_code /api/graph)"
+[ "$code" = 401 ] && grep -q memora_graph "$RH_ROOT/graph-body.txt" \
+  && pass "graph /api/graph refuses without the graph token (401 JSON)" || fail "graph /api/graph without the token answered $code"
 [ "$(graph_code /force-graph.html "$GRAPH_TOKEN")" = 200 ] && grep -qi "force" "$RH_ROOT/graph-body.txt" \
   && pass "graph /force-graph.html answers 200 with the graph token" || fail "graph /force-graph.html with the token"
 code="$(graph_code /graph/force "$GRAPH_TOKEN")"
