@@ -297,6 +297,19 @@ function iterableTags(tags: unknown): Iterable<unknown> {
   return Array.isArray(tags) || typeof tags === "string" ? tags : [];
 }
 
+/**
+ * PG2: String(value) for a stored JSON value, without calling a toString or
+ * valueOf the value itself carries: a tag {"toString": 0} used to throw on
+ * conversion. Plain objects are "[object Object]", arrays join their
+ * elements (null as ""), as String() does for ordinary JSON values.
+ */
+function storedKey(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return value.map(v => (v == null ? "" : storedKey(v))).join(",");
+  if (typeof value === "object") return "[object Object]";
+  return String(value);
+}
+
 /** PG1: tags[0] without throwing on a null tags value. */
 function firstTag(tags: unknown): unknown {
   return tags == null ? undefined : (tags as Record<number, unknown>)[0];
@@ -343,10 +356,10 @@ function getIssueStatus(metadata: Record<string, unknown>): string {
   if (status === "wontfix") return "closed:not_planned";
   if (status === "in_progress") return "open";
   if (status === "closed") {
-    const reason = (metadata.closed_reason as string) || "complete";
-    return `closed:${reason}`;
+    const reason = metadata.closed_reason || "complete";
+    return `closed:${storedKey(reason)}`;
   }
-  return status;
+  return storedKey(status);
 }
 
 function getTodoStatus(metadata: Record<string, unknown>): string {
@@ -355,10 +368,10 @@ function getTodoStatus(metadata: Record<string, unknown>): string {
   if (status === "blocked") return "closed:not_planned";
   if (status === "in_progress") return "open";
   if (status === "closed") {
-    const reason = (metadata.closed_reason as string) || "complete";
-    return `closed:${reason}`;
+    const reason = metadata.closed_reason || "complete";
+    return `closed:${storedKey(reason)}`;
   }
-  return status;
+  return storedKey(status);
 }
 
 export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
@@ -579,7 +592,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
   const tagColors = keyedMap<string>();
   for (const m of memories) {
     const tags = parseJson<unknown>(m.tags, []);
-    const primaryTag = String(firstTag(tags) || "untagged");
+    const primaryTag = storedKey(firstTag(tags) || "untagged");
     if (!(primaryTag in tagColors)) {
       tagColors[primaryTag] = TAG_COLORS[Object.keys(tagColors).length % TAG_COLORS.length];
     }
@@ -603,7 +616,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
     if (isFrag && !includeDocs) continue;
 
     const tags = parseJson<unknown>(m.tags, []);
-    const primaryTag = String(firstTag(tags) || "untagged");
+    const primaryTag = storedKey(firstTag(tags) || "untagged");
     const content = m.content;
 
     const firstLine = content.split("\n")[0].replace(/^#+\s*/, "").trim().slice(0, 60);
@@ -756,7 +769,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
 
     // Tags mapping
     for (const tag of iterableTags(tags)) {
-      const key = String(tag);
+      const key = storedKey(tag);
       if (!tagToNodes[key]) tagToNodes[key] = [];
       tagToNodes[key].push(m.id);
     }
@@ -767,7 +780,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       if (!statusToNodes[status]) statusToNodes[status] = [];
       statusToNodes[status].push(m.id);
 
-      const component = (meta.component as string) || "uncategorized";
+      const component = storedKey(meta.component || "uncategorized");
       if (!issueCategoryToNodes[component]) issueCategoryToNodes[component] = [];
       issueCategoryToNodes[component].push(m.id);
     }
@@ -778,7 +791,7 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
       if (!todoStatusToNodes[status]) todoStatusToNodes[status] = [];
       todoStatusToNodes[status].push(m.id);
 
-      const category = (meta.category as string) || "uncategorized";
+      const category = storedKey(meta.category || "uncategorized");
       if (!todoCategoryToNodes[category]) todoCategoryToNodes[category] = [];
       todoCategoryToNodes[category].push(m.id);
     }
@@ -803,14 +816,14 @@ export const onRequestGet: PagesFunction<Env> = async ({ env, request }) => {
         if (typeof subsection === "string" && subsection) parts = subsection.split("/");
       }
 
-      const sectionKey = String(section);
+      const sectionKey = storedKey(section);
       if (!sectionToNodes[sectionKey]) sectionToNodes[sectionKey] = [];
       sectionToNodes[sectionKey].push(m.id);
 
       if (parts.length) {
         for (let i = 0; i < parts.length; i++) {
-          const partialPath = parts.slice(0, i + 1).join("/");
-          const fullKey = `${section}/${partialPath}`;
+          const partialPath = parts.slice(0, i + 1).map(p => (p == null ? "" : storedKey(p))).join("/");
+          const fullKey = `${sectionKey}/${partialPath}`;
           if (!subsectionToNodes[fullKey]) subsectionToNodes[fullKey] = [];
           subsectionToNodes[fullKey].push(m.id);
         }

@@ -205,6 +205,11 @@ _ODD_OK = [
     ('{"section": "S", "subsection": ""}', '["a"]'),
     ('{"type": "document_fragment", "document_key": "k"}', '{"0": "z"}'),       # fragments are never mapped
     ('{"type": "document_fragment", "document_key": "k", "section_heading": 5}', '5'),
+    # PG2: values carrying their own toString (graph.ts threw on these before PG2)
+    ('{"section": {"toString": 0}}', '[{"toString": 0}, ["x", {"valueOf": 1}, null]]'),
+    ('{"hierarchy": {"path": ["T", {"toString": 0}]}}', '["a"]'),
+    ('{"type": "issue", "status": {"toString": 0}, "component": {"toString": 0}}', '["a"]'),
+    ('{"type": "todo", "status": "closed", "closed_reason": {"toString": 0}, "category": {"toString": 0}}', '["a"]'),
 ]
 # values graph.ts throws on: one per memory, a Pages defect each
 _ODD_THROWS = [

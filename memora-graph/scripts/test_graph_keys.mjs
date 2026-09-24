@@ -130,5 +130,36 @@ for (const query of ["", "&docs=1"]) {
   check(`an object's tags[0] is still its primary tag (${query || "-"})`, typeof body.tagColors.z === "string");
 }
 
+// ---------------------------------------------------------------- PG2: values that carry their own toString
+
+nextId = 1;
+{
+  const own = '{"toString": 0}';
+  const rows = [
+    mem("plain", "{}", '["b"]', "2026-09-30"),
+    mem("object tag", "{}", `[${own}]`, "2026-09-29"),
+    mem("nested tag", "{}", `["x", [${own}, null]]`, "2026-09-28"),
+    mem("object section", `{"section": ${own}}`, '["a"]', "2026-09-27"),
+    mem("object path part", `{"hierarchy": {"path": ["T", ${own}]}}`, '["a"]', "2026-09-26"),
+    mem("object issue status", `{"type": "issue", "status": ${own}, "component": ${own}}`, '["a"]', "2026-09-25"),
+    mem("object closed_reason", `{"type": "todo", "status": "closed", "closed_reason": ${own}, "category": ${own}}`,
+      '["a"]', "2026-09-24"),
+  ];
+  const { status, body } = await graph(rows);
+  check("values with their own toString answer 200", status === 200, JSON.stringify(body).slice(0, 200));
+  if (status === 200) {
+    check("an object tag is '[object Object]'", JSON.stringify(body.tagToNodes["[object Object]"]) === "[2]"
+      && typeof body.tagColors["[object Object]"] === "string");
+    check("a nested tag joins as String() does", JSON.stringify(body.tagToNodes["[object Object],"]) === "[3]");
+    check("an object section and path part", JSON.stringify(body.sectionToNodes["[object Object]"]) === "[4]"
+      && JSON.stringify(body.subsectionToNodes["T/[object Object]"]) === "[5]");
+    check("an object status and component", JSON.stringify(body.statusToNodes["[object Object]"]) === "[6]"
+      && JSON.stringify(body.issueCategoryToNodes["[object Object]"]) === "[6]"
+      && body.nodes.find(n => n.id === 6)?.color === "#ff7b72");
+    check("an object closed_reason and category", JSON.stringify(body.todoStatusToNodes["closed:[object Object]"]) === "[7]"
+      && JSON.stringify(body.todoCategoryToNodes["[object Object]"]) === "[7]");
+  }
+}
+
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

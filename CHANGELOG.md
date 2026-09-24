@@ -31,6 +31,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
   The answer is exactly memora-all's (G4); nothing changes for any other
   input. New CI step: `scripts/test_graph_keys.mjs`.
 - Ships with the next Pages deploy (a user step).
+- PG2: a stored value that carries its own `toString` (a tag, section,
+  path part, status, `closed_reason`, component or category such as
+  `{"toString": 0}`) no longer makes the conversion to a key throw. It is
+  keyed as `String()` keys an ordinary JSON value (`[object Object]`),
+  exactly as memora-all does.
 
 ## 0.5.4
 
