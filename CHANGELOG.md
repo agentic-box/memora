@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.6 — 2026-09-25
+
 The deploy can turn on the `/api/v1` JSON API (API1).
 
 - `deploy-memora-all.sh` sets `MEMORA_API_TOKENS_FILE` when `api-tokens.json` (sha256 digests only) is in the secrets dir; the smoke check then requires 401 without a token and, with an optional `api-smoke.token`, 200/403 per store. Without the file the API stays off (404), as before.

@@ -360,15 +360,15 @@ def test_memory_limit_is_the_measured_gate(deploy):
 # ---------------------------------------------------------------- R1: rehearsal parameters
 
 def test_the_defaults_are_the_production_deploy(deploy):
-    """Unparameterised: ssh to deploy-host, docker, the v0.5.5 checkout, memora-all
+    """Unparameterised: ssh to deploy-host, docker, the v0.5.6 checkout, memora-all
     on 8920 with memora-all-data and memora:latest, the tokens from
     ~/.config/memora-lp."""
     proc, calls, cfg = deploy()
     tools = deploy.tools.read_text().splitlines()
     assert tools[0] == "ssh deploy-host"
     assert ("deploy target: host=deploy-host runtime=docker container=memora-all volume=memora-all-data "
-            "image=memora:latest port=8920 graph=100.64.0.10:8766 tag=v0.5.5 secrets=~/.config/memora-lp") in proc.stdout
-    assert any(t.startswith("git ") and "checkout v0.5.5" in t for t in tools)
+            "image=memora:latest port=8920 graph=100.64.0.10:8766 tag=v0.5.6 secrets=~/.config/memora-lp") in proc.stdout
+    assert any(t.startswith("git ") and "checkout v0.5.6" in t for t in tools)
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
     assert "0.0.0.0:8920:8000" in _flag_values(run, "-p")
@@ -984,7 +984,7 @@ class TestRemoteArguments:
         line = (tmp_path / "ssh-command.txt").read_text().strip()
         params = _decode_blob(line)
         assert len(params) == N_REMOTE_ARGS
-        assert params[0] == "v0.5.5" and params[3] == "docker" and params[4] == "memora-all"
+        assert params[0] == "v0.5.6" and params[3] == "docker" and params[4] == "memora-all"
         assert params[12] == ""                      # DEPLOY_LABELS: empty in production
         assert params[13] == "~/.config/memora-lp"
         assert params[17] == ""                      # MEMORA_REPLICAS_B64: empty (dark)
