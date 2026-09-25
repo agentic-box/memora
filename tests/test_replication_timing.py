@@ -250,8 +250,18 @@ def test_an_uncertain_outcome_also_waits_the_interval(env):
     actually sent."""
     local, replica, sends = env
     d1 = []  # monotonic time of every D1 request
+    hit = []  # the uncertain failure this send actually raised
     post, read = replica.post_json, replica.reader_post
-    replica.post_json = lambda body: (d1.append(("write", time.monotonic())), post(body))[1]
+
+    def post_or_record(body):
+        d1.append(("write", time.monotonic()))
+        try:
+            return post(body)
+        except RuntimeError as exc:
+            hit.append(exc)  # appended BEFORE the raise reaches the loop
+            raise
+
+    replica.post_json = post_or_record
     replica.reader_post = lambda body: (d1.append(("read", time.monotonic())), read(body))[1]
     replica.apply_then_raise = (10**6, RuntimeError("connection reset after the batch applied"))
     rep = _rep(local, replica, interval_s=2.0, poll_s=0.05)
@@ -270,6 +280,12 @@ def test_an_uncertain_outcome_also_waits_the_interval(env):
     try:
         assert _wait(lambda: any(k == "write" for k, _ in d1), 5)
         failed_at = next(t for k, t in d1 if k == "write")
+        # The write timestamp is appended BEFORE post(body) runs, so clearing
+        # the fault right after observing it races the send: a cleared fault
+        # lets the first send succeed and ack before the interval, which no
+        # correct path can satisfy (review 8370 P1). Wait until the worker has
+        # actually raised the uncertain failure before clearing it.
+        assert _wait(lambda: bool(hit), 5), rep.status()
         replica.apply_then_raise = None
         assert _wait(acked, 10)
     finally:
