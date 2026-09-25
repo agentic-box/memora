@@ -41,8 +41,9 @@ under the route's `_bound_store`):
    - `in_progress` → different sha → 409 `key_conflict`; same sha with a live
      lease → 409 `in_progress`; expired, or `failed_clean` → takeover
      `fence=fence+1`.
-   The frozen `absorb_in_progress` fixture is **409**, so the design returns 409,
-   not the "202" wording in the brief; the contract is authoritative.
+   The frozen `absorb_in_progress` fixture is **409** (leader confirmed), so the
+   design returns 409, not the "202" wording in the brief; the contract is
+   authoritative.
 2. **Absorb** outside the claim's lock: `storage.absorb_memory(conn, facts, ...,
    project=..., source=..., context=..., metadata=..., tags=..., phase3_done=cb)`.
    New optional `phase3_done` seam threaded through `_absorb_memory_impl` into
@@ -55,21 +56,30 @@ under the route's `_bound_store`):
    (`status/created/superseded/skipped/linked/memory_ids/took_ms`) built from
    `counts`, created ids and the elapsed time.
 3. Reply 200 with the stored body; a replay reads it back and never re-runs the
-   LLM. A failure before phase 3 committed best-effort marks the claim
-   `failed_clean` (nothing can have committed) so a retry need not wait out the
-   lease; `done` remains the only completion boundary.
+   LLM. `done` remains the only completion boundary. On any absorb failure the
+   executor first re-reads the claim, because a commit can be ambiguous and an
+   exception can occur after the done commit:
+   - row now `done` → the transaction committed (an ack was lost); reply with the
+     stored body, exactly once;
+   - row still `in_progress` with this `owner` and `fence` → the phase-3
+     transaction rolled back (the done update is inside it), so the executor may
+     best-effort `failed_clean`, but only with the conditional
+     `UPDATE ... SET status='failed_clean' WHERE key=? AND owner=? AND fence=? AND
+     status='in_progress'`; it must never overwrite `done` and matches no row once
+     a commit happened. An unreadable or ambiguous claim is left untouched for a
+     replay or lease takeover, which always reads `done` first.
 
 ## (3) Tags — `memora/__init__.py`
 
 Add `"landing"`, `"clmux"`, `"memora"` to `DEFAULT_TAGS`. Sourcing in
 `_load_tag_whitelist`: `MEMORA_ALLOW_ANY_TAG=1` → any; else `MEMORA_TAG_FILE`
 (or the packaged `config/allowed_tags.json` if present); else `MEMORA_TAGS`;
-else `DEFAULT_TAGS`. The deploy currently sets `MEMORA_ALLOW_ANY_TAG=1`, so the
-container accepts any tag today; the `DEFAULT_TAGS` addition makes a container
-that does not set it accept the landing tags. **LEADER DECISION:** plan §13 Q4
-says "do not allow any tag"; enforcing that means dropping
-`MEMORA_ALLOW_ANY_TAG=1` from the deploy, which changes acceptance for arbitrary
-existing tags. I keep the env as is unless told otherwise.
+else `DEFAULT_TAGS`. The deploy keeps its `MEMORA_ALLOW_ANY_TAG=1` (leader
+decision, msg 8283), so the container accepts any tag today and the new
+`DEFAULT_TAGS` entries cover a container that does not set it. **Out of scope,
+recorded P2 follow-up:** enforcing the plan §6.3/§13 Q4 restricted-tag policy
+means dropping that env, which needs an audit of the tags the four stores
+already use so existing writes are not rejected.
 
 ## (4) Deploy smoke — `scripts/deploy-memora-all.sh`, `scripts/rehearse_deploy.sh`
 
@@ -87,10 +97,13 @@ commit owns it (as for v0.5.6).
 `tests/test_api_v1.py`: capability (`transactional` local, `unsupported` D1 /
 cloud / refused), the real executor through the route, replay returns the stored
 body without calling the LLM, same-key/different-sha 409, live-lease 409,
-expired takeover, wedged resume rolls back. `tests/test_api_absorb.py` (new):
-claim/done/fence, crash-at-each-statement via the L4 hooks plus new claim/done
-hooks, `failed_clean`, the replay response compared to the `absorb_done`,
-`absorb_in_progress` and `absorb_key_conflict` fixtures. `tests/test_schema.py`
+expired takeover, wedged resume rolls back, and an injected post-commit /
+ack-loss failure whose replay returns the stored body without re-running the
+LLM (exactly once). `tests/test_api_absorb.py` (new): claim/done/fence,
+crash-at-each-statement via the L4 hooks plus new claim/done hooks, the
+conditional `failed_clean` (never overwrites `done`), the replay response
+compared to the `absorb_done`, `absorb_in_progress` and `absorb_key_conflict`
+fixtures. `tests/test_schema.py`
 (or the schema-pending test) for the new table. `tests/test_deploy_memora_all.py`
 and `tests/test_api_contract.py` stay in the targeted set. The final report maps
 each review finding to the section above.
