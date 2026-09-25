@@ -141,6 +141,11 @@ the deploy-host deploy; `tests/test_deploy_memora_all.py` pins both.
    - it replicates in **log** mode, not halted;
    - after `thaw`, a write through `/mcp/gamma` is logged: `lag_rows` 0, and
      the log cursor moved.
+   - (API1) the deploy before it runs with `/api/v1` off (404); the smoke
+     token minted with `scripts/mint_api_token.sh` (memora only) makes the
+     next deploy set `MEMORA_API_TOKENS_FILE` on the read-only mount, and
+     its smoke check requires 401 without a token, 200 for memora and 403
+     for alpha.
 
    Log mode sends nothing to D1. **Write mode is not rehearsed**: the
    replicator's D1 endpoint is fixed to Cloudflare's, and no fake D1 HTTP

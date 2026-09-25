@@ -80,6 +80,18 @@ class ApiConfigError(RuntimeError):
 # Token file (§3.3, §7.1)
 # --------------------------------------------------------------------------
 
+def _read_only_mount(path: str) -> bool:
+    """Is `path` on a read-only mounted filesystem (statvfs ST_RDONLY)? API1
+    (leader 8213): the deploy mounts its secrets directory read-only into
+    the container, so the tokens file keeps the host user's uid while the
+    server runs as root (rootful docker). On such a mount, and only there,
+    the OWNER matches are dropped; every other check stays."""
+    try:
+        return bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
+    except OSError:
+        return False
+
+
 def _check_parent_dirs(path: str) -> None:
     """Every parent directory must be trustworthy (§7.1).
 
@@ -101,7 +113,7 @@ def _check_parent_dirs(path: str) -> None:
         if not stat.S_ISDIR(st.st_mode):
             raise ApiConfigError(f"tokens file parent {directory} is not a directory")
         allowed_owners = {euid} if under_home else {euid, 0}
-        if st.st_uid not in allowed_owners:
+        if st.st_uid not in allowed_owners and not _read_only_mount(directory):
             raise ApiConfigError(f"tokens file parent {directory} has owner uid {st.st_uid}")
         if st.st_mode & 0o022:
             raise ApiConfigError(
@@ -121,6 +133,8 @@ def read_token_file(path: str) -> bytes:
     O_RDONLY | O_NOFOLLOW | O_CLOEXEC, then fstat the descriptor: a regular
     file, owned by this effective uid, no group/other permission bits, at
     most 4 KiB; and every parent directory checked (_check_parent_dirs).
+    On a read-only mount (the deploy's secrets mount) the owner matches of
+    the file and of its read-only parents are not required (API1).
     """
     if not os.path.isabs(path):
         raise ApiConfigError("MEMORA_API_TOKENS_FILE must be an absolute path")
@@ -136,7 +150,7 @@ def read_token_file(path: str) -> bytes:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise ApiConfigError("tokens file is not a regular file")
-        if st.st_uid != os.geteuid():
+        if st.st_uid != os.geteuid() and not _read_only_mount(path):
             raise ApiConfigError(f"tokens file owner uid {st.st_uid} is not this user")
         if st.st_mode & 0o077:
             raise ApiConfigError(f"tokens file mode {st.st_mode & 0o777:o} allows group/other")
@@ -551,7 +565,7 @@ def register_api_routes(mcp: Any, *, bind_host: str, env: Optional[Mapping[str, 
     env = os.environ if env is None else env
     tokens_path = (env.get("MEMORA_API_TOKENS_FILE") or "").strip()
     if not tokens_path:
-        logger.error(
+        logger.info(  # an intentional state: the deploy sets it only with a tokens file (issue 1131)
             "api/v1 NOT registered: MEMORA_API_TOKENS_FILE is unset (the API always requires "
             "store-scoped tokens; bind %s)", bind_host,
         )

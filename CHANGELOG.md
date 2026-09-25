@@ -14,6 +14,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+The deploy can turn on the `/api/v1` JSON API (API1).
+
+- `deploy-memora-all.sh` sets `MEMORA_API_TOKENS_FILE` when `api-tokens.json` (sha256 digests only) is in the secrets dir; the smoke check then requires 401 without a token and, with an optional `api-smoke.token`, 200/403 per store. Without the file the API stays off (404), as before.
+- New `scripts/mint_api_token.sh`: mints a token into a new 0600 file and adds its digest to `api-tokens.json`; prints nothing.
+- The tokens file may be owned by another user when it sits on a read-only mount (rootful docker reads the operator's file as root); every other check stays.
+- An unset `MEMORA_API_TOKENS_FILE` is logged at INFO, not ERROR (issue 1131).
+
 ## 0.5.5
 
 Pages viewer crash fixes, matching memora-all's graph handling.

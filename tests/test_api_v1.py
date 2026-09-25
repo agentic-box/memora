@@ -300,6 +300,7 @@ def _registered(bind_host, env):
 def test_without_a_tokens_file_the_api_is_never_registered(bind, caplog, tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"memora": str(tmp_path / "m.db")}))
     monkeypatch.setenv("MEMORA_DEFAULT_DB", "memora")
+    caplog.set_level("INFO")  # an intentional state is INFO, not ERROR (issue 1131)
     ok, mcp = _registered(bind, {})
     assert ok is False and "MEMORA_API_TOKENS_FILE is unset" in caplog.text
     with TestClient(mcp.streamable_http_app()) as client:
@@ -984,3 +985,80 @@ def test_many_small_chunks_stop_right_after_the_cap(api):
     status, calls = _asgi_post(api.app, messages)
     assert status == 413
     assert calls == api_v1.MAX_BODY_BYTES // piece + 1  # stopped at the first message past the cap
+
+
+# --------------------------------------------------------------------------
+# API1 (leader 8213): the deploy's read-only secrets mount (rootful docker)
+# --------------------------------------------------------------------------
+
+class _Vfs:
+    def __init__(self, flag):
+        self.f_flag = flag
+
+
+def _fake_statvfs(monkeypatch, read_only):
+    flag = getattr(os, "ST_RDONLY", 1) if read_only else 0
+    monkeypatch.setattr(os, "statvfs", lambda p: _Vfs(flag))
+
+
+def _foreign_owner(monkeypatch):
+    """Model rootful docker: the server's euid is not the file's owner (the
+    host user's files on the mount)."""
+    real = os.geteuid()
+    monkeypatch.setattr(os, "geteuid", lambda: real + 1)
+
+
+def test_rootful_read_only_mount_accepts_a_foreign_owner(home, monkeypatch):
+    path = _write_tokens(home, {_digest(TOKEN): ["memora"]})
+    _foreign_owner(monkeypatch)
+    _fake_statvfs(monkeypatch, read_only=True)
+    assert _load(path) == {_digest(TOKEN): frozenset({"memora"})}
+
+
+def test_rootful_read_write_mount_still_refuses_a_foreign_owner(home, monkeypatch):
+    path = _write_tokens(home, {_digest(TOKEN): ["memora"]})
+    _foreign_owner(monkeypatch)
+    _fake_statvfs(monkeypatch, read_only=False)
+    with pytest.raises(api_v1.ApiConfigError, match="owner"):
+        _load(path)
+
+
+def test_read_only_mount_keeps_every_other_check(home, monkeypatch):
+    _fake_statvfs(monkeypatch, read_only=True)
+    _foreign_owner(monkeypatch)
+    loose = _write_tokens(home, {_digest(TOKEN): ["memora"]}, mode=0o640)
+    with pytest.raises(api_v1.ApiConfigError, match="mode"):
+        _load(loose)
+    loose.chmod(0o600)
+    (home / "secrets").chmod(0o770)
+    try:
+        with pytest.raises(api_v1.ApiConfigError, match="writable"):
+            _load(loose)
+    finally:
+        (home / "secrets").chmod(0o700)
+    link = home / "secrets" / "link.json"
+    link.symlink_to(loose)
+    with pytest.raises(api_v1.ApiConfigError, match="cannot open"):
+        _load(link)
+
+
+def test_read_only_mount_detection_uses_statvfs(monkeypatch, tmp_path):
+    _fake_statvfs(monkeypatch, read_only=True)
+    assert api_v1._read_only_mount(str(tmp_path)) is True
+    _fake_statvfs(monkeypatch, read_only=False)
+    assert api_v1._read_only_mount(str(tmp_path)) is False
+
+    def boom(p):
+        raise OSError("no such path")
+
+    monkeypatch.setattr(os, "statvfs", boom)
+    assert api_v1._read_only_mount(str(tmp_path)) is False
+
+
+def test_an_unset_tokens_file_is_logged_at_info_not_error(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger=api_v1.logger.name):
+        assert api_v1.register_api_routes(object(), bind_host="0.0.0.0", env={}) is False
+    rec = [r for r in caplog.records if "MEMORA_API_TOKENS_FILE is unset" in r.getMessage()]
+    assert rec and rec[0].levelno == logging.INFO

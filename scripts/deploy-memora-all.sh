@@ -61,16 +61,17 @@
 #    evidence; they follow the memory's project once one is declared.
 #  - A plain JSON API /api/v1/<store>/{health,search,absorb} (Phase 0 of the
 #    clmux memora daemon; contract memora-api-v1.0.0). It is registered ONLY
-#    when MEMORA_API_TOKENS_FILE is set. THIS DEPLOY DOES NOT SET IT: the API
-#    stays unregistered on memora-all, and step 5 checks that it is (an actual
-#    HTTP 404 on /api/v1/memora/health), so an accidental registration -- or
-#    a server that stopped answering -- fails the deploy.
+#    when MEMORA_API_TOKENS_FILE is set. API1: this deploy sets it ONLY when
+#    $DEPLOY_API_TOKENS_FILE (default api-tokens.json: sha256 digests, never
+#    tokens; minted by scripts/mint_api_token.sh) is in the secrets dir, 0600
+#    and owned by the deploying user. Absent, the API stays off and step 5
+#    requires an actual HTTP 404 on /api/v1/memora/health.
 #  - memora-server now pins uvicorn to http=h11, loop=asyncio (explicit
 #    instead of "auto"); readiness probes (/health/db) no longer run schema
 #    setup and never create a database.
 #
 # NO ENV CHANGE: MEMORA_PROJECTS is already set (v0.4.5) and re-set to the
-# same value below; MEMORA_API_TOKENS_FILE is NOT set; MEMORA_LLM_MODEL stays
+# same value below; MEMORA_API_TOKENS_FILE is set only with a tokens file (above); MEMORA_LLM_MODEL stays
 # openai/gpt-4o-mini (step 2 re-writes the same value, a confirming no-op);
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
@@ -108,10 +109,13 @@
 #     report that store as its bound database, with an integer
 #     import_pending. Any store failing is named and fails the deploy.
 #     ("pi" in the memora project list is a tag project inside the memora
-#     store, not a store; pi agents have no MCP config.) Finally, GET
-#     /api/v1/memora/health must be an actual HTTP 404 (the API is not
-#     registered without a tokens file); no HTTP answer within ~20 s, or any
-#     other status, fails the deploy.
+#     store, not a store; pi agents have no MCP config.) Finally /api/v1:
+#     without a tokens file, GET /api/v1/memora/health must be an actual HTTP
+#     404; with one, it must be 401 without a token, and when
+#     $DEPLOY_API_SMOKE_TOKEN_FILE (default api-smoke.token, a plain token
+#     minted with --out <secrets>/api-smoke.token) exists, 200 on the first
+#     store it allows and 403 on the first it does not. No HTTP answer within
+#     ~20 s, or any other status, fails the deploy.
 #
 # /data VOLUME (local-primary L2a): memora-all used to reuse its existing data
 # volume by id. The image declares VOLUME /data, so that id is normally an
@@ -201,7 +205,13 @@ DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-cloudflare-api.tok
 DEPLOY_D1_READ_TOKEN_FILE="${DEPLOY_D1_READ_TOKEN_FILE:-d1-read.token}"
 DEPLOY_D1_REPLICATOR_TOKEN_FILE="${DEPLOY_D1_REPLICATOR_TOKEN_FILE:-d1-read.token}"
 DEPLOY_GRAPH_TOKEN_FILE="${DEPLOY_GRAPH_TOKEN_FILE:-graph.token}"   # minted on first use (G1)
-for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE DEPLOY_GRAPH_TOKEN_FILE; do
+# /api/v1 (API1): ON only when this file (sha256 digests; scripts/mint_api_token.sh)
+# is in the token directory; the smoke check uses a plain token from the second
+# one when it is there too.
+DEPLOY_API_TOKENS_FILE="${DEPLOY_API_TOKENS_FILE:-api-tokens.json}"
+DEPLOY_API_SMOKE_TOKEN_FILE="${DEPLOY_API_SMOKE_TOKEN_FILE:-api-smoke.token}"
+for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE DEPLOY_GRAPH_TOKEN_FILE \
+         DEPLOY_API_TOKENS_FILE DEPLOY_API_SMOKE_TOKEN_FILE; do
   printf '%s' "${!v}" | grep -Eqx '[A-Za-z0-9_-][A-Za-z0-9._-]*' \
     || { echo "refused: $v must be a plain file name inside DEPLOY_SECRETS_DIR (got '${!v}') — nothing was done" >&2; exit 1; }
 done
@@ -354,7 +364,7 @@ MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 # preceded by the blob's sha256 as a second word (review 7889: a changed
 # character that keeps the field count must refuse too). The remote script
 # checks the digest, decodes (a decoder error refuses), requires exactly
-# the 25 parameters it reads, and only then restores $1..$25. A localhost
+# the 27 parameters it reads, and only then restores $1..$27. A localhost
 # rehearsal sends the SAME command line through `sh -c`, i.e. the same
 # re-parsing a remote shell does.
 REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
@@ -362,10 +372,11 @@ REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_C
   "$DEPLOY_SKIP_CHECKOUT" "$DEPLOY_SMOKE_ABSORB" "$DEPLOY_LABELS" "$DEPLOY_SECRETS_DIR"
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
   "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S"
-  "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE" "$MEMORA_PROJECTS_B64")
+  "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE" "$MEMORA_PROJECTS_B64"
+  "$DEPLOY_API_TOKENS_FILE" "$DEPLOY_API_SMOKE_TOKEN_FILE")
 PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
 PARAMS_SHA="$(printf '%s' "$PARAMS_B64" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-[ "${#REMOTE_ARGS[@]}" -eq 25 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 25" >&2; exit 1; }
+[ "${#REMOTE_ARGS[@]}" -eq 27 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 27" >&2; exit 1; }
 REMOTE_CMD="bash -s -- $PARAMS_SHA $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
   TARGET=(sh -c "$REMOTE_CMD")
@@ -385,7 +396,7 @@ printf '%s' "$2" | base64 -d > "$DECODED" 2>/dev/null || { rm -f "$DECODED"; bro
 P=()
 while IFS= read -r -d '' v; do P+=("$v"); done < "$DECODED"
 rm -f "$DECODED"
-[ "${#P[@]}" -eq 25 ] || broken "${#P[@]} parameters arrived, not 25"
+[ "${#P[@]}" -eq 27 ] || broken "${#P[@]} parameters arrived, not 27"
 set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -399,6 +410,7 @@ SECRETS_DIR="${14/#\~/$HOME}"
 CF_TOKEN_NAME="${15}"; READ_TOKEN_NAME="${16}"; REPL_TOKEN_NAME="${17}"
 MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
 GRAPH_BIND="${22}"; GRAPH_PORT="${23}"; GRAPH_TOKEN_NAME="${24}"
+API_TOKENS_NAME="${26}"; API_SMOKE_NAME="${27}"
 MEMORA_PROJECTS="$(printf '%s' "${25}" | base64 -d)"
 SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
@@ -419,7 +431,15 @@ fi
 # user; each file a regular file (not a symlink) owned by this user, mode
 # exactly 0600, not empty. Refused otherwise, never chmod-ed. Values are
 # never read into this shell.
-python3 - "$SECRETS_DIR" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" <<'PY' || exit 1
+# /api/v1 (API1): on only when the tokens file is present; the optional smoke
+# token too. Present files get the same checks as every token file below.
+API_ON=0; OPTIONAL_TOKENS=()
+if [ -e "$SECRETS_DIR/$API_TOKENS_NAME" ] || [ -L "$SECRETS_DIR/$API_TOKENS_NAME" ]; then
+  API_ON=1; OPTIONAL_TOKENS+=("$API_TOKENS_NAME")
+  if [ -e "$SECRETS_DIR/$API_SMOKE_NAME" ] || [ -L "$SECRETS_DIR/$API_SMOKE_NAME" ]; then OPTIONAL_TOKENS+=("$API_SMOKE_NAME"); fi
+fi
+python3 - "$SECRETS_DIR" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" \
+  ${OPTIONAL_TOKENS[@]+"${OPTIONAL_TOKENS[@]}"} <<'PY' || exit 1
 import os, stat, sys
 d, names = sys.argv[1], sys.argv[2:]
 hint = ("  write it on this host first, e.g. for the Cloudflare token (value never printed):\n"
@@ -460,6 +480,12 @@ TOKEN_FILE_ARGS=(-e "CLOUDFLARE_API_TOKEN_FILE=$SECRETS_MOUNT/$CF_TOKEN_NAME"
                  -e "MEMORA_D1_READ_TOKEN_FILE=$SECRETS_MOUNT/$READ_TOKEN_NAME"
                  -e "MEMORA_D1_REPLICATOR_TOKEN_FILE=$SECRETS_MOUNT/$REPL_TOKEN_NAME"
                  -e "MEMORA_GRAPH_TOKEN_FILE=$SECRETS_MOUNT/$GRAPH_TOKEN_NAME")
+if [ "$API_ON" = 1 ]; then
+  TOKEN_FILE_ARGS+=(-e "MEMORA_API_TOKENS_FILE=$SECRETS_MOUNT/$API_TOKENS_NAME")
+  echo "/api/v1: ON ($SECRETS_DIR/$API_TOKENS_NAME is present)"
+else
+  echo "/api/v1: off ($SECRETS_DIR/$API_TOKENS_NAME is absent)"
+fi
 LP_ARGS=()   # the local-primary switches, only when all.env sets them (absent = dark)
 [ -z "$MEMORA_REPLICAS" ] || LP_ARGS+=(-e "MEMORA_REPLICAS=$MEMORA_REPLICAS")
 [ -z "$MEMORA_REPLICATION" ] || LP_ARGS+=(-e "MEMORA_REPLICATION=$MEMORA_REPLICATION")
@@ -739,7 +765,8 @@ fi
 # credentials, so not argv; stdin is the program's heredoc).
 EXPOSED="the new $CONTAINER exposes a token or mounts the tokens writable — remove it: $RT rm -f $CONTAINER, then roll back (below)"
 NEW_INSPECT="$("$RT" inspect "$CONTAINER")" || { echo "cannot inspect the new $CONTAINER. $EXPOSED" >&2; exit 1; }
-NEW_INSPECT="$NEW_INSPECT" python3 - "$SECRETS_DIR" "$SECRETS_MOUNT" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" <<'PY' \
+NEW_INSPECT="$NEW_INSPECT" python3 - "$SECRETS_DIR" "$SECRETS_MOUNT" "$CF_TOKEN_NAME" "$READ_TOKEN_NAME" "$REPL_TOKEN_NAME" "$GRAPH_TOKEN_NAME" \
+  ${OPTIONAL_TOKENS[@]+"${OPTIONAL_TOKENS[@]}"} <<'PY' \
   || { echo "$EXPOSED" >&2; exit 1; }
 import json, os, sys
 d, mount, names = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -773,7 +800,8 @@ if [ "$healthy" -ne 1 ]; then
   exit 1
 fi
 
-python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" "${21}" "$GRAPH_BIND" "$GRAPH_PORT" "$GRAPH_TOKEN_PATH" <<'PY'
+python3 - "${TAG#v}" "$MEMORA_DATABASES" "$HEALTH_TOKEN" "$PORT" "$SMOKE_ABSORB" "$MEMORA_REPLICAS" "$MEMORA_REPLICATION" "${21}" "$GRAPH_BIND" "$GRAPH_PORT" "$GRAPH_TOKEN_PATH" \
+  "$API_ON" "$SECRETS_DIR/$API_TOKENS_NAME" "$SECRETS_DIR/$API_SMOKE_NAME" <<'PY'
 import json, sys, time, urllib.error, urllib.request
 
 EXPECTED_VERSION = sys.argv[1]
@@ -786,6 +814,8 @@ REPLICATION = sys.argv[7]
 STORE_WAIT_S = float(sys.argv[8])   # 90 in production (DEPLOY_STORE_WAIT_S: rehearsals only)
 GRAPH_ROOT = f"http://{sys.argv[9]}:{sys.argv[10]}"
 GRAPH_TOKEN_PATH = sys.argv[11]
+API_ON = sys.argv[12] == "1"
+API_TOKENS_PATH, API_SMOKE_PATH = sys.argv[13], sys.argv[14]
 L6 = ("rollback: a store already cut over (in MEMORA_REPLICAS) follows docs/cutover-runbook.md \"Rollback\" "
       "and the L6 runbook, docs/local-primary-implementation.md §5.3")
 BASE = f"{ROOT}/mcp/memora"
@@ -1030,8 +1060,8 @@ if failed:
 print(f"all {len(STORES)} stores verified: {', '.join(STORES)}")
 
 # The plain JSON API is registered ONLY with MEMORA_API_TOKENS_FILE, which
-# this deploy does not set: /api/v1/... must not exist. REQUIRE an actual
-# HTTP 404 from the running server. A refused connection, a timeout or any
+# this deploy sets only with a tokens file (API_ON): off, REQUIRE an actual
+# HTTP 404 from the running server; on, an actual 401 without a token. A refused connection, a timeout or any
 # other transport error FAILS (8920 is the same port every check above used,
 # so a dead or restarting container here must not pass as "not registered");
 # transport errors are retried for at most ~20 s first. Any other status --
@@ -1084,10 +1114,53 @@ if status != 200 or sorted(dbs.get("databases") or []) != sorted(STORES):
     sys.exit(1)
 print(f"graph UI at {GRAPH_ROOT}: refuses without the token; serves {len(STORES)} stores with it")
 
-if api_status != 404:
-    print(f"/api/v1/memora/health answered {api_status}: the API is registered, but this deploy "
-          "sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)
-    sys.exit(1)
-print(f"/api/v1 not registered (/api/v1/memora/health: {api_status})")
+if not API_ON:
+    if api_status != 404:
+        print(f"/api/v1/memora/health answered {api_status}: the API is registered, but this deploy "
+              "sets no MEMORA_API_TOKENS_FILE", file=sys.stderr)
+        sys.exit(1)
+    print(f"/api/v1 not registered (/api/v1/memora/health: {api_status})")
+else:
+    # API1: ON. Without a token: 401. With the smoke token (if present): 200 on
+    # a store it allows, 403 on a configured store it does not.
+    import hashlib
+
+    if api_status != 401:
+        print(f"/api/v1/memora/health without a token answered {api_status}, not 401", file=sys.stderr)
+        sys.exit(1)
+
+    def _api_health(store, token):
+        req = urllib.request.Request(f"{ROOT}/api/v1/{store}/health",
+                                     headers={"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    import os as _os
+    if not _os.path.exists(API_SMOKE_PATH):
+        print("/api/v1 ON: 401 without a token; no smoke token "
+              f"({API_SMOKE_PATH}), so the per-store checks are skipped")
+    else:
+        token = open(API_SMOKE_PATH).read().strip()
+        allowed = set(json.load(open(API_TOKENS_PATH)).get(hashlib.sha256(token.encode()).hexdigest(), []))
+        ok_store = next((s for s in STORES if s in allowed), None)
+        no_store = next((s for s in STORES if s not in allowed), None)
+        if ok_store is None:
+            print("the smoke token allows none of this server's stores", file=sys.stderr)
+            sys.exit(1)
+        got = _api_health(ok_store, token)
+        if got != 200:
+            print(f"/api/v1/{ok_store}/health with the smoke token answered {got}, not 200", file=sys.stderr)
+            sys.exit(1)
+        line = f"/api/v1 ON: 401 without a token; {ok_store} 200 with the smoke token"
+        if no_store is not None:
+            got = _api_health(no_store, token)
+            if got != 403:
+                print(f"/api/v1/{no_store}/health with the smoke token answered {got}, not 403", file=sys.stderr)
+                sys.exit(1)
+            line += f"; {no_store} 403 (not listed)"
+        print(line)
 PY
 REMOTE

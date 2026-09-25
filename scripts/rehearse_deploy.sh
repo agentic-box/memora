@@ -386,6 +386,11 @@ from memora.schema import install_sync
 c = sqlite3.connect("/data/gamma.db"); install_sync(c, "d1://rh-acct/rh-db", 1); c.close()'
 printf "MEMORA_DATABASES='%s'\nMEMORA_REPLICAS='%s'\nMEMORA_REPLICATION=log\nMEMORA_REPLICATION_INTERVAL_S=2\nMEMORA_REPLICATION_BATCH_ROWS=50\n" \
   "$REG" '{"gamma": "d1://rh-acct/rh-db"}' > "$ENVF"
+# /api/v1 (API1): deploys 1-3 ran without a tokens file (the smoke check
+# required 404); from deploy 4 on, the minted file turns the API on.
+check "mint the smoke token (memora only) with scripts/mint_api_token.sh" \
+  bash "$ROOT/scripts/mint_api_token.sh" --dir "$SECRETS" --stores memora --out "$SECRETS/api-smoke.token"
+grep -q "/api/v1 not registered" "$RH_ROOT/deploy-1.log" && pass "deploy 1 ran with /api/v1 off (404)" || fail "deploy 1: /api/v1 not checked as off"
 if deploy > "$RH_ROOT/deploy-4.log" 2>&1; then pass "deploy with MEMORA_REPLICAS / MEMORA_REPLICATION=log from all.env"; \
   else fail "deploy 4 (exit $?; see deploy-4.log)"; tail -30 "$RH_ROOT/deploy-4.log"; fi
 adopt NEW4_ID container "$NAME"; adopt NEW_IMAGE_ID image "$IMAGE"; adopt_run_tags
@@ -394,6 +399,10 @@ grep -q "store gamma: replicating (log) to d1://rh-acct/rh-db" "$RH_ROOT/deploy-
   && pass "the deploy checked gamma's replication and ran memory_stats on it while frozen (X2: frozen stores serve reads)" \
   || fail "deploy 4 did not check gamma as a frozen replicated store"
 check "wait for /health after deploy 4" wait_health
+grep -q "/api/v1 ON: 401 without a token; memora 200 with the smoke token; alpha 403 (not listed)" "$RH_ROOT/deploy-4.log" \
+  && pass "deploy 4 turned /api/v1 on and smoke-checked it (401, memora 200, alpha 403)" || fail "deploy 4: /api/v1 smoke lines missing"
+"$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q '"MEMORA_API_TOKENS_FILE=/run/secrets/memora/api-tokens.json"' \
+  && pass "the container env names the tokens file on the read-only mount" || fail "MEMORA_API_TOKENS_FILE not passed"
 "$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q 'MEMORA_REPLICATION=log' \
   && pass "the container env carries the local-primary switches from all.env" || fail "MEMORA_REPLICATION not passed through"
 sleep 5

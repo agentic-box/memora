@@ -740,6 +740,7 @@ class _FakeMemora:
         self.health_db = health_db
         self.tool_calls = []
         self.graph_token = None
+        self.api_tokens = None  # API1: {plain token: [stores]}; None = /api/v1 not registered
 
         class H(http.server.BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -756,6 +757,17 @@ class _FakeMemora:
                 self.wfile.write(raw)
 
             def do_GET(self):
+                if self.path.startswith("/api/v1/"):  # API1: the contract's order of checks
+                    if outer.api_tokens is None:
+                        return self._send(404, {})
+                    store = self.path.split("/")[3]
+                    auth = self.headers.get("Authorization", "")
+                    token = auth[7:] if auth.startswith("Bearer ") else None
+                    if token not in outer.api_tokens:
+                        return self._send(401, {"error": {"code": "bad_token"}})
+                    if store not in outer.api_tokens[token]:
+                        return self._send(403, {"error": {"code": "store_forbidden"}})
+                    return self._send(200, {"status": "ok"})
                 if self.path == "/api/databases":  # the graph UI (G1), on the same fake port
                     if self.headers.get("Authorization", "") != f"Bearer {outer.graph_token}":
                         return self._send(401, {"error": "unauthorized", "memora_graph": True})
@@ -814,9 +826,27 @@ def poststart(deploy, tmp_path):
                     f"MEMORA_REPLICAS='{json.dumps({'gamma': 'd1://acct/db3'})}'\nMEMORA_REPLICATION=write\n")
     servers = []
 
-    def run(health_db):
+    def run(health_db, api=None, smoke_token=None, server_api=True, server_table=None):
+        """api: {plain token: [stores]} -> api-tokens.json (digests) in the
+        secrets dir; server_table (default api): the fake's /api/v1 token
+        table, so a host file and a server table can deliberately disagree;
+        server_api=False: the server did not register the API at all;
+        smoke_token: written as api-smoke.token."""
+        import hashlib
+
         fake = _FakeMemora(health_db)
         fake.graph_token = GRAPH_TOKEN
+        for name in ("api-tokens.json", "api-smoke.token"):
+            if (rsec / name).exists():
+                (rsec / name).unlink()
+        if api is not None:
+            fake.api_tokens = (api if server_table is None else server_table) if server_api else None
+            (rsec / "api-tokens.json").write_text(json.dumps(
+                {hashlib.sha256(t.encode()).hexdigest(): v for t, v in api.items()}))
+            os.chmod(rsec / "api-tokens.json", 0o600)
+            if smoke_token is not None:
+                (rsec / "api-smoke.token").write_text(smoke_token + "\n")
+                os.chmod(rsec / "api-smoke.token", 0o600)
         servers.append(fake)
         proc, calls, _ = deploy(runtime_env={
             **REHEARSAL, "DEPLOY_REHEARSAL": "1", "DEPLOY_REHEARSAL_ROOT": str(tmp_path),
@@ -929,7 +959,7 @@ class TestDataDirPinned:
 
 # ---------------------------------------------------------------- REL2: the remote arguments survive ssh
 
-N_REMOTE_ARGS = 25
+N_REMOTE_ARGS = 27
 
 
 def _decode_blob(line):
@@ -963,6 +993,7 @@ class TestRemoteArguments:
         assert params[21:24] == ["100.64.0.10", "8766", "graph.token"]  # G1: the graph publish
         import base64
         assert json.loads(base64.b64decode(params[24])) == PROJECTS    # CFG1: from deploy.env
+        assert params[25:27] == ["api-tokens.json", "api-smoke.token"]  # API1: the file names
 
     def test_spaces_survive_the_transport(self, deploy, tmp_path):
         root = tmp_path / "rh root"
@@ -1258,3 +1289,97 @@ def test_a_service_on_the_old_fixed_port_is_never_reached(deploy, tmp_path):
             lst.accept()  # nobody connected to the old fixed port
     finally:
         lst.close()
+
+
+
+# ---------------------------------------------------------------- API1: /api/v1 on when its tokens file is there
+
+class TestApiTokensFile:
+    def test_absent_file_keeps_the_api_off(self, deploy):
+        proc, calls, _ = deploy()
+        envs = _flag_values(_new_container_run(calls), "-e")
+        assert not [e for e in envs if e.startswith("MEMORA_API_TOKENS_FILE=")]
+        assert "/api/v1: off" in proc.stdout
+
+    def test_present_file_turns_it_on_through_the_mount(self, deploy):
+        tok = deploy.secrets / "api-tokens.json"
+        tok.write_text(json.dumps({"a" * 64: ["memora"]}))
+        os.chmod(tok, 0o600)
+        proc, calls, _ = deploy()
+        envs = _flag_values(_new_container_run(calls), "-e")
+        assert f"MEMORA_API_TOKENS_FILE={SECRETS_MOUNT}/api-tokens.json" in envs
+        assert "/api/v1: ON" in proc.stdout
+
+    def test_the_file_name_is_a_documented_override(self, deploy):
+        tok = deploy.secrets / "clmuxd-tokens.json"
+        tok.write_text(json.dumps({"a" * 64: ["memora"]}))
+        os.chmod(tok, 0o600)
+        proc, calls, _ = deploy(runtime_env={"DEPLOY_API_TOKENS_FILE": "clmuxd-tokens.json"})
+        assert f"MEMORA_API_TOKENS_FILE={SECRETS_MOUNT}/clmuxd-tokens.json" in _flag_values(
+            _new_container_run(calls), "-e")
+
+    @pytest.mark.parametrize("name, mode", [("api-tokens.json", 0o644), ("api-smoke.token", 0o640)])
+    def test_a_loose_file_is_refused_before_anything(self, deploy, name, mode):
+        tok = deploy.secrets / "api-tokens.json"
+        tok.write_text(json.dumps({"a" * 64: ["memora"]}))
+        os.chmod(tok, 0o600)
+        f = deploy.secrets / name
+        f.write_text(f.read_text() if f.exists() else "t" * 43)
+        os.chmod(f, mode)
+        proc, calls, _ = deploy()
+        _secrets_refused(deploy, proc, calls, "mode 0600")
+
+    def test_a_symlinked_tokens_file_is_refused(self, deploy, tmp_path):
+        real = tmp_path / "elsewhere.json"
+        real.write_text("{}")
+        os.chmod(real, 0o600)
+        (deploy.secrets / "api-tokens.json").symlink_to(real)
+        proc, calls, _ = deploy()
+        _secrets_refused(deploy, proc, calls, "regular file")
+
+    def test_the_smoke_token_value_never_leaks(self, deploy):
+        tok = deploy.secrets / "api-tokens.json"
+        tok.write_text(json.dumps({"a" * 64: ["memora"]}))
+        os.chmod(tok, 0o600)
+        smoke = deploy.secrets / "api-smoke.token"
+        smoke.write_text("SmokeTokenValue" + "q" * 30)
+        os.chmod(smoke, 0o600)
+        proc, calls, _ = deploy()
+        assert "SmokeTokenValue" not in _all_argv(calls) + proc.stdout + proc.stderr
+        # the post-start check also covers it: a leak into the env fails the deploy
+        proc, _, _ = deploy(runtime_env={"RUN_INSPECT_EXTRA_ENV": "X=SmokeTokenValue" + "q" * 30})
+        assert proc.returncode != 0 and "exposes a token" in proc.stderr
+
+
+class TestApiSmokeCheck:
+    SMOKE = "smoke-" + "s" * 40
+
+    def test_off_requires_404(self, poststart):
+        proc, _ = poststart({"gamma": {"replication": REPL_OK}})
+        assert "/api/v1 not registered (/api/v1/memora/health: 404)" in proc.stdout, proc.stderr[-1500:]
+
+    def test_on_with_a_smoke_token_checks_200_and_403(self, poststart):
+        proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={self.SMOKE: ["memora", "gamma"]},
+                            smoke_token=self.SMOKE)
+        assert proc.returncode == 0, proc.stderr[-1500:]
+        assert "/api/v1 ON: 401 without a token; memora 200 with the smoke token; alpha 403 (not listed)" in proc.stdout
+
+    def test_on_without_a_smoke_token_checks_401_only(self, poststart):
+        proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={"other-" + "o" * 40: ["memora"]})
+        assert proc.returncode == 0, proc.stderr[-1500:]
+        assert "401 without a token; no smoke token" in proc.stdout
+
+    def test_on_but_the_allowed_store_answers_403_is_a_failure(self, poststart):
+        # the host file allows memora, but the server's table (the fake) does
+        # not: the per-store 200 check must fail the deploy.
+        proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={self.SMOKE: ["memora"]},
+                            smoke_token=self.SMOKE, server_table={self.SMOKE: ["alpha"]})
+        assert proc.returncode != 0, proc.stdout[-1500:]
+        assert "health with the smoke token answered 403, not 200" in proc.stderr, proc.stderr[-1500:]
+
+    def test_on_but_the_server_still_answers_404_is_a_failure(self, poststart):
+        """The file is there but the server did not register the API (e.g. it
+        refused the file): 404 without a token fails the deploy."""
+        proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={self.SMOKE: ["memora"]},
+                            smoke_token=self.SMOKE, server_api=False)
+        assert proc.returncode != 0 and "without a token answered 404, not 401" in proc.stderr
