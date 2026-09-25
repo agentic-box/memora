@@ -348,6 +348,41 @@ def current_backend():
     return STORAGE_BACKEND
 
 
+def store_is_transactional(store: str) -> bool:
+    """API2: is this /api/v1 store on a backend whose writer connections can
+    hold absorb's phase 3 in ONE transaction? The same condition as
+    `_has_transactions(conn)`: only `LocalSQLiteBackend` opens connections
+    with `supports_transactions=True`; D1, CloudSQLite and local reads do not.
+
+    Side-effect free: it resolves the backend object (which touches no file)
+    and checks its type, so `/health` stays read-only. A refused or
+    misconfigured store is False (fail closed). The route only calls this for
+    a store `_admit_store` already validated, so `store` names a configured
+    store: with a registry it is the registry name, without one it is the
+    single legacy store."""
+    from .backends import LocalSQLiteBackend
+    from .data_volume import DataVolumeRefused
+
+    try:
+        registry = database_registry()
+    except DatabaseRegistryError:
+        return False  # a malformed registry fails closed, like current_backend
+    name = store if registry else None
+    try:
+        if name is not None:
+            # backend_for raises DataVolumeRefused for a startup refusal; a
+            # misconfigured entry raises DatabaseRegistryError.
+            backend = backend_for(name)
+        else:
+            _raise_if_refused(None)  # the registry-less store's data-volume refusal
+            backend = STORAGE_BACKEND
+    except (DatabaseRegistryError, DataVolumeRefused):
+        return False
+    if getattr(backend, "refused_reason", None) is not None:
+        return False  # fence()/fk_gate() refused this store in this process
+    return isinstance(backend, LocalSQLiteBackend)
+
+
 # Embedding backend configuration
 EMBEDDING_MODEL = os.getenv("MEMORA_EMBEDDING_MODEL", "openai")  # openai, sentence-transformers, tfidf
 
@@ -7479,7 +7514,8 @@ def _absorb_pregate_job(conn: sqlite3.Connection, corpus: "_CorpusSnapshot", job
 
 
 def _absorb_phase3_transactional(conn, corpus, phase3_jobs, run_phase3, decisions, counts, owned_ids,
-                                 appended_ids, *, context: Optional[str]) -> Dict[str, Any]:
+                                 appended_ids, *, context: Optional[str],
+                                 phase3_done: Optional[Callable[[sqlite3.Connection, Dict[str, Any], List[int]], None]] = None) -> Dict[str, Any]:
     """Absorb phase 3 as ONE store_write (BEGIN IMMEDIATE) with no network
     call under the lock (plan §3). Supersede checks run first, outside; a
     leaf that still needs a check inside rolls the transaction back, is gated
@@ -7509,6 +7545,11 @@ def _absorb_phase3_transactional(conn, corpus, phase3_jobs, run_phase3, decision
             try:
                 with store_write(conn):
                     run_phase3(offline)
+                    # API2: the /api/v1 executor writes its fenced `done` row
+                    # here, inside the SAME transaction as every effect. A
+                    # raise rolls the whole absorb back (the fence rule).
+                    if phase3_done is not None:
+                        phase3_done(conn, dict(counts), list(owned_ids))
                 break
             except _NeedsRegate as need:
                 reset()
@@ -7536,6 +7577,7 @@ def absorb_memory(
     tags: Optional[List[str]] = None,
     dry_run: bool = False,
     project: Optional[str] = None,
+    phase3_done: Optional[Callable[[sqlite3.Connection, Dict[str, Any], List[int]], None]] = None,
 ) -> Dict[str, Any]:
     """Intelligently absorb facts; see _absorb_memory_impl.
 
@@ -7550,7 +7592,7 @@ def absorb_memory(
             result = _absorb_memory_impl(
                 conn, facts, source=source, confidence=confidence,
                 context=context, metadata=metadata, tags=tags, dry_run=dry_run,
-                project=project,
+                project=project, phase3_done=phase3_done,
             )
         except BaseException as exc:
             summary = profile.finish()
@@ -7576,6 +7618,7 @@ def _absorb_memory_impl(
     tags: Optional[List[str]] = None,
     dry_run: bool = False,
     project: Optional[str] = None,
+    phase3_done: Optional[Callable[[sqlite3.Connection, Dict[str, Any], List[int]], None]] = None,
 ) -> Dict[str, Any]:
     """Intelligently absorb facts into memory with dedup and reconciliation.
 
@@ -8284,7 +8327,7 @@ def _absorb_memory_impl(
     if tx:
         return _absorb_phase3_transactional(
             conn, corpus, phase3_jobs, _run_phase3, decisions, counts, owned_ids, appended_ids,
-            context=context,
+            context=context, phase3_done=phase3_done,
         )
 
     try:

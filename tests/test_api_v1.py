@@ -81,6 +81,9 @@ def api(request, tmp_path, monkeypatch):
     app = mcp.streamable_http_app()
     with TestClient(app) as client:
         client.mcp = mcp
+        # API2: the expected writes capability for this backend (the pytest
+        # `request` fixture is shadowed in tests here, so record it).
+        client.expected_writes = "transactional" if request.param == "sqlite" else "unsupported"
         yield client
     storage._corpus_cache.clear()
 
@@ -121,7 +124,8 @@ def test_health_ok_reports_capability_and_projects(api):
     r = api.get("/api/v1/memora/health", headers=AUTH)
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["status"] == "ok" and body["writes"] == "unsupported"
+    # API2: a local SQLite store is transactional; the D1 double is not.
+    assert body["status"] == "ok" and body["writes"] == api.expected_writes
     assert body["projects"] == ["clmux", "memora"] and body["supervisor"] is None
     assert body["api_version"] == "v1" and body["contract_version"] == api_v1.CONTRACT_VERSION
     assert body["mode"] == "hybrid-v1" and body["version"] == memora.__version__
@@ -224,7 +228,12 @@ ABSORB = {"idempotency_key": "landing:clmux:dev:abc123", "project": "clmux",
           "facts": ["a landed fact"], "source": "landing"}
 
 
-def test_absorb_is_501_and_writes_nothing(api):
+def test_writes_capability_follows_the_backend(api):
+    assert api_v1.writes_capability("memora") == api.expected_writes
+
+
+def test_absorb_is_501_and_writes_nothing(api, monkeypatch):
+    monkeypatch.setattr(api_v1, "writes_capability", lambda store: "unsupported")
     with _connect_store() as conn:
         before = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
     r = api.post("/api/v1/memora/absorb", headers=AUTH, json=ABSORB)
@@ -232,6 +241,18 @@ def test_absorb_is_501_and_writes_nothing(api):
     assert r.json()["error"] == "writes_unsupported" and r.json()["writes"] == "unsupported"
     with _connect_store() as conn:
         assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == before
+
+
+def test_absorb_runs_on_a_local_store_and_replays(api, monkeypatch):
+    if api.expected_writes != "transactional":
+        pytest.skip("API2 writes are local-primary only")
+    monkeypatch.setattr(storage, "_search_snapshot_full", lambda *a, **k: [])
+    first = api.post("/api/v1/memora/absorb", headers=AUTH, json=ABSORB)
+    assert first.status_code == 200, first.text
+    body = first.json()
+    assert body["status"] == "done" and body["created"] == 1 and body["memory_ids"]
+    second = api.post("/api/v1/memora/absorb", headers=AUTH, json=ABSORB)
+    assert second.status_code == 200 and second.json() == body
 
 
 @pytest.mark.parametrize("patch", [

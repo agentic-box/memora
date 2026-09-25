@@ -220,6 +220,8 @@ def schema_pending(conn) -> List[str]:
     for typ, name in sorted(ref["objects"]):
         if d1 and name.startswith("memories_fts"):
             continue  # _ensure_fts skips D1
+        if d1 and name == "api_idempotency":
+            continue  # local-only /api/v1 idempotency table (API2)
         if (typ, name) not in have:
             pending.append(f"{typ} {name}")
     for table in sorted({t for t, _ in ref["added_columns"]}):
@@ -286,6 +288,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_tombstones_table(conn)
     _ensure_absorb_inflight_table(conn)
     _ensure_import_lease_table(conn)
+    _ensure_api_idempotency_table(conn)
     _ensure_sync_outbox(conn)
 
 
@@ -547,6 +550,31 @@ def _ensure_absorb_inflight_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_absorb_inflight_lease "
         "ON absorb_inflight(lease_until, status)"
+    )
+    conn.commit()
+
+
+def _ensure_api_idempotency_table(conn: sqlite3.Connection) -> None:
+    """The /api/v1 absorb idempotency table (API2, plan §3.2). Local only:
+    D1 has no write path (Option B), and the table is not in SYNC_TABLES, so
+    it never replicates. `done` with a stored response_json is the only
+    completion boundary."""
+    if isinstance(conn, D1Connection):
+        return
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_idempotency (
+            key TEXT PRIMARY KEY,
+            request_sha256 TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('in_progress', 'done', 'failed_clean')),
+            owner TEXT,
+            fence INTEGER NOT NULL DEFAULT 0,
+            response_json TEXT,
+            lease_until_ms INTEGER,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL
+        )
+        """
     )
     conn.commit()
 

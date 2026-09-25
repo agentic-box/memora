@@ -14,6 +14,12 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+`/api/v1` absorb writes are real on local-primary stores (API2).
+
+- `POST /api/v1/<store>/absorb` runs the L4 transactional absorb and is exactly-once: a claim in `api_idempotency` plus a fenced `done` row written in the same transaction as the effects; the same key and request replays the stored response, a live claim answers 409 `in_progress`, a different request under the same key answers 409 `key_conflict`, and an expired claim is taken over with `fence+1`.
+- `/health` reports `writes: "transactional"` for a local SQLite primary; D1 and read-only stores stay `unsupported` and the absorb route still 501s there.
+- Tags `landing`, `clmux` and `memora` are in `DEFAULT_TAGS`; the deploy smoke asserts `writes=transactional` when a smoke token exists.
+
 ## 0.5.6 — 2026-09-25
 
 The deploy can turn on the `/api/v1` JSON API (API1).

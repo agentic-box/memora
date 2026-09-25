@@ -225,14 +225,20 @@ def configured_stores() -> Tuple[Dict[str, Optional[str]], Optional[str]]:
 # --------------------------------------------------------------------------
 
 def writes_capability(store: str) -> str:
-    """"transactional" or "unsupported". Phase 0: no store is transactional
-    -- memora's absorb is not yet one fenced transaction on any backend
-    (that is Phase L), so every store is "unsupported"."""
-    return "unsupported"
+    """"transactional" or "unsupported". API2: "transactional" iff the store
+    is on a local SQLite primary, the only backend whose writer can hold
+    absorb's phase 3 in one transaction (the same condition as L4's
+    storage._has_transactions). D1, cloud and refused stores stay
+    "unsupported". This opens no connection, so /health stays read-only."""
+    from .storage import store_is_transactional
+
+    return "transactional" if store_is_transactional(store) else "unsupported"
 
 
-# Phase L installs a callable (store, request_dict) -> (http_status, body)
-# implementing §3.2's claim / fenced-done protocol. None in Phase 0.
+# API2 (docs/api-v1-writes.md): the (store, request_dict) -> (http_status,
+# body) executor implementing §3.2's claim / fenced-done protocol. It is
+# installed when the routes register and is only reached for a store whose
+# writes_capability is "transactional".
 absorb_executor: Optional[Callable[[str, Dict[str, Any]], Tuple[int, Dict[str, Any]]]] = None
 
 
@@ -731,5 +737,9 @@ def register_api_routes(mcp: Any, *, bind_host: str, env: Optional[Mapping[str, 
                 return _error(500, "internal", "absorb failed")
         return _json(body, status)
 
+    from . import api_absorb
+
+    global absorb_executor
+    absorb_executor = api_absorb.execute  # only reached when the store is transactional
     logger.info("api/v1 registered on %s (%d tokens)", bind_host, len(tokens))
     return True

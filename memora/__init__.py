@@ -60,6 +60,12 @@ DEFAULT_TAGS = {
     "dataset",
     "model",
     "analysis",
+    # API2 (plan §6.3/§13 Q4): the landing records use ["landing", "<repo_id>"];
+    # the deploy sets MEMORA_ALLOW_ANY_TAG=1 today, so these matter for a
+    # container that does not -- see docs/api-v1-writes.md.
+    "landing",
+    "clmux",
+    "memora",
 }
 
 

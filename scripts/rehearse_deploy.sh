@@ -399,8 +399,8 @@ grep -q "store gamma: replicating (log) to d1://rh-acct/rh-db" "$RH_ROOT/deploy-
   && pass "the deploy checked gamma's replication and ran memory_stats on it while frozen (X2: frozen stores serve reads)" \
   || fail "deploy 4 did not check gamma as a frozen replicated store"
 check "wait for /health after deploy 4" wait_health
-grep -q "/api/v1 ON: 401 without a token; memora 200 with the smoke token; alpha 403 (not listed)" "$RH_ROOT/deploy-4.log" \
-  && pass "deploy 4 turned /api/v1 on and smoke-checked it (401, memora 200, alpha 403)" || fail "deploy 4: /api/v1 smoke lines missing"
+grep -q "/api/v1 ON: 401 without a token; memora 200 with the smoke token (writes=transactional); alpha 403 (not listed)" "$RH_ROOT/deploy-4.log" \
+  && pass "deploy 4 turned /api/v1 on and smoke-checked it (401, memora 200 writes=transactional, alpha 403)" || fail "deploy 4: /api/v1 smoke lines missing"
 "$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q '"MEMORA_API_TOKENS_FILE=/run/secrets/memora/api-tokens.json"' \
   && pass "the container env names the tokens file on the read-only mount" || fail "MEMORA_API_TOKENS_FILE not passed"
 "$RT" inspect "$NAME" --format '{{json .Config.Env}}' | grep -q 'MEMORA_REPLICATION=log' \

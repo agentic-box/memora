@@ -1134,9 +1134,9 @@ else:
                                      headers={"Authorization": f"Bearer {token}"})
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.status
+                return resp.status, json.loads(resp.read() or b"{}")
         except urllib.error.HTTPError as exc:
-            return exc.code
+            return exc.code, {}
 
     import os as _os
     if not _os.path.exists(API_SMOKE_PATH):
@@ -1150,13 +1150,19 @@ else:
         if ok_store is None:
             print("the smoke token allows none of this server's stores", file=sys.stderr)
             sys.exit(1)
-        got = _api_health(ok_store, token)
+        got, health = _api_health(ok_store, token)
         if got != 200:
             print(f"/api/v1/{ok_store}/health with the smoke token answered {got}, not 200", file=sys.stderr)
             sys.exit(1)
-        line = f"/api/v1 ON: 401 without a token; {ok_store} 200 with the smoke token"
+        # API2: /api/v1 writes are real only on a local primary (Phase L).
+        if health.get("writes") != "transactional":
+            print(f"/api/v1/{ok_store}/health reports writes={health.get('writes')!r}, not 'transactional': "
+                  "API2 writes need a local primary", file=sys.stderr)
+            sys.exit(1)
+        line = (f"/api/v1 ON: 401 without a token; {ok_store} 200 with the smoke token "
+                "(writes=transactional)")
         if no_store is not None:
-            got = _api_health(no_store, token)
+            got, _ = _api_health(no_store, token)
             if got != 403:
                 print(f"/api/v1/{no_store}/health with the smoke token answered {got}, not 403", file=sys.stderr)
                 sys.exit(1)

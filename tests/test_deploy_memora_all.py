@@ -767,7 +767,8 @@ class _FakeMemora:
                         return self._send(401, {"error": {"code": "bad_token"}})
                     if store not in outer.api_tokens[token]:
                         return self._send(403, {"error": {"code": "store_forbidden"}})
-                    return self._send(200, {"status": "ok"})
+                    # API2: a local primary reports writes=transactional.
+                    return self._send(200, {"status": "ok", "writes": "transactional"})
                 if self.path == "/api/databases":  # the graph UI (G1), on the same fake port
                     if self.headers.get("Authorization", "") != f"Bearer {outer.graph_token}":
                         return self._send(401, {"error": "unauthorized", "memora_graph": True})
@@ -1362,7 +1363,8 @@ class TestApiSmokeCheck:
         proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={self.SMOKE: ["memora", "gamma"]},
                             smoke_token=self.SMOKE)
         assert proc.returncode == 0, proc.stderr[-1500:]
-        assert "/api/v1 ON: 401 without a token; memora 200 with the smoke token; alpha 403 (not listed)" in proc.stdout
+        assert ("/api/v1 ON: 401 without a token; memora 200 with the smoke token "
+                "(writes=transactional); alpha 403 (not listed)") in proc.stdout
 
     def test_on_without_a_smoke_token_checks_401_only(self, poststart):
         proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={"other-" + "o" * 40: ["memora"]})
