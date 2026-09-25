@@ -243,8 +243,11 @@ def test_a_later_valid_start_clears_the_refusal(configured, monkeypatch):
 
 
 def test_an_uncertain_outcome_also_waits_the_interval(env):
-    """Review 7787 P2: a batch that reached D1 but failed before the ack is
-    reconciled no sooner than one interval after that send started."""
+    """Review 7787 P2 / FLK4: a batch that reached D1 but failed before the ack
+    is reconciled no sooner than one interval after that send started. The
+    reconcile may PROVE the batch applied and ack without a second send, so the
+    invariant is timed on the ack itself; a write is required only when one was
+    actually sent."""
     local, replica, sends = env
     d1 = []  # monotonic time of every D1 request
     post, read = replica.post_json, replica.reader_post
@@ -254,15 +257,28 @@ def test_an_uncertain_outcome_also_waits_the_interval(env):
     rep = _rep(local, replica, interval_s=2.0, poll_s=0.05)
     _insert(local, [1])
     rep.start()
+    acked_at = None
+
+    def acked():
+        nonlocal acked_at
+        if sync_state(local)["last_acked_seq"] == _head(local):
+            if acked_at is None:
+                acked_at = time.monotonic()
+            return True
+        return False
+
     try:
         assert _wait(lambda: any(k == "write" for k, _ in d1), 5)
         failed_at = next(t for k, t in d1 if k == "write")
         replica.apply_then_raise = None
-        assert _wait(lambda: sync_state(local)["last_acked_seq"] == _head(local), 10)
+        assert _wait(acked, 10)
     finally:
         rep.stop()
-    after = [t for _, t in d1 if t > failed_at]
-    assert after and after[0] - failed_at >= 2.0 - 0.3, (after[0] - failed_at if after else None)
+    assert acked_at is not None, "the batch was never acked"
+    assert acked_at - failed_at >= 2.0 - 0.3, (acked_at - failed_at, d1)
+    writes_after = [t for k, t in d1 if k == "write" and t > failed_at]
+    if writes_after:  # only when the recheck could not prove the batch applied
+        assert writes_after[0] - failed_at >= 2.0 - 0.3, (writes_after[0] - failed_at, d1)
 
 
 def test_health_shows_the_sync_schema_it_read(env):

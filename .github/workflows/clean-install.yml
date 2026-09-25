@@ -33,6 +33,10 @@ jobs:
         # develop on much newer, so "works here" says nothing about the floor.
         python: ["3.10", "3.13"]
 
+    # A hang must fail fast instead of burning a runner for hours (FLK4): the
+    # 3.10 leg once ran 40+ min on a step that normally takes ~10.
+    timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
