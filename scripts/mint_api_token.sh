@@ -33,7 +33,7 @@ done
 [ -n "$STORES" ] && [ -n "$OUT" ] || { echo "usage: $0 --stores a,b --out FILE [--dir DIR] [--tokens-file NAME]" >&2; exit 2; }
 
 exec python3 - "$STORES" "$OUT" "$DIR" "$NAME" <<'PY'
-import base64, hashlib, json, os, re, secrets, stat, sys
+import base64, hashlib, json, os, re, secrets, stat, sys, tempfile
 
 stores_arg, out, directory, name = sys.argv[1:]
 NAME_RE = re.compile(r"^[a-z0-9_-]{1,64}$")          # memora/api_v1.py NAME_RE
@@ -62,6 +62,8 @@ except OSError:
 if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
     refuse(f"{directory} must be a directory (not a symlink) owned by this user")
 path = os.path.join(directory, name)
+if os.path.realpath(out) == os.path.realpath(path):
+    refuse("--out must not be the tokens file itself")
 table = {}
 if os.path.lexists(path):
     st = os.lstat(path)
@@ -84,24 +86,40 @@ if len(body) > MAX:
     refuse(f"the tokens file would exceed {MAX} bytes")
 
 # The plain token first (a new 0600 file), then the digest (atomic replace).
-fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+# Never write both to the same path (checked above): the digest write would
+# silently replace the plain token, leaving an authorized digest nobody can
+# use (review 8232). A UNIQUE temp file next to the tokens file, and only a
+# temp this invocation created is ever removed.
+created_out = False
+tmp = None
 try:
-    os.write(fd, (token + "\n").encode("utf-8"))
-    os.fsync(fd)
-finally:
-    os.close(fd)
-tmp = path + ".mint-tmp"
-try:
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    created_out = True
+    try:
+        os.write(fd, (token + "\n").encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fd, tmp = tempfile.mkstemp(prefix=name + ".", suffix=".mint-tmp", dir=directory)
     try:
         os.write(fd, body)
         os.fsync(fd)
     finally:
         os.close(fd)
     os.replace(tmp, path)
-except BaseException:
-    if os.path.exists(tmp):
-        os.unlink(tmp)
-    os.unlink(out)  # no orphan token without its digest
+    tmp = None
+except BaseException as exc:
+    if tmp is not None:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+    if created_out:
+        try:
+            os.unlink(out)  # no orphan token without its digest
+        except OSError:
+            pass
+    if isinstance(exc, OSError):
+        refuse(f"cannot write the token and digest files: {exc}")
     raise
 PY

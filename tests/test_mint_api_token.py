@@ -101,6 +101,25 @@ def test_the_4k_limit_is_kept(secrets, tmp_path):
     assert f.read_text() == before and not (tmp_path / "t.token").exists()
 
 
+def test_out_must_not_be_the_tokens_file(secrets, tmp_path):
+    # review 8232: on a first mint neither file exists, but passing the tokens
+    # file as --out would overwrite the plain token with the digest JSON.
+    r = _mint(secrets, secrets / "api-tokens.json", "--stores", "memora")
+    assert r.returncode == 2 and "must not be the tokens file" in r.stderr
+    assert not (secrets / "api-tokens.json").exists()
+
+
+def test_a_stale_temp_file_is_not_removed(secrets, tmp_path):
+    # review 8232: the old fixed temp name collided and its cleanup deleted a
+    # pre-existing file; a unique temp name leaves it alone.
+    stale = secrets / "api-tokens.json.mint-tmp"
+    stale.write_text("someone else's temp")
+    out = tmp_path / "t.token"
+    r = _mint(secrets, out, "--stores", "memora")
+    assert r.returncode == 0, r.stderr
+    assert stale.read_text() == "someone else's temp"
+
+
 def test_a_missing_directory_is_refused(tmp_path):
     r = subprocess.run(["bash", str(SCRIPT), "--dir", str(tmp_path / "nope"), "--out", str(tmp_path / "t"),
                         "--stores", "memora"], capture_output=True, text=True, timeout=30)
