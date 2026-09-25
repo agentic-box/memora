@@ -826,17 +826,24 @@ def connect(*, check_same_thread: bool = True) -> sqlite3.Connection:
     return _connect(current_backend(), check_same_thread=check_same_thread)
 
 
-def connect_without_schema(*, check_same_thread: bool = True) -> sqlite3.Connection:
+def connect_without_schema(*, check_same_thread: bool = True,
+                           timeout: Optional[float] = None) -> sqlite3.Connection:
     """A connection that NEVER runs schema setup (no CREATE / ALTER / INSERT
     OR IGNORE): for read-only callers -- the plain JSON API and the readiness
     probe -- which must have no write path. The schema is set up by the
     writing paths (startup pre-warm, MCP tools, CLI); a store without one
     fails its queries instead of being created by a read. Local SQLite opens
     in read-only URI mode (no mkdir, no new file; a missing database raises
-    backends.StoreMissingError); D1 and other backends open as usual."""
+    backends.StoreMissingError); D1 and other backends open as usual.
+
+    `timeout` (seconds) bounds the wait for an in-process read lock on a local
+    store, so the readiness probe cannot block forever behind a wedged writer;
+    None keeps the historical unbounded wait."""
     backend = current_backend()
-    opener = getattr(backend, "connect_read_only", None) or backend.connect
-    return opener(check_same_thread=check_same_thread)
+    opener = getattr(backend, "connect_read_only", None)
+    if opener is not None:
+        return opener(check_same_thread=check_same_thread, timeout=timeout)
+    return backend.connect(check_same_thread=check_same_thread)
 
 
 def sync_to_cloud() -> None:

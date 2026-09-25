@@ -648,6 +648,40 @@ class TestTimedOutProbesAreTrulyAbandoned:
         )
         _t.sleep(3.2)
 
+    def test_interpreter_exit_does_not_wait_for_a_stuck_probe(self):
+        """FLK4b: an abandoned probe must not keep the interpreter alive.
+
+        A daemon worker cannot be joined by concurrent.futures._python_exit,
+        so a probe blocked in a never-returning fake still lets the process
+        exit. Only a fresh interpreter can prove the exit property, so this
+        runs in a subprocess.
+        """
+        import subprocess
+        import sys
+        import textwrap
+        import time
+
+        script = textwrap.dedent(
+            """
+            import time
+            import memora.health as health
+            import memora.storage as storage
+            health.REFRESH_DEADLINE_S = 0.3
+            storage.connect_without_schema = lambda *a, **k: time.sleep(10**6)
+            print(health.readiness_payload()["status"], flush=True)
+            """
+        )
+        env = {k: v for k, v in os.environ.items() if not k.startswith("MEMORA_")}
+        started = time.monotonic()
+        proc = subprocess.run([sys.executable, "-c", script],
+                              capture_output=True, text=True, timeout=30, env=env)
+        elapsed = time.monotonic() - started
+        assert proc.returncode == 0, proc.stderr
+        assert elapsed < 15, (
+            f"the interpreter waited {elapsed:.1f}s for a stuck probe "
+            f"(stdout={proc.stdout!r} stderr={proc.stderr!r})"
+        )
+
 
 class TestTuningRelationship:
     def test_max_stale_below_ttl_is_refused(self):

@@ -219,10 +219,12 @@ class StorageBackend(ABC):
         """
         pass
 
-    def connect_read_only(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    def connect_read_only(self, *, check_same_thread: bool = True,
+                          timeout: Optional[float] = None) -> sqlite3.Connection:
         """A connection for READ-ONLY callers (the plain JSON API, readiness
         probes). Default: connect(). Local SQLite overrides it so a read never
-        creates a file or directory."""
+        creates a file or directory; `timeout` bounds an internal lock wait
+        there, while the cloud/D1 paths use their own network timeouts."""
         return self.connect(check_same_thread=check_same_thread)
 
     @abstractmethod
@@ -265,12 +267,22 @@ class _StoreRWLock:
         self._deferred: list = []  # writer connections the GC could not close yet
         self._draining = False
 
-    def acquire_shared(self) -> None:
+    def acquire_shared(self, timeout: Optional[float] = None) -> None:
+        """Take the shared side. `timeout` (seconds) bounds the wait so a
+        read-only caller -- the readiness probe -- cannot block forever behind
+        a wedged writer; None keeps the historical unbounded wait."""
         me = threading.get_ident()
+        deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             if me not in self._readers:
                 while self._writer or self._waiting_writers:
-                    self._cond.wait()
+                    if deadline is None:
+                        self._cond.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise StoreLockedError("read lock not acquired within the read-only timeout")
+                        self._cond.wait(remaining)
             self._readers[me] = self._readers.get(me, 0) + 1
 
     def release_shared(self, holder: Optional[int] = None) -> None:
@@ -1081,9 +1093,11 @@ class LocalSQLiteBackend(StorageBackend):
             conn._memora_gate = self.write_gate()
         return conn
 
-    def connect_read_only(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+    def connect_read_only(self, *, check_same_thread: bool = True,
+                          timeout: Optional[float] = None) -> sqlite3.Connection:
         """A read that NEVER creates a file (no directory, database, -wal or
-        -shm) -- for writers in THIS process; a read may be REFUSED.
+        -shm) -- for writers in THIS process; a read may be REFUSED. `timeout`
+        bounds the wait for the in-process read lock.
 
         The whole read -- from this open to the returned connection's close
         -- holds the SHARED side of the store's process-wide lock, so no
@@ -1116,7 +1130,7 @@ class LocalSQLiteBackend(StorageBackend):
             raise StoreLockedError(f"store refused in this process: {self.refused_reason}")
         path = self.db_path
         lock = _store_lock(path)
-        lock.acquire_shared()
+        lock.acquire_shared(timeout)
         try:
             if not path.is_file():
                 raise StoreMissingError(f"no database file at {path}")

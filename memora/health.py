@@ -36,11 +36,13 @@ status only.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import hmac
 import ipaddress
 import os
+import queue
 import threading
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 import time
 from typing import Any, Dict, Optional
 
@@ -159,13 +161,15 @@ def _probe_one(name: Optional[str]) -> Dict[str, Any]:
     row count is both costlier and unnecessary inventory to expose.
     """
     # Read-only: no schema setup (it writes), and a missing local database is
-    # an error here, never created by a probe.
+    # an error here, never created by a probe. The per-call timeout bounds the
+    # one unbounded blocking path (a local store's in-process read lock); the
+    # HTTP/S3 paths already carry their own timeouts.
     from .storage import connect_without_schema
 
     started = time.time()
     token = CURRENT_DB.set(name) if name is not None else None
     try:
-        conn = connect_without_schema()
+        conn = connect_without_schema(timeout=REFRESH_DEADLINE_S)
         try:
             # One row at most, never a count: proves the store answers AND
             # has its schema (a store without one fails here).
@@ -194,7 +198,77 @@ def _probe_one(name: Optional[str]) -> Dict[str, Any]:
 # return, and with a genuinely hung backend the single refresh slot stuck
 # forever. The test asserted the payload but not the elapsed time, so it was
 # vacuous for the property it claimed.
-_probe_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="memora-health")
+class _ProbePool:
+    """Daemon worker threads for readiness probes (FLK4b).
+
+    A ThreadPoolExecutor worker is non-daemon and concurrent.futures joins
+    every worker at interpreter exit, so ONE abandoned probe keeps the whole
+    process alive; an atexit shutdown(wait=False) cannot help because
+    _python_exit joins before normal atexit handlers (measured). These workers
+    are daemon: exit never waits for a probe. The submit()/done()/result()
+    surface is the one `_probe_all` already uses, so healthy probes are
+    unchanged. shutdown() cancels queued work and is also registered with
+    atexit for hygiene."""
+
+    def __init__(self, max_workers: int, thread_name_prefix: str):
+        self._max_workers = max_workers
+        self._thread_name_prefix = thread_name_prefix
+        self._work: "queue.Queue" = queue.Queue()
+        self._lock = threading.Lock()
+        self._threads: list = []
+        self._closed = False
+
+    def submit(self, fn, *args) -> Future:
+        fut: Future = Future()
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("the readiness probe pool is shut down")
+            self._work.put((fut, fn, args))
+            if len(self._threads) < self._max_workers:
+                t = threading.Thread(
+                    target=self._worker,
+                    name=f"{self._thread_name_prefix}_{len(self._threads)}",
+                    daemon=True,
+                )
+                self._threads.append(t)
+                t.start()
+        return fut
+
+    def _worker(self) -> None:
+        while True:
+            item = self._work.get()
+            if item is None:
+                return
+            fut, fn, args = item
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as exc:
+                fut.set_exception(exc)
+
+    def shutdown(self, wait: bool = False, *, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._closed = True
+        if cancel_futures:
+            while True:
+                try:
+                    item = self._work.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    item[0].cancel()
+        for _ in self._threads:
+            self._work.put(None)
+        if wait:
+            for t in self._threads:
+                t.join()
+
+
+_probe_pool = _ProbePool(max_workers=8, thread_name_prefix="memora-health")
+# Daemon workers already make exit independent of a stuck probe; this is
+# defensive, so queued probes never start once shutdown has begun.
+atexit.register(_probe_pool.shutdown, wait=False, cancel_futures=True)
 # name -> in-flight future. A name is never resubmitted while its previous
 # probe is still running; shutdown(wait=False) alone would leak one thread per
 # refresh against a permanently hung store.
