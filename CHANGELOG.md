@@ -14,6 +14,8 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.7 — 2026-09-25
+
 `/api/v1` absorb writes are real on local-primary stores (API2).
 
 - `POST /api/v1/<store>/absorb` runs the L4 transactional absorb and is exactly-once: a claim in `api_idempotency` plus a fenced `done` row written in the same transaction as the effects; the same key and request replays the stored response, a live claim answers 409 `in_progress`, a different request under the same key answers 409 `key_conflict`, and an expired claim is taken over with `fence+1`.

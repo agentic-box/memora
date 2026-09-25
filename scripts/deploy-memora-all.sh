@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (on DEPLOY_HOST) to v0.5.6: fetch +
+# Full deploy of the live memora-all container (on DEPLOY_HOST) to v0.5.7: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
 # CONFIGURATION (CFG1): the deploy host, the graph's publish address, the
@@ -76,7 +76,7 @@
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
 # Steps, all on deploy-host:
-#  1. git fetch + checkout the v0.5.6 tag in the deploy-host checkout, docker build.
+#  1. git fetch + checkout the v0.5.7 tag in the deploy-host checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
@@ -93,7 +93,7 @@
 #     as memora-all-grok-<ts> (the name predates the model switch being a
 #     no-op; it still means "the container before this deploy", and the
 #     rollback commands below depend on it).
-#  5. Wait for GET /health, check it reports version 0.5.6 (proves the new
+#  5. Wait for GET /health, check it reports version 0.5.7 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
 #     dry-run memory_absorb call, one memory_semantic_search call and one
 #     memory_stats call, asserting no JSON-RPC error and a real session id at
@@ -161,7 +161,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="${DEPLOY_TAG:-v0.5.6}"
+TAG="${DEPLOY_TAG:-v0.5.7}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The production values that identify real infrastructure (CFG1) are NOT in
 # this public script: they come from the operator's git-ignored
@@ -230,7 +230,7 @@ OVERRIDDEN=()
 while IFS='|' read -r var label default; do
   [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
 done <<DEFAULTS
-TAG|DEPLOY_TAG|v0.5.6
+TAG|DEPLOY_TAG|v0.5.7
 DEPLOY_HOST|DEPLOY_HOST|$CFG_DEPLOY_HOST
 RUNTIME|RUNTIME|docker
 DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
