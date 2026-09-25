@@ -81,9 +81,8 @@ created, used or held.
   example `{"ad1e…7823": ["memora", "alpha"]}`. The file never holds a token.
 - The API **always** needs a tokens file. Without `MEMORA_API_TOKENS_FILE`
   the routes are not registered on any bind address, loopback included, and
-  startup logs at INFO (issue 1131) -- an intentional state, not an error.
-  Every request needs a token that lists the store, from any address. Local
-  smoke tests use a scratch tokens file.
+  startup logs an error. Every request needs a token that lists the store,
+  from any address. Local smoke tests use a scratch tokens file.
 - The tokens file is opened `O_RDONLY | O_NOFOLLOW | O_CLOEXEC` and checked on
   the descriptor: a regular file, owned by the server's effective uid, no
   group/other permission bits, at most 4 KiB. Every parent directory is
@@ -91,11 +90,8 @@ created, used or held.
   world-writable). For a file under `$HOME`, parents up to `$HOME` must be
   owned by the server's user. For any other file (a container secret),
   parents up to `/` must be owned by that user or root, so `/tmp` (world-
-  writable) is refused. **When the file sits on a read-only mount** (the
-  deploy's secrets mount, where rootful docker reads the operator's file as
-  root; `statvfs` reports `ST_RDONLY`), the owner matches -- the file's and
-  its read-only parents' -- are not required; every other check still
-  applies. At startup, any failure leaves the routes unregistered.
+  writable) is refused. At startup, any failure leaves the routes
+  unregistered.
 - **Rotation without a restart:** the file is re-read when its mtime, size or
   inode changes, checked at most once per second. A reload that fails any
   check or validation keeps the last good token set and logs an error.

@@ -60,6 +60,27 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 - 🧠 **Memory Insights** - Activity summary, stale detection, consolidation suggestions, and LLM-powered pattern analysis
 - 📜 **Action History** - Track all memory operations (create, update, delete, merge, boost, link) with grouped timeline view
 
+## JSON API (`/api/v1`)
+
+The server can expose a plain JSON API at `/api/v1/<store>/{health,search,absorb}`
+(the wire contract is `contracts/memora-api/v1/`). It is **off unless
+`MEMORA_API_TOKENS_FILE`** is set to an absolute path; an unset variable is an
+intentional state and is logged at INFO, not ERROR (issue 1131).
+
+The file holds sha256 digests, never tokens. The server opens it
+`O_RDONLY | O_NOFOLLOW | O_CLOEXEC` and requires a regular file, no group/other
+permission bits and at most 4 KiB, owned by the server's user, under parents
+that are not symlinks and not group/world-writable. On a **read-only mount**
+(for example the deploy's read-only secrets mount, where rootful docker reads
+the operator's file as root and `statvfs` reports `ST_RDONLY`), the owner match
+for the file and for its read-only parents is not required; every other check
+still applies. A failed reload keeps the last good token set.
+
+`scripts/mint_api_token.sh` mints a token into a new 0600 file and adds its
+digest to `api-tokens.json`; `scripts/deploy-memora-all.sh` sets
+`MEMORA_API_TOKENS_FILE` when that file is in its secrets directory. Request
+semantics (401/403/404) and rotation are in the contract.
+
 ## Preview
 
 <p align="center">
