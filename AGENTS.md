@@ -33,7 +33,7 @@ test file that imports the touched module.
 | `memora/graph/**` | `tests/test_graph_server.py`, `memora-graph/scripts/test_ui.mjs` |
 | `contracts/memora-api/v1/**` | `tests/test_api_contract.py` |
 | `scripts/deploy*`, `Dockerfile` | `tests/test_deploy_memora_all.py`, `tests/test_deploy_config.py` |
-| `scripts/<x>.py` | `tests/test_<x>.py` (e.g. `mint_api_token.py` → `tests/test_mint_api_token.py`) |
+| `scripts/<x>.py`, `scripts/<x>.sh` | `tests/test_<x>.py` where one exists (e.g. `mint_api_token.sh` → `tests/test_mint_api_token.py`) |
 | `scripts/memora_api_contract.py` | `tests/test_api_contract.py` |
 
 ## Frozen contract
