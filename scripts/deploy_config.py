@@ -30,6 +30,7 @@ KEYS = (
     "DEPLOY_HOST",          # ssh name of the host that runs memora-all
     "DEPLOY_GRAPH_BIND",    # the host address the graph UI is published on
     "DEPLOY_REPO",          # the memora checkout on DEPLOY_HOST
+    "DEPLOY_BACKUP_DIR",    # cutover_store.sh: where all.env backups go (outside the repo)
     "MEMORA_PROJECTS",      # JSON: store name -> list of project names
     "EMBEDDING_OLD_URL",    # scripts/switch-embedding-host.sh only
     "EMBEDDING_NEW_URL",    # scripts/switch-embedding-host.sh only

@@ -37,5 +37,12 @@ launchd/generated/
 # The example file is committed; the real ones are not.
 instances/*.env
 !instances/example.env
+# Backups and copies of the local instance config (cutover, hand edits) are
+# NEVER committable; the committed examples stay tracked.
+instances/*.bak*
+instances/*.env.*
+!instances/*.env.example
 # CFG1: the operator's own identifier list for tests/test_no_infra_identifiers.py
 instances/*.local
+# scripts/repoint_mcp_config.py writes its backup next to the workspace config.
+.mcp.json.bak*

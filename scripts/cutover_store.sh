@@ -11,7 +11,8 @@
 #      export (still frozen) if D1 moved or the receipt is older than 24 h
 #   c  seed /data/<db>.db INSIDE memora-all (the named volume is root-owned
 #      on the host), then the fk audit (clean required)
-#   d  print the all.env edits; --apply-env makes them (0600 backup first):
+#   d  print the all.env edits; --apply-env makes them (a 0600 backup first,
+#      written OUTSIDE the repo to DEPLOY_BACKUP_DIR / ~/memora-backups/cutover-env):
 #        MEMORA_DATABASES[<db>] = /data/<db>.db
 #        MEMORA_REPLICAS[<db>]  = d1://<account>/<database-id>
 #        MEMORA_REPLICATION     = write
@@ -300,7 +301,7 @@ plan() {
   runs a && echo "  c  seed:     ${TOOL[*]} seed $DB --receipt <b's receipt> --out $LOCAL ${COMMON[*]};" \
                  "then fk-audit $DB --store $LOCAL (clean required); check still frozen"
   if runs d; then
-    echo "  d  env:      $ENV_FILE edits (made only with --apply-env; timestamped 0600 backup first):"
+    echo "  d  env:      $ENV_FILE edits (made only with --apply-env; 0600 backup outside the repo first):"
     envtool edits
   fi
   runs e && echo "  e  redeploy: $DEPLOY (production defaults; the store comes up frozen from /data/freeze)"
@@ -376,10 +377,25 @@ if runs d; then
     echo "next: $0 $DB --execute --from d --apply-env"
     exit 0
   fi
-  BACKUP="$ENV_FILE.bak-cutover-$DB-$(date +%Y%m%dT%H%M%S)"
+  # The backup goes OUTSIDE the repo (DEPLOY_BACKUP_DIR; default below): a copy
+  # of instances/all.env inside the tree is a committable leak of the store/D1
+  # configuration. The resolved directory must not be inside the repo.
+  # The key is OPTIONAL: deploy_config.py exits 2 when it is absent, which
+  # `set -o pipefail` would otherwise turn into an abort, so swallow it.
+  BACKUP_DIR="$(python3 "$ROOT/scripts/deploy_config.py" "$CONFIG_FILE" DEPLOY_BACKUP_DIR 2>/dev/null | tr -d '\0')" \
+    || BACKUP_DIR=""
+  [ -n "$BACKUP_DIR" ] || BACKUP_DIR="$HOME/memora-backups/cutover-env"
+  BACKUP_DIR="$(python3 -c 'import os, sys; print(os.path.realpath(os.path.expanduser(sys.argv[1])))' "$BACKUP_DIR")" \
+    || refuse "cannot resolve DEPLOY_BACKUP_DIR ($BACKUP_DIR)"
+  ROOT_REAL="$(cd "$ROOT" && pwd -P)"
+  case "$BACKUP_DIR/" in
+    "$ROOT_REAL"/*) refuse "DEPLOY_BACKUP_DIR ($BACKUP_DIR) is inside the repo ($ROOT_REAL); set it outside the checkout" ;;
+  esac
+  mkdir -p "$BACKUP_DIR" && chmod 700 "$BACKUP_DIR" || fail d "cannot create backup dir $BACKUP_DIR"
+  BACKUP="$BACKUP_DIR/all.env.bak-cutover-$DB-$(date +%Y%m%dT%H%M%S)"
   ( umask 077; cp "$ENV_FILE" "$BACKUP" ) && chmod 600 "$BACKUP" || fail d "cannot back up $ENV_FILE"
   envtool apply || fail d "the edit of $ENV_FILE failed; the original is $BACKUP"
-  echo "  edited; backup $BACKUP (0600)"
+  echo "  edited; backup $BACKUP (0600; DEPLOY_BACKUP_DIR=$BACKUP_DIR)"
   FROM=e  # the edits are in place: the rest reads them
   IDS="$(envtool ids)" || fail d "$ENV_FILE does not read back as edited"
 fi

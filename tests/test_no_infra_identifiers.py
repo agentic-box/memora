@@ -131,6 +131,20 @@ def test_the_ignore_rules_cover_the_local_configuration():
         assert r.returncode == 0, f"{rel} is not git-ignored"
 
 
+def test_the_ignore_rules_cover_config_backups_and_copies():
+    """Backups/copies of the local config are never committable (item 49):
+    the cutover script writes them outside the repo, and `.gitignore` covers
+    the names anyway so a hand-made copy cannot be `git add -A`-ed."""
+    for rel in ("instances/all.env.bak-cutover-x-1", "instances/deploy.env.bak",
+                "instances/all.env.cutover-tmp", ".mcp.json.bak-repoint-20260101T000000Z"):
+        r = subprocess.run(["git", "check-ignore", "-q", "--no-index", rel], cwd=REPO)
+        assert r.returncode == 0, f"config backup {rel} is not git-ignored"
+    # The committed examples must stay tracked.
+    for rel in ("instances/example.env", "instances/deploy.env.example"):
+        r = subprocess.run(["git", "check-ignore", "-q", "--no-index", rel], cwd=REPO)
+        assert r.returncode != 0, f"{rel} must stay tracked"
+
+
 # ------------------------------------------------------------ operator (local)
 
 def _env_values(path: Path) -> Dict[str, str]:

@@ -76,6 +76,7 @@ def cut(tmp_path):
     run.exports = exports
     run.offhost = tmp_path / "offhost"
     run.repo = repo
+    run.home = home
     return run
 
 
@@ -245,9 +246,13 @@ class TestEnvEdits:
         _frozen(cut)
         proc, calls = cut("gamma", "--execute", "--from", "d", "--apply-env")
         assert proc.returncode == 0, proc.stderr
-        backups = list(cut.env_file.parent.glob("all.env.bak-cutover-gamma-*"))
+        # The backup is OUTSIDE the repo, in the default DEPLOY_BACKUP_DIR.
+        backup_dir = cut.home / "memora-backups" / "cutover-env"
+        backups = list(backup_dir.glob("all.env.bak-cutover-gamma-*"))
         assert len(backups) == 1 and backups[0].read_text() == ENV_TEXT
         assert stat.S_IMODE(os.stat(backups[0]).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(backup_dir).st_mode) == 0o700
+        assert not list(cut.env_file.parent.glob("all.env.bak-*")), "no backup inside the repo"
         assert stat.S_IMODE(os.stat(cut.env_file).st_mode) == 0o600
         text = cut.env_file.read_text()
         assert f"MEMORA_DATABASES='{json.dumps(EDITED)}'" in text
@@ -260,6 +265,24 @@ class TestEnvEdits:
         assert cmp[cmp.index("--mode") + 1] == "barrier" and cmp[cmp.index("--store") + 1] == "/data/gamma.db"
         assert cmp[cmp.index("--drain-timeout") + 1] == "600"
         assert "stopped before the thaw" in proc.stdout and "--from h --thaw" in proc.stdout
+
+    def test_backup_dir_comes_from_the_deploy_configuration(self, cut, tmp_path):
+        _frozen(cut)
+        out_dir = tmp_path / "backups"
+        (cut.repo / "instances" / "deploy.env").write_text(f"DEPLOY_HOST=deploy-host\nDEPLOY_BACKUP_DIR={out_dir}\n")
+        proc, _ = cut("gamma", "--execute", "--from", "d", "--apply-env")
+        assert proc.returncode == 0, proc.stderr
+        assert len(list(out_dir.glob("all.env.bak-cutover-gamma-*"))) == 1
+        assert f"DEPLOY_BACKUP_DIR={out_dir}" in proc.stdout
+
+    def test_a_backup_dir_inside_the_repo_is_refused(self, cut):
+        _frozen(cut)
+        inside = cut.repo / "instances"
+        (cut.repo / "instances" / "deploy.env").write_text(f"DEPLOY_HOST=deploy-host\nDEPLOY_BACKUP_DIR={inside}\n")
+        proc, calls = cut("gamma", "--execute", "--from", "d", "--apply-env")
+        assert proc.returncode == 2 and "inside the repo" in proc.stderr, proc.stderr
+        assert cut.env_file.read_text() == ENV_TEXT and not _deployed(cut)
+        assert not list(cut.env_file.parent.glob("all.env.bak-*"))
 
     def test_without_apply_env_nothing_is_edited(self, cut):
         _frozen(cut)
