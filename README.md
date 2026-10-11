@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/agentic-box-memora-badge.png)](https://mseep.ai/app/agentic-box-memora)
+
 <h1 align="center"><img src="media/memora_new.gif" width="60" alt="Memora Logo" align="absmiddle"> Memora</h1>
 
 <p align="center"><sub><sub><i>"You never truly know the value of a moment until it becomes a memory."</i></sub></sub></p>
