@@ -895,5 +895,11 @@ def test_every_credential_file_in_the_operator_tools_goes_through_the_one_rule()
     for name in ("admin_token_file", "health_token_file", "credential_file"):
         assert f"lp.load_credential_file(args.{name})" in cli
     assert "lp.load_credential_file(args.health_token_file)" in copy
+    # nothing reads a token/credential argument by another route (a mutation found this gap: the verify-replication
+    # site read the health token with a bare open() and the test above still passed)
+    import re
+
+    bypass = re.compile(r"(?:open|Path|read_text|read_bytes)\(\s*args\.\w*(?:token|credential)\w*")
+    assert not bypass.search(cli) and not bypass.search(copy)
     assert "return load_credential_file(token_file)" in (root / "memora" / "local_primary.py").read_text()   # read_token
     assert (root / "memora" / "local_primary.py").read_text().count("st_uid") == 2        # the one rule (compare + message)
