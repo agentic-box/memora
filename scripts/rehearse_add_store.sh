@@ -142,6 +142,24 @@ check "the image carries bootstrap-d1" "${LP[@]}" bootstrap-d1 --help
 check "the image carries pre-freeze and clear-freeze" bash -c "'$RT' exec '$NAME' python /app/scripts/local_primary.py pre-freeze --help && '$RT' exec '$NAME' python /app/scripts/local_primary.py clear-freeze --help"
 check "the image carries the copy tool" "$RT" exec "$NAME" python /app/scripts/copy_memories.py --help
 
+echo "== 1b. the production credential layout (Item 97): root reader, 0600 files of another uid, read-only mount"
+new_volume CREDVOL "memora-$RUN_ID-cred"
+check "two 0600 token files owned by uid 1000 (the host operator's uid in production)" once -v "$CREDVOL:/w" --entrypoint sh "$IMAGE" -c \
+  'printf rh-edit-token > /w/edit.token && printf rh-read-token > /w/read.token && chown 1000:1000 /w/edit.token /w/read.token && chmod 600 /w/edit.token /w/read.token && ls -ln /w'
+CRED_PY='from memora import local_primary as lp; import os; st = os.stat("/run/secrets/x/edit.token"); print("euid", os.geteuid(), "owner", st.st_uid, "mode", oct(st.st_mode & 0o777)); print(lp.load_credential_file("/run/secrets/x/edit.token"))'
+OUT="$(once -v "$CREDVOL:/run/secrets/x:ro" --entrypoint python "$IMAGE" -c "$CRED_PY" 2>&1)"; RC=$?
+echo "$OUT" | grep -q "euid 0 owner 1000 mode 0o600" && echo "$OUT" | grep -q "rh-edit-token" && [ "$RC" = 0 ] \
+  && pass "root reads the 0600 file owned by uid 1000 on a READ-ONLY mount (the production layout)" || fail "production layout refused: rc=$RC $OUT"
+OUT="$(once -v "$CREDVOL:/run/secrets/x" --entrypoint python "$IMAGE" -c "$CRED_PY" 2>&1)"; RC=$?
+[ "$RC" != 0 ] && echo "$OUT" | grep -q "not owned by this user" \
+  && pass "the same file on a WRITABLE mount is still refused (the owner check keeps its meaning)" || fail "writable-mount case: rc=$RC $OUT"
+OUT="$(once --network none -v "$CREDVOL:/run/secrets/x:ro" --entrypoint python "$IMAGE" \
+  /app/scripts/local_primary.py bootstrap-d1 newstore --account rh-acct-0001 --database-id rh-newdb-0001 --d1-name newstore-rh \
+  --read-token-file /run/secrets/x/read.token --credential-file /run/secrets/x/edit.token 2>&1)"; RC=$?
+echo "$OUT" | grep -q "not owned by this user" && fail "bootstrap-d1 still refuses the production credential layout: $OUT" \
+  || { echo "$OUT" | grep -q "cannot read the pinned database's identity" && pass "bootstrap-d1 passes both credential checks with a root reader (it stops later, at the network leg: --network none)" \
+       || fail "bootstrap-d1 on the production layout: rc=$RC $OUT"; }
+
 echo "== 2. seed the source store with memories tagged newstore (and one that is not)"
 check "write the source memories, links and an old created_at" "$RT" exec -i "$NAME" python - <<'PY'
 from memora import schema, storage

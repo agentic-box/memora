@@ -813,3 +813,87 @@ def test_native_export_of_the_throwaway_database(tmp_path):
                    database_id=database, d1_name=name, read_token=token, native_export=True)
     r = json.loads(lp.export(name, deps, tmp_path / "exports").read_text())
     print("native export method:", r["method"])
+
+
+# ---------------------------------------------------------------- Item 97: the owner rule on the production layout
+
+class _OtherReader:
+    """Make the test process look like another reader: a different effective uid (e.g. root, 0), and optionally the
+    file's directory on a read-only mount (statvfs ST_RDONLY)."""
+
+    def __init__(self, monkeypatch, euid, read_only):
+        monkeypatch.setattr(os, "geteuid", lambda: euid)
+        real = os.statvfs
+
+        def statvfs(path):
+            res = real(path)
+            if not read_only:
+                return res
+            return os.statvfs_result((res.f_bsize, res.f_frsize, res.f_blocks, res.f_bfree, res.f_bavail, res.f_files,
+                                      res.f_ffree, res.f_favail, res.f_flag | getattr(os, "ST_RDONLY", 1), res.f_namemax))
+        monkeypatch.setattr(os, "statvfs", statvfs)
+
+
+def _tok(tmp_path, mode=0o600):
+    f = tmp_path / "cloudflare-api.token"
+    f.write_text("secret\n")
+    f.chmod(mode)
+    return f
+
+
+def test_the_production_layout_root_reader_0600_file_of_another_uid_on_a_read_only_mount_passes(tmp_path, monkeypatch):
+    f = _tok(tmp_path)
+    assert f.stat().st_uid != 0
+    _OtherReader(monkeypatch, euid=0, read_only=True)
+    assert lp.load_credential_file(str(f)) == "secret"
+    assert (f.stat().st_mode & 0o777) == 0o600                                   # never chmod-ed
+
+
+def test_another_uid_on_a_writable_path_is_still_refused_root_reader_included(tmp_path, monkeypatch):
+    f = _tok(tmp_path)
+    for euid in (0, f.stat().st_uid + 1):
+        _OtherReader(monkeypatch, euid=euid, read_only=False)
+        with pytest.raises(lp.L5Refused, match="not owned by this user.*not on a read-only mount"):
+            lp.load_credential_file(str(f))
+
+
+def test_the_owner_itself_passes_on_a_writable_path(tmp_path):
+    assert lp.load_credential_file(str(_tok(tmp_path))) == "secret"
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o644, 0o660, 0o604, 0o606, 0o400, 0o700])
+def test_a_read_only_mount_does_not_relax_the_mode(tmp_path, monkeypatch, mode):
+    f = _tok(tmp_path, mode)
+    _OtherReader(monkeypatch, euid=0, read_only=True)
+    with pytest.raises(lp.L5Refused, match="must be mode 0600"):
+        lp.load_credential_file(str(f))
+
+
+def test_a_read_only_mount_does_not_relax_the_symlink_or_regular_file_rule(tmp_path, monkeypatch):
+    real = _tok(tmp_path)
+    link = tmp_path / "link.tok"
+    link.symlink_to(real)
+    _OtherReader(monkeypatch, euid=0, read_only=True)
+    with pytest.raises(lp.L5Refused, match="is a symlink"):
+        lp.load_credential_file(str(link))
+    with pytest.raises(lp.L5Refused, match="regular"):
+        lp.load_credential_file(str(tmp_path))
+    real.write_text("  \n")
+    with pytest.raises(lp.L5Refused, match="empty"):
+        lp.load_credential_file(str(real))
+
+
+def test_every_credential_file_in_the_operator_tools_goes_through_the_one_rule():
+    """verify-replication's --read-token-file (via read_token), the health and admin token files, the add-store
+    credential file and the copy tool all call lp.load_credential_file: there is no second owner check."""
+    from pathlib import Path
+
+    root = Path(lp.__file__).resolve().parent.parent
+    cli = (root / "scripts" / "local_primary.py").read_text()
+    copy = (root / "scripts" / "copy_memories.py").read_text()
+    assert "st_uid" not in cli and "getuid" not in cli and "st_uid" not in copy and "getuid" not in copy
+    for name in ("admin_token_file", "health_token_file", "credential_file"):
+        assert f"lp.load_credential_file(args.{name})" in cli
+    assert "lp.load_credential_file(args.health_token_file)" in copy
+    assert "return load_credential_file(token_file)" in (root / "memora" / "local_primary.py").read_text()   # read_token
+    assert (root / "memora" / "local_primary.py").read_text().count("st_uid") == 2        # the one rule (compare + message)

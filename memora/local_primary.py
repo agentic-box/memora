@@ -79,11 +79,27 @@ def read_token(token_file: Optional[str] = None) -> str:
     return token
 
 
+def _on_read_only_mount(path: str) -> bool:
+    """Is `path` on a read-only mounted filesystem (statvfs ST_RDONLY)? The same test api_v1 uses for its tokens file
+    (API1, leader 8213): a deploy mounts its secrets directory read-only into the container."""
+    try:
+        return bool(os.statvfs(path).f_flag & getattr(os, "ST_RDONLY", 1))
+    except OSError:
+        return False
+
+
 def load_credential_file(path: str) -> str:
-    """A secret from a file, never from the environment. The same rule as
-    the L2a admin tokens (cross-finding 7633): lstat (a symlink is refused,
-    not followed), a regular file, owned by this user, mode exactly 0600.
-    Refused otherwise; the file is never chmod-ed."""
+    """A secret from a file, never from the environment. The rule of the L2a admin tokens (cross-finding 7633): lstat
+    (a symlink is refused, not followed), a regular file, mode EXACTLY 0600 (not merely "no group/other bits"),
+    not empty; the file is never chmod-ed.
+
+    OWNER (Item 97, found in the first production run of the add-store tooling): the file must be owned by this
+    process's effective uid OR sit on a READ-ONLY mount. memora-all runs as root inside its container and the deploy
+    mounts the host operator's ~/.config/memora-lp read-only at /run/secrets/memora, so the files keep the host
+    operator's uid (the replicator reads the same files through memora.secret_files, which checks no owner at all).
+    On a read-only mount nobody in the container can alter or replace the file, so who owns it does not matter; on a
+    writable path the owner check keeps its meaning (a private file that another uid can rewrite is refused, root
+    reader included: root reading is not what makes a file trustworthy). The same rule as api_v1's tokens file."""
     p = Path(path)
     try:
         st = os.lstat(p)
@@ -95,8 +111,9 @@ def load_credential_file(path: str) -> str:
         raise L5Refused(f"credential file {path} is not a regular file")
     if stat.S_IMODE(st.st_mode) != 0o600:
         raise L5Refused(f"credential file {path} must be mode 0600 (it is {oct(stat.S_IMODE(st.st_mode))})")
-    if hasattr(os, "getuid") and st.st_uid != os.getuid():
-        raise L5Refused(f"credential file {path} is not owned by this user")
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid() and not _on_read_only_mount(str(p)):
+        raise L5Refused(f"credential file {path} is not owned by this user (uid {st.st_uid}) and is not on a "
+                        "read-only mount")
     token = p.read_text().strip()
     if not token:
         raise L5Refused(f"credential file {path} is empty")
