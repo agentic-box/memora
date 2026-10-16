@@ -40,6 +40,8 @@ if args[:2] == ["exec", "memora-all"]:
     if rest[:2] == ["python", "/app/scripts/local_primary.py"]:
         cmd, tail = rest[2], rest[3:]
         key = cmd.upper().replace("-", "_")
+        if cmd == "bootstrap-d1" and "--help" in tail:  # the script's "does this image have the tool" probe
+            key = "BOOTSTRAP_D1_HELP"
         rc = int(knob(f"TOOL_RC_{key}", "0"))
         default = {"ok": rc == 0}
         if cmd == "recheck":
@@ -52,8 +54,10 @@ if args[:2] == ["exec", "memora-all"]:
         if rc == 0:
             if cmd == "freeze" and knob("FREEZE_STAYS_OPEN") != "1":
                 state["freeze"] = "frozen"
-            if cmd == "thaw":
+            if cmd in ("thaw", "clear-freeze"):
                 state["freeze"] = "open"
+            if cmd == "pre-freeze":  # Item 95: the persisted freeze, before the store is served
+                state["freeze"] = "frozen"
             if cmd == "compare":
                 state["compare"] = "clean"
             save()
