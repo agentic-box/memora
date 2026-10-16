@@ -130,7 +130,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
 ```
 
 - **Source: read only** (MCP read tools: `memory_list`, `memory_get` with images, `follow=all` for the exact row).
-  **Destination: written only through its running server** (`memory_import` strategy `append`, `memory_update`,
+  **Destination: written only through its running server** (`memory_create`, `memory_update`,
   `memory_link`: the tools of the production `leader` profile; `memory_import` is not in it), so the gate, outbox
   triggers and replication stay in force. A file is never opened directly.
 - **`created_at` becomes the copy time** (leader decision 2026-10-16: no API sets it, and for a copy of this size
@@ -142,7 +142,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   fresh read of the source no longer matches the digest or the plan file was edited.
 - **Provenance**: every copy carries `metadata.memora_copy = {store, id}` and `metadata.project`. A source row that
   already has `memora_copy` is refused. Markers are looked up over **all** destination rows (every lineage
-  state), so a superseded copy is never re-copied. After the import there must be exactly one destination row per
+  state), so a superseded copy is never re-copied. After the creates there must be exactly one destination row per
   source id; a duplicate marker stops the run.
 - **Retries**: one run at a time per destination (an `flock` held for the whole operation) plus a durable state
   file (`new → creating → mapped → remapped → linked → done`). Rows are created **one at a time**, in ascending
@@ -166,7 +166,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   by `memory_link`: the dry run lists it as unrepresentable and `--apply` refuses unless `--allow-unrepresentable`
   (then it is listed in the manifest). Edges to memories outside the selection are dropped and counted. The score of a
   created edge is 1.0 (`memory_link` has no score): edges whose source score differed are counted. The
-  destination's import also rebuilds automatic crossrefs: extra edges it created between copied rows are listed
+  destination's `memory_create` may also compute automatic crossrefs: extra edges it created between copied rows are listed
   as `recomputed_extra_edges` and never removed.
 - **Verification**: content equal, `metadata.original_created_at` equal to the source's `created_at`, tags a superset, metadata keys equal, the marker and
   project present, and every source edge present in the destination; the source is re-read afterwards and its
@@ -174,7 +174,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   write by this tool; the tool never calls a write tool on the source.
 - Outputs: `/data/copy/<src>-<dest>.json` (state), `….manifest.json` (source id → destination id, links
   created/present/unrepresentable/dropped, dropped references).
-- If the destination's tag allowlist rejects a tag, the import reports errors and the run fails visibly.
+- If the destination's tag allowlist rejects a tag, the create returns an error and the run stops visibly.
 
 ## Rehearsal
 
