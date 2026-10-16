@@ -14,6 +14,12 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+## 0.5.7.2 — 2026-10-16
+
+The add-store tooling accepts the production credential layout (Item 97).
+
+- `lp.load_credential_file` (every credential/token file of the operator tools: `bootstrap-d1`, the admin and health token files, `verify-replication`, the copy tool) no longer refuses a 0600 file owned by another uid when it sits on a read-only mount, the deploy's `/run/secrets/memora` read by memora-all as root (found in the first production run of `add_store.sh`, which stopped at step 1 with "not owned by this user"). The mode must still be exactly 0600, symlinks and non-regular files are still refused, and on a writable path the owner must still be the reading (effective) uid, root included.
+
 ## 0.5.7.1 — 2026-10-16
 
 Add-store tooling (Item 95); deploying this build is what lets `scripts/add_store.sh` run (it refuses on a v0.5.7 image).
