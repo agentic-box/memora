@@ -7,11 +7,14 @@ live ONLY in this git-ignored file, never in the (public) repository.
 instances/deploy.env.example documents every key with placeholders.
 
   scripts/deploy_config.py FILE KEY [KEY ...]
+  scripts/deploy_config.py --optional FILE KEY [KEY ...]
 
 prints the requested values in order, each terminated by NUL, and exits 0.
 It prints nothing and exits 2 when the file is missing or unreadable, a line
 is malformed, a key is unknown, or a requested key is absent or empty -- so
 a caller that counts the values it read can never run on a guessed default.
+With --optional, only the OPTIONAL_KEYS may be requested and an absent key
+prints an empty value (the caller applies its own default).
 
 Format: one KEY=VALUE per line; blank lines and lines starting with # are
 ignored; a value may be wrapped in one pair of matching single or double
@@ -34,7 +37,16 @@ KEYS = (
     "MEMORA_PROJECTS",      # JSON: store name -> list of project names
     "EMBEDDING_OLD_URL",    # scripts/switch-embedding-host.sh only
     "EMBEDDING_NEW_URL",    # scripts/switch-embedding-host.sh only
+    # deploy-memora-all.sh only, optional: token file NAMES inside DEPLOY_SECRETS_DIR
+    # (the environment variable of the same name wins; absent = the script's default)
+    "DEPLOY_CLOUDFLARE_TOKEN_FILE",
+    "DEPLOY_D1_READ_TOKEN_FILE",
+    "DEPLOY_D1_REPLICATOR_TOKEN_FILE",
+    "DEPLOY_GRAPH_TOKEN_FILE",
+    "DEPLOY_API_TOKENS_FILE",
+    "DEPLOY_API_SMOKE_TOKEN_FILE",
 )
+OPTIONAL_KEYS = KEYS[KEYS.index("DEPLOY_CLOUDFLARE_TOKEN_FILE"):]
 _LINE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")
 
 
@@ -75,6 +87,9 @@ def require(cfg: Dict[str, str], keys: List[str], path: Path) -> List[str]:
 
 
 def main(argv: List[str]) -> int:
+    optional = len(argv) > 1 and argv[1] == "--optional"
+    if optional:
+        argv = argv[:1] + argv[2:]
     if len(argv) < 3:
         print(__doc__.strip().splitlines()[0], file=sys.stderr)
         print("usage: deploy_config.py FILE KEY [KEY ...]", file=sys.stderr)
@@ -84,7 +99,14 @@ def main(argv: List[str]) -> int:
         unknown = [k for k in argv[2:] if k not in KEYS]
         if unknown:
             raise ConfigError(f"unknown key requested: {', '.join(unknown)}")
-        values = require(load(path), argv[2:], path)
+        if optional:
+            bad = [k for k in argv[2:] if k not in OPTIONAL_KEYS]
+            if bad:
+                raise ConfigError(f"not an optional key: {', '.join(bad)}")
+            cfg = load(path)
+            values = [cfg.get(k, "") for k in argv[2:]]
+        else:
+            values = require(load(path), argv[2:], path)
     except ConfigError as exc:
         print(f"deploy config: {exc}", file=sys.stderr)
         return 2

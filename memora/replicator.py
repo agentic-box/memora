@@ -549,8 +549,10 @@ class StoreReplicator:
         self._conn = None
         self._relaxed_epoch_before: Optional[int] = None
         self._backoff = 0.0
+        self._write_probed = False
         self._lock = threading.Lock()
         self._metrics: Dict[str, Any] = {"mode": mode, "status": "disabled", "last_error": None,
+                                         "write_probe": None,
                                          "d1_missing_vectors": None, "interval_s": interval_s,
                                          "poll_s": poll_s, "batch_rows": batch_rows}
         # The H3 marker as the store's gate sees it (review 7599 P1-1): set in
@@ -663,6 +665,19 @@ class StoreReplicator:
         if self._writer is None:
             self._writer = self._writer_factory(self.replica_uri)
         return self._writer
+
+    def _probe_write(self) -> None:
+        """Prove the replicator token can WRITE (Item 99): one allow-listed
+        DELETE by a primary key no row has (memories.id = -1), so it removes
+        nothing and writes no row, yet D1 refuses it for a read-only token
+        (code 7500). Runs once per process before the first cycle; a refusal
+        raises into the loop's backoff path, so the status block shows the D1
+        error and write_probe stays not-"ok" until a later attempt succeeds."""
+        stmts = _build_statements("memories", [-1], None, [])
+        self._d1().execute_batch(stmts)
+        self._write_probed = True
+        with self._lock:
+            self._metrics["write_probe"] = "ok"
 
     def _read(self):
         if self._reader is None:
@@ -893,6 +908,8 @@ class StoreReplicator:
                     break
             started = time.monotonic()  # before the try: the handler uses it (review 7841 P2)
             try:
+                if self.mode == "write" and not self._write_probed:
+                    self._probe_write()
                 outcome = self.run_once()
                 if outcome not in ("idle", "halted"):
                     # a send, a reconcile read-back or resend: the next one waits

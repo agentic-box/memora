@@ -41,9 +41,15 @@ pointer (below).
     before the old container is stopped.
   - Keep only token files in `~/.config/memora-lp`: the container sees the
     whole directory. The deploy lists the directory's entries.
-  - In this pilot, `d1-read.token` is both the read token and the
-    replicator token (the user's decision). To split them later, add a
-    file and set `DEPLOY_D1_REPLICATOR_TOKEN_FILE=<name>` for the deploy.
+  - The replicator writes to D1, so by default it takes the write-capable
+    `cloudflare-api.token`; `d1-read.token` is the read-only token and must
+    be a different file (the pilot's shared-file arrangement ended with
+    Item 99: a read-only token as the replicator's made every store's
+    replicator back off with D1 code 7500). To use another file, set
+    `DEPLOY_D1_REPLICATOR_TOKEN_FILE=<name>` in `instances/deploy.env` (or
+    the environment). The deploy proves the write after the start: each
+    replicated store's `/health/db/<store>` shows `write_probe: "ok"`, else
+    the deploy fails with the D1 error.
 - **A verified export of the store** exists on deploy-host under
   `~/memora-lp/exports/<db>/` (`<stamp>.sql` and `<stamp>.receipt.json`),
   with copies off the host.

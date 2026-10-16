@@ -500,7 +500,7 @@ class TestTokenFiles:
         envs = _flag_values(run, "-e")
         assert f"CLOUDFLARE_API_TOKEN_FILE={SECRETS_MOUNT}/cloudflare-api.token" in envs
         assert f"MEMORA_D1_READ_TOKEN_FILE={SECRETS_MOUNT}/d1-read.token" in envs
-        assert f"MEMORA_D1_REPLICATOR_TOKEN_FILE={SECRETS_MOUNT}/d1-read.token" in envs
+        assert f"MEMORA_D1_REPLICATOR_TOKEN_FILE={SECRETS_MOUNT}/cloudflare-api.token" in envs  # Item 99: write-capable
         for plain in ("CLOUDFLARE_API_TOKEN=", "CF_API_TOKEN=", "MEMORA_D1_READ_TOKEN=", "MEMORA_D1_REPLICATOR_TOKEN="):
             assert not [e for e in envs if e.startswith(plain)], plain
         assert "OPENAI_API_KEY=k" in envs  # the other credentials still pass through
@@ -614,6 +614,24 @@ class TestTokenFiles:
         envs = _flag_values(_new_container_run(calls), "-e")
         assert f"MEMORA_D1_REPLICATOR_TOKEN_FILE={SECRETS_MOUNT}/d1-replicator.token" in envs
         assert f"MEMORA_D1_READ_TOKEN_FILE={SECRETS_MOUNT}/d1-read.token" in envs
+
+    def test_the_names_may_come_from_deploy_env_and_the_environment_wins(self, deploy):
+        for n in ("repl-a.token", "repl-b.token"):
+            (deploy.secrets / n).write_text("r" * 40)
+            os.chmod(deploy.secrets / n, 0o600)
+        deploy.config_file.write_text(deploy.config_file.read_text() + "DEPLOY_D1_REPLICATOR_TOKEN_FILE=repl-a.token\n")
+        proc, calls, _ = deploy()
+        assert "overrides are for rehearsals only" not in proc.stderr
+        assert f"MEMORA_D1_REPLICATOR_TOKEN_FILE={SECRETS_MOUNT}/repl-a.token" in _flag_values(_new_container_run(calls), "-e")
+        proc, calls, _ = deploy(runtime_env={"DEPLOY_D1_REPLICATOR_TOKEN_FILE": "repl-b.token"})
+        assert f"MEMORA_D1_REPLICATOR_TOKEN_FILE={SECRETS_MOUNT}/repl-b.token" in _flag_values(_new_container_run(calls), "-e")
+
+    @pytest.mark.parametrize("bad", ["../x.token", "/etc/passwd", "sub/x.token", ".hidden"])
+    def test_a_deploy_env_token_name_that_is_not_a_plain_name_is_refused(self, deploy, bad):
+        deploy.config_file.write_text(deploy.config_file.read_text() + f"DEPLOY_D1_REPLICATOR_TOKEN_FILE={bad}\n")
+        proc, calls, _ = deploy()
+        _nothing_done(deploy, proc, calls)
+        assert "must be a plain file name inside DEPLOY_SECRETS_DIR" in proc.stderr
 
     def test_the_cloudflare_file_name_is_an_override_too(self, deploy):
         cf = deploy.secrets / "cf-other.token"
@@ -808,7 +826,8 @@ class _FakeMemora:
 
 GRAPH_TOKEN = "G" * 48
 REPL_OK = {"mode": "write", "status": "running", "replica_uri": "d1://acct/db3", "head_seq": 0,
-           "last_acked_seq": 0, "lag_rows": 0, "trigger_version": 2, "trigger_version_expected": 2}
+           "last_acked_seq": 0, "lag_rows": 0, "trigger_version": 2, "trigger_version_expected": 2,
+           "write_probe": "ok"}
 FROZEN = {"freeze": {"state": "frozen", "in_flight": 0}}
 
 
@@ -907,6 +926,21 @@ class TestReplicatedStoreAfterStart:
         assert ("STORE CHECK FAILED — gamma: replication status 'backoff', not running "
                 "(last_error 'D1 403 Forbidden', lag_rows 1)") in proc.stderr, proc.stderr[-1500:]
         assert "all 3 stores verified" not in proc.stdout
+
+    @pytest.mark.parametrize("probe", [None, "failed"])
+    def test_running_with_lag_zero_is_not_enough_without_the_write_probe(self, poststart, probe):
+        # Item 99: a read-only replicator token reported "running", lag 0, while nothing was pending
+        repl = {**REPL_OK, "write_probe": probe, "last_error": "D1 API error (400): code 7500 You do not have permission"}
+        proc, _ = poststart({"gamma": {**FROZEN, "replication": repl}})
+        assert proc.returncode != 0
+        assert (f"STORE CHECK FAILED — gamma: the replicator has not proved it can write to D1 (write_probe {probe!r}; "
+                "last_error 'D1 API error (400): code 7500 You do not have permission')") in proc.stderr, proc.stderr[-1500:]
+        assert "all 3 stores verified" not in proc.stdout
+
+    def test_the_write_probe_may_arrive_within_the_wait(self, poststart):
+        proc, _ = poststart({"gamma": [{**FROZEN, "replication": {**REPL_OK, "write_probe": None}},
+                                       {**FROZEN, "replication": REPL_OK}]})
+        assert "all 3 stores verified" in proc.stdout and "write_probe ok" in proc.stdout, proc.stderr[-1500:]
 
     def test_a_backoff_that_recovers_within_the_wait_passes(self, poststart):
         repl = {**REPL_OK, "status": "backoff", "last_error": "D1 503", "lag_rows": 1}

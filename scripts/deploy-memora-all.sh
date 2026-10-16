@@ -16,9 +16,14 @@
 #    READ-ONLY at /run/secrets/memora, and the container gets only the paths:
 #      CLOUDFLARE_API_TOKEN_FILE       <- cloudflare-api.token  (DEPLOY_CLOUDFLARE_TOKEN_FILE)
 #      MEMORA_D1_READ_TOKEN_FILE       <- d1-read.token         (DEPLOY_D1_READ_TOKEN_FILE)
-#      MEMORA_D1_REPLICATOR_TOKEN_FILE <- d1-read.token         (DEPLOY_D1_REPLICATOR_TOKEN_FILE)
-#    The three DEPLOY_*_TOKEN_FILE overrides are file NAMES inside that
-#    directory (the only directory the container sees). No token value is on
+#      MEMORA_D1_REPLICATOR_TOKEN_FILE <- cloudflare-api.token  (DEPLOY_D1_REPLICATOR_TOKEN_FILE)
+#    The replicator WRITES to D1, so it takes the write-capable token; the read
+#    token (d1-read.token) is read-only and never the replicator's (Item 99:
+#    it was the default once, and every store's replicator went into backoff
+#    with D1 code 7500). The deploy proves the write after the start
+#    (write_probe in /health/db). The three DEPLOY_*_TOKEN_FILE overrides are
+#    file NAMES inside that directory (the only directory the container sees);
+#    set them in the environment or as keys of instances/deploy.env. No token value is on
 #    a command line, in the container's configuration (docker inspect) or in
 #    this repo; CLOUDFLARE_API_TOKEN, CF_API_TOKEN and the D1 token variables
 #    in credentials.mcp.json are NOT passed through any more. Each file must
@@ -179,6 +184,15 @@ MEMORA_PROJECTS="${CFG[3]}"
 python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert isinstance(d, dict) and all(isinstance(v, list) for v in d.values())' \
   "$MEMORA_PROJECTS" 2>/dev/null \
   || { echo "refused: MEMORA_PROJECTS in $CONFIG_FILE is not a JSON object of lists — nothing was done" >&2; exit 1; }
+# The token file NAMES may also be set in instances/deploy.env (optional keys;
+# the environment variable of the same name wins), so a production deploy is
+# reproducible without shell state (Item 99). Validated as plain names below.
+CFG_TOKEN=()
+while IFS= read -r -d '' v; do CFG_TOKEN+=("$v"); done \
+  < <(python3 "$ROOT/scripts/deploy_config.py" --optional "$CONFIG_FILE" \
+      DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE \
+      DEPLOY_GRAPH_TOKEN_FILE DEPLOY_API_TOKENS_FILE DEPLOY_API_SMOKE_TOKEN_FILE)
+[ "${#CFG_TOKEN[@]}" -eq 6 ] || { echo "refused: cannot read the token file names from $CONFIG_FILE — nothing was done" >&2; exit 1; }
 # Rehearsal parameters (R1): every default is the production value (from the
 # deploy configuration), so an unparameterised run is exactly the production
 # deploy. scripts/rehearse_deploy.sh sets them to run the same steps against
@@ -200,16 +214,18 @@ DEPLOY_STORE_WAIT_S="${DEPLOY_STORE_WAIT_S:-90}"            # per-store readines
 DEPLOY_GRAPH_BIND="${DEPLOY_GRAPH_BIND:-$CFG_DEPLOY_GRAPH_BIND}"   # the host address the graph port is published on
 DEPLOY_GRAPH_PORT="${DEPLOY_GRAPH_PORT:-8766}"               # the host port (the container's graph is 8765)
 # Production overrides (documented, no sentinel): token file NAMES inside
-# DEPLOY_SECRETS_DIR. The same file may serve both D1 roles (the pilot does).
-DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-cloudflare-api.token}"
-DEPLOY_D1_READ_TOKEN_FILE="${DEPLOY_D1_READ_TOKEN_FILE:-d1-read.token}"
-DEPLOY_D1_REPLICATOR_TOKEN_FILE="${DEPLOY_D1_REPLICATOR_TOKEN_FILE:-d1-read.token}"
-DEPLOY_GRAPH_TOKEN_FILE="${DEPLOY_GRAPH_TOKEN_FILE:-graph.token}"   # minted on first use (G1)
+# DEPLOY_SECRETS_DIR, from the environment or instances/deploy.env (below). The
+# replicator token MUST be able to write D1 (cloudflare-api.token); the read
+# token is read-only and must be a different file (Item 99).
+DEPLOY_CLOUDFLARE_TOKEN_FILE="${DEPLOY_CLOUDFLARE_TOKEN_FILE:-${CFG_TOKEN[0]:-cloudflare-api.token}}"
+DEPLOY_D1_READ_TOKEN_FILE="${DEPLOY_D1_READ_TOKEN_FILE:-${CFG_TOKEN[1]:-d1-read.token}}"
+DEPLOY_D1_REPLICATOR_TOKEN_FILE="${DEPLOY_D1_REPLICATOR_TOKEN_FILE:-${CFG_TOKEN[2]:-cloudflare-api.token}}"
+DEPLOY_GRAPH_TOKEN_FILE="${DEPLOY_GRAPH_TOKEN_FILE:-${CFG_TOKEN[3]:-graph.token}}"   # minted on first use (G1)
 # /api/v1 (API1): ON only when this file (sha256 digests; scripts/mint_api_token.sh)
 # is in the token directory; the smoke check uses a plain token from the second
 # one when it is there too.
-DEPLOY_API_TOKENS_FILE="${DEPLOY_API_TOKENS_FILE:-api-tokens.json}"
-DEPLOY_API_SMOKE_TOKEN_FILE="${DEPLOY_API_SMOKE_TOKEN_FILE:-api-smoke.token}"
+DEPLOY_API_TOKENS_FILE="${DEPLOY_API_TOKENS_FILE:-${CFG_TOKEN[4]:-api-tokens.json}}"
+DEPLOY_API_SMOKE_TOKEN_FILE="${DEPLOY_API_SMOKE_TOKEN_FILE:-${CFG_TOKEN[5]:-api-smoke.token}}"
 for v in DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE DEPLOY_GRAPH_TOKEN_FILE \
          DEPLOY_API_TOKENS_FILE DEPLOY_API_SMOKE_TOKEN_FILE; do
   printf '%s' "${!v}" | grep -Eqx '[A-Za-z0-9_-][A-Za-z0-9._-]*' \
@@ -1001,6 +1017,12 @@ def _replication_problem(store, body):
         # waited for (it may recover), then a failure naming the last error
         return False, (f"replication status {rep.get('status')!r}, not running "
                        f"(last_error {rep.get('last_error')!r}, lag_rows {rep.get('lag_rows')!r})")
+    if REPLICATION == "write" and rep.get("write_probe") != "ok":
+        # Item 99: "running" with lag 0 proves nothing when no write is pending
+        # (a read-only replicator token passed this check once). The replicator
+        # sends one no-op DELETE at start; D1 refuses it for a token that cannot write.
+        return False, (f"the replicator has not proved it can write to D1 (write_probe {rep.get('write_probe')!r}; "
+                       f"last_error {rep.get('last_error')!r}) -- is MEMORA_D1_REPLICATOR_TOKEN_FILE a write-capable token?")
     return None
 
 
@@ -1031,7 +1053,7 @@ for store in STORES:
     if store in REPLICAS:
         rep = body["replication"]
         print(f"store {store}: replicating ({rep['mode']}) to {rep['replica_uri']}, status {rep.get('status')}, "
-              f"trigger version {rep['trigger_version']}, lag_rows {rep.get('lag_rows')}")
+              f"trigger version {rep['trigger_version']}, lag_rows {rep.get('lag_rows')}, write_probe {rep.get('write_probe')}")
     # A store that comes up FROZEN (the persisted freeze of a cutover,
     # scripts/cutover_store.sh step e) serves reads (X2), so memory_stats
     # below checks it like any other; a replicated one also passed the

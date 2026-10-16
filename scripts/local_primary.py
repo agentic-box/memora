@@ -493,6 +493,19 @@ def _add_store_cmd(args) -> int:
     edit_token = lp.load_credential_file(args.credential_file)
     if edit_token == read_token:
         raise lp.L5Refused("the edit credential and the read token must be different tokens")
+    # Item 99: the replicator WRITES to D1; the read token cannot. A deploy once
+    # defaulted the replicator to the read token file and every store's
+    # replicator went into backoff (D1 code 7500). Refused before any D1 call.
+    from memora.secret_files import SecretFileError, secret
+
+    try:
+        replicator_token = secret("MEMORA_D1_REPLICATOR_TOKEN")
+    except SecretFileError as exc:
+        raise lp.L5Refused(str(exc))
+    if replicator_token and replicator_token == read_token:
+        raise lp.L5Refused("the replicator token (MEMORA_D1_REPLICATOR_TOKEN_FILE) is the READ token: it cannot write "
+                           "to D1. Point DEPLOY_D1_REPLICATOR_TOKEN_FILE at the write-capable token file "
+                           "(instances/deploy.env), then deploy")
     reader = D1SelectOnlyConnection(args.account, args.database_id, read_token)
     ids, names = ads.configured_from_env()
     deps = ads.BootstrapDeps(

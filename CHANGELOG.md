@@ -14,6 +14,13 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
+The replicator token no longer defaults to the D1 read token, and a replicator that cannot write is caught at deploy time (Item 99).
+
+- `scripts/deploy-memora-all.sh`: `DEPLOY_D1_REPLICATOR_TOKEN_FILE` defaults to `cloudflare-api.token` (write-capable), not `d1-read.token`. After the 2026-10-17 deploy the replicator of every store ran with the read-only token (D1 400, code 7500, backoff) while the deploy reported all stores verified, because nothing was pending.
+- The six `DEPLOY_*_TOKEN_FILE` names are now optional keys of `instances/deploy.env` (the environment variable wins), validated as plain file names.
+- The write-mode replicator sends one no-op write at start (an allow-listed `DELETE FROM memories WHERE id = -1`: no row exists, none is written; D1 refuses it for a read-only token) and reports `write_probe: "ok"` in its status. The deploy waits for it per replicated store and fails with the D1 error otherwise.
+- `local_primary.py bootstrap-d1` (step 1 of `add_store.sh`) refuses when the replicator token is the read token.
+
 ## 0.5.7.2 — 2026-10-16
 
 The add-store tooling accepts the production credential layout (Item 97).

@@ -27,7 +27,8 @@ def env(tmp_path, monkeypatch):
     post = replica.post_json
 
     def counting(body):
-        if "batch" in body:
+        probe = [{"sql": "DELETE FROM memories WHERE id = ?", "params": [-1]}]  # Item 99's write probe: not a send
+        if "batch" in body and body["batch"] != probe:
             sends.append((time.monotonic(), len(body["batch"]) - 1))  # minus the epoch postcheck
         return post(body)
 
