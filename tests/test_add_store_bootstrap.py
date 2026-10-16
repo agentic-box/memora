@@ -546,3 +546,15 @@ def test_verify_replication_detects_a_missing_a_differing_row_and_a_count_mismat
     assert "D1 row count equals the local count" in failed(r.run())
     r = Repl()
     assert "at least 5 local rows" in failed(r.run(expect_min_rows=5))
+
+
+def test_the_scratch_d1_refuses_a_registered_store_file(tmp_path, monkeypatch):
+    store = tmp_path / "live.db"
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"live": str(store), "remote": "d1://acct/db"}))
+    with pytest.raises(ValueError, match="registered memora store"):
+        ads.ScratchD1Connection(str(store))
+    monkeypatch.setenv("MEMORA_DATABASES", json.dumps({"live": "file://" + str(store)}))
+    with pytest.raises(ValueError, match="registered memora store"):
+        ads.ScratchD1Connection(str(store))
+    assert ads.ScratchD1Connection(":memory:") and ads.ScratchD1Connection(str(tmp_path / "other.sqlite"))
+    assert not store.exists()                                         # nothing was created at the registered path

@@ -138,6 +138,26 @@ class BootstrapD1Backend(D1Backend):
 
 # ------------------------------------------------------------------ scratch D1 (reference + tests)
 
+def _refuse_registered_store(path: str) -> None:
+    """A scratch D1 is the REMOTE side of a D1Connection, never a memora store: it opens ":memory:" or a file the
+    caller owns (tests), and refuses a path that is one of memora-all's registered local stores (which must only be
+    opened through LocalSQLiteBackend.connect, under the store lock)."""
+    from .storage import database_registry
+
+    try:
+        routes = database_registry()
+    except Exception:
+        return
+    real = os.path.realpath(path)
+    for spec in routes.values():
+        spec = str(spec)
+        if "://" in spec and not spec.startswith("file://"):
+            continue
+        local = spec[len("file://"):] if spec.startswith("file://") else spec
+        if os.path.realpath(local) == real:
+            raise ValueError(f"ScratchD1Connection refuses {path}: it is a registered memora store")
+
+
 class ScratchD1Connection(D1Connection):
     """A D1Connection whose HTTP leg is a local SQLite database. It takes
     every D1 branch (it IS a D1Connection) and is what the reference schema is
@@ -146,6 +166,8 @@ class ScratchD1Connection(D1Connection):
 
     def __init__(self, path: str = ":memory:", account_id: str = "scratch", database_id: str = "scratch"):
         super().__init__(account_id, database_id, "scratch")
+        if str(path) != ":memory:":
+            _refuse_registered_store(str(path))
         self._sql = sqlite3.connect(path, check_same_thread=False)
         self._sql.row_factory = sqlite3.Row
         self.sent: List[str] = []

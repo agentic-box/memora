@@ -171,12 +171,18 @@ EXPECTED_SQLITE_CONNECT_SITES = {
     ("local_primary.py", "_scratch_connect"),
     # X2: the in-memory reference schema (":memory:"), never a store file.
     ("schema.py", "_reference_schema"),
+    # Item 95: the scratch D1 stand-in. It is the REMOTE side of a D1Connection (Cloudflare's HTTP leg replaced by
+    # SQLite): ":memory:" for the reference schema in production code, a test-owned tmp file in tests. It is never a
+    # local store and takes no store lock; the constructor refuses a path that is a registered memora store.
+    ("add_store.py", "ScratchD1Connection.__init__"),
 }
 # Every storage backend class; each one's connect() is the only way a
 # connection to its store is made (storage.connect, schema.connect, the graph
 # server, CLI, sync, import, rebuild, backfill and absorb all call
 # backend.connect() / connect_read_only()).
-EXPECTED_BACKENDS = {"StorageBackend", "LocalSQLiteBackend", "CloudSQLiteBackend", "D1Backend"}
+# BootstrapD1Backend (Item 95) is a D1Backend subclass whose connect() returns the guarded HTTP D1 connection; it
+# has no sqlite3 and no local store.
+EXPECTED_BACKENDS = {"StorageBackend", "LocalSQLiteBackend", "CloudSQLiteBackend", "D1Backend", "BootstrapD1Backend"}
 
 
 def _qualname_sites():
