@@ -14,13 +14,13 @@ from memora.backends import LocalSQLiteBackend
 
 from .copy_fakes import InProcessEndpoint, in_store
 
-TAG = "acebar"
+TAG = "newstore"
 
 
 @pytest.fixture
 def stores(monkeypatch, tmp_path):
     backends = {"memora": LocalSQLiteBackend(tmp_path / "memora.db"),
-                "acebar": LocalSQLiteBackend(tmp_path / "acebar.db")}
+                "newstore": LocalSQLiteBackend(tmp_path / "newstore.db")}
     monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
     monkeypatch.setattr(storage, "backend_for", lambda name: backends[name])
     monkeypatch.setenv("MEMORA_DATABASES", json.dumps({n: str(tmp_path / f"{n}.db") for n in backends}))
@@ -31,7 +31,7 @@ def stores(monkeypatch, tmp_path):
     for name in backends:
         with in_store(name) as c:
             c.commit()
-    yield {"src": InProcessEndpoint("memora"), "dest": InProcessEndpoint("acebar")}
+    yield {"src": InProcessEndpoint("memora"), "dest": InProcessEndpoint("newstore")}
     server._tool_last_call.clear()
     server._tool_running.clear()
 
@@ -65,11 +65,11 @@ def opts(tmp_path, **kw):
 def plan_for(stores, tmp_path=None, **kw):
     for ep in stores.values():
         ep.calls.clear()                      # setup is over: what follows is the tool's own traffic
-    return cm.build_plan(stores["src"], stores["dest"], tag=TAG, follow="active", project="acebar", **kw)
+    return cm.build_plan(stores["src"], stores["dest"], tag=TAG, follow="active", project="newstore", **kw)
 
 
 def dest_rows(stores):
-    with in_store("acebar") as c:
+    with in_store("newstore") as c:
         return [dict(r) for r in c.execute("SELECT * FROM memories ORDER BY id").fetchall()]
 
 
@@ -123,7 +123,7 @@ def test_the_plan_file_is_0600_and_tamper_evident(stores, seeded, tmp_path):
 
 def test_source_equal_to_destination_is_refused(stores, seeded):
     with pytest.raises(cm.CopyError, match="same store"):
-        cm.build_plan(stores["src"], stores["src"], tag=TAG, follow="active", project="acebar")
+        cm.build_plan(stores["src"], stores["src"], tag=TAG, follow="active", project="newstore")
 
 
 # ------------------------------------------------------------------ apply
@@ -134,7 +134,7 @@ def test_apply_copies_content_tags_metadata_original_created_at_and_provenance(s
     out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert out["ok"] is True and out["copied"] == 5
     src_rows = {r["id"]: r for r in plan["rows"]}
-    mapping = json.loads((tmp_path / "copystate" / "memora-acebar.manifest.json").read_text())["map"]
+    mapping = json.loads((tmp_path / "copystate" / "memora-newstore.manifest.json").read_text())["map"]
     assert sorted(int(k) for k in mapping) == sorted(src_rows)
     for sid, did in mapping.items():
         rec = stores["dest"].call("memory_get", {"memory_id": did, "include_images": True, "follow": "all"})["memory"]
@@ -148,12 +148,12 @@ def test_apply_copies_content_tags_metadata_original_created_at_and_provenance(s
         for k, v in (s["metadata"] or {}).items():
             assert rec["metadata"][k] == v
         assert rec["metadata"][cm.PROV_KEY] == {"store": "memora", "id": int(sid)}
-        assert rec["metadata"]["project"] == "acebar"
+        assert rec["metadata"]["project"] == "newstore"
     # the originals are untouched, and no write tool ever went to the source
     assert source_digest(stores) == before
     assert stores["src"].writes() == []
     # embeddings were recomputed in the destination
-    with in_store("acebar") as c:
+    with in_store("newstore") as c:
         assert c.execute("SELECT COUNT(*) FROM memories_embeddings").fetchone()[0] == 5
 
 
@@ -172,7 +172,7 @@ def test_a_superseded_copy_is_not_copied_again(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     mapping = {int(k): v for k, v in json.loads((tmp_path / "copystate" /
-                                                  "memora-acebar.manifest.json").read_text())["map"].items()}
+                                                  "memora-newstore.manifest.json").read_text())["map"].items()}
     newer = create(stores["dest"], "a newer version, written later in the destination")
     link(stores["dest"], newer, mapping[seeded["a"]], "supersedes")           # the copy of 'a' is now superseded
     active = stores["dest"].call("memory_list", {"limit": -1, "follow": "active", "fields": ["id"]})["memories"]
@@ -203,7 +203,7 @@ def test_a_concurrent_copy_into_the_same_destination_is_refused(stores, seeded, 
     plan = plan_for(stores)
     o = opts(tmp_path)
     o.state_dir.mkdir(parents=True)
-    fd = os.open(o.state_dir / "acebar.lock", os.O_CREAT | os.O_RDWR)
+    fd = os.open(o.state_dir / "newstore.lock", os.O_CREAT | os.O_RDWR)
     fcntl.flock(fd, fcntl.LOCK_EX)
     try:
         with pytest.raises(cm.CopyError, match="another copy"):
@@ -245,7 +245,7 @@ def test_an_unknown_outcome_whose_row_landed_is_not_created_again(stores, seeded
 
 
 def attempts_of(tmp_path):
-    return json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text()).get("attempts", {})
+    return json.loads((tmp_path / "copystate" / "memora-newstore.json").read_text()).get("attempts", {})
 
 
 def test_a_delayed_create_is_never_repeated_and_late_completion_reconciles_with_one_row(stores, seeded, tmp_path):
@@ -398,7 +398,7 @@ def test_manual_reconciliation_then_a_single_create(stores, seeded, tmp_path):
     with pytest.raises(Boom):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     stores["dest"].hook = None
-    path = tmp_path / "copystate" / "memora-acebar.json"
+    path = tmp_path / "copystate" / "memora-newstore.json"
     st = json.loads(path.read_text())
     ambiguous = [k for k, a in st["attempts"].items() if a["state"] == "sent"]
     assert len(ambiguous) == 1
@@ -412,7 +412,7 @@ def test_manual_reconciliation_then_a_single_create(stores, seeded, tmp_path):
 def test_the_state_is_bound_to_the_plan_digest(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    path = tmp_path / "copystate" / "memora-acebar.json"
+    path = tmp_path / "copystate" / "memora-newstore.json"
     st = json.loads(path.read_text())
     st["digest"] = "0" * 64
     path.write_text(json.dumps(st))
@@ -493,7 +493,7 @@ def test_every_internal_edge_type_and_direction_is_preserved(stores, seeded, tmp
     assert lk["unrepresentable"] == []
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     m = {int(k): v for k, v in json.loads((tmp_path / "copystate" /
-                                           "memora-acebar.manifest.json").read_text())["map"].items()}
+                                           "memora-newstore.manifest.json").read_text())["map"].items()}
     d = stores["dest"]
     A, B, C, D, E = (m[seeded[k]] for k in "abcde")
     assert (B, "references") in related(d, A) and (A, "referenced_by") in related(d, B)
@@ -524,7 +524,7 @@ def test_a_reciprocal_only_edge_is_refused_unless_allowed(stores, seeded, tmp_pa
     assert dest_rows(stores) == []                                        # refused before any write
     out = cm.apply_plan(plan, s, stores["dest"], opts(tmp_path, allow_unrepresentable=True))
     assert out["unrepresentable"] and out["copied"] == 5
-    manifest = json.loads((tmp_path / "copystate" / "memora-acebar.manifest.json").read_text())
+    manifest = json.loads((tmp_path / "copystate" / "memora-newstore.manifest.json").read_text())
     assert manifest["links"]["unrepresentable"]                           # conspicuous in the manifest
 
 
@@ -533,8 +533,8 @@ def test_a_rerun_repairs_missing_links_with_nothing_left_to_import(stores, seede
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     m = {int(k): v for k, v in json.loads((tmp_path / "copystate" /
-                                           "memora-acebar.manifest.json").read_text())["map"].items()}
-    with in_store("acebar") as c:                                         # an interrupted link phase
+                                           "memora-newstore.manifest.json").read_text())["map"].items()}
+    with in_store("newstore") as c:                                         # an interrupted link phase
         c.execute("UPDATE memories_crossrefs SET related = '[]' WHERE memory_id IN (?, ?)", (m[seeded["a"]], m[seeded["b"]]))
         c.commit()
     assert (m[seeded["b"]], "references") not in related(stores["dest"], m[seeded["a"]])
@@ -559,12 +559,12 @@ def test_a_crash_in_the_link_phase_is_repaired_by_a_rerun(stores, seeded, tmp_pa
     stores["dest"].hook = hook
     with pytest.raises(Boom):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    st = json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())
+    st = json.loads((tmp_path / "copystate" / "memora-newstore.json").read_text())
     assert st["phase"] == "remapped"                                      # mapped and remapped; links unfinished
     stores["dest"].hook = None
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert len(dest_rows(stores)) == 5
-    assert json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())["phase"] == "done"
+    assert json.loads((tmp_path / "copystate" / "memora-newstore.json").read_text())["phase"] == "done"
 
 
 # ------------------------------------------------------------------ metadata references
@@ -576,12 +576,12 @@ def test_merged_from_is_remapped_by_exact_key_after_the_ids_exist(stores, seeded
     assert plan["report"]["merged_from"] == {"remap": [inside], "dropped": [outside]}
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     m = {int(k): v for k, v in json.loads((tmp_path / "copystate" /
-                                           "memora-acebar.manifest.json").read_text())["map"].items()}
+                                           "memora-newstore.manifest.json").read_text())["map"].items()}
     rec_in = stores["dest"].call("memory_get", {"memory_id": m[inside], "follow": "all"})["memory"]
     rec_out = stores["dest"].call("memory_get", {"memory_id": m[outside], "follow": "all"})["memory"]
     assert rec_in["metadata"]["merged_from"] == m[seeded["b"]]            # the destination id, not the source id
     assert "merged_from" not in rec_out["metadata"]                        # a dangling source id never lands
-    manifest = json.loads((tmp_path / "copystate" / "memora-acebar.manifest.json").read_text())
+    manifest = json.loads((tmp_path / "copystate" / "memora-newstore.manifest.json").read_text())
     assert manifest["dropped_metadata_refs"] == [{"id": outside, "key": "merged_from", "value": seeded["out"]}]
 
 
@@ -643,7 +643,7 @@ def test_a_symmetric_forward_only_edge_keeps_its_direction():
 # ------------------------------------------------------------------ MCP endpoint plumbing
 
 def test_mcp_endpoint_maps_transport_failures_to_an_uncertain_outcome(monkeypatch):
-    ep = cm.McpEndpoint("http://127.0.0.1:1", "acebar", "tok", timeout=0.2)
+    ep = cm.McpEndpoint("http://127.0.0.1:1", "newstore", "tok", timeout=0.2)
     with pytest.raises(cm.EndpointUncertain):
         ep.call("memory_create", {"content": "x"})
 
@@ -679,7 +679,7 @@ def test_the_state_is_made_durable_file_and_directory(stores, seeded, tmp_path, 
 def test_a_corrupt_or_unreadable_state_is_never_read_as_an_empty_attempts_map(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    path = tmp_path / "copystate" / "memora-acebar.json"
+    path = tmp_path / "copystate" / "memora-newstore.json"
     path.write_text("{ truncated")
     n = len(creates(stores["dest"]))
     with pytest.raises(cm.CopyError, match="unreadable or corrupt"):
@@ -743,9 +743,9 @@ def test_the_source_project_may_differ_from_the_destination_project(stores, seed
     plan = plan_for(stores)
     out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert out["copied"] == 6
-    m = {int(k): v for k, v in json.loads((tmp_path / "copystate" / "memora-acebar.manifest.json").read_text())["map"].items()}
+    m = {int(k): v for k, v in json.loads((tmp_path / "copystate" / "memora-newstore.manifest.json").read_text())["map"].items()}
     rec = stores["dest"].call("memory_get", {"memory_id": m[odd], "follow": "all"})["memory"]
-    assert rec["metadata"]["project"] == "acebar"
+    assert rec["metadata"]["project"] == "newstore"
 
 
 def test_a_remapped_reference_is_verified_after_the_update(stores, seeded, tmp_path):
@@ -771,7 +771,7 @@ def test_a_done_attempt_whose_marker_is_gone_is_never_created_again(stores, seed
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     victim = plan["rows"][1]["id"]
-    with in_store("acebar") as c:                                  # someone strips the marker (metadata) from one copy
+    with in_store("newstore") as c:                                  # someone strips the marker (metadata) from one copy
         c.execute("UPDATE memories SET metadata = '{}' WHERE json_extract(metadata, '$.memora_copy.id') = ?", (victim,))
         c.commit()
     n = len(creates(stores["dest"]))

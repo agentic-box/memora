@@ -10,7 +10,7 @@
 #   * add_store_config.py check/apply/remove on copies of the operator files;
 #   * pre-freeze: the persisted freeze makes a store come up FROZEN in a real deploy, and the
 #     deploy's own frozen-store check passes; clear-freeze refuses while the service routes the store;
-#   * a 5th local store is routed at /mcp/acebar by a real deploy and survives a redeploy;
+#   * a 5th local store is routed at /mcp/newstore by a real deploy and survives a redeploy;
 #   * the copy tool inside the container against the live server: dry-run writes nothing, apply copies
 #     (content, tags, metadata, original_created_at, provenance, links), a rerun and a redeploy copy nothing twice,
 #     the source is byte-identical before and after.
@@ -37,9 +37,9 @@ DEPLOY_CFGF="$RH_ROOT/deploy.env"
 RESULTS="$RH_ROOT/results.txt"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/pyproject.toml")"
 REG4='{"memora": "/data/memora.db", "alpha": "/data/alpha.db", "beta": "/data/beta.db", "gamma": "/data/gamma.db"}'
-REG5='{"memora": "/data/memora.db", "alpha": "/data/alpha.db", "beta": "/data/beta.db", "gamma": "/data/gamma.db", "acebar": "/data/acebar.db"}'
+REG5='{"memora": "/data/memora.db", "alpha": "/data/alpha.db", "beta": "/data/beta.db", "gamma": "/data/gamma.db", "newstore": "/data/newstore.db"}'
 PROJ4='{"memora":["memora"],"alpha":["alpha"],"beta":["beta"],"gamma":["gamma"]}'
-PROJ5='{"memora":["memora"],"alpha":["alpha"],"beta":["beta"],"gamma":["gamma"],"acebar":["acebar"]}'
+PROJ5='{"memora":["memora"],"alpha":["alpha"],"beta":["beta"],"gamma":["gamma"],"newstore":["newstore"]}'
 
 OBJECTS="$RH_ROOT/run-$RUN_ID.objects"
 mkdir -p "$RH_ROOT" "$CFG" "$SECRETS"
@@ -84,7 +84,7 @@ tokens_in() {
   "$RT" exec "$NAME" sh -c "umask 077 && mkdir -p $SHM && printf %s \"\$MEMORA_ADMIN_TOKEN\" > $SHM/admin.token && printf %s \"\$MEMORA_HEALTH_TOKEN\" > $SHM/health.token"
 }
 LP=("$RT" exec "$NAME" python /app/scripts/local_primary.py)
-COPY=("$RT" exec "$NAME" python /app/scripts/copy_memories.py --source memora --dest acebar --health-token-file "$SHM/health.token"
+COPY=("$RT" exec "$NAME" python /app/scripts/copy_memories.py --source memora --dest newstore --health-token-file "$SHM/health.token"
       --base-url http://127.0.0.1:8000 --state-dir /data/copy)
 # a content digest of a store, read through the container's own code (rows + links), for before/after
 digest() {  # digest STORE
@@ -142,18 +142,18 @@ check "the image carries bootstrap-d1" "${LP[@]}" bootstrap-d1 --help
 check "the image carries pre-freeze and clear-freeze" bash -c "'$RT' exec '$NAME' python /app/scripts/local_primary.py pre-freeze --help && '$RT' exec '$NAME' python /app/scripts/local_primary.py clear-freeze --help"
 check "the image carries the copy tool" "$RT" exec "$NAME" python /app/scripts/copy_memories.py --help
 
-echo "== 2. seed the source store with memories tagged acebar (and one that is not)"
+echo "== 2. seed the source store with memories tagged newstore (and one that is not)"
 check "write the source memories, links and an old created_at" "$RT" exec -i "$NAME" python - <<'PY'
 from memora import schema, storage
 from memora.storage import add_link
 conn = schema.connect(storage.backend_for("memora"))
 ids = {}
 for key, content, tags, meta, created in [
-    ("a", "rehearsal acebar note one: apples", ["acebar"], {"k": 1, "nested": {"x": [1, 2]}}, "2020-01-02 03:04:05"),
-    ("b", "rehearsal acebar note two: bananas", ["acebar"], None, "2021-05-06 07:08:09"),
-    ("c", "rehearsal acebar note three: cherries", ["acebar", "extra"], None, None),
-    ("d", "rehearsal acebar note four: dates", ["acebar"], None, "2019-12-31 23:59:59"),
-    ("out", "rehearsal not acebar: kumquat", ["other"], None, None),
+    ("a", "rehearsal newstore note one: apples", ["newstore"], {"k": 1, "nested": {"x": [1, 2]}}, "2020-01-02 03:04:05"),
+    ("b", "rehearsal newstore note two: bananas", ["newstore"], None, "2021-05-06 07:08:09"),
+    ("c", "rehearsal newstore note three: cherries", ["newstore", "extra"], None, None),
+    ("d", "rehearsal newstore note four: dates", ["newstore"], None, "2019-12-31 23:59:59"),
+    ("out", "rehearsal not newstore: kumquat", ["other"], None, None),
 ]:
     rec = storage.add_memory(conn, content=content, tags=tags, metadata=meta)
     ids[key] = rec["id"]
@@ -175,57 +175,57 @@ CT="$RH_ROOT/cfgtest"; rm -rf "$CT"; mkdir -p "$CT"
 cp "$ENVF" "$CT/all.env"; cp "$DEPLOY_CFGF" "$CT/deploy.env"
 printf 'MEMORA_REPLICATION=write\nMEMORA_REPLICATION_INTERVAL_S=60\n' >> "$CT/all.env"
 CFGT=("$PY" "$ROOT/scripts/add_store_config.py")
-CFGARGS=(--all-env "$CT/all.env" --deploy-env "$CT/deploy.env" --db acebar --repo "$ROOT")
+CFGARGS=(--all-env "$CT/all.env" --deploy-env "$CT/deploy.env" --db newstore --repo "$ROOT")
 check "check accepts a new store" "${CFGT[@]}" check "${CFGARGS[@]}" --uri d1://rh-acct/rh-newdb-001
 cp "$CT/all.env" "$CT/all.env.orig"
 check "apply edits the interim entry and the project" "${CFGT[@]}" apply "${CFGARGS[@]}" --uri d1://rh-acct/rh-newdb-001 --backup-dir "$RH_ROOT/cfgbackup"
-grep -q 'acebar' "$CT/all.env" && grep -q 'acebar' "$CT/deploy.env" && pass "acebar is in both files" || fail "acebar missing after apply"
-check "remove takes only the acebar keys back out" "${CFGT[@]}" remove "${CFGARGS[@]}" --backup-dir "$RH_ROOT/cfgbackup"
+grep -q 'newstore' "$CT/all.env" && grep -q 'newstore' "$CT/deploy.env" && pass "newstore is in both files" || fail "newstore missing after apply"
+check "remove takes only the newstore keys back out" "${CFGT[@]}" remove "${CFGARGS[@]}" --backup-dir "$RH_ROOT/cfgbackup"
 cmp -s "$CT/all.env" "$CT/all.env.orig" && pass "the file is byte-identical to the original after apply + remove" || fail "all.env differs after apply + remove"
 [ "$(stat -c %a "$RH_ROOT/cfgbackup")" = 700 ] && pass "the backup directory is 0700" || fail "backup dir mode"
 
 echo "== 4. the new store, pre-frozen, then a real deploy that routes it (stand-ins for bootstrap + seed)"
-check "create /data/acebar.db with the app's schema (stand-in for bootstrap + seed; a D1 leg is not rehearsable)" "${IN[@]}" python -c '
+check "create /data/newstore.db with the app's schema (stand-in for bootstrap + seed; a D1 leg is not rehearsable)" "${IN[@]}" python -c '
 from pathlib import Path
 from memora.backends import LocalSQLiteBackend
 from memora import schema
-c = LocalSQLiteBackend(Path("/data/acebar.db")).connect(); schema.ensure_schema(c); c.commit(); c.close()'
+c = LocalSQLiteBackend(Path("/data/newstore.db")).connect(); schema.ensure_schema(c); c.commit(); c.close()'
 check "a verified bootstrap state (stand-in), then the REAL pre-freeze command" "${IN[@]}" python -c '
 from memora import add_store as a
-a._save_state("acebar", {"account_id": "rh-acct", "database_id": "rh-newdb-001", "d1_name": "acebar-rh", "phase": "verified"}, None)'
-check "bootstrap-status accepts exactly the pinned ids (verified state; no freeze yet allowed with the flag)" "${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh --no-freeze-check
-OUT="$("${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-OTHER-db --d1-name acebar-rh 2>&1)"; RC=$?
+a._save_state("newstore", {"account_id": "rh-acct", "database_id": "rh-newdb-001", "d1_name": "newstore-rh", "phase": "verified"}, None)'
+check "bootstrap-status accepts exactly the pinned ids (verified state; no freeze yet allowed with the flag)" "${LP[@]}" bootstrap-status newstore --account rh-acct --database-id rh-newdb-001 --d1-name newstore-rh --no-freeze-check
+OUT="$("${LP[@]}" bootstrap-status newstore --account rh-acct --database-id rh-OTHER-db --d1-name newstore-rh 2>&1)"; RC=$?
 [ "$RC" = 2 ] && pass "bootstrap-status refuses a different database id (exit 2)" || fail "bootstrap-status with another id: rc=$RC $OUT"
-OUT="$("${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh 2>&1)"; RC=$?
+OUT="$("${LP[@]}" bootstrap-status newstore --account rh-acct --database-id rh-newdb-001 --d1-name newstore-rh 2>&1)"; RC=$?
 [ "$RC" = 2 ] && echo "$OUT" | grep -q "freeze" && pass "bootstrap-status refuses while the persisted freeze is missing" || fail "bootstrap-status without the freeze: rc=$RC $OUT"
-check "pre-freeze acebar" "${LP[@]}" pre-freeze acebar
-check "bootstrap-status now passes with the freeze" "${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh
+check "pre-freeze newstore" "${LP[@]}" pre-freeze newstore
+check "bootstrap-status now passes with the freeze" "${LP[@]}" bootstrap-status newstore --account rh-acct --database-id rh-newdb-001 --d1-name newstore-rh
 check "the image carries verify-replication" "${LP[@]}" verify-replication --help
-check "the persisted freeze file exists" "${IN[@]}" test -e /data/freeze/acebar
+check "the persisted freeze file exists" "${IN[@]}" test -e /data/freeze/newstore
 printf "MEMORA_DATABASES='%s'\n" "$REG5" > "$ENVF"
 printf '%s\n' "DEPLOY_HOST=localhost" "DEPLOY_GRAPH_BIND=127.0.0.1" "DEPLOY_REPO=$ROOT" "MEMORA_PROJECTS='$PROJ5'" > "$DEPLOY_CFGF"
 if deploy > "$RH_ROOT/deploy-2.log" 2>&1; then pass "deploy 2: five stores (log: deploy-2.log)"; \
   else fail "deploy 2 (exit $?; see deploy-2.log)"; tail -30 "$RH_ROOT/deploy-2.log"; fi
 adopt C2 container "$NAME"; adopt _ image "$IMAGE"; adopt_run_tags
 check "the container answers /health" wait_health
-grep -q "store acebar: /health/db 200 ok, FROZEN .*memory_stats" "$RH_ROOT/deploy-2.log" \
-  && pass "the deploy checked acebar as a FROZEN store and ran memory_stats on it" || fail "deploy 2 did not check acebar as frozen"
-health_db acebar > "$RH_ROOT/health-acebar.json"
-"$PY" -c 'import json,sys; f=json.load(open(sys.argv[1]))["freeze"]; assert f["state"]=="frozen" and f["in_flight"]==0, f' "$RH_ROOT/health-acebar.json" \
-  && pass "/health/db/acebar: frozen from the persisted freeze, 0 in flight (nothing could write it)" || fail "acebar health: $(cat "$RH_ROOT/health-acebar.json")"
+grep -q "store newstore: /health/db 200 ok, FROZEN .*memory_stats" "$RH_ROOT/deploy-2.log" \
+  && pass "the deploy checked newstore as a FROZEN store and ran memory_stats on it" || fail "deploy 2 did not check newstore as frozen"
+health_db newstore > "$RH_ROOT/health-newstore.json"
+"$PY" -c 'import json,sys; f=json.load(open(sys.argv[1]))["freeze"]; assert f["state"]=="frozen" and f["in_flight"]==0, f' "$RH_ROOT/health-newstore.json" \
+  && pass "/health/db/newstore: frozen from the persisted freeze, 0 in flight (nothing could write it)" || fail "newstore health: $(cat "$RH_ROOT/health-newstore.json")"
 check "token files for the tools" tokens_in
-OUT="$("${LP[@]}" clear-freeze acebar 2>&1)"; RC=$?
-[ "$RC" != 0 ] && echo "$OUT" | grep -q "still routes" && pass "clear-freeze refuses while the service routes acebar (the freeze stays)" || fail "clear-freeze while routed: rc=$RC $OUT"
-check "the freeze file is still there" "${IN[@]}" test -e /data/freeze/acebar
+OUT="$("${LP[@]}" clear-freeze newstore 2>&1)"; RC=$?
+[ "$RC" != 0 ] && echo "$OUT" | grep -q "still routes" && pass "clear-freeze refuses while the service routes newstore (the freeze stays)" || fail "clear-freeze while routed: rc=$RC $OUT"
+check "the freeze file is still there" "${IN[@]}" test -e /data/freeze/newstore
 
 echo "== 5. the copy: dry-run (still frozen), a refused apply, thaw, apply, rerun, redeploy"
-DEST0="$(digest acebar)"
-check "dry-run writes the plan file (a frozen destination is only read)" "${COPY[@]}" --tag acebar --plan /data/copy/plan.json
+DEST0="$(digest newstore)"
+check "dry-run writes the plan file (a frozen destination is only read)" "${COPY[@]}" --tag newstore --plan /data/copy/plan.json
 OUT="$("${COPY[@]}" --plan /data/copy/plan.json --apply 2>&1)"; RC=$?
 [ "$RC" = 2 ] && echo "$OUT" | grep -q "frozen" && pass "apply into the FROZEN interim store is refused (exit 2)" || fail "apply into a frozen store: rc=$RC $OUT"
-[ "$(digest acebar)" = "$DEST0" ] && pass "the refused apply wrote nothing" || fail "the refused apply changed acebar"
-check "thaw acebar (the cutover's last step, here by the operator tool)" "${LP[@]}" thaw acebar --admin-token-file "$SHM/admin.token" --health-token-file "$SHM/health.token"
-[ "$(digest acebar)" = "$DEST0" ] && pass "the dry-run wrote nothing to the destination" || fail "the dry-run changed acebar"
+[ "$(digest newstore)" = "$DEST0" ] && pass "the refused apply wrote nothing" || fail "the refused apply changed newstore"
+check "thaw newstore (the cutover's last step, here by the operator tool)" "${LP[@]}" thaw newstore --admin-token-file "$SHM/admin.token" --health-token-file "$SHM/health.token"
+[ "$(digest newstore)" = "$DEST0" ] && pass "the dry-run wrote nothing to the destination" || fail "the dry-run changed newstore"
 [ "$(digest memora)" = "$SRC_BEFORE" ] && pass "the dry-run left the source byte-identical" || fail "the dry-run changed memora"
 "${IN[@]}" python -c '
 import json
@@ -234,21 +234,21 @@ assert r["selected"] == 4 and len(r["would_copy"]) == 4 and not r["unknown_refs"
 assert r["links"]["external_dropped"] >= 1, r
 print("plan ok", r["links"])' >>"$RH_ROOT/commands.log" 2>&1 && pass "the plan: 4 selected, 4 to copy, the external edge counted" || fail "the plan report is not as expected"
 check "apply" "${COPY[@]}" --plan /data/copy/plan.json --apply
-"$RT" exec -i "$NAME" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "acebar holds the four copies: content, original_created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
+"$RT" exec -i "$NAME" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "newstore holds the four copies: content, original_created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
 import json
 from memora import schema, storage
-conn = schema.connect(storage.backend_for("acebar"))
+conn = schema.connect(storage.backend_for("newstore"))
 rows = {r["content"]: dict(r) for r in conn.execute("SELECT * FROM memories")}
 assert len(rows) == 4, sorted(rows)
-a = rows["rehearsal acebar note one: apples"]
+a = rows["rehearsal newstore note one: apples"]
 assert a["created_at"] != "2020-01-02 03:04:05", a["created_at"]   # no API sets it: the copy time
 meta = json.loads(a["metadata"])
 assert meta["original_created_at"] == "2020-01-02 03:04:05", meta
-assert meta["k"] == 1 and meta["nested"] == {"x": [1, 2]} and meta["project"] == "acebar", meta
+assert meta["k"] == 1 and meta["nested"] == {"x": [1, 2]} and meta["project"] == "newstore", meta
 assert meta["memora_copy"]["store"] == "memora", meta
-assert "acebar" in json.loads(a["tags"])
-c = rows["rehearsal acebar note three: cherries"]
-assert set(json.loads(c["tags"])) >= {"acebar", "extra"}
+assert "newstore" in json.loads(a["tags"])
+c = rows["rehearsal newstore note three: cherries"]
+assert set(json.loads(c["tags"])) >= {"newstore", "extra"}
 ids = {k.split(": ")[1]: v["id"] for k, v in rows.items()}
 rel = {r["memory_id"]: {(e["id"], e["edge_type"]) for e in json.loads(r["related"] or "[]")}
        for r in conn.execute("SELECT memory_id, related FROM memories_crossrefs")}
@@ -258,22 +258,22 @@ assert (ids["dates"], "related_to") in rel[ids["cherries"]] and (ids["cherries"]
 assert (ids["dates"], "supersedes") in rel[ids["apples"]] and (ids["apples"], "superseded_by") not in rel.get(ids["dates"], set())
 src = schema.connect(storage.backend_for("memora"))
 assert {r[0] for r in src.execute("SELECT id FROM memories")} >= set(), "source readable"
-print("acebar ok")
+print("newstore ok")
 PY
 [ "$(digest memora)" = "$SRC_BEFORE" ] && pass "the source is byte-identical after the copy" || fail "the source changed"
-AFTER1="$(digest acebar)"
+AFTER1="$(digest newstore)"
 [ "$AFTER1" != "$DEST0" ] && case "$AFTER1" in *" 4") true ;; *) false ;; esac \
-  && pass "apply changed acebar to exactly 4 rows (so the unchanged-after-rerun checks below are not vacuous)" \
-  || fail "apply did not produce exactly 4 rows in acebar ($AFTER1)"
+  && pass "apply changed newstore to exactly 4 rows (so the unchanged-after-rerun checks below are not vacuous)" \
+  || fail "apply did not produce exactly 4 rows in newstore ($AFTER1)"
 check "a rerun copies nothing twice" "${COPY[@]}" --plan /data/copy/plan.json --apply
-[ "$(digest acebar)" = "$AFTER1" ] && pass "the rerun left acebar byte-identical (4 rows, no duplicates)" || fail "the rerun changed acebar"
+[ "$(digest newstore)" = "$AFTER1" ] && pass "the rerun left newstore byte-identical (4 rows, no duplicates)" || fail "the rerun changed newstore"
 if deploy > "$RH_ROOT/deploy-3.log" 2>&1; then pass "deploy 3 (restart with the copied data)"; else fail "deploy 3 (exit $?; see deploy-3.log)"; fi
 adopt C3 container "$NAME"; adopt _ image "$IMAGE"; adopt_run_tags
 check "the container answers /health" wait_health
-[ "$(digest acebar)" = "$AFTER1" ] && pass "the copies survived the redeploy unchanged" || fail "acebar changed across the redeploy"
-curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/acebar" > "$RH_ROOT/health-acebar2.json"
-"$PY" -c 'import json,sys; assert json.load(open(sys.argv[1]))["freeze"]["state"]=="open"' "$RH_ROOT/health-acebar2.json" \
-  && pass "acebar stayed thawed across the redeploy (the thaw removed the persisted freeze)" || fail "acebar health after deploy 3: $(cat "$RH_ROOT/health-acebar2.json")"
+[ "$(digest newstore)" = "$AFTER1" ] && pass "the copies survived the redeploy unchanged" || fail "newstore changed across the redeploy"
+curl -s -H "Authorization: Bearer $HEALTH_TOKEN" "http://127.0.0.1:$PORT/health/db/newstore" > "$RH_ROOT/health-newstore2.json"
+"$PY" -c 'import json,sys; assert json.load(open(sys.argv[1]))["freeze"]["state"]=="open"' "$RH_ROOT/health-newstore2.json" \
+  && pass "newstore stayed thawed across the redeploy (the thaw removed the persisted freeze)" || fail "newstore health after deploy 3: $(cat "$RH_ROOT/health-newstore2.json")"
 check "remove the tool's token files" "$RT" exec "$NAME" rm -rf "$SHM"
 
 echo

@@ -5,11 +5,11 @@ Run INSIDE the memora-all container (the only execution location: the copy
 lock and state live on its /data volume), against its own endpoint:
 
   docker exec memora-all python /app/scripts/copy_memories.py \\
-      --source memora --dest acebar --tag acebar \\
+      --source memora --dest newstore --tag newstore \\
       --health-token-file /dev/shm/h.token --plan /data/copy/plan.json          # dry-run
 
   docker exec memora-all python /app/scripts/copy_memories.py \\
-      --source memora --dest acebar --plan /data/copy/plan.json --apply \\
+      --source memora --dest newstore --plan /data/copy/plan.json --apply \\
       --health-token-file /dev/shm/h.token
 
 The dry-run reads the source and the destination and writes only the plan file

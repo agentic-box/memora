@@ -1,7 +1,7 @@
 """Copy memories from one store of memora-all to another (Item 95).
 
-    scripts/copy_memories.py --source memora --dest acebar --tag acebar            # dry-run: plan.json
-    scripts/copy_memories.py --source memora --dest acebar --plan plan.json --apply
+    scripts/copy_memories.py --source memora --dest newstore --tag newstore            # dry-run: plan.json
+    scripts/copy_memories.py --source memora --dest newstore --plan plan.json --apply
 
 Design (docs/add-store-runbook.md "The copy"):
 

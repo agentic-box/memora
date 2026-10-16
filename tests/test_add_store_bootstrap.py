@@ -17,7 +17,7 @@ from memora.backends import D1Connection
 
 ACCT = "a" * 32
 DBID = "0f0f0f0f-1111-2222-3333-444444444444"
-NAME = "acebar-test"
+NAME = "newstore-test"
 
 
 class Rig:
@@ -61,7 +61,7 @@ class Rig:
             configured_ids=self.configured_ids, configured_names=self.configured_names,
             data_dir=tmp_path / "data")
 
-    def run(self, tmp_path, db="acebar"):
+    def run(self, tmp_path, db="newstore"):
         return ads.bootstrap_d1(db, account_id=ACCT, database_id=DBID, d1_name=NAME, deps=self.deps(tmp_path))
 
     def sent(self):
@@ -143,7 +143,7 @@ def test_selects_and_table_info_pass():
 def test_bootstrap_initialises_a_pinned_empty_database(tmp_path, rig):
     out = rig.run(tmp_path)
     assert out["status"] == "initialised"
-    state = ads.read_state("acebar", tmp_path / "data")
+    state = ads.read_state("newstore", tmp_path / "data")
     assert state["phase"] == "verified"
     assert (state["account_id"], state["database_id"], state["d1_name"]) == (ACCT, DBID, NAME)
     # the app's schema, meta == only the epoch row '0', business tables empty
@@ -153,7 +153,7 @@ def test_bootstrap_initialises_a_pinned_empty_database(tmp_path, rig):
     assert out["tables"] and "memories" in out["tables"]
     for table in out["tables"]:
         assert rig._read(f'SELECT COUNT(*) AS n FROM "{table}"', ())[0]["n"] == 0
-    mode = (tmp_path / "data" / "bootstrap" / "acebar.json").stat().st_mode & 0o777
+    mode = (tmp_path / "data" / "bootstrap" / "newstore.json").stat().st_mode & 0o777
     assert mode == 0o600
 
 
@@ -176,21 +176,21 @@ def test_a_complete_database_without_a_bootstrap_state_is_refused_not_adopted(tm
     """P2-1: a lost state file is a manual recovery decision; a database already holding a matching schema is
     not known to be ours and is never adopted automatically."""
     rig.run(tmp_path)
-    (tmp_path / "data" / "bootstrap" / "acebar.json").unlink()
+    (tmp_path / "data" / "bootstrap" / "newstore.json").unlink()
     with pytest.raises(AddStoreRefused, match="no bootstrap state"):
         rig.run(tmp_path)
-    assert ads.read_state("acebar", tmp_path / "data") is None            # nothing was written either
+    assert ads.read_state("newstore", tmp_path / "data") is None            # nothing was written either
     assert len(rig.writers) == 1
 
 
 def test_a_known_interrupted_bootstrap_with_a_complete_schema_is_verified_without_ddl(tmp_path, rig):
     """State says ddl_done (the crash came before 'verified'): a complete matching schema is verified only."""
     rig.run(tmp_path)
-    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_done"},
+    ads._save_state("newstore", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_done"},
                     tmp_path / "data")
     out = rig.run(tmp_path)
     assert out["status"] == "already-initialised" and len(rig.writers) == 1
-    assert ads.read_state("acebar", tmp_path / "data")["phase"] == "verified"
+    assert ads.read_state("newstore", tmp_path / "data")["phase"] == "verified"
 
 
 # ------------------------------------------------------------------ the pins and gates
@@ -217,7 +217,7 @@ def test_an_id_already_configured_is_refused(tmp_path, rig):
 
 
 def test_a_store_name_already_configured_is_refused(tmp_path, rig):
-    rig.configured_names = {"acebar"}
+    rig.configured_names = {"newstore"}
     with pytest.raises(AddStoreRefused, match="already in MEMORA_DATABASES"):
         rig.run(tmp_path)
     assert rig.writers == []
@@ -227,9 +227,9 @@ def test_bad_inputs_are_refused(tmp_path, rig):
     with pytest.raises(AddStoreRefused):
         ads.bootstrap_d1("Bad Name", account_id=ACCT, database_id=DBID, d1_name=NAME, deps=rig.deps(tmp_path))
     with pytest.raises(AddStoreRefused):
-        ads.bootstrap_d1("acebar", account_id="x", database_id=DBID, d1_name=NAME, deps=rig.deps(tmp_path))
+        ads.bootstrap_d1("newstore", account_id="x", database_id=DBID, d1_name=NAME, deps=rig.deps(tmp_path))
     with pytest.raises(AddStoreRefused):
-        ads.bootstrap_d1("acebar", account_id=ACCT, database_id=DBID, d1_name="", deps=rig.deps(tmp_path))
+        ads.bootstrap_d1("newstore", account_id=ACCT, database_id=DBID, d1_name="", deps=rig.deps(tmp_path))
     assert rig.writers == []
 
 
@@ -243,7 +243,7 @@ def test_a_read_token_that_cannot_read_is_refused_before_any_write(tmp_path, rig
 
 
 def test_state_for_other_ids_is_refused(tmp_path, rig):
-    ads._save_state("acebar", {"account_id": ACCT, "database_id": "other-id-123456", "d1_name": NAME,
+    ads._save_state("newstore", {"account_id": ACCT, "database_id": "other-id-123456", "d1_name": NAME,
                                "phase": "verified"}, tmp_path / "data")
     with pytest.raises(AddStoreRefused, match="other ids"):
         rig.run(tmp_path)
@@ -271,14 +271,14 @@ def test_identity_is_rechecked_after_the_ddl(tmp_path, rig):
     rig.info_hook = info
     with pytest.raises(AddStoreRefused, match="after the DDL"):
         rig.run(tmp_path)
-    assert ads.read_state("acebar", tmp_path / "data")["phase"] == "ddl_done"   # not 'verified'
+    assert ads.read_state("newstore", tmp_path / "data")["phase"] == "ddl_done"   # not 'verified'
 
 
 # ------------------------------------------------------------------ non-empty and partial databases
 
 def test_a_non_empty_database_with_a_foreign_schema_is_refused_with_no_ddl(tmp_path, rig):
     sqlite3.connect(rig.path).execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)").connection.commit()
-    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"},
+    ads._save_state("newstore", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"},
                     tmp_path / "data")                                       # a known interrupted run, but a foreign schema
     with pytest.raises(AddStoreRefused, match="not what the app's initializer builds"):
         rig.run(tmp_path)
@@ -318,7 +318,7 @@ def test_a_crash_mid_ddl_is_not_replayed_automatically(tmp_path, rig):
     rig._writer = crashing
     with pytest.raises(Crash):
         rig.run(tmp_path)
-    assert ads.read_state("acebar", tmp_path / "data")["phase"] == "ddl_started"
+    assert ads.read_state("newstore", tmp_path / "data")["phase"] == "ddl_started"
     rig._writer = real
     n_writers = len(rig.writers)
     with pytest.raises(AddStoreRefused, match="no automatic replay"):
@@ -334,7 +334,7 @@ def test_a_crash_before_the_first_statement_can_be_retried(tmp_path, rig):
     rig._writer = lambda: (_ for _ in ()).throw(Crash("cannot open"))
     with pytest.raises(Crash):
         rig.run(tmp_path)
-    assert ads.read_state("acebar", tmp_path / "data")["phase"] == "ddl_started"
+    assert ads.read_state("newstore", tmp_path / "data")["phase"] == "ddl_started"
     rig._writer = real
     assert rig.run(tmp_path)["status"] == "initialised"           # still zero objects: a clean retry
 
@@ -366,7 +366,7 @@ def test_the_epoch_row_must_be_exactly_zero(tmp_path, rig):
 
 def test_pre_freeze_needs_a_verified_bootstrap(tmp_path, rig):
     with pytest.raises(AddStoreRefused, match="no verified bootstrap"):
-        ads.pre_freeze("acebar", data_dir=tmp_path / "data")
+        ads.pre_freeze("newstore", data_dir=tmp_path / "data")
 
 
 def test_pre_freeze_writes_the_persisted_freeze_and_is_idempotent(tmp_path, rig, monkeypatch):
@@ -374,23 +374,23 @@ def test_pre_freeze_writes_the_persisted_freeze_and_is_idempotent(tmp_path, rig,
 
     rig.run(tmp_path)
     monkeypatch.setenv("MEMORA_DATA_DIR", str(tmp_path / "data"))
-    out = ads.pre_freeze("acebar", data_dir=tmp_path / "data")
+    out = ads.pre_freeze("newstore", data_dir=tmp_path / "data")
     assert out["already_present"] is False
-    assert write_gate.freeze_file("acebar").exists()
-    assert ads.pre_freeze("acebar", data_dir=tmp_path / "data")["already_present"] is True
+    assert write_gate.freeze_file("newstore").exists()
+    assert ads.pre_freeze("newstore", data_dir=tmp_path / "data")["already_present"] is True
 
 
 def test_clear_freeze_refuses_while_the_service_routes_the_store(tmp_path, monkeypatch):
     from memora import write_gate
 
     monkeypatch.setenv("MEMORA_DATA_DIR", str(tmp_path / "data"))
-    write_gate.persist_freeze("acebar")
+    write_gate.persist_freeze("newstore")
     with pytest.raises(AddStoreRefused, match="still routes"):
-        ads.clear_freeze("acebar", routes={"acebar": "d1://x/y", "memora": "/data/memora.db"})
-    assert write_gate.freeze_file("acebar").exists()                # the freeze stays
-    assert ads.clear_freeze("acebar", routes={"memora": "/data/memora.db"}) == {"removed": True}
-    assert not write_gate.freeze_file("acebar").exists()
-    assert ads.clear_freeze("acebar", routes={}) == {"removed": False}
+        ads.clear_freeze("newstore", routes={"newstore": "d1://x/y", "memora": "/data/memora.db"})
+    assert write_gate.freeze_file("newstore").exists()                # the freeze stays
+    assert ads.clear_freeze("newstore", routes={"memora": "/data/memora.db"}) == {"removed": True}
+    assert not write_gate.freeze_file("newstore").exists()
+    assert ads.clear_freeze("newstore", routes={}) == {"removed": False}
 
 
 # ------------------------------------------------------------------ config parsing
@@ -424,19 +424,19 @@ def test_status_needs_a_verified_bootstrap_for_exactly_the_pinned_ids_and_the_fr
     monkeypatch.setenv("MEMORA_DATA_DIR", str(data))
     pins = dict(account_id=ACCT, database_id=DBID, d1_name=NAME, data_dir=data)
     with pytest.raises(AddStoreRefused, match="no bootstrap state"):
-        ads.status("acebar", **pins)
+        ads.status("newstore", **pins)
     rig.run(tmp_path)
     with pytest.raises(AddStoreRefused, match="persisted freeze .* is missing"):
-        ads.status("acebar", **pins)
-    assert ads.status("acebar", require_freeze=False, **pins)["phase"] == "verified"
-    ads.pre_freeze("acebar", data_dir=data)
-    assert ads.status("acebar", **pins)["freeze_file"] is True
+        ads.status("newstore", **pins)
+    assert ads.status("newstore", require_freeze=False, **pins)["phase"] == "verified"
+    ads.pre_freeze("newstore", data_dir=data)
+    assert ads.status("newstore", **pins)["freeze_file"] is True
     for field, other in (("database_id", "another-db-id-1"), ("account_id", "b" * 32), ("d1_name", "someone-else")):
         with pytest.raises(AddStoreRefused, match="other"):
-            ads.status("acebar", **{**pins, field: other})
-    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"}, data)
+            ads.status("newstore", **{**pins, field: other})
+    ads._save_state("newstore", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"}, data)
     with pytest.raises(AddStoreRefused, match="not verified"):
-        ads.status("acebar", **pins)
+        ads.status("newstore", **pins)
 
 
 # ------------------------------------------------------------------ verify_replication (the first real write)
@@ -447,7 +447,7 @@ class Repl:
     def __init__(self):
         self.local = {1: row(1, "a"), 2: row(2, "b"), 3: row(3, "c")}
         self.remote = {k: dict(v) for k, v in self.local.items()}
-        self.h = {"http": 200, "status": "ok", "registry_entry": "/data/acebar.db", "freeze": {"state": "open"},
+        self.h = {"http": 200, "status": "ok", "registry_entry": "/data/newstore.db", "freeze": {"state": "open"},
                   "replication": {"mode": "write", "interval_s": 60.0, "status": "running", "halted_reason": None,
                                   "head_seq": 12, "last_acked_seq": 12, "lag_rows": 0}}
         self.now = 0.0
@@ -468,7 +468,7 @@ class Repl:
                     local_rows=lambda: list(self.local.values()), d1_rows=lambda ids: {i: self.remote[i] for i in ids if i in self.remote},
                     d1_count=lambda: len(self.remote), transactional=True, sleep=self.sleep, monotonic=lambda: self.now)
         args.update(kw)
-        return ads.verify_replication("acebar", **args)
+        return ads.verify_replication("newstore", **args)
 
 
 def row(i, text):

@@ -1,6 +1,6 @@
 # Runbook: add a new, empty store to memora-all, and copy memories into it (Item 95)
 
-This adds a fifth store (`acebar` in the first use) to memora-all: a local
+This adds a further store (`<new-store>`) to memora-all: a local
 SQLite primary on `/data/<db>.db`, replicated in write mode to a NEW
 Cloudflare D1 database, served at `/mcp/<db>`. It then copies the memories
 tagged for that store out of another store (the originals stay).
@@ -55,13 +55,13 @@ files and on the command line; never in a commit or a test.
 ## The steps (`scripts/add_store.sh`; dry run by default)
 
 ```
-scripts/add_store.sh acebar --d1-account A --d1-id I --d1-name N --credential-file F          # the plan
-scripts/add_store.sh acebar … --execute                           # 1 bootstrap, 2 pre-freeze (stops)
-scripts/add_store.sh acebar … --execute --from env --apply-env    # 3 env, 4 deploy, 5 export (then prints the cutover commands)
-scripts/cutover_store.sh acebar --execute                         # a, b, c (the freeze is already in place)
-scripts/cutover_store.sh acebar --execute --from d --apply-env    # d..g: env edits, the redeploy (the ONE deploy of the finished store), health, barrier compare
-scripts/cutover_store.sh acebar --execute --from h --thaw         # h: only after a clean barrier compare
-scripts/add_store.sh acebar --d1-account A --d1-id I --d1-name N --execute --verify-first-write --expect-rows N   # AFTER a first write (the copy): the first REAL replicated write, below
+scripts/add_store.sh <new-store> --d1-account <account> --d1-id <id> --d1-name <d1-name> --credential-file F          # the plan
+scripts/add_store.sh <new-store> … --execute                           # 1 bootstrap, 2 pre-freeze (stops)
+scripts/add_store.sh <new-store> … --execute --from env --apply-env    # 3 env, 4 deploy, 5 export (then prints the cutover commands)
+scripts/cutover_store.sh <new-store> --execute                         # a, b, c (the freeze is already in place)
+scripts/cutover_store.sh <new-store> --execute --from d --apply-env    # d..g: env edits, the redeploy (the ONE deploy of the finished store), health, barrier compare
+scripts/cutover_store.sh <new-store> --execute --from h --thaw         # h: only after a clean barrier compare
+scripts/add_store.sh <new-store> --d1-account <account> --d1-id <id> --d1-name <d1-name> --execute --verify-first-write --expect-rows N   # AFTER a first write (the copy): the first REAL replicated write, below
 ```
 
 **Every resumable boundary proves its preconditions first.** `--from prefreeze|env|deploy|export` run
@@ -112,7 +112,7 @@ below is the natural one; an empty store is refused as proof) and **no live D1 w
 
 ```
 # after: cutover --from h --thaw, and the copy (apply) with N rows
-scripts/add_store.sh acebar --d1-account A --d1-id I --d1-name N --execute --verify-first-write --expect-rows N
+scripts/add_store.sh <new-store> --d1-account <account> --d1-id <id> --d1-name <d1-name> --execute --verify-first-write --expect-rows N
 ```
 
 1. `local_primary.py verify-replication` (read-only; credentials are file paths in the container: the health token
@@ -153,12 +153,12 @@ one throwaway write can serve; it stays in the store.
 changes. Add the new store to the named tokens only:
 
 - keep the existing clmux token: edit its digest's list (0600 file, owned by you), e.g. on deploy-host
-  `python3 - <<'PY'` … load the JSON, `table[<digest>].append("acebar")`, write it back atomically with the same mode …`PY`;
+  `python3 - <<'PY'` … load the JSON, `table[<digest>].append("<new-store>")`, write it back atomically with the same mode …`PY`;
   other tokens' lists are not touched; or
-- mint a new token for the stores it should reach: `scripts/mint_api_token.sh --stores memora,ob1,bestation,re,acebar --out <new file>`
+- mint a new token for the stores it should reach: `scripts/mint_api_token.sh --stores <store-1>,<store-2>,…,<new-store> --out <new file>`
   (the old token keeps working until revoked; clients must be given the new one).
 
-The son's m1 workspace needs a token that reaches `acebar` and nothing it does not need.
+Every other workspace that will use the store needs a token that reaches `<new-store>` and nothing it does not need.
 
 ## The copy (`scripts/copy_memories.py`)
 
@@ -167,9 +167,9 @@ Run **inside the memora-all container** (the only execution location: the lock, 
 `cutover_store.sh` does.
 
 ```
-docker exec memora-all python /app/scripts/copy_memories.py --source memora --dest acebar --tag acebar \
+docker exec memora-all python /app/scripts/copy_memories.py --source <source-store> --dest <new-store> --tag <tag> \
     --health-token-file /dev/shm/…/health.token --plan /data/copy/plan.json              # dry run: writes only the plan
-docker exec memora-all python /app/scripts/copy_memories.py --source memora --dest acebar \
+docker exec memora-all python /app/scripts/copy_memories.py --source <source-store> --dest <new-store> \
     --plan /data/copy/plan.json --apply --health-token-file …
 ```
 

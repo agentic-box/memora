@@ -82,7 +82,7 @@ def add(tmp_path):
     return run
 
 
-COMMON = ["acebar", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "acebar-graph",
+COMMON = ["newstore", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "newstore-graph",
           "--credential-file", "/run/secrets/memora/edit.token"]
 
 
@@ -115,11 +115,11 @@ class TestPlan:
         out = proc.stdout
         for n in "12345":
             assert f"\n  {n}  " in out, n
-        assert "bootstrap-d1 acebar --account acct00000001 --database-id newdb0000001 --d1-name acebar-graph" in out
-        assert "pre-freeze acebar" in out
-        assert f"MEMORA_DATABASES[acebar]={URI}" in out
-        assert 'MEMORA_PROJECTS[acebar]=["acebar"]' in out
-        assert "scripts/cutover_store.sh acebar --execute" in out
+        assert "bootstrap-d1 newstore --account acct00000001 --database-id newdb0000001 --d1-name newstore-graph" in out
+        assert "pre-freeze newstore" in out
+        assert f"MEMORA_DATABASES[newstore]={URI}" in out
+        assert 'MEMORA_PROJECTS[newstore]=["newstore"]' in out
+        assert "scripts/cutover_store.sh newstore --execute" in out
         assert "NOT advertised" in out
 
     def test_a_store_already_configured_with_another_value_is_refused_even_in_the_dry_run(self, add):
@@ -131,15 +131,15 @@ class TestPlan:
         assert calls == []
 
     def test_a_d1_id_that_another_store_uses_is_refused(self, add):
-        proc, calls = add("acebar", "--d1-account", ACCT, "--d1-id", "id-gamma-001", "--d1-name", "x",
+        proc, calls = add("newstore", "--d1-account", ACCT, "--d1-id", "id-gamma-001", "--d1-name", "x",
                           "--credential-file", "/c")
         assert proc.returncode == 2 and "already used by another store" in proc.stderr
         assert calls == []
 
     @pytest.mark.parametrize("args,msg", [
-        (["acebar", "--d1-id", DBID, "--d1-name", "n", "--credential-file", "/c"], "--d1-account"),
-        (["acebar", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "n"], "--credential-file"),
-        (["acebar", "--d1-account", "short", "--d1-id", DBID, "--d1-name", "n", "--credential-file", "/c"], "not Cloudflare ids"),
+        (["newstore", "--d1-id", DBID, "--d1-name", "n", "--credential-file", "/c"], "--d1-account"),
+        (["newstore", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "n"], "--credential-file"),
+        (["newstore", "--d1-account", "short", "--d1-id", DBID, "--d1-name", "n", "--credential-file", "/c"], "not Cloudflare ids"),
         (["Bad Name", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "n", "--credential-file", "/c"], "usage"),
     ])
     def test_missing_or_bad_inputs_are_refused(self, add, args, msg):
@@ -162,7 +162,7 @@ class TestBootstrapAndPrefreeze:
         cmds = _tool_cmds(calls)
         assert cmds.index("bootstrap-d1") < cmds.index("pre-freeze")
         boot = next(c for c in calls if len(c) > 4 and c[4] == "bootstrap-d1" and "--d1-name" in c)
-        assert boot[5:] == ["acebar", "--account", ACCT, "--database-id", DBID, "--d1-name", "acebar-graph",
+        assert boot[5:] == ["newstore", "--account", ACCT, "--database-id", DBID, "--d1-name", "newstore-graph",
                             "--credential-file", "/run/secrets/memora/edit.token"]
         assert "stopped before the env edits" in proc.stdout
         assert add.env_file.read_text() == ALL_ENV and not _deployed(add)
@@ -171,7 +171,7 @@ class TestBootstrapAndPrefreeze:
         proc, calls = add(*COMMON, "--execute", env={"TOOL_RC_BOOTSTRAP_D1_HELP": "2"})
         assert proc.returncode == 2 and "predates Item 95" in proc.stderr
         assert "pre-freeze" not in _tool_cmds(calls) and not _deployed(add)
-        assert not any(len(c) > 5 and c[4] == "bootstrap-d1" and c[5] == "acebar" for c in calls)
+        assert not any(len(c) > 5 and c[4] == "bootstrap-d1" and c[5] == "newstore" for c in calls)
 
     def test_a_failed_bootstrap_stops_before_the_prefreeze(self, add):
         proc, calls = add(*COMMON, "--execute", env={"TOOL_RC_BOOTSTRAP_D1": "2"})
@@ -199,9 +199,9 @@ class TestEnvDeployExport:
         proc, calls = add(*COMMON, "--execute", "--from", "env", "--apply-env")
         assert proc.returncode == 0, proc.stderr + proc.stdout
         registry = _json(add.env_file, "MEMORA_DATABASES")
-        assert registry == {**REGISTRY, "acebar": URI}                       # the four unchanged, acebar added
+        assert registry == {**REGISTRY, "newstore": URI}                       # the four unchanged, newstore added
         assert _json(add.env_file, "MEMORA_REPLICAS") == REPLICAS            # no replica entry yet (the cutover adds it)
-        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "newstore": ["newstore"]}
         before = ALL_ENV.split("\n")
         after = add.env_file.read_text().split("\n")
         assert [l for l in before if not l.startswith("MEMORA_DATABASES=")] == \
@@ -213,7 +213,7 @@ class TestEnvDeployExport:
         add.state.write_text(json.dumps({"freeze": "frozen", "compare": None}))
         add(*COMMON, "--execute", "--from", "env", "--apply-env")
         names = sorted(p.name for p in add.backups.iterdir())
-        assert len(names) == 2 and all("bak-addstore-acebar-" in n for n in names)
+        assert len(names) == 2 and all("bak-addstore-newstore-" in n for n in names)
         for p in add.backups.iterdir():
             assert stat.S_IMODE(p.stat().st_mode) == 0o600
             assert not str(p).startswith(str(add.repo))
@@ -231,10 +231,10 @@ class TestEnvDeployExport:
         proc, calls = add(*COMMON, "--execute", "--from", "env", "--apply-env")
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert "export" in _tool_cmds(calls)
-        host_dir = add.home / "memora-lp" / "exports" / "acebar"
+        host_dir = add.home / "memora-lp" / "exports" / "newstore"
         assert sorted(p.suffix for p in host_dir.iterdir()) == [".json", ".sql"]
-        assert sorted(p.suffix for p in (add.offhost / "acebar").iterdir()) == [".json", ".sql"]
-        assert "scripts/cutover_store.sh acebar --execute --from h --thaw" in proc.stdout
+        assert sorted(p.suffix for p in (add.offhost / "newstore").iterdir()) == [".json", ".sql"]
+        assert "scripts/cutover_store.sh newstore --execute --from h --thaw" in proc.stdout
         assert "Nothing may point at it yet" in proc.stdout
 
     def test_an_interim_store_that_is_not_frozen_stops_the_run_after_the_deploy(self, add):
@@ -259,9 +259,9 @@ class TestEnvDeployExport:
 
 def _applied(add):
     """The operator files as step 3 leaves them."""
-    add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": URI})))
+    add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": URI})))
     add.deploy_env.write_text(add.deploy_env.read_text().replace(
-        json.dumps(PROJECTS), json.dumps({**PROJECTS, "acebar": ["acebar"]})))
+        json.dumps(PROJECTS), json.dumps({**PROJECTS, "newstore": ["newstore"]})))
 
 
 def _nothing_happened(add, calls, before_env, before_deploy):
@@ -269,7 +269,7 @@ def _nothing_happened(add, calls, before_env, before_deploy):
     assert add.env_file.read_text() == before_env and add.deploy_env.read_text() == before_deploy, "no config edit"
     assert not add.backups.exists(), "no backup was even made"
     assert not [c for c in _tool_cmds(calls) if c in ("export", "pre-freeze")], _tool_cmds(calls)
-    assert not [c for c in calls if len(c) > 5 and c[4] == "bootstrap-d1" and c[5] == "acebar"], "no real bootstrap"
+    assert not [c for c in calls if len(c) > 5 and c[4] == "bootstrap-d1" and c[5] == "newstore"], "no real bootstrap"
 
 
 class TestResumableBoundaries:
@@ -289,7 +289,7 @@ class TestResumableBoundaries:
         if frm in ("deploy", "export"):
             _applied(add)
         before_env, before_dep = add.env_file.read_text(), add.deploy_env.read_text()
-        add_args = ["acebar", "--d1-account", ACCT, "--d1-id", "otherdb00001", "--d1-name", "acebar-graph",
+        add_args = ["newstore", "--d1-account", ACCT, "--d1-id", "otherdb00001", "--d1-name", "newstore-graph",
                     "--credential-file", "/c"]
         extra = ["--apply-env"] if frm == "env" else []
         proc, calls = add(*add_args, "--execute", "--from", frm, *extra, env={"PINNED_ID": DBID})
@@ -321,25 +321,25 @@ class TestResumableBoundaries:
         assert "export" not in _tool_cmds(calls)
 
     def test_a_resumed_env_step_after_a_crash_between_the_files_completes(self, add):
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": URI})))  # all.env done, deploy.env not
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": URI})))  # all.env done, deploy.env not
         add.state.write_text(json.dumps({"freeze": "frozen", "compare": None}))
         proc, _ = add(*COMMON, "--execute", "--from", "env", "--apply-env")
         assert proc.returncode == 0, proc.stderr + proc.stdout
-        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}
-        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "newstore": ["newstore"]}
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "newstore": URI}
 
 
 # ---------------------------------------------------------------- P1-4: the first real replicated write
 
 class TestVerifyFirstWrite:
-    VERIFY = ["acebar", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "acebar-graph"]
+    VERIFY = ["newstore", "--d1-account", ACCT, "--d1-id", DBID, "--d1-name", "newstore-graph"]
 
     def test_the_plan_names_both_checks_and_changes_nothing(self, add):
         proc, calls = add(*self.VERIFY, "--verify-first-write", "--expect-rows", "5")
         assert proc.returncode == 0 and "dry run" in proc.stdout and calls == []
-        assert "verify-replication acebar" in proc.stdout and "--expect-min-rows 5" in proc.stdout
+        assert "verify-replication newstore" in proc.stdout and "--expect-min-rows 5" in proc.stdout
         assert "--timeout 150" in proc.stdout and "2 x interval + 30" in proc.stdout        # 2 x 60 + 30
-        assert "compare acebar --mode barrier" in proc.stdout and "READ" in proc.stdout
+        assert "compare newstore --mode barrier" in proc.stdout and "READ" in proc.stdout
 
     def test_it_needs_the_expected_row_count_and_no_credential_file(self, add):
         proc, _ = add(*self.VERIFY, "--verify-first-write")
@@ -351,7 +351,7 @@ class TestVerifyFirstWrite:
         cmds = _tool_cmds(calls)
         assert cmds.index("verify-replication") < cmds.index("freeze") < cmds.index("compare") < cmds.index("thaw")
         vr = next(c for c in calls if len(c) > 4 and c[4] == "verify-replication")
-        assert vr[5:11] == ["acebar", "--account", ACCT, "--database-id", DBID, "--interval"]
+        assert vr[5:11] == ["newstore", "--account", ACCT, "--database-id", DBID, "--interval"]
         assert "60" in vr and "--expect-min-rows" in vr and "5" in vr and "--timeout" in vr and "150" in vr
         assert "first-write verification PASSED" in proc.stdout and "Only now: the api-tokens.json scope" in proc.stdout
         assert not _deployed(add)
@@ -378,22 +378,22 @@ class TestVerifyFirstWrite:
 
 class TestRollback:
     def _interim(self, add):
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": URI})))
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": URI})))
         add.deploy_env.write_text(add.deploy_env.read_text().replace(
-            json.dumps(PROJECTS), json.dumps({**PROJECTS, "acebar": ["acebar"]})))
+            json.dumps(PROJECTS), json.dumps({**PROJECTS, "newstore": ["newstore"]})))
 
     def test_rollback_env_dry_run_changes_nothing(self, add):
         self._interim(add)
         before = add.env_file.read_text()
-        proc, calls = add("acebar", "--rollback-env")
+        proc, calls = add("newstore", "--rollback-env")
         assert proc.returncode == 0 and "dry run" in proc.stdout and calls == []
         assert add.env_file.read_text() == before
 
-    def test_rollback_env_removes_only_the_acebar_keys_from_the_current_files(self, add):
+    def test_rollback_env_removes_only_the_newstore_keys_from_the_current_files(self, add):
         self._interim(add)
         # a concurrent, unrelated edit made after the interim edits must survive
         add.env_file.write_text(add.env_file.read_text() + "LATER_EDIT=kept\n")
-        proc, _ = add("acebar", "--execute", "--rollback-env")
+        proc, _ = add("newstore", "--execute", "--rollback-env")
         assert proc.returncode == 0, proc.stderr + proc.stdout
         assert _json(add.env_file, "MEMORA_DATABASES") == REGISTRY
         assert _json(add.deploy_env, "MEMORA_PROJECTS") == PROJECTS
@@ -401,20 +401,20 @@ class TestRollback:
         assert "redeploy" in proc.stdout and "--clear-freeze" in proc.stdout
 
     def test_rollback_env_is_refused_once_the_store_is_local(self, add):
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": "/data/acebar.db"})))
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": "/data/newstore.db"})))
         before = add.env_file.read_text()
-        proc, _ = add("acebar", "--execute", "--rollback-env")
+        proc, _ = add("newstore", "--execute", "--rollback-env")
         assert proc.returncode == 2 and "past the interim stage" in proc.stdout
         assert add.env_file.read_text() == before
 
     def test_clear_freeze_runs_the_tool_and_refusal_is_reported(self, add):
-        proc, calls = add("acebar", "--execute", "--clear-freeze")
+        proc, calls = add("newstore", "--execute", "--clear-freeze")
         assert proc.returncode == 0 and "clear-freeze" in _tool_cmds(calls)
-        proc, _ = add("acebar", "--execute", "--clear-freeze", env={"TOOL_RC_CLEAR_FREEZE": "2"})
+        proc, _ = add("newstore", "--execute", "--clear-freeze", env={"TOOL_RC_CLEAR_FREEZE": "2"})
         assert proc.returncode == 1 and "the freeze was kept" in proc.stderr
 
     def test_the_two_rollback_steps_cannot_be_combined(self, add):
-        proc, _ = add("acebar", "--execute", "--rollback-env", "--clear-freeze")
+        proc, _ = add("newstore", "--execute", "--rollback-env", "--clear-freeze")
         assert proc.returncode == 2 and "two steps" in proc.stderr
 
 
@@ -429,7 +429,7 @@ def _cfg(add, *args):
 
 class TestConfigTool:
     def test_check_accepts_a_new_store_and_lists_the_existing_ones(self, add):
-        rc, out = _cfg(add, "check", "--db", "acebar", "--uri", URI)
+        rc, out = _cfg(add, "check", "--db", "newstore", "--uri", URI)
         assert rc == 0 and out["stores"] == sorted(REGISTRY) and out["replicated"] == sorted(REPLICAS)
 
     @pytest.mark.parametrize("env_change,msg", [
@@ -440,36 +440,36 @@ class TestConfigTool:
     ])
     def test_check_refuses_a_broken_configuration(self, add, env_change, msg):
         add.env_file.write_text(env_change(ALL_ENV))
-        rc, out = _cfg(add, "check", "--db", "acebar", "--uri", URI)
+        rc, out = _cfg(add, "check", "--db", "newstore", "--uri", URI)
         assert rc == 2 and msg in out["refused"]
 
     def test_check_refuses_a_bad_uri_and_name(self, add):
-        assert _cfg(add, "check", "--db", "acebar", "--uri", "d1://only-one")[0] == 2
+        assert _cfg(add, "check", "--db", "newstore", "--uri", "d1://only-one")[0] == 2
         assert _cfg(add, "check", "--db", "Bad", "--uri", URI)[0] == 2
 
     def test_apply_is_atomic_with_respect_to_a_changed_file(self, add):
         # the file changed between the operator's plan and the apply: the guards re-run on the CURRENT file
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": "/data/x.db"})))
-        rc, out = _cfg(add, "apply", "--db", "acebar", "--uri", URI, "--backup-dir", str(add.backups))
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": "/data/x.db"})))
+        rc, out = _cfg(add, "apply", "--db", "newstore", "--uri", URI, "--backup-dir", str(add.backups))
         assert rc == 2 and "already configured" in out["refused"]
         assert not add.backups.exists()
 
     def test_apply_then_remove_round_trips_to_the_original_files(self, add):
-        rc, _ = _cfg(add, "apply", "--db", "acebar", "--uri", URI, "--backup-dir", str(add.backups))
+        rc, _ = _cfg(add, "apply", "--db", "newstore", "--uri", URI, "--backup-dir", str(add.backups))
         assert rc == 0
-        rc, out = _cfg(add, "remove", "--db", "acebar", "--backup-dir", str(add.backups))
+        rc, out = _cfg(add, "remove", "--db", "newstore", "--backup-dir", str(add.backups))
         assert rc == 0 and out["removed"]["MEMORA_DATABASES"] == URI
         assert _json(add.env_file, "MEMORA_DATABASES") == REGISTRY
         assert _json(add.deploy_env, "MEMORA_PROJECTS") == PROJECTS
 
     def test_remove_is_refused_when_replicas_name_the_store(self, add):
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": URI})).replace(
-            json.dumps(REPLICAS), json.dumps({**REPLICAS, "acebar": URI})))
-        rc, out = _cfg(add, "remove", "--db", "acebar", "--backup-dir", str(add.backups))
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": URI})).replace(
+            json.dumps(REPLICAS), json.dumps({**REPLICAS, "newstore": URI})))
+        rc, out = _cfg(add, "remove", "--db", "newstore", "--backup-dir", str(add.backups))
         assert rc == 2 and "cutover has started" in out["refused"]
 
     def test_remove_of_a_store_that_is_not_there_is_a_no_op(self, add):
-        rc, out = _cfg(add, "remove", "--db", "acebar", "--backup-dir", str(add.backups))
+        rc, out = _cfg(add, "remove", "--db", "newstore", "--backup-dir", str(add.backups))
         assert rc == 0 and out["removed"] == {}
         assert add.env_file.read_text() == ALL_ENV
 
@@ -494,9 +494,9 @@ class TestConfigLockAndRecovery:
                 add.env_file.write_text(add.env_file.read_text() + "CONCURRENT=kept\n")
         cfg._hook = hook
         with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
-            cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+            cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         assert "CONCURRENT=kept" in add.env_file.read_text()                    # the other writer's line is intact
-        assert "acebar" not in add.env_file.read_text().split("MEMORA_REPLICAS")[0]
+        assert "newstore" not in add.env_file.read_text().split("MEMORA_REPLICAS")[0]
         assert _json(add.deploy_env, "MEMORA_PROJECTS") == PROJECTS                # and deploy.env was not touched
 
     def test_a_change_between_the_two_files_stops_the_second_write(self, add):
@@ -507,14 +507,14 @@ class TestConfigLockAndRecovery:
                 add.deploy_env.write_text(add.deploy_env.read_text() + "OTHER=kept\n")
         cfg._hook = hook
         with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
-            cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+            cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         assert "OTHER=kept" in add.deploy_env.read_text()
-        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI}     # first file done: resumable
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "newstore": URI}     # first file done: resumable
         cfg._hook = lambda *a: None
-        out = cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)   # the resume
+        out = cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)   # the resume
         assert out["wrote"] == [str(add.deploy_env)]
         assert "OTHER=kept" in add.deploy_env.read_text()
-        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "newstore": ["newstore"]}
 
     def test_a_crash_between_the_files_is_resumed_with_the_same_value(self, add):
         cfg = _load_cfg()
@@ -528,33 +528,33 @@ class TestConfigLockAndRecovery:
             return real(path, sha, text)
         cfg._write_if_unchanged = boom
         with pytest.raises(RuntimeError):
-            cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+            cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         cfg._write_if_unchanged = real
-        assert cfg.check(add.env_file, add.deploy_env, "acebar", URI)["all_env"] == "present"     # not refused
-        out = cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+        assert cfg.check(add.env_file, add.deploy_env, "newstore", URI)["all_env"] == "present"     # not refused
+        out = cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         assert out["wrote"] == [str(add.deploy_env)]
-        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI}              # the four intact
-        assert cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)["already_applied"]
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "newstore": URI}              # the four intact
+        assert cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)["already_applied"]
 
     def test_the_same_entry_with_another_value_is_still_refused(self, add):
         cfg = _load_cfg()
-        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "acebar": "d1://acct00000001/other0000001"})))
+        add.env_file.write_text(ALL_ENV.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "newstore": "d1://acct00000001/other0000001"})))
         with pytest.raises(cfg.Refused, match="another value"):
-            cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+            cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
 
     def test_parallel_applies_and_removes_serialise_on_the_shared_lock(self, add):
         import concurrent.futures
 
         def run(cmd):
             return subprocess.run([sys.executable, CONFIG, cmd, "--all-env", str(add.env_file), "--deploy-env",
-                                   str(add.deploy_env), "--repo", str(add.repo), "--db", "acebar", "--uri", URI,
+                                   str(add.deploy_env), "--repo", str(add.repo), "--db", "newstore", "--uri", URI,
                                    "--backup-dir", str(add.backups)], capture_output=True, text=True)
         with concurrent.futures.ThreadPoolExecutor(6) as ex:
             results = list(ex.map(run, ["apply"] * 6))
         assert all(r.returncode == 0 for r in results), [r.stdout for r in results if r.returncode]
         assert sum('"already_applied": true' in r.stdout for r in results) == 5          # exactly one did the work
-        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI}
-        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "newstore": URI}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "newstore": ["newstore"]}
         with concurrent.futures.ThreadPoolExecutor(6) as ex:
             results = list(ex.map(run, ["remove"] * 6))
         assert all(r.returncode == 0 for r in results)
@@ -568,7 +568,7 @@ class TestConfigLockAndRecovery:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             proc = subprocess.run([sys.executable, CONFIG, "apply", "--all-env", str(add.env_file), "--deploy-env",
-                                   str(add.deploy_env), "--repo", str(add.repo), "--db", "acebar", "--uri", URI,
+                                   str(add.deploy_env), "--repo", str(add.repo), "--db", "newstore", "--uri", URI,
                                    "--backup-dir", str(add.backups), "--lock-timeout", "0.3"],
                                   capture_output=True, text=True)
         finally:
@@ -579,9 +579,9 @@ class TestConfigLockAndRecovery:
     def test_verify_applied_needs_both_files(self, add):
         cfg = _load_cfg()
         with pytest.raises(cfg.Refused, match="does not hold the interim entry"):
-            cfg.verify_applied(add.env_file, add.deploy_env, "acebar", URI)
-        cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
-        assert cfg.verify_applied(add.env_file, add.deploy_env, "acebar", URI)["all_env"] == "present"
+            cfg.verify_applied(add.env_file, add.deploy_env, "newstore", URI)
+        cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
+        assert cfg.verify_applied(add.env_file, add.deploy_env, "newstore", URI)["all_env"] == "present"
 
 
 class TestSameBytesSeam:
@@ -614,7 +614,7 @@ class TestSameBytesSeam:
         real_init = self._inject_after_initial_reads(cfg, add.env_file, mutate)
         try:
             with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
-                cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+                cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         finally:
             cfg.EnvFile.__init__ = real_init
         assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "injected": "/data/injected.db"}   # preserved
@@ -622,20 +622,20 @@ class TestSameBytesSeam:
 
     def test_remove_does_not_overwrite_an_unrelated_database_entry_added_between_the_reads(self, add):
         cfg = _load_cfg()
-        cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+        cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
 
         def mutate():
             text = add.env_file.read_text()
-            add.env_file.write_text(text.replace(json.dumps({**REGISTRY, "acebar": URI}),
-                                                 json.dumps({**REGISTRY, "acebar": URI, "injected": "/data/injected.db"})))
+            add.env_file.write_text(text.replace(json.dumps({**REGISTRY, "newstore": URI}),
+                                                 json.dumps({**REGISTRY, "newstore": URI, "injected": "/data/injected.db"})))
         real_init = self._inject_after_initial_reads(cfg, add.env_file, mutate)
         try:
             with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
-                cfg.remove(add.env_file, add.deploy_env, "acebar", add.backups, repo=add.repo)
+                cfg.remove(add.env_file, add.deploy_env, "newstore", add.backups, repo=add.repo)
         finally:
             cfg.EnvFile.__init__ = real_init
-        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI, "injected": "/data/injected.db"}
-        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}              # nothing removed
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "newstore": URI, "injected": "/data/injected.db"}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "newstore": ["newstore"]}              # nothing removed
 
     def test_an_unrelated_project_added_between_the_reads_is_preserved_too(self, add):
         cfg = _load_cfg()
@@ -646,7 +646,7 @@ class TestSameBytesSeam:
         real_init = self._inject_after_initial_reads(cfg, add.deploy_env, mutate)
         try:
             with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
-                cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+                cfg.apply(add.env_file, add.deploy_env, "newstore", URI, add.backups, repo=add.repo)
         finally:
             cfg.EnvFile.__init__ = real_init
         assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "injected": ["injected"]}
