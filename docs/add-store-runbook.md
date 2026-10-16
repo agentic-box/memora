@@ -163,8 +163,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   claim of universal exactly-once: manual state edits, a deleted state file, a second container or unrelated
   writers to the destination are outside it. Partial progress and a manual step after an unknown outcome are the
   intended cost. The state file is written with an atomic 0600 replacement and an fsync of the file and of its
-  directory before each request; a missing-then-corrupt or unreadable state file stops the run (it is never read as
-  "no attempts").
+  directory before each request; a corrupt or unreadable state file stops the run (it is never read as "no attempts").
   **Manual reconciliation (deliberately outside the tool)** to re-create an ambiguous row that has no marker:
   1. make sure no copy invocation is running (nothing but this container runs the tool);
   2. restart memora-all (`docker restart memora-all`, or a deploy) **and verify the old server process is gone**:
