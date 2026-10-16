@@ -14,6 +14,10 @@ COPY memora/ memora/
 # the container: the named volume is root-owned on the host). Code only; no
 # token or data is in the image.
 COPY scripts/local_primary.py scripts/local_primary.py
+# Item 95: the copy tool, run the same way (`docker exec memora-all python
+# /app/scripts/copy_memories.py ...`): it needs the stores' volume for its lock
+# and state, and the container's own endpoint.
+COPY scripts/copy_memories.py scripts/copy_memories.py
 
 RUN pip install --no-cache-dir .
 

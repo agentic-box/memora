@@ -123,6 +123,17 @@ new_container OLD_ID --name "$NAME" --restart unless-stopped -p "0.0.0.0:$PORT:8
 pass "start the first container ($OLD_ID)"
 check "it answers /health" wait_health
 anon_of OLD_VOL "$OLD_ID"
+check "create the four store files (the deploy's preflight reads them)" "$RT" exec -i "$NAME" python - <<'PY'
+import json, os
+from memora import storage
+for name in json.loads(os.environ["MEMORA_DATABASES"]):
+    conn = storage.backend_for(name).connect()
+    try:
+        storage.add_memory(conn, content=f"rehearsal {name} baseline memory", tags=["rehearsal"])
+        conn.commit()
+    finally:
+        conn.close()
+PY
 if deploy > "$RH_ROOT/deploy-1.log" 2>&1; then pass "deploy 1 (four stores; log: deploy-1.log)"; \
   else fail "deploy 1 (exit $?; see deploy-1.log)"; tail -30 "$RH_ROOT/deploy-1.log"; fi
 adopt _ image "$IMAGE"; adopt VOL_ID volume "$VOL"; adopt C1 container "$NAME"; adopt_run_tags

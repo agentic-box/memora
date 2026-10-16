@@ -483,3 +483,13 @@ def test_mcp_endpoint_maps_transport_failures_to_an_uncertain_outcome(monkeypatc
     ep = cm.McpEndpoint("http://127.0.0.1:1", "acebar", "tok", timeout=0.2)
     with pytest.raises(cm.EndpointUncertain):
         ep.call("memory_import", {"data": [], "strategy": "append"})
+
+
+def test_the_image_carries_the_copy_tool_next_to_the_operator_tool():
+    """The tool runs inside memora-all (`docker exec memora-all python /app/scripts/copy_memories.py`): the
+    Dockerfile must copy it, as it copies local_primary.py (the podman rehearsal found it missing)."""
+    from pathlib import Path
+
+    dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text()
+    assert "COPY scripts/copy_memories.py scripts/copy_memories.py" in dockerfile
+    assert "COPY scripts/local_primary.py scripts/local_primary.py" in dockerfile
