@@ -14,7 +14,11 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## Unreleased
 
-- Add a new, empty store to memora-all, and copy memories into it (Item 95; `docs/add-store-runbook.md`). `local_primary.py bootstrap-d1` gives a pinned, brand-new, empty D1 database exactly the app's own schema (a statement guard refuses everything `ensure_schema` does not send), `pre-freeze` / `clear-freeze` manage the persisted freeze of a store before it is first served, `scripts/add_store.sh` prepares the store up to the unchanged `cutover_store.sh`, and `scripts/copy_memories.py` copies memories between stores through the destination's running server (provenance markers, idempotent, links last, source read-only). `scripts/rehearse_add_store.sh` is the podman rehearsal (local stores only).
+## 0.5.7.1 — 2026-10-16
+
+Add-store tooling (Item 95); deploying this build is what lets `scripts/add_store.sh` run (it refuses on a v0.5.7 image).
+
+- Add a new, empty store to memora-all, and copy memories into it (Item 95; `docs/add-store-runbook.md`). `local_primary.py bootstrap-d1` gives a pinned, brand-new, empty D1 database exactly the app's own schema (a statement guard refuses everything `ensure_schema` does not send), `pre-freeze` / `clear-freeze` manage the persisted freeze of a store before it is first served, `scripts/add_store.sh` prepares the store up to the unchanged `cutover_store.sh`, and `scripts/copy_memories.py` copies memories between stores through the destination's running server (provenance markers, idempotent, links last, source read-only). `scripts/rehearse_add_store.sh` is the podman rehearsal (local stores only). The image now also carries `scripts/copy_memories.py`; `local_primary.py bootstrap-status` / `verify-replication` and `add_store.sh --verify-first-write` prove the preconditions and the first replicated write.
 
 - Cutover backups of `instances/all.env` can no longer leak into a commit. `scripts/cutover_store.sh --apply-env` writes its 0600 backup to `DEPLOY_BACKUP_DIR` (new `instances/deploy.env.example` key; default `~/memora-backups/cutover-env`, created 0700) and refuses a directory inside the checkout. `.gitignore` also covers `instances/*.bak*`, `instances/*.env.*` (the committed examples stay tracked) and `.mcp.json.bak*`, so a hand-made copy of a local config cannot be `git add -A`-ed either.
 
