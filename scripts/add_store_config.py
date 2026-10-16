@@ -32,6 +32,7 @@ Exit 0 done, 2 refused (nothing further was changed). Prints one JSON line.
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import hashlib
 import json
@@ -110,6 +111,13 @@ class EnvFile:
 
     def render(self) -> str:
         return "\n".join(self.lines)
+
+    def snapshot(self) -> "EnvFile":
+        """An immutable-by-convention copy of what was read: same bytes, same sha, its own line list. The edit, the
+        expected hash and the read-back baseline all derive from this ONE read, never from a second one."""
+        snap = copy.copy(self)
+        snap.lines = list(self.lines)
+        return snap
 
 
 class OperatorLock:
@@ -252,8 +260,8 @@ def apply(all_env: Path, deploy_env: Path, db: str, uri: str, backup_dir: Path, 
           lock_timeout_s: float = 15.0) -> Dict[str, Any]:
     backup_dir = _backup_dir_outside(repo, backup_dir)
     with OperatorLock(all_env, lock_timeout_s):
-        a, d = EnvFile(all_env), EnvFile(deploy_env)            # re-read under the lock
-        a0, d0 = EnvFile(all_env), EnvFile(deploy_env)
+        a, d = EnvFile(all_env), EnvFile(deploy_env)            # ONE read of each, under the lock
+        a0, d0 = a.snapshot(), d.snapshot()                       # the baseline is the SAME bytes the edit starts from
         databases, projects, na, nd = _state(a, d, db, uri)
         if na == "present" and nd == "present":
             return {"added": {}, "already_applied": True, "unchanged_databases": sorted(databases), "backups": []}
@@ -288,8 +296,8 @@ def remove(all_env: Path, deploy_env: Path, db: str, backup_dir: Path, *, repo: 
     if not DB_RE.fullmatch(db or ""):
         raise Refused(f"store name {db!r} must match {DB_RE.pattern}")
     with OperatorLock(all_env, lock_timeout_s):
-        a, d = EnvFile(all_env), EnvFile(deploy_env)
-        a0, d0 = EnvFile(all_env), EnvFile(deploy_env)
+        a, d = EnvFile(all_env), EnvFile(deploy_env)            # ONE read of each, under the lock
+        a0, d0 = a.snapshot(), d.snapshot()                       # the baseline is the SAME bytes the edit starts from
         databases = a.json_object("MEMORA_DATABASES")
         replicas = a.json_object("MEMORA_REPLICAS", required=False)
         projects = d.json_object("MEMORA_PROJECTS")
@@ -318,7 +326,8 @@ def remove(all_env: Path, deploy_env: Path, db: str, backup_dir: Path, *, repo: 
             _write_if_unchanged(path, expected, text)
             _hook("after-write", path)
         ra, rd = EnvFile(all_env), EnvFile(deploy_env)
-        if db in ra.json_object("MEMORA_DATABASES") or db in rd.json_object("MEMORA_PROJECTS") \
+        if ra.json_object("MEMORA_DATABASES") != {k: v for k, v in databases.items() if k != db} \
+                or rd.json_object("MEMORA_PROJECTS") != {k: v for k, v in projects.items() if k != db} \
                 or not _other_lines_unchanged(a0, ra, "MEMORA_DATABASES") \
                 or not _other_lines_unchanged(d0, rd, "MEMORA_PROJECTS"):
             raise Refused("the files do not read back as edited; inspect them and the backups by hand")

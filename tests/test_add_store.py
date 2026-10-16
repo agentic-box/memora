@@ -582,3 +582,78 @@ class TestConfigLockAndRecovery:
             cfg.verify_applied(add.env_file, add.deploy_env, "acebar", URI)
         cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
         assert cfg.verify_applied(add.env_file, add.deploy_env, "acebar", URI)["all_env"] == "present"
+
+
+class TestSameBytesSeam:
+    """Round 2 (reviewer 12227): the edit, the expected hash and the read-back baseline must all come from the SAME
+    read of each file. An unrelated key added by another writer between the INITIAL reads and what used to be a second
+    read (the baseline) must be preserved or refused BEFORE the overwrite, never overwritten."""
+
+    @staticmethod
+    def _inject_after_initial_reads(cfg, target, mutate):
+        """Right after the second EnvFile construction of the operation (each file read once) and before anything
+        else: run `mutate`. With the old two-read structure this lands BEFORE the baseline reads (3rd/4th
+        constructions); with the single-read structure it lands before the write phase."""
+        real_init = cfg.EnvFile.__init__
+        n = {"k": 0}
+
+        def init(self, path):
+            real_init(self, path)
+            n["k"] += 1
+            if n["k"] == 2:
+                mutate()
+        cfg.EnvFile.__init__ = init
+        return real_init
+
+    def test_apply_does_not_overwrite_an_unrelated_database_entry_added_between_the_reads(self, add):
+        cfg = _load_cfg()
+
+        def mutate():
+            text = add.env_file.read_text()
+            add.env_file.write_text(text.replace(json.dumps(REGISTRY), json.dumps({**REGISTRY, "injected": "/data/injected.db"})))
+        real_init = self._inject_after_initial_reads(cfg, add.env_file, mutate)
+        try:
+            with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
+                cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+        finally:
+            cfg.EnvFile.__init__ = real_init
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "injected": "/data/injected.db"}   # preserved
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == PROJECTS                                       # untouched
+
+    def test_remove_does_not_overwrite_an_unrelated_database_entry_added_between_the_reads(self, add):
+        cfg = _load_cfg()
+        cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+
+        def mutate():
+            text = add.env_file.read_text()
+            add.env_file.write_text(text.replace(json.dumps({**REGISTRY, "acebar": URI}),
+                                                 json.dumps({**REGISTRY, "acebar": URI, "injected": "/data/injected.db"})))
+        real_init = self._inject_after_initial_reads(cfg, add.env_file, mutate)
+        try:
+            with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
+                cfg.remove(add.env_file, add.deploy_env, "acebar", add.backups, repo=add.repo)
+        finally:
+            cfg.EnvFile.__init__ = real_init
+        assert _json(add.env_file, "MEMORA_DATABASES") == {**REGISTRY, "acebar": URI, "injected": "/data/injected.db"}
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "acebar": ["acebar"]}              # nothing removed
+
+    def test_an_unrelated_project_added_between_the_reads_is_preserved_too(self, add):
+        cfg = _load_cfg()
+
+        def mutate():
+            text = add.deploy_env.read_text()
+            add.deploy_env.write_text(text.replace(json.dumps(PROJECTS), json.dumps({**PROJECTS, "injected": ["injected"]})))
+        real_init = self._inject_after_initial_reads(cfg, add.deploy_env, mutate)
+        try:
+            with pytest.raises(cfg.Refused, match="changed while the edit was being prepared"):
+                cfg.apply(add.env_file, add.deploy_env, "acebar", URI, add.backups, repo=add.repo)
+        finally:
+            cfg.EnvFile.__init__ = real_init
+        assert _json(add.deploy_env, "MEMORA_PROJECTS") == {**PROJECTS, "injected": ["injected"]}
+
+    def test_the_baseline_is_the_snapshot_of_the_very_same_read(self, add):
+        cfg = _load_cfg()
+        f = cfg.EnvFile(add.env_file)
+        snap = f.snapshot()
+        f.set_json("MEMORA_DATABASES", {"x": "/data/x.db"})
+        assert snap.sha == f.sha and snap.json_object("MEMORA_DATABASES") == REGISTRY   # edits do not leak into the baseline
