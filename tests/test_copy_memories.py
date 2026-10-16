@@ -57,7 +57,7 @@ def related(ep, mid):
 
 def opts(tmp_path, **kw):
     slept = []
-    o = cm.ApplyOptions(state_dir=tmp_path / "copystate", sleep=lambda s: slept.append(s), max_wait_s=600, **kw)
+    o = cm.ApplyOptions(state_dir=tmp_path / "copystate", sleep=lambda s: slept.append(s), unknown_wait_s=60, **kw)
     o.slept = slept
     return o
 
@@ -102,6 +102,7 @@ def test_dry_run_writes_nothing_anywhere(stores, seeded):
     assert plan["report"]["selected"] == 5
     assert plan["report"]["would_copy"] == sorted(seeded[k] for k in "abcde")
     assert plan["report"]["already_copied"] == []
+    assert plan["report"]["created_at_becomes_copy_time"] is True and "original_created_at" in plan["report"]["note"]
     assert stores["src"].writes() == [] and stores["dest"].writes() == []
     assert source_digest(stores) == before
     assert dest_rows(stores) == []
@@ -127,7 +128,7 @@ def test_source_equal_to_destination_is_refused(stores, seeded):
 
 # ------------------------------------------------------------------ apply
 
-def test_apply_copies_content_tags_metadata_created_at_and_provenance(stores, seeded, tmp_path):
+def test_apply_copies_content_tags_metadata_original_created_at_and_provenance(stores, seeded, tmp_path):
     before = source_digest(stores)
     plan = plan_for(stores)
     out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
@@ -139,7 +140,10 @@ def test_apply_copies_content_tags_metadata_created_at_and_provenance(stores, se
         rec = stores["dest"].call("memory_get", {"memory_id": did, "include_images": True, "follow": "all"})["memory"]
         s = src_rows[int(sid)]
         assert rec["content"] == s["content"]
-        assert rec["created_at"] == s["created_at"]                       # preserved, not "now"
+        assert rec["created_at"] >= s["created_at"]                       # no API sets it: it is the copy time...
+        if s["created_at"] < "2022":
+            assert rec["created_at"] != s["created_at"]
+        assert rec["metadata"]["original_created_at"] == s["created_at"]  # ...and the source's is kept
         assert set(s["tags"]) <= set(rec["tags"])
         for k, v in (s["metadata"] or {}).items():
             assert rec["metadata"][k] == v
@@ -157,11 +161,10 @@ def test_a_rerun_copies_nothing_twice(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     n = len(dest_rows(stores))
-    imports = [c for c in stores["dest"].calls if c[0] == "memory_import"]
-    server._tool_last_call.clear()
+    made = creates(stores["dest"])
     out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert len(dest_rows(stores)) == n == 5
-    assert [c for c in stores["dest"].calls if c[0] == "memory_import"] == imports   # no second import call
+    assert creates(stores["dest"]) == made                                # no second create call
     assert out["ok"] is True
 
 
@@ -174,7 +177,6 @@ def test_a_superseded_copy_is_not_copied_again(stores, seeded, tmp_path):
     link(stores["dest"], newer, mapping[seeded["a"]], "supersedes")           # the copy of 'a' is now superseded
     active = stores["dest"].call("memory_list", {"limit": -1, "follow": "active", "fields": ["id"]})["memories"]
     assert mapping[seeded["a"]] not in {m["id"] for m in active}              # hidden from the default lineage
-    server._tool_last_call.clear()
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     contents = [r["content"] for r in dest_rows(stores)]
     assert contents.count("alpha apples orchard note") == 1                   # not duplicated
@@ -221,75 +223,86 @@ def test_a_frozen_or_unhealthy_destination_is_refused(stores, seeded, tmp_path):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
 
 
-# ------------------------------------------------------------------ retries and single-flight
+# ------------------------------------------------------------------ retries and unknown outcomes
 
-def test_timeout_after_commit_does_not_import_again(stores, seeded, tmp_path):
-    plan = plan_for(stores)
-    state = {"done": False}
-
-    def hook(tool, args, phase):
-        if tool == "memory_import" and phase == "after" and not state["done"]:
-            state["done"] = True
-            raise cm.EndpointUncertain("reply lost after commit")
-    stores["dest"].hook = hook
-    out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert out["copied"] == 5 and len(dest_rows(stores)) == 5
-    assert len([c for c in stores["dest"].calls if c[0] == "memory_import"]) == 1
+def creates(ep):
+    return [c for c in ep.calls if c[0] == "memory_create"]
 
 
-def test_timeout_before_commit_retries_after_relisting(stores, seeded, tmp_path):
+def test_an_unknown_outcome_whose_row_landed_is_not_created_again(stores, seeded, tmp_path):
     plan = plan_for(stores)
     state = {"n": 0}
 
     def hook(tool, args, phase):
-        if tool == "memory_import" and phase == "before":
+        if tool == "memory_create" and phase == "after":
             state["n"] += 1
-            if state["n"] == 1:
-                raise cm.EndpointUncertain("connection refused before the request was sent")
+            if state["n"] == 2:
+                raise cm.EndpointUncertain("reply lost after the row was committed")
     stores["dest"].hook = hook
+    out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert out["copied"] == 5 and len(dest_rows(stores)) == 5
+    assert len(creates(stores["dest"])) == 5                          # exactly one create per row
+
+
+def test_an_unknown_outcome_whose_row_never_landed_stops_the_run_and_a_rerun_finishes(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    state = {"n": 0}
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "before":
+            state["n"] += 1
+            if state["n"] == 3:
+                raise cm.EndpointUncertain("connection reset before the request left")
+    stores["dest"].hook = hook
+    with pytest.raises(cm.CopyError, match="outcome of creating source id .* is unknown"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 2                                # k of n created, nothing guessed
+    stores["dest"].hook = None
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 5                                # resumed, no duplicates
+    contents = [r["content"] for r in dest_rows(stores)]
+    assert len(contents) == len(set(contents))
+
+
+def test_a_crash_after_k_creates_resumes_without_duplicates(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+
+    class Boom(RuntimeError):
+        pass
+    state = {"n": 0}
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "before":
+            state["n"] += 1
+            if state["n"] == 4:
+                raise Boom("process died")
+    stores["dest"].hook = hook
+    with pytest.raises(Boom):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 3
+    assert json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())["phase"] == "creating"
+    stores["dest"].hook = None
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert len(dest_rows(stores)) == 5
-    assert state["n"] == 2
 
 
-def test_a_first_import_still_running_on_the_server_appends_nothing_and_is_waited_out(stores, seeded, tmp_path):
-    """Client timed out but the server's import is still in flight (its
-    single-flight flag): the second attempt gets 'already running', appends
-    nothing, waits, re-lists, and imports exactly once afterwards."""
+def test_a_create_reported_ok_whose_marker_is_not_visible_is_never_repeated(stores, seeded, tmp_path):
+    """If the server accepts the create but the marker does not show up (e.g. the metadata was dropped), the tool
+    must stop rather than create the same row again."""
     plan = plan_for(stores)
-    server._tool_running["memory_import"] = True
-    o = opts(tmp_path)
-    rows_when_waiting = []
+    real_call = stores["dest"].call
 
-    def sleep(s):
-        rows_when_waiting.append(len(dest_rows(stores)))
-        server._tool_running.pop("memory_import", None)      # the first import finishes...
-        server._tool_last_call.clear()                        # ...and its cooldown has passed
-    o.sleep = sleep
-    cm.apply_plan(plan, stores["src"], stores["dest"], o)
-    assert rows_when_waiting == [0]
-    assert len(dest_rows(stores)) == 5
+    def call(tool, args):
+        if tool == "memory_create":
+            args = {k: v for k, v in args.items() if k != "metadata"}
+        return real_call(tool, args)
+    stores["dest"].call = call
+    with pytest.raises(cm.CopyError, match="marker is not visible"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 1                                # one create, then stop
 
 
-def test_a_client_that_died_while_the_server_import_continues_does_not_double_append(stores, seeded, tmp_path):
-    """Run 1's client is gone; its server-side import completes during run 2's wait."""
-    plan = plan_for(stores)
-    server._tool_running["memory_import"] = True
-    o = opts(tmp_path)
-    first_entries = [dict(cm._entry(r, "memora", "acebar"), project="acebar") for r in plan["rows"]]
-
-    def sleep(s):
-        # the first import's server-side work finishes now
-        server._tool_running.pop("memory_import", None)
-        res = InProcessEndpoint("acebar").call("memory_import", {"data": first_entries, "strategy": "append"})
-        assert res["imported"] == 5
-        server._tool_last_call.clear()
-    o.sleep = sleep
-    cm.apply_plan(plan, stores["src"], stores["dest"], o)
-    assert len(dest_rows(stores)) == 5                        # not 10
-
-
-def test_an_import_that_reports_errors_fails_and_links_nothing(stores, seeded, tmp_path, monkeypatch):
+def test_a_create_that_returns_an_error_stops_the_run_and_links_nothing(stores, seeded, tmp_path, monkeypatch):
     plan = plan_for(stores)
     monkeypatch.setattr(memora, "TAG_WHITELIST", {"only-this-tag"})     # every tag is now rejected
     with pytest.raises(cm.CopyError):
@@ -297,29 +310,23 @@ def test_an_import_that_reports_errors_fails_and_links_nothing(stores, seeded, t
     assert [c for c in stores["dest"].calls if c[0] == "memory_link"] == []
 
 
-def test_a_clean_import_whose_markers_are_not_visible_is_never_appended_again(stores, seeded, tmp_path):
-    """If the server accepts the import but the markers do not show up (e.g. a metadata filter dropped them),
-    the tool must stop rather than append the same rows a second time."""
-    plan = plan_for(stores)
-    real_call = stores["dest"].call
+def test_the_copy_uses_only_leader_profile_tools_never_memory_import(stores, seeded, tmp_path):
+    from memora.tool_profile import LEADER_TOOLS
 
-    def call(tool, args):
-        if tool == "memory_import":
-            args = dict(args, data=[{k: v for k, v in e.items() if k != "metadata"} for e in args["data"]])
-        return real_call(tool, args)
-    stores["dest"].call = call
-    with pytest.raises(cm.CopyError, match="refusing to append again"):
-        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert len(dest_rows(stores)) == 5                                   # one import, not two
+    build_graph(stores, seeded)
+    plan = plan_for(stores)
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    used = {c[0] for ep in stores.values() for c in ep.calls}
+    assert used <= LEADER_TOOLS, sorted(used - LEADER_TOOLS)
+    assert "memory_import" not in used
 
 
 def test_duplicate_markers_stop_the_run(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    entry = dict(cm._entry(plan["rows"][0], "memora", "acebar"), project="acebar")
-    server._tool_last_call.clear()
-    stores["dest"].call("memory_import", {"data": [entry], "strategy": "append"})     # a duplicate, by hand
-    server._tool_last_call.clear()
+    row = plan["rows"][0]
+    stores["dest"].call("memory_create", {"content": "a duplicate, by hand", "tags": [TAG],
+                                          "metadata": cm._entry_metadata(row, "memora"), "suggest_similar": False})
     with pytest.raises(cm.CopyError, match="duplicate provenance markers"):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
 
@@ -390,7 +397,6 @@ def test_a_rerun_repairs_missing_links_with_nothing_left_to_import(stores, seede
         c.execute("UPDATE memories_crossrefs SET related = '[]' WHERE memory_id IN (?, ?)", (m[seeded["a"]], m[seeded["b"]]))
         c.commit()
     assert (m[seeded["b"]], "references") not in related(stores["dest"], m[seeded["a"]])
-    server._tool_last_call.clear()
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert (m[seeded["b"]], "references") in related(stores["dest"], m[seeded["a"]])
     assert len(dest_rows(stores)) == 5
@@ -415,7 +421,6 @@ def test_a_crash_in_the_link_phase_is_repaired_by_a_rerun(stores, seeded, tmp_pa
     st = json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())
     assert st["phase"] == "remapped"                                      # mapped and remapped; links unfinished
     stores["dest"].hook = None
-    server._tool_last_call.clear()
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert len(dest_rows(stores)) == 5
     assert json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())["phase"] == "done"
@@ -457,7 +462,8 @@ def test_a_source_change_during_the_run_is_reported_as_concurrent_not_as_a_tool_
     state = {"n": 0}
 
     def hook(tool, args, phase):
-        if tool == "memory_import" and phase == "after":
+        if tool == "memory_create" and phase == "after" and not state["n"]:
+            state["n"] = 1
             create(stores["src"], "someone else wrote to the source meanwhile")
     stores["dest"].hook = hook
     out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
@@ -498,7 +504,7 @@ def test_a_symmetric_forward_only_edge_keeps_its_direction():
 def test_mcp_endpoint_maps_transport_failures_to_an_uncertain_outcome(monkeypatch):
     ep = cm.McpEndpoint("http://127.0.0.1:1", "acebar", "tok", timeout=0.2)
     with pytest.raises(cm.EndpointUncertain):
-        ep.call("memory_import", {"data": [], "strategy": "append"})
+        ep.call("memory_create", {"content": "x"})
 
 
 def test_the_image_carries_the_copy_tool_next_to_the_operator_tool():

@@ -131,7 +131,12 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
 
 - **Source: read only** (MCP read tools: `memory_list`, `memory_get` with images, `follow=all` for the exact row).
   **Destination: written only through its running server** (`memory_import` strategy `append`, `memory_update`,
-  `memory_link`), so the gate, outbox triggers and replication stay in force. A file is never opened directly.
+  `memory_link`: the tools of the production `leader` profile; `memory_import` is not in it), so the gate, outbox
+  triggers and replication stay in force. A file is never opened directly.
+- **`created_at` becomes the copy time** (leader decision 2026-10-16: no API sets it, and for a copy of this size
+  an admin import route is not worth the new server code). The source's `created_at` is kept in
+  `metadata.original_created_at`; the dry-run report says so (`created_at_becomes_copy_time`). If a larger copy ever
+  needs exact timestamps, an admin-token import route is the possible later item.
 - **Dry run** reads both stores and writes only the plan (0600): the selected rows in full (content, metadata
   with images, tags, `created_at`, links) and a digest. `--apply` copies from the saved plan and refuses if a
   fresh read of the source no longer matches the digest or the plan file was edited.
@@ -140,11 +145,15 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   state), so a superseded copy is never re-copied. After the import there must be exactly one destination row per
   source id; a duplicate marker stops the run.
 - **Retries**: one run at a time per destination (an `flock` held for the whole operation) plus a durable state
-  file (`new → importing → mapped → remapped → linked → done`); a rerun repairs every later phase even with
-  nothing left to import. The destination is re-listed before every append. The server's own single-flight and
-  60 s cooldown on `memory_import` are the gate against a first import still running (or just finished) after a
-  client timeout: those answers append nothing, the tool waits and re-lists. An uncertain outcome is never
-  followed by a blind retry. A report with errors, skips or a short count fails the run and links nothing.
+  file (`new → creating → mapped → remapped → linked → done`). Rows are created **one at a time**, in ascending
+  source id, and the destination is re-listed (all lineage) before every create, so a rerun resumes exactly where
+  the last run stopped and never creates a row twice. A create whose outcome is **unknown** (timeout, dropped
+  connection) is never retried on a guess: the tool polls for that row's marker (`--unknown-wait`, default 60 s)
+  and, if it does not appear, **stops** naming the source id; the operator inspects the destination and reruns
+  (the markers are authoritative). Residual risk, accepted: a request stuck for longer than the wait that lands
+  after a manual rerun has already created the row would duplicate it; the cardinality check before any remap or
+  link then fails the run visibly. A create that reports success whose marker is not visible stops the run (no
+  second create). An error (for example a tag the destination's allowlist rejects) stops the run and links nothing.
 - **Metadata references**: `merged_from` is remapped to the destination id after the ids exist (a reference to
   a memory that was not copied is dropped and listed in the manifest); other reference-shaped keys
   (`*_id`, `parent`, …) with integer values are reported by the dry run and refused unless `--allow-unknown-refs`.
@@ -159,7 +168,7 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   created edge is 1.0 (`memory_link` has no score): edges whose source score differed are counted. The
   destination's import also rebuilds automatic crossrefs: extra edges it created between copied rows are listed
   as `recomputed_extra_edges` and never removed.
-- **Verification**: content and `created_at` must be equal, tags a superset, metadata keys equal, the marker and
+- **Verification**: content equal, `metadata.original_created_at` equal to the source's `created_at`, tags a superset, metadata keys equal, the marker and
   project present, and every source edge present in the destination; the source is re-read afterwards and its
   digest and size compared. A mismatch is reported as *the source changed during the run* (exit 4), never as a
   write by this tool; the tool never calls a write tool on the source.

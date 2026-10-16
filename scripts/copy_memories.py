@@ -49,7 +49,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--health-token-file", required=True, help="0600 file with MEMORA_HEALTH_TOKEN")
     p.add_argument("--state-dir", default="/data/copy", help="lock, state and manifest (on memora-all's volume)")
     p.add_argument("--timeout", type=float, default=600.0, help="per-call HTTP timeout in seconds")
-    p.add_argument("--max-wait", type=float, default=240.0, help="how long to wait out the import cooldown")
+    p.add_argument("--unknown-wait", type=float, default=60.0,
+                   help="how long to wait for a row's marker after a create whose outcome is unknown")
     p.add_argument("--allow-unrepresentable", action="store_true",
                    help="copy without edges memory_link cannot create (listed in the manifest)")
     p.add_argument("--allow-unknown-refs", action="store_true",
@@ -73,7 +74,7 @@ def main(argv=None) -> int:
             return 0
         plan = cm.load_plan(Path(args.plan))
         opts = cm.ApplyOptions(state_dir=Path(args.state_dir), allow_unrepresentable=args.allow_unrepresentable,
-                               allow_unknown_refs=args.allow_unknown_refs, max_wait_s=args.max_wait,
+                               allow_unknown_refs=args.allow_unknown_refs, unknown_wait_s=args.unknown_wait,
                                log=lambda m: print(m, file=sys.stderr))
         out = cm.apply_plan(plan, src, dest, opts)
         print(json.dumps(out, indent=2))

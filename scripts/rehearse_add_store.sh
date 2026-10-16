@@ -12,7 +12,7 @@
 #     deploy's own frozen-store check passes; clear-freeze refuses while the service routes the store;
 #   * a 5th local store is routed at /mcp/acebar by a real deploy and survives a redeploy;
 #   * the copy tool inside the container against the live server: dry-run writes nothing, apply copies
-#     (content, tags, metadata, created_at, provenance, links), a rerun and a redeploy copy nothing twice,
+#     (content, tags, metadata, original_created_at, provenance, links), a rerun and a redeploy copy nothing twice,
 #     the source is byte-identical before and after.
 # Every runtime object goes through scripts/rehearse_objects.sh (per-run names, labels, captured IDs,
 # removal by ID). RH_KEEP=1 keeps them for inspection.
@@ -227,15 +227,16 @@ assert r["selected"] == 4 and len(r["would_copy"]) == 4 and not r["unknown_refs"
 assert r["links"]["external_dropped"] >= 1, r
 print("plan ok", r["links"])' >>"$RH_ROOT/commands.log" 2>&1 && pass "the plan: 4 selected, 4 to copy, the external edge counted" || fail "the plan report is not as expected"
 check "apply" "${COPY[@]}" --plan /data/copy/plan.json --apply
-"$RT" exec -i "$NAME" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "acebar holds the four copies: content, created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
+"$RT" exec -i "$NAME" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "acebar holds the four copies: content, original_created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
 import json
 from memora import schema, storage
 conn = schema.connect(storage.backend_for("acebar"))
 rows = {r["content"]: dict(r) for r in conn.execute("SELECT * FROM memories")}
 assert len(rows) == 4, sorted(rows)
 a = rows["rehearsal acebar note one: apples"]
-assert a["created_at"] == "2020-01-02 03:04:05", a["created_at"]
+assert a["created_at"] != "2020-01-02 03:04:05", a["created_at"]   # no API sets it: the copy time
 meta = json.loads(a["metadata"])
+assert meta["original_created_at"] == "2020-01-02 03:04:05", meta
 assert meta["k"] == 1 and meta["nested"] == {"x": [1, 2]} and meta["project"] == "acebar", meta
 assert meta["memora_copy"]["store"] == "memora", meta
 assert "acebar" in json.loads(a["tags"])
@@ -257,7 +258,6 @@ AFTER1="$(digest acebar)"
 [ "$AFTER1" != "$DEST0" ] && case "$AFTER1" in *" 4") true ;; *) false ;; esac \
   && pass "apply changed acebar to exactly 4 rows (so the unchanged-after-rerun checks below are not vacuous)" \
   || fail "apply did not produce exactly 4 rows in acebar ($AFTER1)"
-sleep 65   # the server's memory_import cooldown (60 s) is part of what a rerun meets
 check "a rerun copies nothing twice" "${COPY[@]}" --plan /data/copy/plan.json --apply
 [ "$(digest acebar)" = "$AFTER1" ] && pass "the rerun left acebar byte-identical (4 rows, no duplicates)" || fail "the rerun changed acebar"
 if deploy > "$RH_ROOT/deploy-3.log" 2>&1; then pass "deploy 3 (restart with the copied data)"; else fail "deploy 3 (exit $?; see deploy-3.log)"; fi

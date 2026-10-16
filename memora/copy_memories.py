@@ -6,20 +6,22 @@
 Design (docs/add-store-runbook.md "The copy"):
 
 * The SOURCE is only ever read, through MCP read tools. The DESTINATION is only
-  ever written through its running server (memory_import / memory_link /
-  memory_update), so the destination's write gate, outbox triggers and
-  replication stay in force. The tool never opens a store file: memora-all
-  holds the stores' primary locks.
+  ever written through its running server (memory_create / memory_link /
+  memory_update: the tools of the production `leader` profile; memory_import is
+  not in it), so the destination's write gate, outbox triggers and replication
+  stay in force. The tool never opens a store file: memora-all holds the
+  stores' primary locks. No API sets created_at: a copy's created_at is the
+  copy time, and the source's is kept in metadata.original_created_at.
 * A dry-run captures the complete selected rows (full content, metadata with
   images, tags, created_at, links) into a plan file and a digest. `--apply`
   copies from that saved plan and refuses if a fresh read of the source no
   longer matches its digest.
 * Idempotency lives in the destination: every copied row carries
-  metadata.memora_copy = {store, id}. Before any append the destination is
-  re-listed (ALL lineage, not only active rows); exactly one destination row
-  per source id is required afterwards. The server's own single-flight and
-  60 s cooldown on memory_import are the gate against a still-running first
-  import; the tool never re-appends blindly after a timeout.
+  metadata.memora_copy = {store, id}. The rows are created ONE AT A TIME and the
+  destination is re-listed (ALL lineage, not only active rows) before each
+  create; exactly one destination row per source id is required afterwards.
+  A create whose outcome is unknown is never retried blindly: the tool waits
+  for its marker to appear and otherwise STOPS (a rerun re-lists first).
 * One run at a time per destination (flock on <state-dir>/<dest>.lock held
   for the whole operation) plus a durable state file, so a rerun repairs every
   later phase (provenance map, metadata remap, links) even with nothing left
@@ -41,6 +43,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 PROV_KEY = "memora_copy"
+ORIG_KEY = "original_created_at"   # the source row's created_at (the copy's own is the copy time)
 PLAN_VERSION = 1
 STATE_VERSION = 1
 NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]*")
@@ -253,7 +256,7 @@ def build_plan(src: Endpoint, dest: Endpoint, *, tag: str, follow: str, project:
     rows = read_source(src, tag, follow)
     markers = read_markers(dest, src.store)
     selected = {r["id"] for r in rows}
-    collisions = [r["id"] for r in rows if PROV_KEY in (r.get("metadata") or {})]
+    collisions = [r["id"] for r in rows if {PROV_KEY, ORIG_KEY} & set(r.get("metadata") or {})]
     links = analyse_links(rows)
     merged = {r["id"]: r["metadata"]["merged_from"] for r in rows
               if isinstance((r.get("metadata") or {}).get("merged_from"), int)}
@@ -261,6 +264,9 @@ def build_plan(src: Endpoint, dest: Endpoint, *, tag: str, follow: str, project:
         "selected": len(rows), "ids": sorted(selected),
         "already_copied": sorted(i for i in selected if i in markers),
         "would_copy": sorted(i for i in selected if i not in markers),
+        "created_at_becomes_copy_time": True,
+        "note": "no API sets created_at: each copy's created_at is the copy time; the source's is kept in "
+                f"metadata.{ORIG_KEY}",
         "duplicate_markers": {str(k): v for k, v in markers.items() if len(v) > 1},
         "provenance_collisions": collisions,
         "unknown_refs": _unknown_refs(rows),
@@ -314,7 +320,8 @@ class ApplyOptions:
     state_dir: Path
     allow_unrepresentable: bool = False
     allow_unknown_refs: bool = False
-    max_wait_s: float = 240.0
+    unknown_wait_s: float = 60.0      # how long an unknown create outcome is polled for its marker
+    poll_s: float = 5.0
     sleep: Callable[[float], None] = time.sleep
     log: Callable[[str], None] = lambda msg: None
 
@@ -362,73 +369,69 @@ def _save_state(path: Path, state: Dict[str, Any]) -> None:
     write_json(path, dict(state, version=STATE_VERSION))
 
 
-def _entry(row: Dict[str, Any], src_store: str, project: str) -> Dict[str, Any]:
+def _entry_metadata(row: Dict[str, Any], src_store: str) -> Dict[str, Any]:
     meta = dict(row.get("metadata") or {})
     for key in KNOWN_ID_KEYS:
-        meta.pop(key, None)  # re-set in the remap phase, never imported as a stale source id
+        meta.pop(key, None)  # re-set in the remap phase, never copied as a stale source id
     meta[PROV_KEY] = {"store": src_store, "id": row["id"]}
-    return {"content": row["content"], "tags": list(row["tags"]), "metadata": meta,
-            "created_at": row["created_at"], "project": None}
+    meta[ORIG_KEY] = row["created_at"]
+    return meta
 
 
-def _wait_hint(message: str) -> float:
-    m = re.search(r"in (\d+)s", message)
-    return float(m.group(1)) + 1.0 if m else 5.0
+def _await_marker(dest: Endpoint, src_store: str, src_id: int, opts: ApplyOptions) -> bool:
+    """After a create whose outcome is unknown: poll for the row's marker. The
+    destination must also show no write in flight before a missing marker is
+    believed. True when the marker appeared."""
+    polls = max(1, int(opts.unknown_wait_s / opts.poll_s))
+    for _ in range(polls):
+        if src_id in read_markers(dest, src_store):
+            return True
+        opts.sleep(opts.poll_s)
+    return src_id in read_markers(dest, src_store)
 
 
-def _import_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], project: str,
-                    opts: ApplyOptions) -> None:
-    """Append the rows the destination does not hold yet, exactly once.
+def _create_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], project: str,
+                    opts: ApplyOptions) -> int:
+    """Create the rows the destination does not hold yet, one at a time, in
+    ascending source id. Returns how many were created by this call.
 
-    Before EVERY attempt the destination is re-listed, so a retry after a
-    timeout appends only what is still missing. The server's single-flight and
-    cooldown on memory_import answer "already running" / "rate limited" while a
-    first import is still running or has just finished: those answers append
-    nothing. An uncertain outcome (timeout, dropped connection) is never
-    followed by a blind retry."""
-    deadline = time.monotonic() + opts.max_wait_s
-    attempt = 0
-    reported_clean = False
-    while True:
+    The destination is re-listed before EVERY create, so a rerun (or a create
+    that landed after an unknown outcome) is never repeated. A create whose
+    outcome is unknown stops the run unless its marker shows up within the
+    wait: the tool does not retry that row on a guess."""
+    created = 0
+    pending_visible: Optional[int] = None     # a row created by the previous turn: its marker must be listed now
+    for r in rows:
         markers = read_markers(dest, src_store)
         dup = {k: v for k, v in markers.items() if len(v) > 1}
         if dup:
             raise CopyError(f"duplicate provenance markers in {dest.store}: {dup}; refusing to continue")
-        missing = [r for r in rows if r["id"] not in markers]
-        if not missing:
-            return
-        if reported_clean:
-            raise CopyError(f"memory_import reported a clean import but {len(missing)} provenance markers are not "
-                            f"visible in {dest.store} (ids {[r['id'] for r in missing][:10]}); refusing to append "
-                            "again: inspect the destination")
-        attempt += 1
-        entries = [dict(_entry(r, src_store, project), project=project) for r in missing]
+        if pending_visible is not None and pending_visible not in markers:
+            raise CopyError(f"memory_create reported success for source id {pending_visible} but its provenance "
+                            f"marker is not visible in {dest.store}; refusing to create again: inspect the destination")
+        pending_visible = None
+        if r["id"] in markers:
+            continue
+        args = {"content": r["content"], "tags": list(r["tags"]), "metadata": _entry_metadata(r, src_store),
+                "project": project, "suggest_similar": False, "response_mode": "minimal"}
         try:
-            resp = dest.call("memory_import", {"data": entries, "strategy": "append"})
+            resp = dest.call("memory_create", args)
         except EndpointUncertain as exc:
-            opts.log(f"import outcome unknown ({exc}); re-listing before any retry")
-            resp = None
-        if resp is not None:
-            if resp.get("error") == "rate_limited":
-                wait = _wait_hint(str(resp.get("message", "")))
-                opts.log(f"memory_import: {resp.get('message')} (waiting {wait:.0f}s, then re-listing)")
-                if time.monotonic() + wait > deadline:
-                    raise CopyError("memory_import is still busy or cooling down after the wait budget; nothing "
-                                    "was appended by this attempt; rerun later (the markers are authoritative)")
-                opts.sleep(wait)
-                continue
-            if resp.get("error"):
-                raise CopyError(f"memory_import failed: {resp!r}"[:400])
-            bad = (resp.get("total_errors") or resp.get("errors") or resp.get("skipped")
-                   or resp.get("imported") != len(entries))
-            if bad:
-                raise CopyError(f"memory_import was not clean (expected {len(entries)} imported, 0 skipped, "
-                                f"0 errors): {resp!r}"[:600])
-            reported_clean = True
-            continue  # verify by re-listing on the next loop turn: every marker must now be visible
-        if time.monotonic() > deadline or attempt >= 20:
-            raise CopyError("the import outcome stayed unknown; nothing more was appended; rerun later")
-        opts.sleep(_wait_hint(""))
+            opts.log(f"create of source id {r['id']}: outcome unknown ({exc}); waiting for its marker")
+            if not _await_marker(dest, src_store, r["id"], opts):
+                raise CopyError(f"the outcome of creating source id {r['id']} in {dest.store} is unknown and its "
+                                f"marker did not appear within {opts.unknown_wait_s:.0f}s; nothing more was created; "
+                                "inspect the destination, then rerun (the markers are authoritative)")
+            created += 1
+            continue
+        if not isinstance(resp, dict) or resp.get("error") or not isinstance((resp.get("memory") or {}).get("id"), int):
+            raise CopyError(f"memory_create for source id {r['id']} failed or returned no id: {resp!r}"[:400])
+        created += 1
+        pending_visible = r["id"]
+    if pending_visible is not None and pending_visible not in read_markers(dest, src_store):
+        raise CopyError(f"memory_create reported success for source id {pending_visible} but its provenance marker "
+                        f"is not visible in {dest.store}; inspect the destination")
+    return created
 
 
 def _dest_records(dest: Endpoint, ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
@@ -447,8 +450,6 @@ def _verify_fidelity(rows: Sequence[Dict[str, Any]], mapping: Dict[int, int], re
         rec = recs[mapping[r["id"]]]
         if rec.get("content") != r["content"]:
             problems.append(f"{r['id']}: content differs")
-        if rec.get("created_at") != r["created_at"]:
-            problems.append(f"{r['id']}: created_at {rec.get('created_at')!r} != {r['created_at']!r}")
         missing_tags = set(r["tags"]) - set(rec.get("tags") or [])
         if missing_tags:
             problems.append(f"{r['id']}: tags lost {sorted(missing_tags)}")
@@ -460,6 +461,8 @@ def _verify_fidelity(rows: Sequence[Dict[str, Any]], mapping: Dict[int, int], re
                 problems.append(f"{r['id']}: metadata[{k!r}] differs")
         if dmeta.get(PROV_KEY, {}).get("id") != r["id"]:
             problems.append(f"{r['id']}: provenance marker missing")
+        if dmeta.get(ORIG_KEY) != r["created_at"]:
+            problems.append(f"{r['id']}: {ORIG_KEY} is {dmeta.get(ORIG_KEY)!r}, not {r['created_at']!r}")
         if dmeta.get("project") != project:
             problems.append(f"{r['id']}: project is {dmeta.get('project')!r}, not {project!r}")
     return problems
@@ -477,7 +480,8 @@ def apply_plan(plan: Dict[str, Any], src: Endpoint, dest: Endpoint, opts: ApplyO
     project: str = plan["project"]
     report = plan["report"]
     if report["provenance_collisions"]:
-        raise CopyError(f"selected rows already carry metadata.{PROV_KEY}: {report['provenance_collisions']}; "
+        raise CopyError(f"selected rows already carry metadata.{PROV_KEY} or metadata.{ORIG_KEY}: "
+                        f"{report['provenance_collisions']}; "
                         "refusing (no silent overwrite)")
     if report["unknown_refs"] and not opts.allow_unknown_refs:
         raise CopyError(f"reference-shaped metadata this tool cannot remap: {report['unknown_refs']}; pass "
@@ -504,9 +508,10 @@ def apply_plan(plan: Dict[str, Any], src: Endpoint, dest: Endpoint, opts: ApplyO
                             "run the dry-run again; nothing was changed")
         before_total = source_total(src)
 
-        state["phase"] = "importing"
+        state["phase"] = "creating"
         _save_state(state_path, state)
-        _import_missing(dest, src.store, rows, project, opts)
+        pre_existing = len(read_markers(dest, src.store))
+        _create_missing(dest, src.store, rows, project, opts)
 
         markers = read_markers(dest, src.store)
         mapping: Dict[int, int] = {}
@@ -589,6 +594,6 @@ def apply_plan(plan: Dict[str, Any], src: Endpoint, dest: Endpoint, opts: ApplyO
         write_json(opts.state_dir / f"{src.store}-{dest.store}.manifest.json", manifest)
         state["phase"] = "done"
         _save_state(state_path, state)
-        return {"ok": not source_changed, "copied": len(mapping), "already_present": len(rows) - len(report["would_copy"]),
+        return {"ok": not source_changed, "copied": len(mapping), "already_present": pre_existing,
                 "manifest": str(opts.state_dir / f"{src.store}-{dest.store}.manifest.json"), **manifest["links"],
                 "dropped_metadata_refs": len(dropped_refs), "source_changed_during_run": source_changed}
