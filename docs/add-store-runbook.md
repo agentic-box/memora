@@ -144,16 +144,25 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   already has `memora_copy` is refused. Markers are looked up over **all** destination rows (every lineage
   state), so a superseded copy is never re-copied. After the creates there must be exactly one destination row per
   source id; a duplicate marker stops the run.
-- **Retries**: one run at a time per destination (an `flock` held for the whole operation) plus a durable state
-  file (`new → creating → mapped → remapped → linked → done`). Rows are created **one at a time**, in ascending
-  source id, and the destination is re-listed (all lineage) before every create, so a rerun resumes exactly where
-  the last run stopped and never creates a row twice. A create whose outcome is **unknown** (timeout, dropped
-  connection) is never retried on a guess: the tool polls for that row's marker (`--unknown-wait`, default 60 s)
-  and, if it does not appear, **stops** naming the source id; the operator inspects the destination and reruns
-  (the markers are authoritative). Residual risk, accepted: a request stuck for longer than the wait that lands
-  after a manual rerun has already created the row would duplicate it; the cardinality check before any remap or
-  link then fails the run visibly. A create that reports success whose marker is not visible stops the run (no
-  second create). An error (for example a tag the destination's allowlist rejects) stops the run and links nothing.
+- **Retries and unknown outcomes (fail-closed)**: one run at a time per destination (an `flock` held for the
+  whole operation) plus a durable state file `/data/copy/<src>-<dest>.json` (phases `new → creating → mapped →
+  remapped → linked → done`, bound to the plan digest). Rows are created **one at a time**, in ascending source id.
+  Before EVERY `memory_create` a write-ahead record `attempts[<source id>] = {"state": "sent"}` is made durable
+  (fsync). It becomes `done` only when the response carries an integer id **and** a fresh listing of the whole
+  destination (every lineage state) shows exactly that one marker. A timeout, a dropped connection, a crash before
+  or after the send, a response without an id, an error, an acknowledged create whose marker is not visible, or a
+  different id leave it `sent` and stop the run. On every rerun, before anything is created: a `sent` row with
+  exactly one marker is reconciled (zero creates for it); a `sent` row with **no** marker makes the tool refuse to
+  create **anything** (zero creates), however much time has passed: a request that timed out may still be queued on
+  the server and land later, and neither elapsed time nor stable reads can prove it will not. Duplicates (more than
+  one marker for a source id) stop the run. A short poll for the marker right after an unknown outcome
+  (`--unknown-wait`, default 60 s) only reconciles a quick completion.
+  **Manual reconciliation (deliberately outside the tool)** to re-create an ambiguous row that has no marker:
+  1. restart memora-all (`scripts/deploy-memora-all.sh` or `docker restart memora-all`), which kills any queued request;
+  2. confirm in `/mcp/<dest>` (`memory_list`, `follow=all`) that no memory carries `metadata.memora_copy.id` = that source id;
+  3. delete that source id's entry from `"attempts"` in the state file (keep the file's mode 0600), then rerun `--apply`.
+  An error response (for example a tag the destination's allowlist rejects) is treated the same way: the run stops,
+  the tool never drops a tag to make the copy pass; fix the cause, then reconcile manually as above.
 - **Metadata references**: `merged_from` is remapped to the destination id after the ids exist (a reference to
   a memory that was not copied is dropped and listed in the manifest); other reference-shaped keys
   (`*_id`, `parent`, …) with integer values are reported by the dry run and refused unless `--allow-unknown-refs`.
@@ -174,7 +183,6 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   write by this tool; the tool never calls a write tool on the source.
 - Outputs: `/data/copy/<src>-<dest>.json` (state), `….manifest.json` (source id → destination id, links
   created/present/unrepresentable/dropped, dropped references).
-- If the destination's tag allowlist rejects a tag, the create returns an error and the run stops visibly.
 
 ## Rehearsal
 

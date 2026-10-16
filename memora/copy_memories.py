@@ -20,8 +20,9 @@ Design (docs/add-store-runbook.md "The copy"):
   metadata.memora_copy = {store, id}. The rows are created ONE AT A TIME and the
   destination is re-listed (ALL lineage, not only active rows) before each
   create; exactly one destination row per source id is required afterwards.
-  A create whose outcome is unknown is never retried blindly: the tool waits
-  for its marker to appear and otherwise STOPS (a rerun re-lists first).
+  Before each create a write-ahead record is made durable; a create whose
+  outcome is unknown is never retried: with no marker the tool refuses to
+  create that row again until an operator has proven the old request dead.
 * One run at a time per destination (flock on <state-dir>/<dest>.lock held
   for the whole operation) plus a durable state file, so a rerun repairs every
   later phase (provenance map, metadata remap, links) even with nothing left
@@ -378,60 +379,98 @@ def _entry_metadata(row: Dict[str, Any], src_store: str) -> Dict[str, Any]:
     return meta
 
 
-def _await_marker(dest: Endpoint, src_store: str, src_id: int, opts: ApplyOptions) -> bool:
-    """After a create whose outcome is unknown: poll for the row's marker. The
-    destination must also show no write in flight before a missing marker is
-    believed. True when the marker appeared."""
+def _await_marker(dest: Endpoint, src_store: str, src_id: int, opts: ApplyOptions) -> Optional[int]:
+    """After a create whose outcome is unknown: poll for the row's marker.
+    Returns the destination id when EXACTLY one marker appeared, None when none
+    did within the wait. This only reconciles a quick completion; it never
+    authorises another create."""
     polls = max(1, int(opts.unknown_wait_s / opts.poll_s))
-    for _ in range(polls):
-        if src_id in read_markers(dest, src_store):
-            return True
-        opts.sleep(opts.poll_s)
-    return src_id in read_markers(dest, src_store)
+    for i in range(polls + 1):
+        ids = read_markers(dest, src_store).get(src_id, [])
+        if len(ids) > 1:
+            raise CopyError(f"duplicate provenance markers for source id {src_id} in {dest.store}: {ids}")
+        if ids:
+            return ids[0]
+        if i < polls:
+            opts.sleep(opts.poll_s)
+    return None
+
+
+AMBIGUOUS_HELP = ("A create whose outcome is unknown can still complete on the server: ordinary reruns will NOT "
+                  "create it again, however long ago it was. To re-create it deliberately, first prove the old "
+                  "request is dead (restart the destination's server), confirm the marker is absent in the "
+                  "destination, then delete that source id from \"attempts\" in the state file "
+                  "(docs/add-store-runbook.md, \"The copy\").")
 
 
 def _create_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], project: str,
-                    opts: ApplyOptions) -> int:
+                    opts: ApplyOptions, state: Dict[str, Any], save: Callable[[], None]) -> Dict[str, int]:
     """Create the rows the destination does not hold yet, one at a time, in
-    ascending source id. Returns how many were created by this call.
+    ascending source id, fail-closed.
 
-    The destination is re-listed before EVERY create, so a rerun (or a create
-    that landed after an unknown outcome) is never repeated. A create whose
-    outcome is unknown stops the run unless its marker shows up within the
-    wait: the tool does not retry that row on a guess."""
-    created = 0
-    pending_visible: Optional[int] = None     # a row created by the previous turn: its marker must be listed now
+    A write-ahead record (state["attempts"][id] = {"state": "sent"}) is made
+    durable BEFORE every create and is resolved to "done" only when the
+    response carries an integer id AND a fresh listing shows exactly that one
+    marker. Anything else (timeout, crash before or after the send, no id, an
+    error, an acknowledged create whose marker is not visible, a different id)
+    leaves it "sent". On a resume a "sent" row with exactly one marker is
+    reconciled; with none, the run REFUSES before creating anything (zero
+    creates): elapsed time and stable reads prove nothing about a request that
+    may still be queued on the server."""
+    attempts: Dict[str, Dict[str, Any]] = state.setdefault("attempts", {})
+    stats = {"created": 0, "reconciled": 0}
+    markers = read_markers(dest, src_store)
+    dup = {k: v for k, v in markers.items() if len(v) > 1}
+    if dup:
+        raise CopyError(f"duplicate provenance markers in {dest.store}: {dup}; refusing to continue")
+    ambiguous_absent = sorted(int(k) for k, a in attempts.items() if a.get("state") == "sent" and int(k) not in markers)
+    if ambiguous_absent:
+        raise CopyError(f"source id(s) {ambiguous_absent} have a create attempt of unknown outcome and no marker in "
+                        f"{dest.store}; refusing to create anything (zero creates). {AMBIGUOUS_HELP}")
     for r in rows:
+        key = str(r["id"])
         markers = read_markers(dest, src_store)
-        dup = {k: v for k, v in markers.items() if len(v) > 1}
-        if dup:
-            raise CopyError(f"duplicate provenance markers in {dest.store}: {dup}; refusing to continue")
-        if pending_visible is not None and pending_visible not in markers:
-            raise CopyError(f"memory_create reported success for source id {pending_visible} but its provenance "
-                            f"marker is not visible in {dest.store}; refusing to create again: inspect the destination")
-        pending_visible = None
-        if r["id"] in markers:
+        ids = markers.get(r["id"], [])
+        if len(ids) > 1:
+            raise CopyError(f"duplicate provenance markers for source id {r['id']} in {dest.store}: {ids}")
+        if ids:
+            if attempts.get(key, {}).get("state") == "sent":
+                attempts[key] = {"state": "done", "dest_id": ids[0], "reconciled": True}
+                save()
+                stats["reconciled"] += 1
             continue
+        attempts[key] = {"state": "sent"}
+        save()                                               # durable BEFORE the request leaves
         args = {"content": r["content"], "tags": list(r["tags"]), "metadata": _entry_metadata(r, src_store),
                 "project": project, "suggest_similar": False, "response_mode": "minimal"}
         try:
             resp = dest.call("memory_create", args)
         except EndpointUncertain as exc:
             opts.log(f"create of source id {r['id']}: outcome unknown ({exc}); waiting for its marker")
-            if not _await_marker(dest, src_store, r["id"], opts):
+            found = _await_marker(dest, src_store, r["id"], opts)
+            if found is None:
                 raise CopyError(f"the outcome of creating source id {r['id']} in {dest.store} is unknown and its "
-                                f"marker did not appear within {opts.unknown_wait_s:.0f}s; nothing more was created; "
-                                "inspect the destination, then rerun (the markers are authoritative)")
-            created += 1
+                                f"marker did not appear within {opts.unknown_wait_s:.0f}s; nothing more was created. "
+                                f"{AMBIGUOUS_HELP}")
+            attempts[key] = {"state": "done", "dest_id": found, "reconciled": True}
+            save()
+            stats["reconciled"] += 1
             continue
-        if not isinstance(resp, dict) or resp.get("error") or not isinstance((resp.get("memory") or {}).get("id"), int):
-            raise CopyError(f"memory_create for source id {r['id']} failed or returned no id: {resp!r}"[:400])
-        created += 1
-        pending_visible = r["id"]
-    if pending_visible is not None and pending_visible not in read_markers(dest, src_store):
-        raise CopyError(f"memory_create reported success for source id {pending_visible} but its provenance marker "
-                        f"is not visible in {dest.store}; inspect the destination")
-    return created
+        new_id = (resp.get("memory") or {}).get("id") if isinstance(resp, dict) else None
+        if isinstance(resp, dict) and resp.get("error"):
+            raise CopyError(f"memory_create for source id {r['id']} returned an error: {resp!r}"[:400]
+                            + f". The attempt stays recorded as ambiguous. {AMBIGUOUS_HELP}")
+        if not isinstance(new_id, int) or isinstance(new_id, bool):
+            raise CopyError(f"memory_create for source id {r['id']} returned no id: {resp!r}"[:400]
+                            + f". The attempt stays recorded as ambiguous. {AMBIGUOUS_HELP}")
+        after = read_markers(dest, src_store).get(r["id"], [])
+        if after != [new_id]:
+            raise CopyError(f"memory_create returned id {new_id} for source id {r['id']} but the destination lists "
+                            f"markers {after}; refusing to create again. {AMBIGUOUS_HELP}")
+        attempts[key] = {"state": "done", "dest_id": new_id}
+        save()
+        stats["created"] += 1
+    return stats
 
 
 def _dest_records(dest: Endpoint, ids: Sequence[int]) -> Dict[int, Dict[str, Any]]:
@@ -511,7 +550,7 @@ def apply_plan(plan: Dict[str, Any], src: Endpoint, dest: Endpoint, opts: ApplyO
         state["phase"] = "creating"
         _save_state(state_path, state)
         pre_existing = len(read_markers(dest, src.store))
-        _create_missing(dest, src.store, rows, project, opts)
+        _create_missing(dest, src.store, rows, project, opts, state, lambda: _save_state(state_path, state))
 
         markers = read_markers(dest, src.store)
         mapping: Dict[int, int] = {}

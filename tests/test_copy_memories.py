@@ -244,27 +244,47 @@ def test_an_unknown_outcome_whose_row_landed_is_not_created_again(stores, seeded
     assert len(creates(stores["dest"])) == 5                          # exactly one create per row
 
 
-def test_an_unknown_outcome_whose_row_never_landed_stops_the_run_and_a_rerun_finishes(stores, seeded, tmp_path):
-    plan = plan_for(stores)
-    state = {"n": 0}
+def attempts_of(tmp_path):
+    return json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text()).get("attempts", {})
 
-    def hook(tool, args, phase):
-        if tool == "memory_create" and phase == "before":
-            state["n"] += 1
-            if state["n"] == 3:
-                raise cm.EndpointUncertain("connection reset before the request left")
-    stores["dest"].hook = hook
+
+def test_a_delayed_create_is_never_repeated_and_late_completion_reconciles_with_one_row(stores, seeded, tmp_path):
+    """The first create is accepted but delayed beyond the poll bound (still queued on the server). A second
+    invocation with no marker must perform ZERO creates; when the delayed create finally lands, a third
+    invocation reconciles it: exactly one row for that source id."""
+    plan = plan_for(stores)
+    real_call = stores["dest"].call
+    deferred = {}
+
+    def call(tool, args):
+        if tool == "memory_create" and "late" not in deferred and len(creates(stores["dest"])) == 2:
+            deferred["late"] = args                                  # accepted by the server, completes later
+            stores["dest"].calls.append((tool, json.loads(json.dumps(args))))
+            raise cm.EndpointUncertain("no reply within the timeout")
+        return real_call(tool, args)
+    stores["dest"].call = call
     with pytest.raises(cm.CopyError, match="outcome of creating source id .* is unknown"):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert len(dest_rows(stores)) == 2                                # k of n created, nothing guessed
-    stores["dest"].hook = None
-    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert len(dest_rows(stores)) == 5                                # resumed, no duplicates
+    assert len(dest_rows(stores)) == 2 and list(attempts_of(tmp_path).values())[-1]["state"] == "sent"
+    # second invocation: marker absent, the old request may still be queued -> ZERO creates, a refusal
+    before = len(creates(stores["dest"]))
+    with pytest.raises(cm.CopyError, match="zero creates"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == before and len(dest_rows(stores)) == 2
+    # the delayed create finally lands
+    real_call("memory_create", deferred["late"])
+    assert len(dest_rows(stores)) == 3
+    stores["dest"].call = real_call
+    n = len(creates(stores["dest"]))
+    out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert out["copied"] == 5 and len(dest_rows(stores)) == 5         # the late row exists exactly once
+    assert len(creates(stores["dest"])) - n == 2                       # only the two rows that were never attempted
     contents = [r["content"] for r in dest_rows(stores)]
     assert len(contents) == len(set(contents))
+    assert all(a["state"] == "done" for a in attempts_of(tmp_path).values())
 
 
-def test_a_crash_after_k_creates_resumes_without_duplicates(stores, seeded, tmp_path):
+def test_a_crash_after_the_attempt_record_and_before_the_send_is_ambiguous_not_retried(stores, seeded, tmp_path):
     plan = plan_for(stores)
 
     class Boom(RuntimeError):
@@ -274,21 +294,64 @@ def test_a_crash_after_k_creates_resumes_without_duplicates(stores, seeded, tmp_
     def hook(tool, args, phase):
         if tool == "memory_create" and phase == "before":
             state["n"] += 1
-            if state["n"] == 4:
-                raise Boom("process died")
+            if state["n"] == 3:
+                raise Boom("process died before the request left")
+    stores["dest"].hook = hook
+    with pytest.raises(Boom):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 2 and "sent" in {a["state"] for a in attempts_of(tmp_path).values()}
+    stores["dest"].hook = None
+    n = len(creates(stores["dest"]))
+    with pytest.raises(cm.CopyError, match="zero creates"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == n                           # the unsent row is NOT guessed to be unsent
+
+
+def test_a_crash_after_the_send_reconciles_by_the_marker_with_zero_extra_creates(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+
+    class Boom(RuntimeError):
+        pass
+    state = {"n": 0}
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "after":
+            state["n"] += 1
+            if state["n"] == 3:
+                raise Boom("process died after the server committed")
     stores["dest"].hook = hook
     with pytest.raises(Boom):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert len(dest_rows(stores)) == 3
-    assert json.loads((tmp_path / "copystate" / "memora-acebar.json").read_text())["phase"] == "creating"
     stores["dest"].hook = None
+    n = len(creates(stores["dest"]))
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert len(dest_rows(stores)) == 5
+    assert len(dest_rows(stores)) == 5 and len(creates(stores["dest"])) - n == 2
+    assert attempts_of(tmp_path)[str(plan["rows"][2]["id"])].get("reconciled") is True
 
 
-def test_a_create_reported_ok_whose_marker_is_not_visible_is_never_repeated(stores, seeded, tmp_path):
-    """If the server accepts the create but the marker does not show up (e.g. the metadata was dropped), the tool
-    must stop rather than create the same row again."""
+def test_a_response_without_an_id_is_ambiguous(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    real_call = stores["dest"].call
+    seen = {"n": 0}
+
+    def call(tool, args):
+        if tool == "memory_create":
+            seen["n"] += 1
+            if seen["n"] == 2:
+                return {"memory": {}}                                # no id, nothing created
+        return real_call(tool, args)
+    stores["dest"].call = call
+    with pytest.raises(cm.CopyError, match="returned no id"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    stores["dest"].call = real_call
+    n = len(creates(stores["dest"]))
+    with pytest.raises(cm.CopyError, match="zero creates"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == n
+
+
+def test_an_acknowledged_create_whose_marker_is_not_visible_is_never_repeated(stores, seeded, tmp_path):
     plan = plan_for(stores)
     real_call = stores["dest"].call
 
@@ -297,9 +360,87 @@ def test_a_create_reported_ok_whose_marker_is_not_visible_is_never_repeated(stor
             args = {k: v for k, v in args.items() if k != "metadata"}
         return real_call(tool, args)
     stores["dest"].call = call
-    with pytest.raises(cm.CopyError, match="marker is not visible"):
+    with pytest.raises(cm.CopyError, match="refusing to create again"):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
-    assert len(dest_rows(stores)) == 1                                # one create, then stop
+    assert len(dest_rows(stores)) == 1
+    stores["dest"].call = real_call
+    n = len(creates(stores["dest"]))
+    with pytest.raises(cm.CopyError, match="zero creates"):                  # rerun: ambiguous, no marker
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == n
+
+
+def test_a_marker_whose_id_differs_from_the_returned_id_stops_the_run(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    real_call = stores["dest"].call
+
+    def call(tool, args):
+        out = real_call(tool, args)
+        if tool == "memory_create":
+            out = {"memory": {"id": out["memory"]["id"] + 1000}}
+        return out
+    stores["dest"].call = call
+    with pytest.raises(cm.CopyError, match="lists markers"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 1
+
+
+def test_manual_reconciliation_then_a_single_create(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+
+    class Boom(RuntimeError):
+        pass
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "before" and len(creates(stores["dest"])) == 3:
+            raise Boom("died before the send")   # the call is already recorded: 3 creates seen, the 3rd never ran
+    stores["dest"].hook = hook
+    with pytest.raises(Boom):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    stores["dest"].hook = None
+    path = tmp_path / "copystate" / "memora-acebar.json"
+    st = json.loads(path.read_text())
+    ambiguous = [k for k, a in st["attempts"].items() if a["state"] == "sent"]
+    assert len(ambiguous) == 1
+    del st["attempts"][ambiguous[0]]                                  # the documented manual step (after proving the old request dead)
+    path.write_text(json.dumps(st))
+    n = len(creates(stores["dest"]))
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 5 and len(creates(stores["dest"])) - n == 3
+
+
+def test_the_state_is_bound_to_the_plan_digest(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    path = tmp_path / "copystate" / "memora-acebar.json"
+    st = json.loads(path.read_text())
+    st["digest"] = "0" * 64
+    path.write_text(json.dumps(st))
+    with pytest.raises(cm.CopyError, match="another plan"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+
+
+def test_the_attempt_record_is_durable_before_the_request_leaves(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    seen = []
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "before":
+            seen.append(dict(attempts_of(tmp_path)))
+    stores["dest"].hook = hook
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    first_id = str(plan["rows"][0]["id"])
+    assert seen[0][first_id] == {"state": "sent"}                    # on disk when the first request was made
+    assert len(seen) == 5
+
+
+def test_a_source_row_with_original_created_at_is_refused(stores, seeded, tmp_path):
+    create(stores["src"], "has the timestamp key", metadata={"original_created_at": "2001-01-01 00:00:00"})
+    plan = plan_for(stores)
+    assert plan["report"]["provenance_collisions"]
+    with pytest.raises(cm.CopyError, match="original_created_at"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert dest_rows(stores) == []
 
 
 def test_a_create_that_returns_an_error_stops_the_run_and_links_nothing(stores, seeded, tmp_path, monkeypatch):
