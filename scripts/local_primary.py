@@ -26,6 +26,10 @@ this file only parses arguments and builds the dependencies.
   snapshot <db> --store /data/<db>.db          nightly: backup, gzip, R2, keep 14
   volume-check --store /data/<db>.db ...      alert (exit 4) when free space is low
   fk-audit <db> --store /data/<db>.db          §9 x: foreign-key orphans (read-only; exit 5 when any)
+  bootstrap-d1 <db> --account A --database-id I --d1-name N --read-token-file R --credential-file C
+                            Item 95: schema-only init of a NEW, EMPTY, pinned D1 (serves nothing)
+  pre-freeze <db>           Item 95: persisted freeze for a bootstrapped store, before its first deploy
+  clear-freeze <db>         Item 95 rollback: remove that freeze once the service no longer routes <db>
   check-endpoint            F4a: authenticated round trip to memora-all through a
                             SCRATCH local store, before a client is repointed (L8)
 
@@ -199,6 +203,18 @@ def _parser() -> argparse.ArgumentParser:
     vc = sub.add_parser("volume-check", help="§4 volume alert")
     vc.add_argument("--store", action="append", required=True)
     vc.add_argument("--min-free-pct", type=float, default=10.0)
+    bd = sub.add_parser("bootstrap-d1", help="Item 95: give a NEW, EMPTY, pinned D1 the app's schema (nothing else)")
+    bd.add_argument("db")
+    bd.add_argument("--account", required=True, help="Cloudflare account id")
+    bd.add_argument("--database-id", required=True, help="the new D1 database id (from `wrangler d1 create`)")
+    bd.add_argument("--d1-name", required=True, help="the new D1 database name (from `wrangler d1 create`)")
+    bd.add_argument("--read-token-file", help="0600 file with the D1 READ token (default: MEMORA_D1_READ_TOKEN)")
+    bd.add_argument("--credential-file", required=True,
+                    help="0600 file with the D1 EDIT token (an operator credential; never a service env)")
+    for name, text in (("pre-freeze", "Item 95: persist the freeze of a bootstrapped store before its first deploy"),
+                       ("clear-freeze", "Item 95 rollback: remove the persisted freeze of a store no longer routed")):
+        pf = sub.add_parser(name, help=text)
+        pf.add_argument("db")
     fa = sub.add_parser("fk-audit", help="§9 x read-only audit: child rows whose foreign-key parent is missing")
     fa.add_argument("db")
     fa.add_argument("--store", required=True, help="the local store file (a live primary may be running)")
@@ -426,6 +442,44 @@ def _restore(args, deps) -> dict:
                             allow_deletes=args.allow_deletes)
 
 
+def _add_store_cmd(args) -> int:
+    """Item 95: bootstrap-d1, pre-freeze, clear-freeze (memora/add_store.py)."""
+    from memora import add_store as ads
+    from memora.backends import D1SelectOnlyConnection
+
+    if args.cmd == "pre-freeze":
+        print(json.dumps({"ok": True, **ads.pre_freeze(args.db)}))
+        return 0
+    if args.cmd == "clear-freeze":
+        from memora.storage import DatabaseRegistryError, database_registry
+
+        if not os.getenv("MEMORA_DATABASES", "").strip():
+            raise lp.L5Refused("clear-freeze needs the running service's MEMORA_DATABASES (run it with "
+                               "`docker exec memora-all`): without its routes the check cannot be made")
+        try:
+            routes = database_registry()
+        except DatabaseRegistryError as exc:
+            raise lp.L5Refused(f"MEMORA_DATABASES is unusable: {exc}")
+        print(json.dumps({"ok": True, **ads.clear_freeze(args.db, routes=routes)}))
+        return 0
+    read_token = lp.read_token(args.read_token_file)
+    edit_token = lp.load_credential_file(args.credential_file)
+    if edit_token == read_token:
+        raise lp.L5Refused("the edit credential and the read token must be different tokens")
+    reader = D1SelectOnlyConnection(args.account, args.database_id, read_token)
+    ids, names = ads.configured_from_env()
+    deps = ads.BootstrapDeps(
+        info=lambda: ads.fetch_d1_info(args.account, args.database_id, read_token),
+        read=lambda sql, params: reader.execute(sql, tuple(params))[0],
+        open_writer=lambda: ads.BootstrapD1Backend(args.account, args.database_id, edit_token).connect(),
+        configured_ids=ids, configured_names=names,
+        log=lambda msg: print(msg, file=sys.stderr))
+    out = ads.bootstrap_d1(args.db, account_id=args.account, database_id=args.database_id,
+                           d1_name=args.d1_name, deps=deps)
+    print(json.dumps({"ok": True, **out}))
+    return 0
+
+
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -498,6 +552,8 @@ def main(argv=None) -> int:
                 raise lp.L5Refused(str(exc))
             print(json.dumps({"ok": True, "shadow": args.shadow, "shadow_state": state}))
             return 0
+        if args.cmd in ("bootstrap-d1", "pre-freeze", "clear-freeze"):
+            return _add_store_cmd(args)
         if args.cmd == "fk-audit":
             from memora.backends import LocalSQLiteBackend, StoreLockedError, StoreMissingError
             from memora.fk_audit import fk_orphans
