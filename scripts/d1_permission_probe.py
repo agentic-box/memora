@@ -14,11 +14,13 @@ Safety, in this order, before any change:
   * the database must hold no table except the scratch table `memories` this script creates (so it can
     never be a memora store).
 Then: create the scratch table with exactly the columns the probe statement names (id INTEGER PRIMARY KEY
-AUTOINCREMENT, content), seed it with three rows including an explicit id of -1, checksum every table
-(read token), send THE gate statement with the read token (expect D1's refusal; its code and message are
+AUTOINCREMENT, content), seed it with three rows including an explicit id of -1, checksum every user table
+(read token; sqlite_* and _cf_* internals excluded), send THE gate statement with the read token (expect D1's refusal; its code and message are
 recorded), send it with the write token (expect success and zero changed rows), checksum again.
 Prints one JSON report (no token values); exit 0 only if the read token was refused, the write token
-succeeded, and the checksums around the two probes are equal. Setup changes (table, seed) are reported
+succeeded, and the checksums around the two probes are equal. Only D1's definite permission refusal
+(code 7500) counts as a refusal: a timeout, an HTTP 5xx or any other D1 error is reported as inconclusive and fails.
+A zero changed-rows count is reported as measured only when D1's response carries it (changes_measured). Setup changes (table, seed) are reported
 separately and are outside that comparison.
 """
 from __future__ import annotations
@@ -35,10 +37,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from memora import local_primary as lp  # noqa: E402
 from memora import replicator as R  # noqa: E402
+from memora.backends import D1DefiniteError  # noqa: E402
 
 NAME_PREFIX = "memora-probe-"
 SCRATCH = "memories"
 SEED = [(-1, "scratch row with the id -1"), (1, "scratch row 1"), (2, "scratch row 2")]
+
+
+PERMISSION_CODE = 7500          # D1's "You do not have permission" (seen when a read-only token wrote)
+_PHASE = ["start"]              # the step in progress, named in a failure report
 
 
 class ProbeRefused(Exception):
@@ -74,17 +81,20 @@ def run(args, *, info=None, reader_factory=None, writer_factory=None) -> Dict[st
     info = info or ads.fetch_d1_info
     reader_factory = reader_factory or D1SelectOnlyConnection
     writer_factory = writer_factory or R.ReplicaD1Connection
+    _PHASE[0] = "database lookup"
     ident = info(args.account, args.database_id, read_token)
     name = str(ident.get("name") or "")
     if ident.get("uuid") != args.database_id or not name.startswith(NAME_PREFIX):
         raise ProbeRefused(f"database {args.database_id} is named {name!r} (uuid {ident.get('uuid')!r}): only a database "
                            f"named {NAME_PREFIX}* is probed; nothing was sent to it")
+    _PHASE[0] = "checksums before setup"
     reader = reader_factory(args.account, args.database_id, read_token)
     tables = _checksums(reader)
     if set(tables) - {SCRATCH}:
         raise ProbeRefused(f"the database holds tables {sorted(set(tables) - {SCRATCH})}: only an empty throwaway "
                            "database is probed; nothing was changed")
     writer = writer_factory(args.account, args.database_id, write_token)
+    _PHASE[0] = "setup"
     setup = []
     for sql, params in (
         (f"CREATE TABLE IF NOT EXISTS {SCRATCH} (id INTEGER PRIMARY KEY AUTOINCREMENT, content TEXT)", []),
@@ -92,20 +102,29 @@ def run(args, *, info=None, reader_factory=None, writer_factory=None) -> Dict[st
     ):
         writer._post_json({"sql": sql, "params": params})   # raw transport: setup is outside the replicator's allow-list
         setup.append(sql.split(" (")[0])
+    _PHASE[0] = "checksums before probes"
     before = _checksums(reader)
     stmts = R.write_probe_statements()
     report: Dict[str, Any] = {"database": name, "statement": stmts[0][0], "params": list(stmts[0][1]),
                               "setup": setup, "tables_before": before}
-    try:                                                        # the READ token: the gate must see a refusal
+    _PHASE[0] = "read-token probe"
+    try:                                                        # the READ token: D1 must DEFINITELY refuse it (7500)
         writer_factory(args.account, args.database_id, read_token).execute_batch(stmts)
-        report["read_token"] = {"refused": False}
-    except Exception as exc:
+        report["read_token"] = {"refused": False, "outcome": "executed"}
+    except D1DefiniteError as exc:
         text = str(exc)
-        report["read_token"] = {"refused": True, "code": _code(text), "message": text[:400]}
+        code = _code(text)
+        report["read_token"] = {"refused": code == PERMISSION_CODE, "code": code, "message": text[:400],
+                                "outcome": "refused" if code == PERMISSION_CODE else "other D1 error (inconclusive)"}
+    except Exception as exc:    # a timeout, an HTTP 5xx, an unreadable answer: says nothing about the permission
+        report["read_token"] = {"refused": False, "outcome": "inconclusive (transport or server error)",
+                                "error": type(exc).__name__, "message": str(exc)[:400]}
+    _PHASE[0] = "write-token probe"
     results = writer.execute_batch(stmts)                       # the WRITE token: must succeed, change nothing
     ok_result = len(results) == 1 and isinstance(results[0], dict) and results[0].get("success") is True
     changes = (results[0].get("meta") or {}).get("changes") if ok_result else None
-    report["write_token"] = {"succeeded": ok_result, "changes": changes}
+    report["write_token"] = {"succeeded": ok_result, "changes": changes, "changes_measured": changes is not None}
+    _PHASE[0] = "after checksums"
     after = _checksums(reader)
     report["tables_after"] = after
     report["data_unchanged"] = before == after
@@ -126,6 +145,10 @@ def main(argv: List[str] = None) -> int:
     except (ProbeRefused, lp.L5Refused) as exc:
         print(json.dumps({"ok": False, "refused": str(exc)}))
         return 2
+    except Exception as exc:    # an operational failure: a JSON report with the phase, never a traceback
+        print(json.dumps({"ok": False, "failed_phase": _PHASE[0], "error": type(exc).__name__,
+                          "message": str(exc)[:400]}))
+        return 3
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ok"] else 1
 

@@ -102,11 +102,95 @@ def test_the_experiment_passes_when_read_is_refused_and_write_succeeds_without_a
     report = _run(tmp_path, fake)
     assert report["ok"] is True and report["data_unchanged"] is True
     assert report["read_token"]["refused"] and report["read_token"]["code"] == 7500
-    assert report["write_token"] == {"succeeded": True, "changes": 0}
+    assert report["write_token"] == {"succeeded": True, "changes": 0, "changes_measured": True}
     assert report["statement"] == R.write_probe_statements()[0][0] and report["params"] == [None]
     rows = [r["id"] for r in fake.con().execute("SELECT id FROM memories ORDER BY id")]
     assert rows == [-1, 1, 2]                    # the seeded -1 row survives the probe
     assert READ not in json.dumps(report) and WRITE not in json.dumps(report)
+
+
+class _Transport:
+    def __init__(self, behaviour):
+        self.behaviour = behaviour
+
+    def post(self, path, body, headers, retry_safe=False):
+        if isinstance(self.behaviour, Exception):
+            raise self.behaviour
+        return self.behaviour
+
+
+def _real_read_writer(fake, behaviour):
+    """The REAL ReplicaD1Connection (its error mapping included) for the read token, the transport faked."""
+    def factory(acct, db, tok):
+        if tok != READ:
+            return fake.writer_factory(acct, db, tok)
+        w = R.ReplicaD1Connection(acct, db, tok)
+        w._raw._own_transport = lambda: _Transport(behaviour)
+        return w
+    return factory
+
+
+def _real(tmp_path, fake, behaviour):
+    return P.run(_args(tmp_path), info=lambda *a: {"uuid": DBID, "name": "memora-probe-1"},
+                 reader_factory=fake.reader_factory, writer_factory=_real_read_writer(fake, behaviour))
+
+
+REFUSAL = (400, {}, b'{"success":false,"errors":[{"code":7500,"message":"You do not have permission"}]}')
+
+
+@pytest.mark.parametrize("behaviour, outcome_prefix", [
+    (TimeoutError("timed out"), "inconclusive"),
+    ((500, {}, b"internal error"), "inconclusive"),
+    ((502, {}, b"<html>bad gateway</html>"), "inconclusive"),
+    ((400, {}, b'{"success":false,"errors":[{"code":7400,"message":"bad request"}]}'), "other D1 error"),
+    ((400, {}, b"not json at all"), "other D1 error"),
+    ((200, {}, b'{"success":false,"errors":[{"message":"nope"}]}'), "other D1 error"),
+])
+def test_only_the_definite_permission_refusal_counts_everything_else_is_inconclusive(tmp_path, fake, behaviour, outcome_prefix):
+    report = _real(tmp_path, fake, behaviour)
+    assert report["read_token"]["refused"] is False and report["read_token"]["outcome"].startswith(outcome_prefix)
+    assert report["ok"] is False
+    assert READ not in json.dumps(report)
+
+
+def test_the_expected_7500_through_the_real_transport_passes(tmp_path, fake):
+    report = _real(tmp_path, fake, REFUSAL)
+    assert report["read_token"]["refused"] is True and report["read_token"]["code"] == 7500 and report["ok"] is True
+
+
+def test_a_200_that_executed_the_statement_for_the_read_token_fails(tmp_path, fake):
+    ok = (200, {}, json.dumps({"success": True, "result": [{"success": True, "results": [], "meta": {"changes": 0}}]}).encode())
+    report = _real(tmp_path, fake, ok)
+    assert report["read_token"]["refused"] is False and report["ok"] is False
+
+
+def test_absent_changes_metadata_is_reported_as_not_measured(tmp_path, fake):
+    class NoMeta:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def _post_json(self, body):
+            return self.inner._post_json(body)
+
+        def execute_batch(self, stmts):
+            return [{"success": True}] * len(self.inner.execute_batch(stmts))
+    report = P.run(_args(tmp_path), info=lambda *a: {"uuid": DBID, "name": "memora-probe-1"},
+                   reader_factory=fake.reader_factory,
+                   writer_factory=lambda a, d, t: NoMeta(fake.writer_factory(a, d, t)) if t == WRITE else fake.writer_factory(a, d, t))
+    assert report["write_token"] == {"succeeded": True, "changes": None, "changes_measured": False}
+
+
+def test_an_operational_failure_is_a_json_report_with_the_phase(tmp_path, fake, monkeypatch, capsys):
+    argv = ["--account", "a" * 32, "--database-id", DBID, "--read-token-file", _tok(tmp_path, "r.tok", READ),
+            "--write-token-file", _tok(tmp_path, "w.tok", WRITE)]
+
+    def boom(*a, **k):
+        raise TimeoutError("lookup timed out")
+
+    monkeypatch.setattr("memora.add_store.fetch_d1_info", boom)
+    assert P.main(argv) == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out == {"ok": False, "failed_phase": "database lookup", "error": "TimeoutError", "message": "lookup timed out"}
 
 
 def test_the_gate_and_the_experiment_use_one_statement(tmp_path, fake):
@@ -148,7 +232,7 @@ def test_the_same_token_in_both_files_is_refused(tmp_path, fake):
 
 def test_a_read_token_that_is_not_refused_fails_the_experiment(tmp_path, fake):
     report = _run(tmp_path, fake, read_refused=False)
-    assert report["read_token"] == {"refused": False} and report["ok"] is False
+    assert report["read_token"] == {"refused": False, "outcome": "executed"} and report["ok"] is False
 
 
 def test_a_write_that_changes_a_row_fails_the_experiment(tmp_path, fake):
