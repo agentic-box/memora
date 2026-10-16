@@ -115,6 +115,14 @@ done
 
 echo "== 1. build the image from this checkout; the first deploy (four local stores)"
 new_image IMG_ID "$IMAGE" "$ROOT" && pass "build the image ($IMG_ID)"
+# the deploy script migrates from a running container's anonymous /data (production's shape), so the
+# rehearsal starts the way R1 does: a first container with the four stores
+new_container OLD_ID --name "$NAME" --restart unless-stopped -p "0.0.0.0:$PORT:8000" \
+  -e "MEMORA_DATABASES=$REG4" -e MEMORA_DEFAULT_DB=memora -e "MEMORA_HEALTH_TOKEN=$HEALTH_TOKEN" \
+  -e MEMORA_EMBEDDING_MODEL=tfidf -e MEMORA_ALLOW_ANY_TAG=1 "$IMAGE"
+pass "start the first container ($OLD_ID)"
+check "it answers /health" wait_health
+anon_of OLD_VOL "$OLD_ID"
 if deploy > "$RH_ROOT/deploy-1.log" 2>&1; then pass "deploy 1 (four stores; log: deploy-1.log)"; \
   else fail "deploy 1 (exit $?; see deploy-1.log)"; tail -30 "$RH_ROOT/deploy-1.log"; fi
 adopt _ image "$IMAGE"; adopt VOL_ID volume "$VOL"; adopt C1 container "$NAME"; adopt_run_tags

@@ -34,6 +34,9 @@ test file that imports the touched module.
 | `contracts/memora-api/v1/**` | `tests/test_api_contract.py` |
 | `scripts/deploy*`, `Dockerfile` | `tests/test_deploy_memora_all.py`, `tests/test_deploy_config.py` |
 | `scripts/<x>.py`, `scripts/<x>.sh` | `tests/test_<x>.py` where one exists (e.g. `mint_api_token.sh` → `tests/test_mint_api_token.py`) |
+| `scripts/add_store.sh`, `scripts/add_store_config.py` | `tests/test_add_store.py` |
+| `memora/add_store.py`, `local_primary.py bootstrap-d1 / pre-freeze / clear-freeze` | `tests/test_add_store_bootstrap.py` |
+| `memora/copy_memories.py`, `scripts/copy_memories.py` | `tests/test_copy_memories.py` |
 | `scripts/memora_api_contract.py` | `tests/test_api_contract.py` |
 
 ## Frozen contract
