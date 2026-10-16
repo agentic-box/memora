@@ -100,6 +100,13 @@ def _build_statements(tbl: str, pk: Sequence[Any], row: Optional[Dict[str, Any]]
              f"ON CONFLICT({_cols_sql(pk_cols)}) DO UPDATE SET {sets}", values)]
 
 
+def write_probe_statements() -> List[Tuple[str, tuple]]:
+    """THE statement of the start-up write probe (Item 99), the one definition
+    the replicator sends and scripts/d1_permission_probe.py checks against D1:
+    a DELETE by a NULL primary key, which `=` can never match."""
+    return _build_statements("memories", [None], None, [])
+
+
 # ------------------------------------------------------------------ P2 checker
 
 _ID = r"[A-Za-z_][A-Za-z0-9_]*"
@@ -678,7 +685,7 @@ class StoreReplicator:
         the store's gate (exempt entry, like a send), so a freeze waits for the
         request. A refusal or a malformed result raises into the loop's backoff
         path (status shows the error; write_probe stays not-"ok"; retried)."""
-        stmts = _build_statements("memories", [None], None, [])
+        stmts = write_probe_statements()
         token = self._gate_enter("replicator write probe")
         try:
             results = self._d1().execute_batch(stmts)

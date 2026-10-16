@@ -18,6 +18,9 @@ COPY scripts/local_primary.py scripts/local_primary.py
 # /app/scripts/copy_memories.py ...`): it needs the stores' volume for its lock
 # and state, and the container's own endpoint.
 COPY scripts/copy_memories.py scripts/copy_memories.py
+# Item 99: the one-time D1 permission experiment (a throwaway `memora-probe-*`
+# database only), run from this image with the token files mounted.
+COPY scripts/d1_permission_probe.py scripts/d1_permission_probe.py
 
 RUN pip install --no-cache-dir .
 
