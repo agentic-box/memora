@@ -28,6 +28,10 @@ this file only parses arguments and builds the dependencies.
   fk-audit <db> --store /data/<db>.db          §9 x: foreign-key orphans (read-only; exit 5 when any)
   bootstrap-d1 <db> --account A --database-id I --d1-name N --read-token-file R --credential-file C
                             Item 95: schema-only init of a NEW, EMPTY, pinned D1 (serves nothing)
+  bootstrap-status <db> --account A --database-id I --d1-name N
+                            Item 95 (read-only): the verified bootstrap state for exactly these ids, and the freeze file
+  verify-replication <db> --account A --database-id I --interval S --expect-min-rows N --memora-url U --health-token-file H
+                            Item 95 (read-only): the first real replicated write, end to end (after the thaw and a write)
   pre-freeze <db>           Item 95: persisted freeze for a bootstrapped store, before its first deploy
   clear-freeze <db>         Item 95 rollback: remove that freeze once the service no longer routes <db>
   check-endpoint            F4a: authenticated round trip to memora-all through a
@@ -211,6 +215,23 @@ def _parser() -> argparse.ArgumentParser:
     bd.add_argument("--read-token-file", help="0600 file with the D1 READ token (default: MEMORA_D1_READ_TOKEN)")
     bd.add_argument("--credential-file", required=True,
                     help="0600 file with the D1 EDIT token (an operator credential; never a service env)")
+    bs = sub.add_parser("bootstrap-status", help="Item 95 (read-only): preconditions of the resumable steps")
+    bs.add_argument("db")
+    bs.add_argument("--account", required=True)
+    bs.add_argument("--database-id", required=True)
+    bs.add_argument("--d1-name", required=True)
+    bs.add_argument("--no-freeze-check", action="store_true", help="do not require the persisted freeze file")
+    vr = sub.add_parser("verify-replication", help="Item 95 (read-only): the first real replicated write, end to end")
+    vr.add_argument("db")
+    vr.add_argument("--account", required=True)
+    vr.add_argument("--database-id", required=True)
+    vr.add_argument("--interval", type=float, required=True, help="the configured MEMORA_REPLICATION_INTERVAL_S")
+    vr.add_argument("--expect-min-rows", type=int, required=True)
+    vr.add_argument("--timeout", type=float, help="seconds for the ack to reach head (default 2 x interval + 30)")
+    vr.add_argument("--store", help="the local store file (default /data/<db>.db)")
+    vr.add_argument("--memora-url", default="http://127.0.0.1:8000")
+    vr.add_argument("--health-token-file", required=True)
+    vr.add_argument("--read-token-file", help="0600 file with the D1 READ token (default: MEMORA_D1_READ_TOKEN)")
     for name, text in (("pre-freeze", "Item 95: persist the freeze of a bootstrapped store before its first deploy"),
                        ("clear-freeze", "Item 95 rollback: remove the persisted freeze of a store no longer routed")):
         pf = sub.add_parser(name, help=text)
@@ -450,6 +471,12 @@ def _add_store_cmd(args) -> int:
     if args.cmd == "pre-freeze":
         print(json.dumps({"ok": True, **ads.pre_freeze(args.db)}))
         return 0
+    if args.cmd == "bootstrap-status":
+        print(json.dumps({"ok": True, **ads.status(args.db, account_id=args.account, database_id=args.database_id,
+                                                  d1_name=args.d1_name, require_freeze=not args.no_freeze_check)}))
+        return 0
+    if args.cmd == "verify-replication":
+        return _verify_replication(args)
     if args.cmd == "clear-freeze":
         from memora.storage import DatabaseRegistryError, database_registry
 
@@ -478,6 +505,65 @@ def _add_store_cmd(args) -> int:
                            d1_name=args.d1_name, deps=deps)
     print(json.dumps({"ok": True, **out}))
     return 0
+
+
+def _verify_replication(args) -> int:
+    """Item 95: the first real replicated write, end to end. Read-only everywhere."""
+    import urllib.error
+    import urllib.request
+
+    from memora import add_store as ads
+    from memora.backends import D1SelectOnlyConnection, LocalSQLiteBackend
+
+    health_token = lp.load_credential_file(args.health_token_file)
+    read_token = lp.read_token(args.read_token_file)
+    store = Path(args.store or f"/data/{args.db}.db")
+    reader = D1SelectOnlyConnection(args.account, args.database_id, read_token)
+    cols = "id, content, metadata, tags, created_at, updated_at"
+
+    def health():
+        req = urllib.request.Request(f"{args.memora_url.rstrip('/')}/health/db/{args.db}",
+                                     headers={"Authorization": f"Bearer {health_token}"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                code, body = r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            code, body = exc.code, {}
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            code, body = None, {"error": str(exc)}
+        reg = json.loads(os.environ.get("MEMORA_DATABASES") or "{}")
+        return {**body, "http": code, "registry_entry": reg.get(args.db)}
+
+    def local_rows():
+        conn = LocalSQLiteBackend(store).connect_read_only()
+        try:
+            return [dict(r) for r in conn.execute(f"SELECT {cols} FROM memories ORDER BY id").fetchall()]
+        finally:
+            conn.close()
+
+    def d1_rows(ids):
+        out = {}
+        ids = list(ids)
+        for i in range(0, len(ids), 50):
+            chunk = ids[i:i + 50]
+            rows, _meta = reader.execute(
+                f"SELECT {cols} FROM memories WHERE id IN ({','.join('?' * len(chunk))})", tuple(chunk))
+            out.update({int(r["id"]): r for r in rows})
+        return out
+
+    def d1_count():
+        rows, _meta = reader.execute("SELECT COUNT(*) AS n FROM memories", ())
+        return int(rows[0]["n"])
+
+    from memora.storage import store_is_transactional
+
+    report = ads.verify_replication(
+        args.db, interval_s=args.interval, expect_min_rows=args.expect_min_rows,
+        timeout_s=args.timeout if args.timeout is not None else 2 * args.interval + 30,
+        health=health, local_rows=local_rows, d1_rows=d1_rows, d1_count=d1_count,
+        transactional=store_is_transactional(args.db))
+    print(json.dumps(report, default=str))
+    return 0 if report["ok"] else 5
 
 
 def main(argv=None) -> int:
@@ -552,7 +638,7 @@ def main(argv=None) -> int:
                 raise lp.L5Refused(str(exc))
             print(json.dumps({"ok": True, "shadow": args.shadow, "shadow_state": state}))
             return 0
-        if args.cmd in ("bootstrap-d1", "pre-freeze", "clear-freeze"):
+        if args.cmd in ("bootstrap-d1", "pre-freeze", "clear-freeze", "bootstrap-status", "verify-replication"):
             return _add_store_cmd(args)
         if args.cmd == "fk-audit":
             from memora.backends import LocalSQLiteBackend, StoreLockedError, StoreMissingError

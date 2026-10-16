@@ -669,7 +669,7 @@ def test_the_state_is_made_durable_file_and_directory(stores, seeded, tmp_path, 
         return real(fd)
     monkeypatch.setattr(cm.os, "fsync", fsync)
     cm.write_json(tmp_path / "newdir" / "x.json", {"a": 1})
-    assert synced == ["file", "dir", "dir"]                      # the file, its directory, and the new directory's parent
+    assert synced == ["dir", "file", "dir"]                      # the new directory's parent, the file, the file's directory
     assert (tmp_path / "newdir" / "x.json").stat().st_mode & 0o777 == 0o600
     synced.clear()
     cm.write_json(tmp_path / "newdir" / "x.json", {"a": 2})
@@ -700,3 +700,82 @@ def test_a_reconciled_or_pre_existing_marker_must_still_match_the_saved_plan(sto
     with pytest.raises(cm.CopyError, match="differ from the source"):
         cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
     assert [c for c in stores["dest"].calls if c[0] == "memory_link"] == []
+
+
+def test_a_fresh_state_directory_is_durable_before_the_first_create(stores, seeded, tmp_path, monkeypatch):
+    """P1-3: apply_plan with a state directory that does not exist yet (nested, several new components) and a plan
+    that lives elsewhere: every newly created directory's parent and the lock/state files are fsynced BEFORE the
+    first memory_create leaves, so a power loss cannot lose the attempt records."""
+    import stat as _stat
+
+    plan = plan_for(stores)
+    plan_file = tmp_path / "elsewhere" / "plan.json"
+    cm.write_json(plan_file, plan)
+    root = tmp_path / "freshroot"
+    state_dir = root / "sub" / "state"
+    assert not root.exists()
+    synced = []                                                   # inodes of everything fsynced, in order
+    real_fsync = os.fsync
+
+    def fsync(fd):
+        st = os.fstat(fd)
+        synced.append(("dir" if _stat.S_ISDIR(st.st_mode) else "file", st.st_ino))
+        return real_fsync(fd)
+    monkeypatch.setattr(cm.os, "fsync", fsync)
+    at_first_create = {}
+
+    def hook(tool, args, phase):
+        if tool == "memory_create" and phase == "before" and "synced" not in at_first_create:
+            at_first_create["synced"] = list(synced)
+    stores["dest"].hook = hook
+    o = cm.ApplyOptions(state_dir=state_dir, sleep=lambda s: None)
+    cm.apply_plan(cm.load_plan(plan_file), stores["src"], stores["dest"], o)
+    done = {ino for kind, ino in at_first_create["synced"] if kind == "dir"}
+    for d in (tmp_path, root, root / "sub", state_dir):           # the parent of each created component, and the state dir
+        assert d.stat().st_ino in done, f"{d} was not fsynced before the first create"
+    assert any(kind == "file" for kind, _ in at_first_create["synced"])        # the attempt record itself
+
+
+def test_the_source_project_may_differ_from_the_destination_project(stores, seeded, tmp_path):
+    """P2-3: a source row that already carries metadata.project must not fail the fidelity check after its copy was
+    created; the destination's project is intentionally the destination's."""
+    odd = create(stores["src"], "belongs to another project", metadata={"project": "memora"})
+    plan = plan_for(stores)
+    out = cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert out["copied"] == 6
+    m = {int(k): v for k, v in json.loads((tmp_path / "copystate" / "memora-acebar.manifest.json").read_text())["map"].items()}
+    rec = stores["dest"].call("memory_get", {"memory_id": m[odd], "follow": "all"})["memory"]
+    assert rec["metadata"]["project"] == "acebar"
+
+
+def test_a_remapped_reference_is_verified_after_the_update(stores, seeded, tmp_path):
+    """P2-3: the remapped value itself is re-read and checked before the phase is marked done."""
+    b = seeded["b"]
+    ref = create(stores["src"], "points at b", metadata={"merged_from": b})
+    plan = plan_for(stores)
+    real_call = stores["dest"].call
+
+    def call(tool, args):
+        if tool == "memory_update":                                # the update silently does nothing
+            return {"memory": {"id": args["memory_id"]}}
+        return real_call(tool, args)
+    stores["dest"].call = call
+    with pytest.raises(cm.CopyError, match="remapped metadata references are wrong"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert ref
+
+
+def test_a_done_attempt_whose_marker_is_gone_is_never_created_again(stores, seeded, tmp_path):
+    """P2-4: the attempt was recorded done with a destination id; if its marker later disappears the tool refuses
+    (zero creates) instead of treating a known earlier create as never attempted."""
+    plan = plan_for(stores)
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    victim = plan["rows"][1]["id"]
+    with in_store("acebar") as c:                                  # someone strips the marker (metadata) from one copy
+        c.execute("UPDATE memories SET metadata = '{}' WHERE json_extract(metadata, '$.memora_copy.id') = ?", (victim,))
+        c.commit()
+    n = len(creates(stores["dest"]))
+    before = len(dest_rows(stores))
+    with pytest.raises(cm.CopyError, match="recorded as done .* markers are absent"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == n and len(dest_rows(stores)) == before

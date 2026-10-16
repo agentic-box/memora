@@ -61,7 +61,16 @@ scripts/add_store.sh acebar … --execute --from env --apply-env    # 3 env, 4 d
 scripts/cutover_store.sh acebar --execute                         # a, b, c (the freeze is already in place)
 scripts/cutover_store.sh acebar --execute --from d --apply-env    # d..g: env edits, the redeploy (the ONE deploy of the finished store), health, barrier compare
 scripts/cutover_store.sh acebar --execute --from h --thaw         # h: only after a clean barrier compare
+scripts/add_store.sh acebar --d1-account A --d1-id I --d1-name N --execute --verify-first-write --expect-rows N   # AFTER a first write (the copy): the first REAL replicated write, below
 ```
+
+**Every resumable boundary proves its preconditions first.** `--from prefreeze|env|deploy|export` run
+`local_primary.py bootstrap-status` (read-only) before anything else: a verified bootstrap state for **exactly** the
+given account, database id and name (a second invocation with another id is refused), and the persisted freeze file;
+`--from env` also needs the operator files to be new or to hold exactly this entry, `--from deploy|export` need
+them to already hold the interim entry (`add_store_config.py verify-applied`), and the export step needs the running
+route to be exactly the pinned `d1://` entry, frozen, with nothing in flight. Otherwise the script refuses **before** any
+edit, deploy or export, and does not initialise or freeze anything to make the check pass.
 
 1. **bootstrap** — `local_primary.py bootstrap-d1`. Checks: inputs well-formed; the id is in neither
    `MEMORA_DATABASES` nor `MEMORA_REPLICAS` and the store is in neither; Cloudflare returns exactly the
@@ -78,7 +87,11 @@ scripts/cutover_store.sh acebar --execute --from h --thaw         # h: only afte
 2. **pre-freeze** — writes `/data/freeze/<db>` (needs a `verified` bootstrap state). Idempotent.
 3. **env** — `scripts/add_store_config.py`: adds `MEMORA_DATABASES[<db>] = d1://<account>/<id>` to
    `instances/all.env` and `MEMORA_PROJECTS[<db>] = ["<db>"]` to `instances/deploy.env`, nothing else. The
-   guards re-run on the current files at the moment of writing; backups are dated, 0600, in
+   guards re-run on the current files at the moment of writing, under ONE shared operator lock for the pair
+   (`instances/.operator-config.lock`, honoured by this tool; `cutover_store.sh` and a person with an editor do not
+   take it), and each file is replaced only if its bytes are still exactly those the edit was computed from (a
+   concurrent change is refused and preserved); a crash between the two files is resumed by running the step again
+   (the same entry is accepted, a different value is refused); backups are dated, 0600, in
    `DEPLOY_BACKUP_DIR` (outside the repo; a directory inside it is refused) and are evidence only; the files
    are read back and every other line and mapping must be byte-identical. `MEMORA_REPLICATION=write` and
    `MEMORA_REPLICATION_INTERVAL_S` must already be set (the other stores use them).
@@ -90,6 +103,37 @@ scripts/cutover_store.sh acebar --execute --from h --thaw         # h: only afte
 
 **The interim store is not advertised.** No clmux binding, MCP entry or token scope for the store may exist
 until the cutover's barrier compare is clean and the store is thawed as a local primary.
+
+## The first real replicated write (leader-only, after the thaw)
+
+The barrier compare before the thaw runs on an empty store, so it says nothing about the replication path. The first
+real write is proven end to end before any client is pointed at the store. It needs a write to have happened (the copy
+below is the natural one; an empty store is refused as proof) and **no live D1 write by anyone but the replicator**.
+
+```
+# after: cutover --from h --thaw, and the copy (apply) with N rows
+scripts/add_store.sh acebar --d1-account A --d1-id I --d1-name N --execute --verify-first-write --expect-rows N
+```
+
+1. `local_primary.py verify-replication` (read-only; credentials are file paths in the container: the health token
+   file the script places on tmpfs, and the D1 READ token the container already has or `--read-token-file`):
+   the store is a local transactional primary (`writes: transactional`), served from `/data/<db>.db`, thawed, the
+   replicator is in **write** mode at the configured interval (from `MEMORA_REPLICATION_INTERVAL_S`, 60 s), running
+   and not halted; then the outbox must drain: `head_seq > 0` and `last_acked_seq == head_seq` with `lag_rows 0` within
+   **2 x interval + 30 s (150 s)**, polled every 3 s; then **every local row** is read back from D1 through the READ
+   token with identical columns (`id, content, metadata, tags, created_at, updated_at`) and the D1 row count equals the
+   local count (at least `--expect-rows`). Exit 0 = proven; 5 = not proven, with the checks that failed in the JSON.
+2. A barrier compare, now non-vacuous, under a brief freeze: `freeze`, `compare --mode barrier --drain-timeout
+   max(600, 2 x interval + 30)` (exit 0 = 0 diffs), `thaw`. On any non-zero exit the script stops and leaves the store
+   **frozen** (no client has it) and names the rollback (stage S6, the L6 runbook).
+3. Final report: the script prints `first-write verification PASSED …` (local transactional primary, write mode every
+   60 s, ack reached head, rows read back identical, barrier compare clean, thawed). Report that line (with the row
+   count) to the leader; only then the `api-tokens.json` scope and the clmux binding.
+
+Timeout and failure handling: the wait is bounded (150 s); a halted or backing-off replicator, a D1 error, a delete
+guard or a non-draining outbox fail the check and leave everything as it is. **Do not delete a copied memory from the
+new store to "clean up": deletes on a table under 100 rows halt the replicator by design (P3).** If no copy is wanted,
+one throwaway write can serve; it stays in the store.
 
 ## Rollback by stage
 

@@ -103,6 +103,10 @@ def test_every_statement_ensure_schema_sends_passes_the_guard_and_data_is_one_ro
     "INSERT OR IGNORE INTO memories_meta(key, value) VALUES ('embedding_change_epoch', '5')",
     "INSERT OR IGNORE INTO memories_meta(key, value) VALUES ('other', '0')",
     "CREATE TABLE IF NOT EXISTS t (a); DROP TABLE memories_meta",
+    "CREATE TABLE IF NOT EXISTS arbitrary (a)",                       # an IF NOT EXISTS shape is not enough
+    "CREATE INDEX IF NOT EXISTS idx_arbitrary ON memories(content)",
+    "CREATE TRIGGER IF NOT EXISTS trg_arbitrary AFTER INSERT ON memories BEGIN UPDATE memories_meta SET value = 1; END",
+    "ALTER TABLE memories ADD COLUMN arbitrary TEXT",
     "CREATE TABLE IF NOT EXISTS t AS SELECT * FROM memories",
     "CREATE TABLE t (a)",                                    # not IF NOT EXISTS
     "ALTER TABLE memories DROP COLUMN content",
@@ -168,10 +172,24 @@ def test_a_complete_matching_database_is_verified_without_ddl(tmp_path, rig):
     assert len(rig.writers) == 1 and len(rig.sent()) == before    # no writer opened, nothing sent
 
 
-def test_a_lost_state_file_with_a_complete_schema_is_recovered_by_verification(tmp_path, rig):
+def test_a_complete_database_without_a_bootstrap_state_is_refused_not_adopted(tmp_path, rig):
+    """P2-1: a lost state file is a manual recovery decision; a database already holding a matching schema is
+    not known to be ours and is never adopted automatically."""
     rig.run(tmp_path)
     (tmp_path / "data" / "bootstrap" / "acebar.json").unlink()
-    assert rig.run(tmp_path)["status"] == "already-initialised"
+    with pytest.raises(AddStoreRefused, match="no bootstrap state"):
+        rig.run(tmp_path)
+    assert ads.read_state("acebar", tmp_path / "data") is None            # nothing was written either
+    assert len(rig.writers) == 1
+
+
+def test_a_known_interrupted_bootstrap_with_a_complete_schema_is_verified_without_ddl(tmp_path, rig):
+    """State says ddl_done (the crash came before 'verified'): a complete matching schema is verified only."""
+    rig.run(tmp_path)
+    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_done"},
+                    tmp_path / "data")
+    out = rig.run(tmp_path)
+    assert out["status"] == "already-initialised" and len(rig.writers) == 1
     assert ads.read_state("acebar", tmp_path / "data")["phase"] == "verified"
 
 
@@ -260,6 +278,8 @@ def test_identity_is_rechecked_after_the_ddl(tmp_path, rig):
 
 def test_a_non_empty_database_with_a_foreign_schema_is_refused_with_no_ddl(tmp_path, rig):
     sqlite3.connect(rig.path).execute("CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT)").connection.commit()
+    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"},
+                    tmp_path / "data")                                       # a known interrupted run, but a foreign schema
     with pytest.raises(AddStoreRefused, match="not what the app's initializer builds"):
         rig.run(tmp_path)
     assert rig.writers == []
@@ -272,7 +292,6 @@ def test_a_database_with_data_is_refused(tmp_path, rig):
     con.execute("UPDATE memories_meta SET value = '0'")   # the epoch trigger bumped it; isolate the emptiness check
     con.commit()
     con.close()
-    (tmp_path / "data" / "bootstrap" / "acebar.json").unlink()
     with pytest.raises(AddStoreRefused, match="not empty"):
         rig.run(tmp_path)
 
@@ -329,7 +348,6 @@ def test_a_right_named_object_with_a_wrong_definition_is_rejected(tmp_path, rig)
     con.close()
     diffs = ads.diff_signature(ads.schema_signature(rig._read), ads.reference_signature())
     assert any("idx_memories_embeddings_representation" in d for d in diffs)
-    (tmp_path / "data" / "bootstrap" / "acebar.json").unlink()
     with pytest.raises(AddStoreRefused, match="definition differs"):
         rig.run(tmp_path)
 
@@ -340,7 +358,6 @@ def test_the_epoch_row_must_be_exactly_zero(tmp_path, rig):
     con.execute("UPDATE memories_meta SET value = '7'")
     con.commit()
     con.close()
-    (tmp_path / "data" / "bootstrap" / "acebar.json").unlink()
     with pytest.raises(AddStoreRefused, match="epoch row"):
         rig.run(tmp_path)
 
@@ -388,3 +405,144 @@ def test_configured_from_env_reads_ids_and_names():
     assert ads.configured_from_env({}) == (set(), set())
     with pytest.raises(AddStoreRefused):
         ads.configured_from_env({"MEMORA_DATABASES": "not json"})
+
+
+def test_the_allow_list_is_exactly_what_the_initializer_sends(tmp_path):
+    writes = ads.reference_writes()
+    con = ads.ScratchD1Connection(str(tmp_path / "r.sqlite"))
+    schema.ensure_schema(con)
+    sent = {ads._norm_stmt(q) for q in con.sent if not q.upper().startswith(("SELECT", "PRAGMA"))}
+    assert sent == set(writes)                                         # no more, no less
+    assert any(w.startswith("INSERT OR IGNORE INTO memories_meta") for w in writes)
+    assert sum(w.startswith("CREATE TRIGGER") for w in writes) == 8
+
+
+# ------------------------------------------------------------------ status: the preconditions of the resumable steps
+
+def test_status_needs_a_verified_bootstrap_for_exactly_the_pinned_ids_and_the_freeze(tmp_path, rig, monkeypatch):
+    data = tmp_path / "data"
+    monkeypatch.setenv("MEMORA_DATA_DIR", str(data))
+    pins = dict(account_id=ACCT, database_id=DBID, d1_name=NAME, data_dir=data)
+    with pytest.raises(AddStoreRefused, match="no bootstrap state"):
+        ads.status("acebar", **pins)
+    rig.run(tmp_path)
+    with pytest.raises(AddStoreRefused, match="persisted freeze .* is missing"):
+        ads.status("acebar", **pins)
+    assert ads.status("acebar", require_freeze=False, **pins)["phase"] == "verified"
+    ads.pre_freeze("acebar", data_dir=data)
+    assert ads.status("acebar", **pins)["freeze_file"] is True
+    for field, other in (("database_id", "another-db-id-1"), ("account_id", "b" * 32), ("d1_name", "someone-else")):
+        with pytest.raises(AddStoreRefused, match="other"):
+            ads.status("acebar", **{**pins, field: other})
+    ads._save_state("acebar", {"account_id": ACCT, "database_id": DBID, "d1_name": NAME, "phase": "ddl_started"}, data)
+    with pytest.raises(AddStoreRefused, match="not verified"):
+        ads.status("acebar", **pins)
+
+
+# ------------------------------------------------------------------ verify_replication (the first real write)
+
+class Repl:
+    """A fake replicated store for verify_replication: health, local rows, D1 rows."""
+
+    def __init__(self):
+        self.local = {1: row(1, "a"), 2: row(2, "b"), 3: row(3, "c")}
+        self.remote = {k: dict(v) for k, v in self.local.items()}
+        self.h = {"http": 200, "status": "ok", "registry_entry": "/data/acebar.db", "freeze": {"state": "open"},
+                  "replication": {"mode": "write", "interval_s": 60.0, "status": "running", "halted_reason": None,
+                                  "head_seq": 12, "last_acked_seq": 12, "lag_rows": 0}}
+        self.now = 0.0
+        self.polls = 0
+        self.on_poll = None
+
+    def health(self):
+        self.polls += 1
+        if self.on_poll:
+            self.on_poll(self)
+        return self.h
+
+    def sleep(self, s):
+        self.now += s
+
+    def run(self, **kw):
+        args = dict(interval_s=60, expect_min_rows=3, timeout_s=150, health=self.health,
+                    local_rows=lambda: list(self.local.values()), d1_rows=lambda ids: {i: self.remote[i] for i in ids if i in self.remote},
+                    d1_count=lambda: len(self.remote), transactional=True, sleep=self.sleep, monotonic=lambda: self.now)
+        args.update(kw)
+        return ads.verify_replication("acebar", **args)
+
+
+def row(i, text):
+    return {"id": i, "content": text, "metadata": None, "tags": '["x"]', "created_at": "2026-10-16 10:00:00", "updated_at": None}
+
+
+def failed(report):
+    return [c["check"] for c in report["checks"] if not c["ok"]]
+
+
+def test_verify_replication_passes_when_everything_is_proven():
+    r = Repl()
+    out = r.run()
+    assert out["ok"] is True and out["rows"] == 3 and not failed(out)
+
+
+@pytest.mark.parametrize("patch,check", [
+    (lambda r: r.h["replication"].update(mode="log"), "replication mode write"),
+    (lambda r: r.h["replication"].update(interval_s=5.0), "replication interval"),
+    (lambda r: r.h["replication"].update(status="halted", halted_reason="delete_guard"), "replicator running, not halted"),
+    (lambda r: r.h.update(freeze={"state": "frozen"}), "thawed"),
+    (lambda r: r.h.update(registry_entry="d1://a/b"), "served from the local file"),
+    (lambda r: r.h.update(status="degraded"), "health ok"),
+])
+def test_verify_replication_refuses_wrong_preconditions_without_waiting(patch, check):
+    r = Repl()
+    patch(r)
+    out = r.run()
+    assert out["ok"] is False and check in failed(out) and out["stopped"] == "preconditions"
+    assert r.now == 0.0
+
+
+def test_verify_replication_requires_the_store_to_be_a_transactional_primary():
+    out = Repl().run(transactional=False)
+    assert "writes are transactional (a local SQLite primary)" in failed(out)
+
+
+def test_verify_replication_fails_when_the_ack_never_reaches_head():
+    r = Repl()
+    r.h["replication"].update(head_seq=20, last_acked_seq=12, lag_rows=8)
+    out = r.run()
+    assert out["ok"] is False and out["stopped"] == "ack did not reach head in time"
+    assert r.now >= 150                                           # it waited the whole bound, no longer
+
+
+def test_verify_replication_waits_for_a_late_ack():
+    r = Repl()
+    r.h["replication"].update(head_seq=20, last_acked_seq=12, lag_rows=8)
+
+    def drain(rep):
+        if rep.now >= 60:
+            rep.h["replication"].update(last_acked_seq=20, lag_rows=0)
+    r.on_poll = drain
+    out = r.run()
+    assert out["ok"] is True and 60 <= out["waited_s"] < 150
+
+
+def test_verify_replication_needs_a_write_to_have_happened():
+    r = Repl()
+    r.h["replication"].update(head_seq=0, last_acked_seq=0)
+    out = r.run(timeout_s=9)
+    assert out["ok"] is False                                       # an empty store proves nothing
+
+
+def test_verify_replication_detects_a_missing_a_differing_row_and_a_count_mismatch():
+    r = Repl()
+    del r.remote[2]
+    out = r.run()
+    assert "every local row is in D1 (read back through the read token)" in failed(out)
+    r = Repl()
+    r.remote[3]["content"] = "changed in D1"
+    assert "every row's columns are identical in D1" in failed(r.run())
+    r = Repl()
+    r.remote[99] = row(99, "extra in D1")
+    assert "D1 row count equals the local count" in failed(r.run())
+    r = Repl()
+    assert "at least 5 local rows" in failed(r.run(expect_min_rows=5))

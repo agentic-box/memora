@@ -15,6 +15,7 @@ Knobs:
   ENV_REPLICATION   memora-all's MEMORA_REPLICATION (default write)
   FAKE_INTERVAL_S   the replication block's interval_s (default 60)
   FREEZE_STAYS_OPEN 1: the freeze call succeeds but the store is not frozen
+  PINNED_ID         bootstrap-status refuses (rc 2) for any other --database-id (Item 95)
 """
 import json
 import os
@@ -43,6 +44,9 @@ if args[:2] == ["exec", "memora-all"]:
         if cmd == "bootstrap-d1" and "--help" in tail:  # the script's "does this image have the tool" probe
             key = "BOOTSTRAP_D1_HELP"
         rc = int(knob(f"TOOL_RC_{key}", "0"))
+        if cmd == "bootstrap-status" and knob("PINNED_ID") and "--database-id" in tail \
+                and tail[tail.index("--database-id") + 1] != knob("PINNED_ID"):
+            rc = 2  # the state was written for another database
         default = {"ok": rc == 0}
         if cmd == "recheck":
             default["receipt"] = tail[tail.index("--receipt") + 1]

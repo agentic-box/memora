@@ -26,8 +26,13 @@
 #   ... --execute                          1, 2 (stops before the env edits)
 #   ... --execute --from env --apply-env   3, 4, 5 (then prints the cutover commands)
 #   ... --execute --from export            5 only
+#   ... --execute --verify-first-write --expect-rows N   AFTER the thaw and a first write (the copy): the first REAL
+#                                          replicated write end to end (below); needs no --credential-file
 #   ... --execute --rollback-env           S2/S3 rollback, step 1: remove ONLY the <db> keys from both files
 #   ... --execute --clear-freeze           S2/S3 rollback, step 2: AFTER the redeploy without <db>, remove its freeze
+# Every resumable boundary (--from prefreeze|env|deploy|export) first proves, BEFORE any configuration edit or deploy:
+# a verified bootstrap state for exactly the given account/id/name, the persisted freeze, and (deploy, export) that the
+# operator files already hold the interim entry. Otherwise it refuses and changes nothing.
 # --credential-file is the D1 EDIT token file as seen INSIDE the container (an operator credential);
 # --read-token-file defaults to the container's own MEMORA_D1_READ_TOKEN(_FILE).
 set -euo pipefail
@@ -47,7 +52,7 @@ OFFHOST="${CUTOVER_OFFHOST_DIR:-$HOME/memora-lp/exports}"
 STEPS="bootstrap prefreeze env deploy export"
 
 DB=""; ACCT=""; DBID=""; D1NAME=""; CRED=""; READ_TOKEN=""
-EXECUTE=0; FROM=bootstrap; APPLY_ENV=0; ROLLBACK_ENV=0; CLEAR_FREEZE=0
+EXECUTE=0; FROM=bootstrap; APPLY_ENV=0; ROLLBACK_ENV=0; CLEAR_FREEZE=0; VERIFY=0; EXPECT_ROWS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --d1-account) ACCT="${2:-}"; shift ;;
@@ -61,6 +66,8 @@ while [ $# -gt 0 ]; do
     --apply-env) APPLY_ENV=1 ;;
     --rollback-env) ROLLBACK_ENV=1 ;;
     --clear-freeze) CLEAR_FREEZE=1 ;;
+    --verify-first-write) VERIFY=1 ;;
+    --expect-rows) EXPECT_ROWS="${2:-}"; shift ;;
     -h|--help) awk 'NR > 1 && /^set -euo/ { exit } NR > 1' "$0"; exit 0 ;;
     -*) echo "unknown option $1" >&2; exit 2 ;;
     *) [ -z "$DB" ] || { echo "one store at a time" >&2; exit 2; }; DB="$1" ;;
@@ -86,8 +93,13 @@ case " $STEPS " in *" $FROM "*) ;; *) refuse "--from takes bootstrap, prefreeze,
 if [ "$ROLLBACK_ENV" != 1 ] && [ "$CLEAR_FREEZE" != 1 ]; then
   [ -n "$ACCT" ] && [ -n "$DBID" ] && [ -n "$D1NAME" ] || refuse "--d1-account, --d1-id and --d1-name (from \`wrangler d1 create\`) are required"
   printf '%s %s' "$ACCT" "$DBID" | grep -Eqx '[A-Za-z0-9_-]{8,64} [A-Za-z0-9_-]{8,64}' || refuse "--d1-account / --d1-id are not Cloudflare ids"
-  [ -n "$CRED" ] || refuse "--credential-file (the D1 edit token file inside $CONTAINER) is required"
+  if [ "$VERIFY" != 1 ]; then
+    [ -n "$CRED" ] || refuse "--credential-file (the D1 edit token file inside $CONTAINER) is required"
+  else
+    printf '%s' "$EXPECT_ROWS" | grep -Eqx '[0-9]+' || refuse "--verify-first-write needs --expect-rows N (the rows the first write should have produced, e.g. the copy's count)"
+  fi
 fi
+[ "$VERIFY" != 1 ] || [ "$ROLLBACK_ENV$CLEAR_FREEZE" = 00 ] || refuse "--verify-first-write cannot be combined with a rollback step"
 [ "$ROLLBACK_ENV" != 1 ] || [ "$CLEAR_FREEZE" != 1 ] || refuse "--rollback-env and --clear-freeze are two steps: run them one after the other, with the redeploy between"
 URI="d1://$ACCT/$DBID"
 
@@ -141,7 +153,7 @@ print(json.dumps({**body, "http": code, "registry_entry": reg.get(db)}))
 health() { cexec python -c "import base64; exec(base64.b64decode('$HEALTH_PROG'))" "$DB"; }
 INTERIM_CHECK="$(cat <<'PY'
 import json, sys
-db = sys.argv[1]
+db, uri = sys.argv[1:3]
 h = json.loads(sys.stdin.read() or "{}")
 fr = h.get("freeze") or {}
 bad = []
@@ -149,8 +161,8 @@ if h.get("http") != 200 or h.get("status") != "ok":
     bad.append(f"/health/db/{db} is HTTP {h.get('http')} status {h.get('status')!r}")
 if fr.get("state") != "frozen" or fr.get("in_flight") != 0 or fr.get("open_intents"):
     bad.append(f"not frozen with 0 in flight (state={fr.get('state')!r} in_flight={fr.get('in_flight')!r} open_intents={fr.get('open_intents')!r})")
-if not str(h.get("registry_entry") or "").startswith("d1://"):
-    bad.append(f"served from {h.get('registry_entry')!r}, not the interim d1:// entry")
+if h.get("registry_entry") != uri:
+    bad.append(f"served from {h.get('registry_entry')!r}, not the pinned interim entry {uri!r}")
 if h.get("replication"):
     bad.append("a replication block is present before the cutover")
 if bad:
@@ -161,7 +173,7 @@ PY
 check_interim() {
   local out msg
   out="$(health)" || out='{}'
-  msg="$(printf '%s' "$out" | python3 -c "$INTERIM_CHECK" "$DB" 2>&1)" || fail "$1" "boundary check (interim stage): $msg"
+  msg="$(printf '%s' "$out" | python3 -c "$INTERIM_CHECK" "$DB" "$URI" 2>&1)" || fail "$1" "boundary check (interim stage): $msg"
   echo "$msg"
 }
 
@@ -170,6 +182,44 @@ BACKUP_DIR="$(python3 "$ROOT/scripts/deploy_config.py" "$DEPLOY_ENV_FILE" DEPLOY
 [ -n "$BACKUP_DIR" ] || BACKUP_DIR="$HOME/memora-backups/cutover-env"
 
 cfg() { python3 "$CONFIGTOOL" "$1" --all-env "$ENV_FILE" --deploy-env "$DEPLOY_ENV_FILE" --db "$DB" --repo "$ROOT" "${@:2}"; }
+
+# ------------------------------------------------------------ the first real replicated write
+if [ "$VERIFY" = 1 ]; then
+  INTERVAL="$(sed -n "s/^MEMORA_REPLICATION_INTERVAL_S=//p" "$ENV_FILE" | head -1 | tr -d "'")"
+  printf '%s' "$INTERVAL" | grep -Eqx '[0-9]+(\.[0-9]+)?' || refuse "MEMORA_REPLICATION_INTERVAL_S is not set in $ENV_FILE"
+  ALLOW_S="$(python3 -c 'import math, sys; print(math.ceil(2 * float(sys.argv[1]) + 30))' "$INTERVAL")"
+  DRAIN_S=$(( ALLOW_S > 600 ? ALLOW_S : 600 ))
+  LOCAL="/data/$DB.db"
+  D1ARGS=(--account "$ACCT" --database-id "$DBID")
+  echo "first-write verification plan for $DB (after the thaw and at least $EXPECT_ROWS rows written, e.g. the copy):"
+  echo "  v1  ${TOOL[*]} verify-replication $DB ${D1ARGS[*]} --interval $INTERVAL --expect-min-rows $EXPECT_ROWS --timeout $ALLOW_S"
+  echo "      (read-only: local transactional primary, write mode at the configured interval, running, thawed; the outbox drains,"
+  echo "       last_acked_seq reaches head_seq, within $ALLOW_S s = 2 x interval + 30; EVERY local row read back from D1 with the"
+  echo "       READ token, identical, and the D1 count equals the local count)"
+  echo "  v2  ${TOOL[*]} freeze $DB ; compare $DB --mode barrier --store $LOCAL --drain-timeout $DRAIN_S (exit 0 = 0 diffs) ; thaw $DB"
+  echo "      (non-vacuous now: the store holds rows)"
+  if [ "$EXECUTE" != 1 ]; then echo "dry run: nothing was done (add --execute to run it)"; exit 0; fi
+  cexec "${TOOL[@]}" bootstrap-status --help >/dev/null 2>&1 || refuse "the running $CONTAINER image has no Item 95 tools"
+  tokens_in verify
+  echo "== v1: verify-replication"
+  tool verify-replication "$DB" "${D1ARGS[@]}" --interval "$INTERVAL" --expect-min-rows "$EXPECT_ROWS" --timeout "$ALLOW_S" \
+    --health-token-file "$SHM/health.token" ${READ_TOKEN:+--read-token-file "$READ_TOKEN"}
+  [ "$TOOL_RC" = 0 ] || fail verify "the first replicated write is NOT proven (exit $TOOL_RC; the checks above say which). The store takes no client until this passes; if replication halted, see docs/local-primary-implementation.md and the L6 rollback"
+  echo "== v2: barrier compare under a brief freeze"
+  tool freeze "$DB" "${AUTH[@]}"
+  [ "$TOOL_RC" = 0 ] || fail verify "the freeze was refused (exit $TOOL_RC); nothing was compared"
+  tool compare "$DB" --mode barrier --store "$LOCAL" "${D1ARGS[@]}" "${AUTH[@]}" --drain-timeout "$DRAIN_S"
+  CRC="$TOOL_RC"
+  if [ "$CRC" != 0 ]; then
+    fail verify "the barrier compare did not come back clean (exit $CRC: 5 = differences, 6 = not drained in time). The store is left FROZEN and takes no client: rollback by stage S6, docs/add-store-runbook.md"
+  fi
+  tool thaw "$DB" "${AUTH[@]}"
+  [ "$TOOL_RC" = 0 ] || fail verify "the thaw was refused (exit $TOOL_RC)"
+  tokens_out
+  echo "first-write verification PASSED for $DB: local transactional primary, replicating in write mode every ${INTERVAL}s, ack reached head, $EXPECT_ROWS+ rows read back from D1 identical, barrier compare clean, thawed."
+  echo "Only now: the api-tokens.json scope (user), the clmux binding."
+  exit 0
+fi
 
 # ------------------------------------------------------------ rollback steps
 if [ "$ROLLBACK_ENV" = 1 ] || [ "$CLEAR_FREEZE" = 1 ]; then
@@ -210,12 +260,15 @@ plan() {
   echo "  NOT advertised: no clmux binding, MCP entry or token scope for $DB until the barrier compare is 0 and the store is thawed"
 }
 plan
-# The store must still be NEW in the configuration until step 3 has edited it.
+# The configuration must be new (or already hold exactly our entry, a resume) until step 3 has edited it, and must
+# already hold the interim entry before the deploy and export steps. Nothing is edited or deployed on a guess.
 config_check() {
+  local out
   case "$FROM" in
     bootstrap|prefreeze|env)
-      local out
       out="$(cfg check --uri "$URI")" || { echo "add_store refused: $out — nothing was done" >&2; exit 2; } ;;
+    deploy|export)
+      out="$(cfg verify-applied --uri "$URI")" || { echo "add_store refused: $out — nothing was done" >&2; exit 2; } ;;
   esac
 }
 if [ "$EXECUTE" != 1 ]; then
@@ -230,6 +283,16 @@ config_check
 if ! cexec "${TOOL[@]}" bootstrap-d1 --help >/dev/null 2>&1; then
   refuse "the running $CONTAINER image has no 'bootstrap-d1' (it predates Item 95): deploy a build that contains it first"
 fi
+
+# Every resumable boundary proves the pinned, verified bootstrap and the persisted freeze BEFORE any edit or deploy.
+status_check() {  # status_check [extra bootstrap-status args]
+  tool bootstrap-status "$DB" --account "$ACCT" --database-id "$DBID" --d1-name "$D1NAME" "$@"
+  [ "$TOOL_RC" = 0 ] || refuse "step $FROM needs the verified bootstrap of exactly this database ($D1NAME) and the persisted freeze (the message above names which is missing); nothing was edited or deployed"
+}
+case "$FROM" in
+  prefreeze) status_check --no-freeze-check ;;
+  env|deploy|export) status_check ;;
+esac
 
 # ------------------------------------------------------------ 1, 2
 if runs bootstrap; then

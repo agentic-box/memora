@@ -15,7 +15,8 @@ bootstrap_d1
     what `schema.ensure_schema` sends over D1 is allowed (CREATE ... IF NOT
     EXISTS, ADD COLUMN, and its one `memories_meta` epoch row), enforced by a
     statement guard on the connection that refuses everything else BEFORE it
-    is sent. The guard is a D1Connection subclass, so ensure_schema takes its
+    is sent (the allow-list is the exact set of write statements the initializer itself
+    sends, recorded from `ensure_schema` on a scratch D1). The guard is a D1Connection subclass, so ensure_schema takes its
     D1 branches (no FTS, no api_idempotency, no sync objects). Nothing is
     served while it runs: the store is in no registry.
 
@@ -59,44 +60,49 @@ class AddStoreRefused(L5Refused):
 # ------------------------------------------------------------------ statement guard
 
 _WS = re.compile(r"\s+")
-_IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
-_ALLOWED_WRITES = (
-    re.compile(rf"^CREATE TABLE IF NOT EXISTS {_IDENT} \(.*\)$", re.I | re.S),
-    re.compile(rf"^CREATE (UNIQUE )?INDEX IF NOT EXISTS {_IDENT} ON {_IDENT}\(.*\)$", re.I | re.S),
-    re.compile(rf"^ALTER TABLE {_IDENT} ADD COLUMN {_IDENT} [A-Za-z]+( DEFAULT [A-Za-z0-9_.'\"-]+)?$", re.I),
-    # The one data statement ensure_schema sends (schema.py, the integrity
-    # epoch): exactly this text, no parameters.
-    re.compile(r"^INSERT OR IGNORE INTO memories_meta\(key, value\) VALUES \('embedding_change_epoch', '0'\)$"),
-    # The eight triggers of schema._ensure_integrity_epoch_triggers, exactly:
-    # the epoch bump on the two tables, and the two embedding-writer guards.
-    re.compile(r"^CREATE TRIGGER IF NOT EXISTS trg_embedding_epoch_(memories|memories_embeddings)_(insert|update|delete) "
-               r"AFTER (INSERT|UPDATE|DELETE) ON (memories|memories_embeddings) BEGIN UPDATE memories_meta "
-               r"SET value = CAST\(value AS INTEGER\) \+ 1 WHERE key = 'embedding_change_epoch'; END$"),
-    re.compile(r"^CREATE TRIGGER IF NOT EXISTS trg_embedding_external_update AFTER UPDATE OF embedding "
-               r"ON memories_embeddings WHEN NEW.writer_token IS OLD.writer_token BEGIN UPDATE memories_embeddings "
-               r"SET representation = NULL, dimension = NULL, encoding_source = 'unknown', writer_token = NULL "
-               r"WHERE memory_id = NEW.memory_id; END$"),
-    re.compile(r"^CREATE TRIGGER IF NOT EXISTS trg_embedding_external_insert AFTER INSERT ON memories_embeddings "
-               r"WHEN NEW.writer_token IS NULL BEGIN UPDATE memories_embeddings SET representation = NULL, "
-               r"dimension = NULL, encoding_source = 'unknown' WHERE memory_id = NEW.memory_id; END$"),
-)
+
+
+def _norm_stmt(sql: str) -> str:
+    text = _WS.sub(" ", sql.strip()).strip()
+    return text[:-1].rstrip() if text.endswith(";") else text
+
+
+_REFERENCE_WRITES: Optional[frozenset] = None
+
+
+def reference_writes() -> frozenset:
+    """The exact (whitespace-normalised) write statements `schema.ensure_schema`
+    sends over a D1 connection to an empty database, recorded by running that
+    very function on a scratch D1 (a D1Connection subclass, so its D1 branches
+    run). This IS the allow-list: the guard cannot drift from the initializer,
+    and an arbitrary CREATE TABLE / INDEX / trigger that the initializer does
+    not send is refused."""
+    global _REFERENCE_WRITES
+    if _REFERENCE_WRITES is None:
+        from . import schema
+
+        conn = ScratchD1Connection()
+        try:
+            schema.ensure_schema(conn)
+            _REFERENCE_WRITES = frozenset(
+                _norm_stmt(sql) for sql in conn.sent
+                if classify_statement(sql).kind != READ)
+        finally:
+            conn.close()
+    return _REFERENCE_WRITES
 
 
 def check_bootstrap_statement(sql: str, params: Optional[Sequence[Any]] = None) -> None:
-    """Raise AddStoreRefused unless `sql` is a read or one of the exact write
-    shapes ensure_schema sends. Called BEFORE a statement is sent."""
-    text = _WS.sub(" ", sql.strip()).strip()
+    """Raise AddStoreRefused unless `sql` is a read or EXACTLY one of the write
+    statements `ensure_schema` sends over D1 (reference_writes). Called BEFORE
+    a statement is sent."""
+    text = _norm_stmt(sql)
     if classify_statement(sql).kind == READ:
         return
     if params:
         raise AddStoreRefused(f"bootstrap refused a statement with parameters: {text[:80]!r}")
-    if text.endswith(";"):
-        text = text[:-1].rstrip()  # a trigger body keeps its inner ';'
-    for pattern in _ALLOWED_WRITES:
-        if pattern.match(text):
-            if ";" in text and not text.startswith("CREATE TRIGGER"):
-                break  # a second statement smuggled behind an allowed one
-            return
+    if text in reference_writes():
+        return
     raise AddStoreRefused(f"bootstrap refused a statement that ensure_schema does not send: {text[:120]!r}")
 
 
@@ -388,9 +394,15 @@ def bootstrap_d1(db: str, *, account_id: str, database_id: str, d1_name: str, de
         raise AddStoreRefused(f"the read token cannot read the pinned database: {exc}; nothing was changed")
 
     if objects:
-        # Not empty. Only a COMPLETE, matching initialisation is accepted (a
-        # resume after the state write was lost); a partial or different
-        # schema is never replayed automatically.
+        # Not empty. Only a COMPLETE, matching initialisation by THIS command is accepted: there must be a
+        # durable state for the same pins (a resume after the state write was lost, or after the verification
+        # was not reached); with no state at all the database is not known to be ours: a manual recovery
+        # decision, never an automatic adoption. A partial or different schema is never replayed.
+        if state is None:
+            raise AddStoreRefused("the database already holds objects but there is no bootstrap state for it: it is "
+                                  "not known to have been initialised by this command (a lost state file is a "
+                                  "manual recovery decision: inspect the database, then restore or recreate the "
+                                  f"state by hand); nothing was changed")
         deps.log("the database already holds objects: verifying it instead of initialising")
         summary = _verify_initialised(deps)
         _save_state(db, dict(pinned, phase="verified", verified_without_ddl=True), deps.data_dir)
@@ -455,3 +467,102 @@ def clear_freeze(db: str, *, routes: Dict[str, str]) -> Dict[str, Any]:
     existed = freeze_file(db).exists()
     remove_freeze(db)
     return {"removed": existed}
+
+
+# ------------------------------------------------------------------ preconditions for the resumable steps
+
+def status(db: str, *, account_id: str, database_id: str, d1_name: str, require_freeze: bool = True,
+           data_dir: Optional[Path] = None) -> Dict[str, Any]:
+    """Read-only. The preconditions every resumable step after the bootstrap needs, proven BEFORE any
+    configuration edit or deploy: a verified bootstrap state for exactly the pinned account/id/name, and
+    (by default) the persisted freeze file. Refuses otherwise; initialises and freezes nothing."""
+    from .write_gate import freeze_file
+
+    if not DB_NAME_RE.fullmatch(db or ""):
+        raise AddStoreRefused(f"store name {db!r} must match {DB_NAME_RE.pattern}")
+    state = read_state(db, data_dir)
+    if state is None:
+        raise AddStoreRefused(f"no bootstrap state for {db!r}: run the bootstrap step first (or this is the wrong "
+                              "container/volume); nothing was changed")
+    pinned = {"account_id": account_id, "database_id": database_id, "d1_name": d1_name}
+    diff = sorted(k for k, v in pinned.items() if state.get(k) != v)
+    if diff:
+        raise AddStoreRefused(f"the bootstrap state of {db!r} was written for other {', '.join(diff)} than the ones "
+                              "given: refusing to continue with a different database; nothing was changed")
+    if state.get("phase") != "verified":
+        raise AddStoreRefused(f"the bootstrap state of {db!r} is {state.get('phase')!r}, not verified: rerun the "
+                              "bootstrap step; nothing was changed")
+    frozen = freeze_file(db).exists()
+    if require_freeze and not frozen:
+        raise AddStoreRefused(f"the persisted freeze of {db!r} is missing: run the pre-freeze step first; nothing was changed")
+    return {"phase": "verified", "freeze_file": frozen, **pinned_view(pinned)}
+
+
+# ------------------------------------------------------------------ first real replicated write: verification
+
+def _row_digest(row: Dict[str, Any]) -> str:
+    import hashlib
+
+    parts = [row.get(k) for k in ("id", "content", "metadata", "tags", "created_at", "updated_at")]
+    return hashlib.sha256(json.dumps(parts, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def verify_replication(db: str, *, interval_s: float, expect_min_rows: int, timeout_s: float,
+                       health: Callable[[], Dict[str, Any]], local_rows: Callable[[], List[Dict[str, Any]]],
+                       d1_rows: Callable[[Sequence[int]], Dict[int, Dict[str, Any]]], d1_count: Callable[[], int],
+                       transactional: bool, poll_s: float = 3.0, sleep: Callable[[float], None] = time.sleep,
+                       monotonic: Callable[[], float] = time.monotonic) -> Dict[str, Any]:
+    """The first REAL replicated write of a cut-over store, proven end to end (the empty-store barrier compare
+    before the thaw is vacuous for the replication path). Call after the thaw and after at least one write
+    (the copy). Checks, each recorded: the store is a local transactional primary; the replicator is in write
+    mode at the configured interval, running and not halted; the store is thawed; at least `expect_min_rows`
+    rows exist; the outbox drains (last_acked_seq reaches head_seq, lag 0, head > 0) within `timeout_s`
+    (2 x interval + 30 s); and EVERY local row is present in D1 with identical columns (read through the READ
+    token) and the D1 row count equals the local count. Never writes anything. Returns {ok, checks, ...}."""
+    checks: List[Dict[str, Any]] = []
+
+    def record(name: str, ok: bool, detail: Any = None) -> bool:
+        checks.append({"check": name, "ok": bool(ok), **({"detail": detail} if detail is not None else {})})
+        return bool(ok)
+
+    h = health()
+    rep = h.get("replication") if isinstance(h.get("replication"), dict) else {}
+    fr = h.get("freeze") or {}
+    record("health ok", h.get("http") == 200 and h.get("status") == "ok", {"http": h.get("http"), "status": h.get("status")})
+    record("writes are transactional (a local SQLite primary)", transactional)
+    record("served from the local file", str(h.get("registry_entry")) in (f"/data/{db}.db", f"file:///data/{db}.db"),
+           h.get("registry_entry"))
+    record("thawed", fr.get("state") == "open", fr.get("state"))
+    record("replication mode write", rep.get("mode") == "write", rep.get("mode"))
+    record("replication interval", rep.get("interval_s") == float(interval_s), rep.get("interval_s"))
+    record("replicator running, not halted", rep.get("status") == "running" and not rep.get("halted_reason"),
+           {"status": rep.get("status"), "halted_reason": rep.get("halted_reason")})
+    if not all(c["ok"] for c in checks):
+        return {"ok": False, "checks": checks, "stopped": "preconditions"}
+
+    start = monotonic()
+    while True:
+        rep = (health().get("replication") or {})
+        drained = (rep.get("head_seq") or 0) > 0 and rep.get("last_acked_seq") == rep.get("head_seq") \
+            and rep.get("lag_rows") == 0 and rep.get("status") == "running" and not rep.get("halted_reason")
+        if drained or monotonic() - start >= timeout_s:
+            break
+        sleep(poll_s)
+    waited = round(monotonic() - start, 1)
+    record("a write exists and the outbox drained within the bound", drained,
+           {"waited_s": waited, "timeout_s": timeout_s, "head_seq": rep.get("head_seq"),
+            "last_acked_seq": rep.get("last_acked_seq"), "lag_rows": rep.get("lag_rows"),
+            "status": rep.get("status"), "halted_reason": rep.get("halted_reason"), "last_error": rep.get("last_error")})
+    if not drained:
+        return {"ok": False, "checks": checks, "stopped": "ack did not reach head in time"}
+
+    local = {int(r["id"]): r for r in local_rows()}
+    record(f"at least {expect_min_rows} local rows", len(local) >= expect_min_rows, len(local))
+    remote = d1_rows(sorted(local))
+    missing = sorted(i for i in local if i not in remote)
+    differ = sorted(i for i in local if i in remote and _row_digest(local[i]) != _row_digest(remote[i]))
+    record("every local row is in D1 (read back through the read token)", not missing, missing[:20])
+    record("every row's columns are identical in D1", not differ, differ[:20])
+    n_remote = d1_count()
+    record("D1 row count equals the local count", n_remote == len(local), {"d1": n_remote, "local": len(local)})
+    return {"ok": all(c["ok"] for c in checks), "checks": checks, "rows": len(local), "waited_s": waited}

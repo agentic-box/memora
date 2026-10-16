@@ -298,12 +298,28 @@ def _fsync_dir(path: Path) -> None:
         os.close(fd)
 
 
+def ensure_durable_dir(path: Path) -> None:
+    """mkdir -p whose every newly created component is durable: each created directory's PARENT is fsynced
+    (the new entry), so a power loss cannot drop the directory that holds the attempt records after a request
+    was sent. Existing ancestors are left alone."""
+    path = Path(path)
+    missing = []
+    cur = path
+    while not cur.exists():
+        missing.append(cur)
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    for d in reversed(missing):
+        d.mkdir(exist_ok=True)
+        _fsync_dir(d.parent)
+
+
 def write_json(path: Path, value: Dict[str, Any]) -> None:
     """Atomic 0600 replacement, durable: the file AND its directory are fsynced
     (and the parent too when the directory is created here), so a record made
     before a request is on disk when the request leaves."""
-    created = not path.parent.exists()
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_durable_dir(path.parent)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -313,8 +329,6 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
         os.close(fd)
     os.replace(tmp, path)
     _fsync_dir(path.parent)
-    if created:
-        _fsync_dir(path.parent.parent)
 
 
 def load_plan(path: Path) -> Dict[str, Any]:
@@ -350,8 +364,11 @@ class _Lock:
         self.fd: Optional[int] = None
 
     def __enter__(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_durable_dir(self.path.parent)           # durable BEFORE any request: the attempts live here
+        existed = self.path.exists()
         self.fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+        if not existed:
+            _fsync_dir(self.path.parent)
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -445,6 +462,11 @@ def _create_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], 
     dup = {k: v for k, v in markers.items() if len(v) > 1}
     if dup:
         raise CopyError(f"duplicate provenance markers in {dest.store}: {dup}; refusing to continue")
+    done_absent = sorted(int(k) for k, a in attempts.items() if a.get("state") == "done" and int(k) not in markers)
+    if done_absent:
+        raise CopyError(f"source id(s) {done_absent} were created by an earlier run (recorded as done with a "
+                        f"destination id) but their markers are absent from {dest.store}: someone removed or edited "
+                        "them; refusing to create anything (zero creates). Inspect the destination.")
     ambiguous_absent = sorted(int(k) for k, a in attempts.items() if a.get("state") == "sent" and int(k) not in markers)
     if ambiguous_absent:
         raise CopyError(f"source id(s) {ambiguous_absent} have a create attempt of unknown outcome and no marker in "
@@ -516,8 +538,8 @@ def _verify_fidelity(rows: Sequence[Dict[str, Any]], mapping: Dict[int, int], re
             problems.append(f"{r['id']}: tags lost {sorted(missing_tags)}")
         dmeta = rec.get("metadata") or {}
         for k, v in (r.get("metadata") or {}).items():
-            if k in KNOWN_ID_KEYS:
-                continue
+            if k in KNOWN_ID_KEYS or k == "project":
+                continue          # merged_from is remapped later; project is intentionally the destination's
             if dmeta.get(k) != v:
                 problems.append(f"{r['id']}: metadata[{k!r}] differs")
         if dmeta.get(PROV_KEY, {}).get("id") != r["id"]:
@@ -603,6 +625,19 @@ def apply_plan(plan: Dict[str, Any], src: Endpoint, dest: Endpoint, opts: ApplyO
                           "memory_update", dest.store)
             else:
                 dropped_refs.append({"id": r["id"], "key": "merged_from", "value": target})
+        if any(isinstance((r.get("metadata") or {}).get("merged_from"), int) for r in rows):
+            recs = _dest_records(dest, sorted(mapping.values()))      # verify the remapped values themselves
+            bad_refs = []
+            for r in rows:
+                target = (r.get("metadata") or {}).get("merged_from")
+                if not isinstance(target, int):
+                    continue
+                got = (recs[mapping[r["id"]]].get("metadata") or {}).get("merged_from")
+                want = mapping.get(target)
+                if got != want:
+                    bad_refs.append({"id": r["id"], "merged_from": got, "expected": want})
+            if bad_refs:
+                raise CopyError(f"remapped metadata references are wrong at the destination: {bad_refs[:10]}")
         state["phase"] = "remapped"
         _save_state(state_path, state)
 

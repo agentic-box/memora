@@ -193,7 +193,14 @@ c = LocalSQLiteBackend(Path("/data/acebar.db")).connect(); schema.ensure_schema(
 check "a verified bootstrap state (stand-in), then the REAL pre-freeze command" "${IN[@]}" python -c '
 from memora import add_store as a
 a._save_state("acebar", {"account_id": "rh-acct", "database_id": "rh-newdb-001", "d1_name": "acebar-rh", "phase": "verified"}, None)'
+check "bootstrap-status accepts exactly the pinned ids (verified state; no freeze yet allowed with the flag)" "${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh --no-freeze-check
+OUT="$("${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-OTHER-db --d1-name acebar-rh 2>&1)"; RC=$?
+[ "$RC" = 2 ] && pass "bootstrap-status refuses a different database id (exit 2)" || fail "bootstrap-status with another id: rc=$RC $OUT"
+OUT="$("${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh 2>&1)"; RC=$?
+[ "$RC" = 2 ] && echo "$OUT" | grep -q "freeze" && pass "bootstrap-status refuses while the persisted freeze is missing" || fail "bootstrap-status without the freeze: rc=$RC $OUT"
 check "pre-freeze acebar" "${LP[@]}" pre-freeze acebar
+check "bootstrap-status now passes with the freeze" "${LP[@]}" bootstrap-status acebar --account rh-acct --database-id rh-newdb-001 --d1-name acebar-rh
+check "the image carries verify-replication" "${LP[@]}" verify-replication --help
 check "the persisted freeze file exists" "${IN[@]}" test -e /data/freeze/acebar
 printf "MEMORA_DATABASES='%s'\n" "$REG5" > "$ENVF"
 printf '%s\n' "DEPLOY_HOST=localhost" "DEPLOY_GRAPH_BIND=127.0.0.1" "DEPLOY_REPO=$ROOT" "MEMORA_PROJECTS='$PROJ5'" > "$DEPLOY_CFGF"
