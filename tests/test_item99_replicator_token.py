@@ -52,6 +52,9 @@ class TestWriteProbe:
     def test_a_write_capable_token_proves_it_and_writes_no_row(self, env):
         local, replica = env
         before = {t: replica.rows(t) for t in R.SYNC_TABLES}
+        bodies = []
+        post = replica.post_json
+        replica.post_json = lambda body: (bodies.append(body), post(body))[1]
         rep = _started(local, replica)
         try:
             assert _wait(lambda: rep.status().get("write_probe") == "ok"), rep.status()
@@ -59,6 +62,7 @@ class TestWriteProbe:
             rep.stop()
         probes = [s for s in replica.statements if s.startswith("DELETE")]
         assert probes == ["DELETE FROM memories WHERE id = ?"]
+        assert bodies[0] == {"batch": [{"sql": "DELETE FROM memories WHERE id = ?", "params": [None]}]}  # id = NULL matches no row
         assert {t: replica.rows(t) for t in R.SYNC_TABLES} == before
 
     def test_a_token_d1_refuses_to_write_never_reports_ok_and_names_the_error(self, env):
@@ -110,9 +114,9 @@ class TestWriteProbe:
         finally:
             rep.stop()
 
-    def test_the_probe_statement_passes_the_allow_list_and_matches_no_real_row(self):
-        (sql, params), = R._build_statements("memories", [-1], None, [])
-        assert R._check_statement(sql) == "delete" and params == (-1,)
+    def test_the_probe_statement_passes_the_allow_list_and_can_match_no_row(self):
+        (sql, params), = R._build_statements("memories", [None], None, [])
+        assert R._check_statement(sql) == "delete" and params == (None,)
 
 
 class TestOptionalTokenKeys:
@@ -188,3 +192,109 @@ class TestBootstrapRefusesAReadOnlyReplicatorToken:
         with pytest.raises(RuntimeError, match="REACHED D1"):
             cli.main(argv)
         assert reached
+
+
+def _rep(local, replica):
+    rep = R.StoreReplicator("s1", local, URI, mode="write", writer_factory=replica.writer,
+                            reader_factory=replica.reader, broadcast=lambda: None)
+    rep._open()
+    return rep
+
+
+def _snapshot(replica):
+    import sqlite3
+    db = sqlite3.connect(replica.path)
+    try:
+        names = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")]
+        return {n: db.execute(f'SELECT * FROM "{n}" ORDER BY 1').fetchall() for n in names}
+    finally:
+        db.close()
+
+
+class TestProbeSafety:
+    def test_a_real_negative_id_row_with_children_and_the_epoch_are_untouched(self, env):
+        """P1-1 (review 12278): D1 may hold an explicitly numbered row -1 (the id column has no CHECK)."""
+        import sqlite3
+        local, replica = env
+        db = sqlite3.connect(replica.path)
+        db.execute("INSERT INTO memories (id, content, created_at) VALUES (-1, 'imported', 't')")
+        db.execute("INSERT INTO memories_crossrefs (memory_id, related) VALUES (-1, '[]')")
+        db.commit()
+        db.close()
+        before = _snapshot(replica)
+        assert any(r[0] == -1 for r in before["memories"])
+        rep = _rep(local, replica)
+        rep.run_once()
+        assert rep.status()["write_probe"] == "ok"
+        assert _snapshot(replica) == before   # every table, including the epoch in memories_meta
+
+    @pytest.mark.parametrize("override, why", [
+        (lambda out: [], "empty"),
+        (lambda out: [{"success": False, "results": []}], "false success"),
+        (lambda out: [{"results": []}], "no success key"),
+        (lambda out: out + out, "too many"),
+    ])
+    def test_a_malformed_or_failed_result_never_certifies_write_capability(self, env, override, why):
+        local, replica = env
+        replica.result_override = override
+        rep = _rep(local, replica)
+        with pytest.raises(RuntimeError, match="write probe did not succeed"):
+            rep.run_once()
+        assert rep.status()["write_probe"] is None and not rep._write_probed
+
+    def test_a_halted_store_sends_nothing(self, env):
+        local, replica = env
+        rep = _rep(local, replica)
+        rep._halt("test: halted")
+        before = len(replica.statements)
+        assert rep.run_once() == "halted"
+        assert len(replica.statements) == before and rep.status()["write_probe"] is None
+
+    def test_a_replica_uri_that_disagrees_with_sync_state_halts_before_any_send(self, env):
+        local, replica = env
+        rep = R.StoreReplicator("s1", local, "d1://acct/another-db", mode="write", writer_factory=replica.writer,
+                                reader_factory=replica.reader, broadcast=lambda: None)
+        rep._open()
+        assert rep.run_once() == "halted"
+        assert replica.statements == [] and rep.status()["write_probe"] is None
+
+    def test_an_unresolved_marker_is_reconciled_before_any_probe(self, env):
+        local, replica = env
+        conn = local.connect()
+        conn.execute("INSERT INTO memories (id, content, tags, created_at) VALUES (5, 'mine', '[]', 't')")
+        conn.commit()
+        conn.close()
+        rep = _rep(local, replica)
+        rep._write_probed = True     # an earlier process proved the write; this one's send is the lost one
+        replica.apply_then_raise = (99, RuntimeError("response lost"))
+        with pytest.raises(RuntimeError):
+            rep.run_once()           # the batch reached D1; the marker stays
+        replica.apply_then_raise = None
+        rep2 = _rep(local, replica)
+        assert rep2.run_once() == "reconciled-acked"   # reconciliation first, no probe in front of it
+        assert rep2.status()["write_probe"] is None
+
+    def test_a_freeze_waits_for_a_held_probe_request(self, env):
+        import threading
+        local, replica = env
+        gate = local.write_gate()
+        box = {}
+
+        def go():
+            box["rep"] = _rep(local, replica)
+            box["rep"].run_once()
+
+        replica.hold, replica.arrived = threading.Event(), threading.Event()
+        t = threading.Thread(target=go)
+        t.start()
+        assert replica.arrived.wait(5)
+        done = threading.Event()
+        f = threading.Thread(target=lambda: (gate.freeze(timeout_s=5), done.set()))
+        f.start()
+        time.sleep(0.2)
+        assert not done.is_set() and gate.state == "draining"   # the probe request is in flight on the gate
+        replica.hold.set()
+        t.join(5)
+        f.join(5)
+        assert done.is_set() and gate.state == "frozen"
+        gate.thaw()

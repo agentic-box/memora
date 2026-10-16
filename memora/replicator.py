@@ -607,6 +607,8 @@ class StoreReplicator:
             return self._log_cycle(state)
         if state.get("inflight_id"):
             return self._reconcile(state)
+        if not self._write_probed:
+            self._probe_write()
         return self._write_cycle(state)
 
     def _next_batch(self, cursor: int, state: Dict[str, Any], hi_cap: Optional[int] = None):
@@ -668,13 +670,22 @@ class StoreReplicator:
 
     def _probe_write(self) -> None:
         """Prove the replicator token can WRITE (Item 99): one allow-listed
-        DELETE by a primary key no row has (memories.id = -1), so it removes
-        nothing and writes no row, yet D1 refuses it for a read-only token
-        (code 7500). Runs once per process before the first cycle; a refusal
-        raises into the loop's backoff path, so the status block shows the D1
-        error and write_probe stays not-"ok" until a later attempt succeeds."""
-        stmts = _build_statements("memories", [-1], None, [])
-        self._d1().execute_batch(stmts)
+        DELETE whose key is NULL. `id = NULL` is never true in SQL, whatever
+        D1 holds (an imported row with a negative id included), so it can match
+        no row and mutates nothing, yet D1 refuses a write statement to a
+        read-only token (code 7500). Called from run_once AFTER the halted and
+        replica-URI checks and with no unresolved in-flight marker, and inside
+        the store's gate (exempt entry, like a send), so a freeze waits for the
+        request. A refusal or a malformed result raises into the loop's backoff
+        path (status shows the error; write_probe stays not-"ok"; retried)."""
+        stmts = _build_statements("memories", [None], None, [])
+        token = self._gate_enter("replicator write probe")
+        try:
+            results = self._d1().execute_batch(stmts)
+        finally:
+            self._gate_leave(token)
+        if len(results) != len(stmts) or not all(isinstance(r, dict) and r.get("success") is True for r in results):
+            raise RuntimeError(f"D1 write probe did not succeed: {json.dumps(results, default=str)[:300]}")
         self._write_probed = True
         with self._lock:
             self._metrics["write_probe"] = "ok"
@@ -908,8 +919,6 @@ class StoreReplicator:
                     break
             started = time.monotonic()  # before the try: the handler uses it (review 7841 P2)
             try:
-                if self.mode == "write" and not self._write_probed:
-                    self._probe_write()
                 outcome = self.run_once()
                 if outcome not in ("idle", "halted"):
                     # a send, a reconcile read-back or resend: the next one waits

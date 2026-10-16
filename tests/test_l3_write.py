@@ -33,6 +33,7 @@ def _rep(local, replica, broadcasts=None, **kw):
                             reader_factory=replica.reader,
                             broadcast=(lambda: broadcasts.append(1)) if broadcasts is not None else (lambda: None), **kw)
     rep._open()
+    rep._write_probed = True  # these tests are about the send path; Item 99's start-up probe has tests/test_item99_replicator_token.py
     return rep
 
 
