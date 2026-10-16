@@ -656,3 +656,47 @@ def test_the_image_carries_the_copy_tool_next_to_the_operator_tool():
     dockerfile = (Path(__file__).resolve().parent.parent / "Dockerfile").read_text()
     assert "COPY scripts/copy_memories.py scripts/copy_memories.py" in dockerfile
     assert "COPY scripts/local_primary.py scripts/local_primary.py" in dockerfile
+
+
+def test_the_state_is_made_durable_file_and_directory(stores, seeded, tmp_path, monkeypatch):
+    import stat as _stat
+
+    synced = []
+    real = os.fsync
+
+    def fsync(fd):
+        synced.append("dir" if _stat.S_ISDIR(os.fstat(fd).st_mode) else "file")
+        return real(fd)
+    monkeypatch.setattr(cm.os, "fsync", fsync)
+    cm.write_json(tmp_path / "newdir" / "x.json", {"a": 1})
+    assert synced == ["file", "dir", "dir"]                      # the file, its directory, and the new directory's parent
+    assert (tmp_path / "newdir" / "x.json").stat().st_mode & 0o777 == 0o600
+    synced.clear()
+    cm.write_json(tmp_path / "newdir" / "x.json", {"a": 2})
+    assert synced == ["file", "dir"]
+
+
+def test_a_corrupt_or_unreadable_state_is_never_read_as_an_empty_attempts_map(stores, seeded, tmp_path):
+    plan = plan_for(stores)
+    cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    path = tmp_path / "copystate" / "memora-acebar.json"
+    path.write_text("{ truncated")
+    n = len(creates(stores["dest"]))
+    with pytest.raises(cm.CopyError, match="unreadable or corrupt"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    path.write_text(json.dumps({"digest": plan["digest"], "attempts": ["not", "a", "map"]}))
+    with pytest.raises(cm.CopyError, match="unexpected shape"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(creates(stores["dest"])) == n
+
+
+def test_a_reconciled_or_pre_existing_marker_must_still_match_the_saved_plan(stores, seeded, tmp_path):
+    """A marker alone does not certify a row: a manually created or altered destination row with the right
+    marker but different content fails the fidelity check before any remap or link."""
+    plan = plan_for(stores)
+    row = plan["rows"][0]
+    stores["dest"].call("memory_create", {"content": "someone's different text", "tags": [TAG],
+                                          "metadata": cm._entry_metadata(row, "memora"), "suggest_similar": False})
+    with pytest.raises(cm.CopyError, match="differ from the source"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert [c for c in stores["dest"].calls if c[0] == "memory_link"] == []

@@ -290,7 +290,19 @@ def _check_names(src: Endpoint, dest: Endpoint) -> None:
         raise CopyError("source and destination are the same store; refusing")
 
 
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_json(path: Path, value: Dict[str, Any]) -> None:
+    """Atomic 0600 replacement, durable: the file AND its directory are fsynced
+    (and the parent too when the directory is created here), so a record made
+    before a request is on disk when the request leaves."""
+    created = not path.parent.exists()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -300,6 +312,9 @@ def write_json(path: Path, value: Dict[str, Any]) -> None:
     finally:
         os.close(fd)
     os.replace(tmp, path)
+    _fsync_dir(path.parent)
+    if created:
+        _fsync_dir(path.parent.parent)
 
 
 def load_plan(path: Path) -> Dict[str, Any]:
@@ -359,7 +374,14 @@ def _state_path(opts: ApplyOptions, src: str, dest: str) -> Path:
 def _load_state(path: Path, plan: Dict[str, Any]) -> Dict[str, Any]:
     if not path.exists():
         return {"version": STATE_VERSION, "digest": plan["digest"], "phase": "new", "map": {}}
-    state = json.loads(path.read_text())
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        # never treat an unreadable record as "no attempts": that would forget an ambiguous create
+        raise CopyError(f"the state file {path} is unreadable or corrupt ({exc}); it may record a create attempt "
+                        "of unknown outcome. Inspect it by hand; nothing was changed")
+    if not isinstance(state, dict) or not isinstance(state.get("attempts", {}), dict):
+        raise CopyError(f"the state file {path} has an unexpected shape; inspect it by hand; nothing was changed")
     if state.get("digest") != plan["digest"]:
         raise CopyError(f"{path} belongs to another plan (digest differs): inspect it; a different selection "
                         "must not resume this run; nothing was changed")

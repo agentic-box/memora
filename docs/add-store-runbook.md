@@ -157,12 +157,50 @@ docker exec memora-all python /app/scripts/copy_memories.py --source memora --de
   the server and land later, and neither elapsed time nor stable reads can prove it will not. Duplicates (more than
   one marker for a source id) stop the run. A short poll for the marker right after an unknown outcome
   (`--unknown-wait`, default 60 s) only reconciles a quick completion.
+  **Guarantee, stated precisely:** under the documented model (the tool runs only inside the one memora-all
+  container, one run at a time per destination under its `flock`, with its durable state intact) there is **no
+  automatic duplicate retry**: an unknown outcome is never turned into permission to create again. It is not a
+  claim of universal exactly-once: manual state edits, a deleted state file, a second container or unrelated
+  writers to the destination are outside it. Partial progress and a manual step after an unknown outcome are the
+  intended cost. The state file is written with an atomic 0600 replacement and an fsync of the file and of its
+  directory before each request; a missing-then-corrupt or unreadable state file stops the run (it is never read as
+  "no attempts").
   **Manual reconciliation (deliberately outside the tool)** to re-create an ambiguous row that has no marker:
-  1. restart memora-all (`scripts/deploy-memora-all.sh` or `docker restart memora-all`), which kills any queued request;
-  2. confirm in `/mcp/<dest>` (`memory_list`, `follow=all`) that no memory carries `metadata.memora_copy.id` = that source id;
-  3. delete that source id's entry from `"attempts"` in the state file (keep the file's mode 0600), then rerun `--apply`.
+  1. make sure no copy invocation is running (nothing but this container runs the tool);
+  2. restart memora-all (`docker restart memora-all`, or a deploy) **and verify the old server process is gone**:
+     `docker inspect -f '{{.State.StartedAt}} {{.State.Pid}}' memora-all` shows a new start time and pid, and the
+     container's uptime is seconds; issuing the command is not proof. A request queued in the old process died with it;
+  3. with fresh reads from the NEW process, confirm in `/mcp/<dest>` (`memory_list`, `follow=all`) that no memory
+     carries `metadata.memora_copy.id` equal to that source id (if one does, do nothing: the next `--apply`
+     reconciles it);
+  4. delete that source id's attempt **and record why**, under the same destination lock, in one step:
+
+```
+docker exec -i memora-all python - <<'PY'
+import fcntl, json, os, time
+SRC_ID, DEST, SRC = "<source id>", "<dest>", "<source store>"
+NOTE = "<who, when, what you verified in steps 2 and 3>"
+lock = os.open(f"/data/copy/{DEST}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)          # fails if a copy is running
+path = f"/data/copy/{SRC}-{DEST}.json"
+st = json.load(open(path))
+assert st["attempts"][SRC_ID]["state"] == "sent", st["attempts"].get(SRC_ID)
+del st["attempts"][SRC_ID]
+st.setdefault("manual_reconciliations", []).append(
+    {"source_id": SRC_ID, "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "note": NOTE})
+tmp = path + ".tmp"
+fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+os.write(fd, (json.dumps(st, indent=2, sort_keys=True) + "\n").encode()); os.fsync(fd); os.close(fd)
+os.replace(tmp, path)
+dfd = os.open("/data/copy", os.O_RDONLY); os.fsync(dfd); os.close(dfd)
+PY
+```
+
+  5. rerun `--apply`. Every row that already has a marker (reconciled, or created by hand) must still match the
+     saved plan (content, tags, metadata keys, project, `original_created_at`) before any remap or link; a marker
+     alone does not certify a row.
   An error response (for example a tag the destination's allowlist rejects) is treated the same way: the run stops,
-  the tool never drops a tag to make the copy pass; fix the cause, then reconcile manually as above.
+  the tool never drops a tag to make the copy pass; fix the cause, then reconcile as above.
 - **Metadata references**: `merged_from` is remapped to the destination id after the ids exist (a reference to
   a memory that was not copied is dropped and listed in the manifest); other reference-shaped keys
   (`*_id`, `parent`, …) with integer values are reported by the dry run and refused unless `--allow-unknown-refs`.
