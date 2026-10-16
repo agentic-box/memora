@@ -297,6 +297,22 @@ def test_an_import_that_reports_errors_fails_and_links_nothing(stores, seeded, t
     assert [c for c in stores["dest"].calls if c[0] == "memory_link"] == []
 
 
+def test_a_clean_import_whose_markers_are_not_visible_is_never_appended_again(stores, seeded, tmp_path):
+    """If the server accepts the import but the markers do not show up (e.g. a metadata filter dropped them),
+    the tool must stop rather than append the same rows a second time."""
+    plan = plan_for(stores)
+    real_call = stores["dest"].call
+
+    def call(tool, args):
+        if tool == "memory_import":
+            args = dict(args, data=[{k: v for k, v in e.items() if k != "metadata"} for e in args["data"]])
+        return real_call(tool, args)
+    stores["dest"].call = call
+    with pytest.raises(cm.CopyError, match="refusing to append again"):
+        cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))
+    assert len(dest_rows(stores)) == 5                                   # one import, not two
+
+
 def test_duplicate_markers_stop_the_run(stores, seeded, tmp_path):
     plan = plan_for(stores)
     cm.apply_plan(plan, stores["src"], stores["dest"], opts(tmp_path))

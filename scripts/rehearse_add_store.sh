@@ -90,8 +90,8 @@ COPY=("$RT" exec "$NAME" python /app/scripts/copy_memories.py --source memora --
 digest() {  # digest STORE
   "$RT" exec -i "$NAME" python - "$1" <<'PY'
 import hashlib, json, sys
-from memora import storage
-conn = storage.backend_for(sys.argv[1]).connect()
+from memora import schema, storage
+conn = schema.connect(storage.backend_for(sys.argv[1]))
 rows = [tuple(r) for r in conn.execute("SELECT id, content, metadata, tags, created_at FROM memories ORDER BY id")]
 refs = [tuple(r) for r in conn.execute("SELECT memory_id, related FROM memories_crossrefs ORDER BY memory_id")]
 conn.close()
@@ -125,9 +125,9 @@ check "it answers /health" wait_health
 anon_of OLD_VOL "$OLD_ID"
 check "create the four store files (the deploy's preflight reads them)" "$RT" exec -i "$NAME" python - <<'PY'
 import json, os
-from memora import storage
+from memora import schema, storage
 for name in json.loads(os.environ["MEMORA_DATABASES"]):
-    conn = storage.backend_for(name).connect()
+    conn = schema.connect(storage.backend_for(name))
     try:
         storage.add_memory(conn, content=f"rehearsal {name} baseline memory", tags=["rehearsal"])
         conn.commit()
@@ -144,9 +144,9 @@ check "the image carries the copy tool" "$RT" exec "$NAME" python /app/scripts/c
 
 echo "== 2. seed the source store with memories tagged acebar (and one that is not)"
 check "write the source memories, links and an old created_at" "$RT" exec -i "$NAME" python - <<'PY'
-from memora import storage
+from memora import schema, storage
 from memora.storage import add_link
-conn = storage.backend_for("memora").connect()
+conn = schema.connect(storage.backend_for("memora"))
 ids = {}
 for key, content, tags, meta, created in [
     ("a", "rehearsal acebar note one: apples", ["acebar"], {"k": 1, "nested": {"x": [1, 2]}}, "2020-01-02 03:04:05"),
@@ -227,10 +227,10 @@ assert r["selected"] == 4 and len(r["would_copy"]) == 4 and not r["unknown_refs"
 assert r["links"]["external_dropped"] >= 1, r
 print("plan ok", r["links"])' >>"$RH_ROOT/commands.log" 2>&1 && pass "the plan: 4 selected, 4 to copy, the external edge counted" || fail "the plan report is not as expected"
 check "apply" "${COPY[@]}" --plan /data/copy/plan.json --apply
-"${IN[@]}" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "acebar holds the four copies: content, created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
+"$RT" exec -i "$NAME" python - <<'PY' >>"$RH_ROOT/commands.log" 2>&1 && pass "acebar holds the four copies: content, created_at, tags, metadata, provenance, project, links" || fail "the copies differ (see commands.log)"
 import json
-from memora import storage
-conn = storage.backend_for("acebar").connect()
+from memora import schema, storage
+conn = schema.connect(storage.backend_for("acebar"))
 rows = {r["content"]: dict(r) for r in conn.execute("SELECT * FROM memories")}
 assert len(rows) == 4, sorted(rows)
 a = rows["rehearsal acebar note one: apples"]
@@ -248,12 +248,15 @@ assert (ids["bananas"], "references") in rel[ids["apples"]] and (ids["apples"], 
 assert (ids["cherries"], "implements") in rel[ids["bananas"]]
 assert (ids["dates"], "related_to") in rel[ids["cherries"]] and (ids["cherries"], "related_to") in rel[ids["dates"]]
 assert (ids["dates"], "supersedes") in rel[ids["apples"]] and (ids["apples"], "superseded_by") not in rel.get(ids["dates"], set())
-src = storage.backend_for("memora").connect()
+src = schema.connect(storage.backend_for("memora"))
 assert {r[0] for r in src.execute("SELECT id FROM memories")} >= set(), "source readable"
 print("acebar ok")
 PY
 [ "$(digest memora)" = "$SRC_BEFORE" ] && pass "the source is byte-identical after the copy" || fail "the source changed"
 AFTER1="$(digest acebar)"
+[ "$AFTER1" != "$DEST0" ] && case "$AFTER1" in *" 4") true ;; *) false ;; esac \
+  && pass "apply changed acebar to exactly 4 rows (so the unchanged-after-rerun checks below are not vacuous)" \
+  || fail "apply did not produce exactly 4 rows in acebar ($AFTER1)"
 sleep 65   # the server's memory_import cooldown (60 s) is part of what a rerun meets
 check "a rerun copies nothing twice" "${COPY[@]}" --plan /data/copy/plan.json --apply
 [ "$(digest acebar)" = "$AFTER1" ] && pass "the rerun left acebar byte-identical (4 rows, no duplicates)" || fail "the rerun changed acebar"

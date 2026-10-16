@@ -388,6 +388,7 @@ def _import_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], 
     followed by a blind retry."""
     deadline = time.monotonic() + opts.max_wait_s
     attempt = 0
+    reported_clean = False
     while True:
         markers = read_markers(dest, src_store)
         dup = {k: v for k, v in markers.items() if len(v) > 1}
@@ -396,6 +397,10 @@ def _import_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], 
         missing = [r for r in rows if r["id"] not in markers]
         if not missing:
             return
+        if reported_clean:
+            raise CopyError(f"memory_import reported a clean import but {len(missing)} provenance markers are not "
+                            f"visible in {dest.store} (ids {[r['id'] for r in missing][:10]}); refusing to append "
+                            "again: inspect the destination")
         attempt += 1
         entries = [dict(_entry(r, src_store, project), project=project) for r in missing]
         try:
@@ -419,7 +424,8 @@ def _import_missing(dest: Endpoint, src_store: str, rows: List[Dict[str, Any]], 
             if bad:
                 raise CopyError(f"memory_import was not clean (expected {len(entries)} imported, 0 skipped, "
                                 f"0 errors): {resp!r}"[:600])
-            continue  # verify by re-listing on the next loop turn
+            reported_clean = True
+            continue  # verify by re-listing on the next loop turn: every marker must now be visible
         if time.monotonic() > deadline or attempt >= 20:
             raise CopyError("the import outcome stayed unknown; nothing more was appended; rerun later")
         opts.sleep(_wait_hint(""))
