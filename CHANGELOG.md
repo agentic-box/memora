@@ -12,7 +12,7 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
-## Unreleased
+## 0.5.7.3 — 2026-10-17
 
 The replicator token no longer defaults to the D1 read token, and a replicator that cannot write is caught at deploy time (Item 99).
 
