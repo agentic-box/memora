@@ -72,9 +72,9 @@ class TestWriteProbe:
         try:
             assert _wait(lambda: "7500" in (rep.status().get("last_error") or "")), rep.status()
             st = rep.status()
-            assert st["write_probe"] is None and st["status"] == "backoff", st
+            assert st["write_probe"] == "refused" and st["status"] == "backoff", st
             time.sleep(0.3)
-            assert rep.status()["write_probe"] is None
+            assert rep.status()["write_probe"] == "refused"
         finally:
             rep.stop()
 
@@ -238,9 +238,26 @@ class TestProbeSafety:
         local, replica = env
         replica.result_override = override
         rep = _rep(local, replica)
-        with pytest.raises(RuntimeError, match="write probe did not succeed"):
-            rep.run_once()
-        assert rep.status()["write_probe"] is None and not rep._write_probed
+        rep.run_once()          # inconclusive: no raise, never certified
+        st = rep.status()
+        assert st["write_probe"] == "unproven" and not rep._write_probed
+        assert "write capability unproven" in st["last_error"]
+        replica.result_override = None
+        rep._next_probe = 0.0   # the retry is spaced; let it run now
+        rep.run_once()
+        assert rep.status()["write_probe"] == "ok" and rep._write_probed
+
+    @pytest.mark.parametrize("exc", [TimeoutError("timed out"), RuntimeError("D1 HTTP 502"),
+                                     D1DefiniteError('D1 API error (400): {"errors":[{"code":7400,"message":"bad"}]}')])
+    def test_only_the_definite_7500_is_a_refusal_everything_else_is_unproven(self, env, exc):
+        local, replica = env
+        replica.fail_before = exc
+        rep = _rep(local, replica)
+        rep.run_once()
+        assert rep.status()["write_probe"] == "unproven" and not rep._write_probed
+        before = len(replica.statements)
+        rep.run_once()          # spaced: not re-sent at once
+        assert len(replica.statements) == before
 
     def test_a_halted_store_sends_nothing(self, env):
         local, replica = env

@@ -100,6 +100,16 @@ def _build_statements(tbl: str, pk: Sequence[Any], row: Optional[Dict[str, Any]]
              f"ON CONFLICT({_cols_sql(pk_cols)}) DO UPDATE SET {sets}", values)]
 
 
+PROBE_RETRY_S = 30.0
+
+
+def _is_permission_refusal(exc: BaseException) -> bool:
+    """D1's definite "You do not have permission" (code 7500): the only probe
+    outcome that proves the token cannot write."""
+    from .backends import D1DefiniteError
+    return isinstance(exc, D1DefiniteError) and re.search(r'"code"\s*:\s*7500\b|\bcode[ :=]+7500\b', str(exc)) is not None
+
+
 def write_probe_statements() -> List[Tuple[str, tuple]]:
     """THE statement of the start-up write probe (Item 99), the one definition
     the replicator sends and scripts/d1_permission_probe.py checks against D1:
@@ -557,6 +567,7 @@ class StoreReplicator:
         self._relaxed_epoch_before: Optional[int] = None
         self._backoff = 0.0
         self._write_probed = False
+        self._next_probe = 0.0      # an unproven probe is retried no sooner than this (monotonic)
         self._lock = threading.Lock()
         self._metrics: Dict[str, Any] = {"mode": mode, "status": "disabled", "last_error": None,
                                          "write_probe": None,
@@ -614,7 +625,7 @@ class StoreReplicator:
             return self._log_cycle(state)
         if state.get("inflight_id"):
             return self._reconcile(state)
-        if not self._write_probed:
+        if not self._write_probed and time.monotonic() >= self._next_probe:
             self._probe_write()
         return self._write_cycle(state)
 
@@ -683,19 +694,37 @@ class StoreReplicator:
         read-only token (code 7500). Called from run_once AFTER the halted and
         replica-URI checks and with no unresolved in-flight marker, and inside
         the store's gate (exempt entry, like a send), so a freeze waits for the
-        request. A refusal or a malformed result raises into the loop's backoff
-        path (status shows the error; write_probe stays not-"ok"; retried)."""
+        request. D1's definite refusal (code 7500) raises into the loop's backoff path
+        (write_probe "refused"); any other failure leaves write_probe "unproven"
+        (not a certification, not a failure) and the probe is retried."""
         stmts = write_probe_statements()
         token = self._gate_enter("replicator write probe")
         try:
             results = self._d1().execute_batch(stmts)
+        except Exception as exc:
+            if not _is_permission_refusal(exc):
+                self._probe_unproven(f"{type(exc).__name__}: {exc}")
+                return
+            with self._lock:
+                self._metrics["write_probe"] = "refused"
+            raise
         finally:
             self._gate_leave(token)
         if len(results) != len(stmts) or not all(isinstance(r, dict) and r.get("success") is True for r in results):
-            raise RuntimeError(f"D1 write probe did not succeed: {json.dumps(results, default=str)[:300]}")
+            self._probe_unproven(f"D1 write probe did not succeed: {json.dumps(results, default=str)[:300]}")
+            return
         self._write_probed = True
         with self._lock:
             self._metrics["write_probe"] = "ok"
+
+    def _probe_unproven(self, message: str) -> None:
+        """An inconclusive probe (timeout, 5xx, other D1 error, malformed result)
+        says nothing about the token: the replicator carries on, the probe is
+        retried next cycle, and the status says "unproven", never "ok"."""
+        self._next_probe = time.monotonic() + PROBE_RETRY_S
+        self._set_error(f"write capability unproven: {message}")
+        with self._lock:
+            self._metrics["write_probe"] = "unproven"
 
     def _read(self):
         if self._reader is None:

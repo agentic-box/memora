@@ -266,6 +266,7 @@ def test_an_uncertain_outcome_also_waits_the_interval(env):
     replica.reader_post = lambda body: (d1.append(("read", time.monotonic())), read(body))[1]
     replica.apply_then_raise = (10**6, RuntimeError("connection reset after the batch applied"))
     rep = _rep(local, replica, interval_s=2.0, poll_s=0.05)
+    rep._write_probed = True    # the Item 99 probe is not under test: its first batch would be the 'send' here
     _insert(local, [1])
     rep.start()
     acked_at = None

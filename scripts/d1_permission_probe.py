@@ -3,7 +3,8 @@
 
 The deploy's write check (memora/replicator.py, write_probe_statements) sends one allow-listed statement
 that matches no row. Whether D1 refuses that zero-row statement for a D1:Read token is the whole point of the
-check and is documented nowhere, so this script measures it once, on a THROWAWAY database.
+check and is documented nowhere, so this script can measure it once, on a THROWAWAY database. STATUS: available, not yet run;
+the deploy gate relies on the refusal as assumed (Cloudflare docs + the 2026-10-17 production 7500), not measured.
 
   d1_permission_probe.py --account A --database-id ID --read-token-file R --write-token-file W
 

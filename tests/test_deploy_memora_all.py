@@ -927,15 +927,27 @@ class TestReplicatedStoreAfterStart:
                 "(last_error 'D1 403 Forbidden', lag_rows 1)") in proc.stderr, proc.stderr[-1500:]
         assert "all 3 stores verified" not in proc.stdout
 
-    @pytest.mark.parametrize("probe", [None, "failed"])
-    def test_running_with_lag_zero_is_not_enough_without_the_write_probe(self, poststart, probe):
+    def test_a_definite_d1_refusal_fails_the_deploy_and_says_it_is_assumed(self, poststart):
         # Item 99: a read-only replicator token reported "running", lag 0, while nothing was pending
-        repl = {**REPL_OK, "write_probe": probe, "last_error": "D1 API error (400): code 7500 You do not have permission"}
+        err = "D1 API error (400): code 7500 You do not have permission"
+        repl = {**REPL_OK, "status": "backoff", "write_probe": "refused", "last_error": err}
         proc, _ = poststart({"gamma": {**FROZEN, "replication": repl}})
         assert proc.returncode != 0
-        assert (f"STORE CHECK FAILED — gamma: the replicator has not proved it can write to D1 (write_probe {probe!r}; "
-                "last_error 'D1 API error (400): code 7500 You do not have permission')") in proc.stderr, proc.stderr[-1500:]
+        assert f"STORE CHECK FAILED — gamma: D1 refused the replicator's write (write_probe 'refused'; last_error {err!r})" in proc.stderr
+        assert "assumed from Cloudflare's documentation" in proc.stderr and "not measured" in proc.stderr
         assert "all 3 stores verified" not in proc.stdout
+
+    def test_an_unproven_probe_is_a_warning_never_a_success_line(self, poststart):
+        repl = {**REPL_OK, "write_probe": "unproven", "last_error": "write capability unproven: TimeoutError: timed out"}
+        proc, _ = poststart({"gamma": {**FROZEN, "replication": repl}})
+        assert proc.returncode == 0, proc.stderr[-1500:]
+        assert "WARNING: store gamma: write capability unproven" in proc.stderr
+        assert "write_probe 'unproven'" in proc.stderr and "write_probe ok" not in proc.stdout.split("store gamma")[1].split("\n")[0]
+
+    def test_a_probe_that_has_not_run_is_waited_for_then_fails(self, poststart):
+        proc, _ = poststart({"gamma": {**FROZEN, "replication": {**REPL_OK, "write_probe": None}}})
+        assert proc.returncode != 0
+        assert "gamma: the replicator has not run its write probe yet" in proc.stderr, proc.stderr[-1500:]
 
     def test_the_write_probe_may_arrive_within_the_wait(self, poststart):
         proc, _ = poststart({"gamma": [{**FROZEN, "replication": {**REPL_OK, "write_probe": None}},

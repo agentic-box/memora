@@ -20,8 +20,12 @@
 #    The replicator WRITES to D1, so it takes the write-capable token; the read
 #    token (d1-read.token) is read-only and never the replicator's (Item 99:
 #    it was the default once, and every store's replicator went into backoff
-#    with D1 code 7500). The deploy proves the write after the start
-#    (write_probe in /health/db). The three DEPLOY_*_TOKEN_FILE overrides are
+#    with D1 code 7500). After the start the deploy checks the write
+#    (write_probe in /health/db): a definite D1 refusal (code 7500) fails the
+#    deploy; any other outcome prints "write capability unproven" and is a
+#    warning, never a success. That D1 refuses the zero-row probe for a read
+#    token is assumed from Cloudflare's docs and the 2026-10-17 production 7500,
+#    not measured (scripts/d1_permission_probe.py exists, not yet run). The three DEPLOY_*_TOKEN_FILE overrides are
 #    file NAMES inside that directory (the only directory the container sees);
 #    set them in the environment or as keys of instances/deploy.env. No token value is on
 #    a command line, in the container's configuration (docker inspect) or in
@@ -1012,17 +1016,19 @@ def _replication_problem(store, body):
     if rep.get("trigger_version") != rep.get("trigger_version_expected"):
         return True, (f"sync trigger version {rep.get('trigger_version')!r}, "
                       f"this build expects {rep.get('trigger_version_expected')!r}")
+    if REPLICATION == "write" and rep.get("write_probe") == "refused":
+        # Item 99: D1's definite refusal (code 7500) of the replicator's no-op write: the token cannot write.
+        # Terminal. (Assumed from Cloudflare's docs and the 2026-10-17 production 7500, not measured on a throwaway D1.)
+        return True, (f"D1 refused the replicator's write (write_probe 'refused'; last_error {rep.get('last_error')!r}) "
+                      "-- is MEMORA_D1_REPLICATOR_TOKEN_FILE a write-capable token? (the refusal of a read-only token is "
+                      "assumed from Cloudflare's documentation and the 2026-10-17 production code 7500, not measured)")
     if rep.get("status") != "running":
         # e.g. "backoff" after a D1 auth or network error (review 7841 P1):
         # waited for (it may recover), then a failure naming the last error
         return False, (f"replication status {rep.get('status')!r}, not running "
                        f"(last_error {rep.get('last_error')!r}, lag_rows {rep.get('lag_rows')!r})")
-    if REPLICATION == "write" and rep.get("write_probe") != "ok":
-        # Item 99: "running" with lag 0 proves nothing when no write is pending
-        # (a read-only replicator token passed this check once). The replicator
-        # sends one no-op DELETE at start; D1 refuses it for a token that cannot write.
-        return False, (f"the replicator has not proved it can write to D1 (write_probe {rep.get('write_probe')!r}; "
-                       f"last_error {rep.get('last_error')!r}) -- is MEMORA_D1_REPLICATOR_TOKEN_FILE a write-capable token?")
+    if REPLICATION == "write" and rep.get("write_probe") is None:
+        return False, "the replicator has not run its write probe yet"   # waited for; "unproven" and "ok" are final
     return None
 
 
@@ -1052,6 +1058,10 @@ for store in STORES:
         continue
     if store in REPLICAS:
         rep = body["replication"]
+        if REPLICATION == "write" and rep.get("write_probe") != "ok":
+            print(f"WARNING: store {store}: write capability unproven (write_probe {rep.get('write_probe')!r}; "
+                  f"last_error {rep.get('last_error')!r}). D1 gave no definite answer; the replicator retries. "
+                  "Not a success: confirm lag_rows falls or the token has write permission.", file=sys.stderr)
         print(f"store {store}: replicating ({rep['mode']}) to {rep['replica_uri']}, status {rep.get('status')}, "
               f"trigger version {rep['trigger_version']}, lag_rows {rep.get('lag_rows')}, write_probe {rep.get('write_probe')}")
     # A store that comes up FROZEN (the persisted freeze of a cutover,

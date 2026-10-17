@@ -47,9 +47,15 @@ pointer (below).
     Item 99: a read-only token as the replicator's made every store's
     replicator back off with D1 code 7500). To use another file, set
     `DEPLOY_D1_REPLICATOR_TOKEN_FILE=<name>` in `instances/deploy.env` (or
-    the environment). The deploy proves the write after the start: each
-    replicated store's `/health/db/<store>` shows `write_probe: "ok"`, else
-    the deploy fails with the D1 error.
+    the environment). After the start the deploy checks each
+    replicated store's `/health/db/<store>` `write_probe`: `ok` passes; `refused`
+    (D1's definite code 7500) fails the deploy with the D1 error; `unproven` (a
+    timeout, 5xx or other D1 answer) prints "write capability unproven" as a
+    warning and is not a success. That D1 refuses the zero-row probe for a
+    read-only token is **assumed** from Cloudflare's documentation and the
+    2026-10-17 production 7500, **not measured**. `scripts/d1_permission_probe.py`
+    (in the image) can measure it on a throwaway `memora-probe-*` D1 database;
+    it is available and has not been run.
 - **A verified export of the store** exists on deploy-host under
   `~/memora-lp/exports/<db>/` (`<stamp>.sql` and `<stamp>.receipt.json`),
   with copies off the host.
