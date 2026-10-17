@@ -252,12 +252,16 @@ class TestProbeSafety:
     def test_only_the_definite_7500_is_a_refusal_everything_else_is_unproven(self, env, exc):
         local, replica = env
         replica.fail_before = exc
+        attempts = []
+        real = replica.post_json
+        replica.post_json = lambda body: (attempts.append(body), real(body))[1]
         rep = _rep(local, replica)
         rep.run_once()
         assert rep.status()["write_probe"] == "unproven" and not rep._write_probed
-        before = len(replica.statements)
+        sent = len(attempts)
+        assert sent >= 1
         rep.run_once()          # spaced: not re-sent at once
-        assert len(replica.statements) == before
+        assert len(attempts) == sent
 
     def test_a_halted_store_sends_nothing(self, env):
         local, replica = env
