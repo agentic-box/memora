@@ -59,16 +59,26 @@ Environment (see launchd/WATCHDOG_RUNBOOK.md):
 """
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
 
 log = logging.getLogger("memora.watchdog")
 
@@ -363,6 +373,47 @@ class Watchdog:
                       (getattr(proc, "stderr", "") or "").strip()[:200])
 
 
+class _WatchdogLock:
+    def __init__(self, pid_path: str, lock_path: str):
+        self.pid_path = pid_path
+        self.lock_path = lock_path
+        self.pid_fh = open(pid_path, "a+")
+        self.lock_fh = open(lock_path, "a+")
+        self._locked = False
+
+    def acquire(self):
+        try:
+            if fcntl is not None:
+                fcntl.flock(self.lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            elif msvcrt is not None:
+                self.lock_fh.seek(0, os.SEEK_END)
+                length = max(self.lock_fh.tell(), 1)
+                self.lock_fh.seek(0)
+                msvcrt.locking(self.lock_fh.fileno(), msvcrt.LK_NBLCK, length)
+            else:
+                raise ConfigError(f"file locking is unavailable on this platform: {sys.platform!r}")
+        except OSError:
+            self.close()
+            raise ConfigError(f"another watchdog already holds {self.lock_path}")
+        self._locked = True
+        self.pid_fh.seek(0)
+        self.pid_fh.truncate()
+        self.pid_fh.write(f"{os.getpid()}\n")
+        self.pid_fh.flush()
+        return self
+
+    def close(self):
+        if self._locked and msvcrt is not None:
+            try:
+                self.lock_fh.seek(0)
+                msvcrt.locking(self.lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+        self.lock_fh.close()
+        self.pid_fh.close()
+        self._locked = False
+
+
 def acquire_lock(path: str):
     """Exclusive, non-blocking, held for the process lifetime.
 
@@ -370,20 +421,14 @@ def acquire_lock(path: str):
     every workspace down; with a single shared container that is the whole
     fleet.
     """
-    # "a" (create, no truncate): opening "w" wiped the CURRENT holder's pid
-    # before the loser discovered it had lost, leaving an empty file exactly
-    # when an operator needs to know who holds it.
-    fh = open(path, "a+")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        raise ConfigError(f"another watchdog already holds {path}")
-    fh.seek(0)
-    fh.truncate()
-    fh.write(f"{os.getpid()}\n")
-    fh.flush()
-    return fh
+    # Use a separate lock file so the pid file itself remains readable while the
+    # lock is held. On Windows, locking the pid file causes the same file to be
+    # unavailable to other open() calls, which breaks the diagnostics test that
+    # expects the holder pid file to stay readable.
+    lock_path = f"{path}.lock"
+    holder = _WatchdogLock(path, lock_path)
+    holder.acquire()
+    return holder
 
 
 def main(argv=None) -> int:
@@ -399,7 +444,9 @@ def main(argv=None) -> int:
         filename=os.environ.get("MEMORA_WATCHDOG_LOG") or None,
     )
 
-    lock_path = os.environ.get("MEMORA_WATCHDOG_LOCK") or f"/tmp/memora-watchdog-{container}.lock"
+    lock_path = os.environ.get("MEMORA_WATCHDOG_LOCK") or os.path.join(
+        tempfile.gettempdir(), f"memora-watchdog-{container}.lock"
+    )
     lock = acquire_lock(lock_path)          # held for the process lifetime
 
     dog = Watchdog(
