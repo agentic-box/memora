@@ -74,3 +74,11 @@ def test_delete_memories_names_each_deleted_id(local_db):
         a, b = _chain(conn, 2)
         assert storage.delete_memories(conn, [b]) == 1
         assert storage.retirement_note(conn, a)["deleted_id"] == b
+
+
+def test_the_legacy_per_member_tombstone_rows_carry_the_same_lineage_reason(local_db):
+    with storage.connect() as conn:
+        a, b = _chain(conn, 2)
+        storage.delete_memory(conn, b)
+        rows = {r["memory_id"]: r["reason"] for r in conn.execute("SELECT memory_id, reason FROM tombstones")}
+    assert rows[b] == "deleted" and rows[a] == f"deleted (lineage of #{b})"
