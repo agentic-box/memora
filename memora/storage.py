@@ -4445,6 +4445,18 @@ def _retirement_reason_for_id(conn: sqlite3.Connection, memory_id: int) -> Optio
     return reason or "deleted"
 
 
+def retirement_note(conn: sqlite3.Connection, memory_id: int) -> Optional[Dict[str, Any]]:
+    """Why a memory that still exists is retired (follow=latest/active hide it), or
+    None when it is not retired. Retirement is lineage-wide: deleting any version
+    retires every version, so the note names the delete that retired this one
+    when the id was recorded (rows retired before Item 104 do not carry it)."""
+    if not _memory_exists(conn, memory_id) or not _is_tombstoned_id(conn, memory_id):
+        return None
+    reason = _retirement_reason_for_id(conn, memory_id) or "deleted"
+    m = re.search(r"\(lineage of #(\d+)\)\s*$", reason)
+    return {"reason": reason, "deleted_id": int(m.group(1)) if m else None}
+
+
 def _write_tombstone(
     conn: sqlite3.Connection,
     *,
@@ -4489,12 +4501,22 @@ def _fill_component_content(
         known[int(row["id"])] = row["content"] or ""
 
 
+def _lineage_reason(reason: str, member: int, origin: Optional[int]) -> str:
+    """The reason stored for one retired member: the deleted memory keeps the
+    plain reason; every other member of its lineage says whose delete retired
+    it, so memory_get can name the id (Item 104)."""
+    if origin is None or member == origin:
+        return reason
+    return f"{reason} (lineage of #{origin})"
+
+
 def _retire_members_atomic(
     conn: sqlite3.Connection,
     members: Iterable[int],
     *,
     reason: str,
     known: Dict[int, str],
+    origin: Optional[int] = None,
 ) -> None:
     """One D1 statement: retire every member id WITH its content_hash."""
     ids = sorted({int(m) for m in members})
@@ -4505,7 +4527,7 @@ def _retire_members_atomic(
     params: List[Any] = []
     for mid in ids:
         content = known.get(mid, "")
-        params.extend([mid, content_tombstone_hash(content), reason])
+        params.extend([mid, content_tombstone_hash(content), _lineage_reason(reason, mid, origin)])
     conn.execute(
         "INSERT INTO tombstone_components(memory_id, content_hash, reason) "
         f"VALUES {values_sql} "
@@ -4544,21 +4566,22 @@ def _tombstone_component(
                 hook(snapshot)
             # Mark the pre-hook snapshot first. A leaf attached after this
             # insert is caught on the next rewalk (delete-side stabilization).
-            _retire_members_atomic(conn, snapshot, reason=reason, known=known)
+            _retire_members_atomic(conn, snapshot, reason=reason, known=known, origin=memory_id)
             marked = set(snapshot)
             first = False
             continue
         new_ids = component - marked
         if not new_ids:
             break
-        _retire_members_atomic(conn, component, reason=reason, known=known)
+        _retire_members_atomic(conn, component, reason=reason, known=known, origin=memory_id)
         marked |= component
     for mid in marked:
         content = known.get(mid)
         if content is None:
             continue
         try:
-            _write_tombstone(conn, memory_id=mid, content=content, reason=reason)
+            _write_tombstone(conn, memory_id=mid, content=content,
+                             reason=_lineage_reason(reason, mid, memory_id))
         except Exception as exc:
             logger.warning(
                 "best-effort per-member tombstone failed for #%d: %s", mid, exc
@@ -6496,7 +6519,8 @@ def _absorb_update_candidate(
 
 
 def _leaf_fingerprint(content: str, tags: Any, meta_type: Optional[str] = None,
-                      project: Optional[str] = None, vector: Any = None) -> str:
+                      project: Optional[str] = None, vector: Any = None,
+                      protected: bool = False) -> str:
     """Identity of exactly what a gate check judged: text, tags, the
     gate-relevant metadata -- the normalised type (the type boundary) and
     metadata.project -- and the leaf's stored vector (its score). A check is
@@ -6515,7 +6539,7 @@ def _leaf_fingerprint(content: str, tags: Any, meta_type: Optional[str] = None,
         meta_type or "",
         project if isinstance(project, str) else "",
         vector_id,
-    ])
+    ] + (["item-record"] if protected else []))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -6555,6 +6579,7 @@ def _absorb_leaf_infos(
         mem = _serialise_row(row)
         meta = mem.get("metadata")
         leaf_type = _memory_type(meta.get("type") if isinstance(meta, dict) else None)
+        protected = _is_item_record(meta, mem.get("tags"))
         vec = vectors.get(mid)
         score = _cosine_similarity(fact_vector, vec) if (fact_vector and vec) else 0.0
         out[mid] = {
@@ -6563,11 +6588,12 @@ def _absorb_leaf_infos(
             "tags": mem.get("tags", []),
             "created_at": mem.get("created_at"),
             "type": leaf_type,
+            "protected": protected,
             "score": float(score),
             "vector": vec,
             "fingerprint": _leaf_fingerprint(
                 mem.get("content", ""), mem.get("tags", []), leaf_type,
-                meta.get("project") if isinstance(meta, dict) else None, vec,
+                meta.get("project") if isinstance(meta, dict) else None, vec, protected,
             ),
         }
     return out
@@ -6580,6 +6606,14 @@ def _memory_type(value: Any) -> Optional[str]:
     if isinstance(value, str) and value.strip():
         return value.strip().lower()
     return None
+
+
+def _is_item_record(metadata: Any, tags: Any) -> bool:
+    """An item record (metadata.kind == "item-record" or the tag item-record):
+    standalone history of a finished item. Absorb never supersedes one."""
+    if isinstance(metadata, dict) and metadata.get("kind") == "item-record":
+        return True
+    return isinstance(tags, (list, tuple)) and "item-record" in tags
 
 
 def _type_label(value: Optional[str]) -> str:
@@ -6613,6 +6647,10 @@ def _absorb_check_supersede(
     old_type, new_type = _memory_type(leaf.get("type")), _memory_type(fact_type)
     audit = {"leaf_id": leaf["id"], "score": score, "old_text": leaf.get("content", ""),
              "fingerprint": leaf.get("fingerprint"), "old_type": old_type, "new_type": new_type}
+    if leaf.get("protected"):
+        return {**audit, "verdict": "related", "gate": "protected", "protected": True,
+                "same_project": False, "same_entity": False, "fully_replaces": False, "related": True,
+                "reason": "the leaf is an item record: item records are standalone history and are never superseded by absorb"}
     if old_type != new_type:
         return {**audit, "verdict": "related", "gate": "type", "type_mismatch": True,
                 "same_project": False, "same_entity": False, "fully_replaces": False, "related": True,
@@ -6827,7 +6865,7 @@ def _supersede_check_summary(check: Optional[Dict[str, Any]]) -> Optional[Dict[s
         return None
     out = {k: check.get(k) for k in (
         "leaf_id", "gate", "verdict", "reason", "same_project", "same_entity", "fully_replaces",
-        "type_mismatch", "old_type", "new_type",
+        "type_mismatch", "old_type", "new_type", "protected",
     ) if k in check}
     out["score"] = round(float(check.get("score") or 0.0), 4)
     return out

@@ -53,6 +53,7 @@ from .storage import (
     get_hierarchy_paths,
     get_memories_metadata_batch,
     get_memory,
+    retirement_note,
     get_statistics,
     hybrid_search,
     import_memories,
@@ -379,6 +380,11 @@ def _create_memory(
 @_with_connection(profile=True)
 def _get_memory(conn, memory_id: int, follow: Optional[str] = None):
     return get_memory(conn, memory_id, follow=follow)
+
+
+@_with_connection
+def _retirement_note(conn, memory_id: int):
+    return retirement_note(conn, memory_id)
 
 
 @_with_connection(writes=True)
@@ -2032,6 +2038,9 @@ async def memory_get(
                 ``full_history`` adds a ``history`` key with all versions root-to-leaf;
                 ``all`` returns the exact requested id with no chain walk (forensic).
                 Omitting follow is NOT unfiltered — it means resolve to latest.
+                A version retired by deleting any version of its lineage answers
+                not_found with retired=true and a message naming the delete; a
+                new supersedes edge does not restore it (follow="all" reads it).
     """
     try:
         effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_GET, for_get=True)
@@ -2039,7 +2048,17 @@ async def memory_get(
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     if not record:
-        return {"error": "not_found", "id": memory_id}
+        out = {"error": "not_found", "id": memory_id}
+        if effective_follow is not None:
+            note = await _retirement_note(memory_id)
+            if note:
+                by = (f"deleting #{note['deleted_id']}" if note["deleted_id"] is not None
+                      else "a delete of its lineage (the deleted id was not recorded)")
+                out.update(retired=True, retired_reason=note["reason"], message=(
+                    f"memory #{memory_id} exists but is retired by {by}: deleting any version of a "
+                    "supersession lineage retires every version, and a new supersedes edge does not "
+                    "restore it. follow=\"all\" reads it."))
+        return out
 
     def _strip_images(mem: Dict) -> None:
         meta = mem.get("metadata") or {}
@@ -2099,6 +2118,11 @@ async def memory_delete(
     reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Delete a memory by id.
+
+    Deleting any version of a supersession lineage retires EVERY version (so a
+    deleted fact cannot reappear as an older version): follow=latest/active hide
+    them, memory_get on one says it was retired by deleting this id, and a later
+    supersedes edge does not restore it. follow="all" still reads the row.
 
     Args:
         memory_id: Memory ID to delete

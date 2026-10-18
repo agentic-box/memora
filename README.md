@@ -36,6 +36,8 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 **Absorb & Lineage**
 - 🧬 **Absorb** - Feed facts in; an LLM classifies each against the store (duplicate / update / contradiction / related / new), skips duplicates, links relations, and consolidates related facts — with `dry_run` preview
 - 🌱 **Supersession Lineage** - Updates supersede old knowledge instead of deleting it; retrieval follows the chain to the current version by default (`follow` modes: `active`, `latest`, `full_history`)
+  - Deleting any version retires the whole lineage (a deleted fact cannot reappear as an older version): `follow=latest`/`active` hide every version, `memory_get` on one answers `not_found` with `retired: true` naming the delete ("retired by deleting #N"), `follow=all` still reads it, and adding a `supersedes` edge to a retired id does not restore it.
+  - `memory_absorb` never supersedes an item record (`metadata.kind = "item-record"` or tag `item-record`): the fact is written and linked `related_to` instead. Todos and issues are protected by the type boundary (a plain fact never supersedes a typed one).
 - 🗞️ **Topic Digest** - `memory_digest(topic)` bundles relevant memories, open TODOs/issues, related edges, and source IDs into one retrieval
 
 **Search & Intelligence**

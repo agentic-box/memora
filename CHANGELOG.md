@@ -12,6 +12,13 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.4 — 2026-10-18
+
+Absorb leaves item records alone, and a retired memory says why (Item 104).
+
+- `memory_absorb` never supersedes an item record (`metadata.kind = "item-record"` or tag `item-record`), whatever the verifier says and whatever the fact's type: the gate returns `related` with `gate: "protected"`, the fact is still written and linked `related_to`. A leaf that becomes an item record between the gate and the write is re-gated. Structured todos and issues were already protected by the type boundary (memora issue 1126), which the plain-typed item records bypassed.
+- Deleting any version of a supersession lineage retires every version; this is unchanged and is now documented. `memory_get` (default `follow=latest`) on a retired id answers `not_found` with `retired: true` and a message naming the delete ("retired by deleting #N"); `follow=all` reads it. A `supersedes` edge added to a retired id does not restore it (the bestation #149/#151/#158 report). Rows retired by earlier deletes carry no deleting id and say so. No stored row is rewritten; only the reason text of lineage members retired from now on carries `(lineage of #N)`.
+
 ## 0.5.7.3 — 2026-10-17
 
 The replicator token no longer defaults to the D1 read token, and a replicator that cannot write is caught at deploy time (Item 99).

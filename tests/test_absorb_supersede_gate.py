@@ -700,3 +700,83 @@ def test_the_floor_is_enforced_on_reuse_even_with_an_unchanged_fingerprint(fake_
     assert leaf["id"] in active and decision["action"] == "linked"
     assert "regated_supersede_checks" not in result["profile"]["counters"]  # reused, then refused
     assert decision["leaf_checks"][0]["gate"] == "score"
+
+
+# --- item records are never superseded (Item 104: absorb superseded item record #149, verdict fully_replaces) ---
+
+ITEM_RECORD = ("Item 120: the replicator write probe. Shipped: the deploy waits for write_probe ok per store. "
+               "Alternatives rejected: a read of D1 permissions, because the API does not expose them.")
+OPS_FACT = ("The replicator write probe now reports write_probe ok per store in /health/db; the deploy waits "
+            "for it and fully replaces the earlier description of the probe.")
+
+
+@pytest.mark.parametrize("marker", ["kind", "tag"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_absorb_never_supersedes_an_item_record_even_when_the_verifier_says_fully_replaces(
+        fake_d1_backend, monkeypatch, marker, dry_run):
+    kw = {"metadata": {"kind": "item-record", "item": 120}, "tags": ["clmux/ideas"]} if marker == "kind" \
+        else {"tags": ["clmux/ideas", "item-record"]}
+    with storage.connect() as conn:
+        leaf = storage.add_memory(conn, content=ITEM_RECORD, **kw)
+    # verify says fully_replaces: the gate must not even ask
+    llm = FakeLLM(classify=_update(leaf["id"], "same feature"), verify=None)
+    result, active, crossrefs = _absorb(monkeypatch, llm, leaf, OPS_FACT, dry_run=dry_run)
+    (decision,) = result["decisions"]
+    assert decision["downgraded_from"] == "UPDATE"
+    check = decision["supersede_check"]
+    assert check["gate"] == "protected" and check["verdict"] == "related" and check["protected"] is True
+    assert check["fully_replaces"] is False
+    assert llm.verify_prompts() == []
+    assert leaf["id"] in active
+    if not dry_run:
+        assert decision["action"] == "linked" and result["superseded"] == 0      # the fact is still written
+        assert all(r.get("edge_type") != "superseded_by" for r in crossrefs)
+        assert any(r["id"] == decision["memory_id"] and r.get("edge_type") == "related_to" for r in crossrefs)
+
+
+def test_an_item_record_fact_does_not_supersede_an_older_item_record_either(fake_d1_backend, monkeypatch):
+    with storage.connect() as conn:
+        leaf = storage.add_memory(conn, content=ITEM_RECORD, metadata={"kind": "item-record"}, tags=["clmux/ideas"])
+    llm = FakeLLM(classify=_update(leaf["id"]), verify=None)
+    result, active, _ = _absorb(monkeypatch, llm, leaf, OPS_FACT, metadata={"kind": "item-record"})
+    (decision,) = result["decisions"]
+    assert decision["supersede_check"]["gate"] == "protected" and leaf["id"] in active
+
+
+def test_the_gate_refuses_a_protected_leaf_before_the_type_boundary_and_the_llm(monkeypatch):
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: FakeLLM(classify=None))
+    for fact_type in (None, "todo"):
+        leaf = {"id": 7, "content": "x", "tags": [], "score": 0.99, "type": None, "protected": True}
+        check = storage._absorb_check_supersede("y", leaf, [], fact_type=fact_type)
+        assert check["gate"] == "protected" and check["verdict"] == "related"
+
+
+def test_sibling_pairs_never_collapse_an_item_record(fake_d1_backend, monkeypatch):
+    llm = FakeLLM(classify=_update(0), verify=None)
+    monkeypatch.setattr(storage, "_get_llm_client", lambda: llm)
+    with storage.connect() as conn:
+        rec = storage.add_memory(conn, content=ITEM_RECORD, metadata={"kind": "item-record"}, tags=["clmux/ideas"])
+        plain = storage.add_memory(conn, content=OPS_FACT, tags=["clmux/ideas"])
+        corpus = storage.get_corpus_snapshot(conn)
+        check = storage._absorb_check_sibling_pair(conn, corpus, plain["id"], rec["id"], context=None)
+    assert check["verdict"] == "related" and check["gate"] == "protected"
+    assert llm.verify_prompts() == []
+
+
+def test_an_ordinary_plain_leaf_is_still_superseded_when_the_verifier_agrees(seeded, monkeypatch):
+    llm = FakeLLM(classify=_update(seeded["id"]), verify=_verdict(True, True, True))
+    result, active, _ = _absorb(monkeypatch, llm, seeded, PI_CHANNEL_WORK)
+    (decision,) = result["decisions"]
+    assert decision["action"] == "superseded" and seeded["id"] not in active
+
+
+def test_a_leaf_that_becomes_an_item_record_at_the_write_boundary_is_regated_and_kept(fake_d1_backend, monkeypatch):
+    leaf, decision, result, active, crossrefs, llm = _absorb_with_boundary_patch(
+        monkeypatch, {"kind": "item-record"},
+    )
+    assert leaf["id"] in active
+    assert decision["action"] == "linked" and decision["downgraded_from"] == "UPDATE"
+    assert all(r.get("edge_type") != "superseded_by" for r in crossrefs)
+    (check,) = decision["leaf_checks"]
+    assert check["gate"] == "protected" and check["protected"] is True
+    assert result["profile"]["counters"]["regated_supersede_checks"] == 1
