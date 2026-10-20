@@ -1481,10 +1481,23 @@ class TestWatchdogWiring:
         assert [c for c in calls if c[0] == "WATCHDOG" and c[1].startswith("hold")]
         assert not [c for c in calls if c[0] == "INSTALL" or (c[0] == "WATCHDOG" and c[1].startswith("release"))]
 
-    def test_a_tag_without_the_watchdog_script_is_deployed_with_a_note(self, deploy):
+    def test_a_tag_without_the_watchdog_script_holds_the_installed_one(self, deploy):
+        """Review 12909: an older tag has no script in the checkout, but a watchdog from an earlier deploy may be running."""
+        (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").unlink()
+        installed = deploy.home / ".local" / "libexec" / "memora" / "watchdog-memora-all"
+        installed.mkdir(parents=True)
+        _exe(installed / "memora_watchdog.py",
+             '#!/usr/bin/env python3\nimport os, sys\n'
+             'open(os.environ["CALL_LOG"], "a").write("INSTALLED-WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n')
+        proc, calls, _ = deploy()
+        assert "holding the installed one" in proc.stdout
+        hold = _index(calls, lambda c: c[0] == "INSTALLED-WATCHDOG" and c[1].startswith("hold --container memora-all"))
+        assert hold < _index(calls, lambda c: c == ["stop", "memora-all"])
+
+    def test_a_tag_without_the_watchdog_script_and_none_installed_is_deployed_with_a_note(self, deploy):
         (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").unlink()
         proc, calls, _ = deploy()
-        assert "no watchdog hold" in proc.stdout
+        assert "none is installed; no watchdog hold" in proc.stdout
         assert [c for c in calls if c[:2] == ["run", "-d"]]
         assert not [c for c in calls if c[0] in ("WATCHDOG", "INSTALL")]
 
@@ -1518,6 +1531,18 @@ class TestWatchdogWiring:
         proc, lines = self._tail(tmp_path, labels=True)
         assert proc.returncode == 0 and lines == ["watchdog release --container memora-all"]
         assert "rehearsal: watchdog service not installed" in proc.stdout
+
+    def test_a_checkout_without_the_installer_leaves_the_installed_watchdog_alone(self, tmp_path):
+        text = Path(SCRIPT).read_text()
+        block = text[text.index("# --- watchdog release + install"):text.index("# --- end watchdog release + install")]
+        repo = tmp_path / "oldrepo"
+        (repo / "scripts").mkdir(parents=True)
+        installed = tmp_path / "installed.py"
+        _exe(installed, '#!/usr/bin/env python3\nprint("released")\n')
+        prog = (f'set -euo pipefail\nREPO={repo}\nWATCHDOG={installed}\nCONTAINER=memora-all\nPORT=8920\nRT=docker\n'
+                f'TAG=v0.0.1\nLABEL_ARGS=()\n{block}\necho tail-done\n')
+        proc = subprocess.run(["bash", "-c", prog], capture_output=True, text=True, timeout=30)
+        assert proc.returncode == 0 and "has no watchdog installer" in proc.stdout and "tail-done" in proc.stdout
 
     def test_without_the_script_the_block_does_nothing(self, tmp_path):
         proc, lines = self._tail(tmp_path, labels=False, script=False)

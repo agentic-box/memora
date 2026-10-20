@@ -166,7 +166,7 @@
 # Item 108: the watchdog service (memora-watchdog-<container>, installed at the end of this script) restarts
 # a container whose /health stops answering. This script holds it before it stops the container and
 # releases it after the new one is verified; a ROLLBACK or any other intentional stop must hold it by hand:
-#   ssh deploy-host 'python3 ~/.local/libexec/memora/memora_watchdog.py hold --container memora-all --minutes 45 --reason rollback'
+#   ssh deploy-host 'python3 ~/.local/libexec/memora/watchdog-memora-all/memora_watchdog.py hold --container memora-all --minutes 45 --reason rollback'
 #   (and `release` when done); docs/cutover-runbook.md "Recovery: memora-all restarts itself".
 #
 # Rollback (for a store already cut over to local primary, follow the L6
@@ -743,12 +743,19 @@ PF_RC=0
 # Item 108: the watchdog must not fight this deploy. Held BEFORE the stop (a failed hold refuses here,
 # with the container untouched); it expires by itself after 45 minutes if the deploy dies, and is released
 # only when the new container has been verified (below). A tag without the watchdog script has nothing to hold.
+# A tag older than the watchdog has no script in the checkout, but a watchdog installed by an earlier deploy may be
+# running: hold it with the INSTALLED copy (per container, see install_memora_watchdog.sh).
 WATCHDOG="$REPO/scripts/memora_watchdog.py"
+INSTALLED_WATCHDOG="$HOME/.local/libexec/memora/watchdog-$CONTAINER/memora_watchdog.py"
+if [ ! -f "$WATCHDOG" ] && [ -f "$INSTALLED_WATCHDOG" ]; then
+  echo "note: $TAG has no watchdog script; holding the installed one ($INSTALLED_WATCHDOG)"
+  WATCHDOG="$INSTALLED_WATCHDOG"
+fi
 if [ -f "$WATCHDOG" ]; then
   python3 "$WATCHDOG" hold --container "$CONTAINER" --minutes 45 --reason "deploy $TAG" \
     || { echo "cannot hold the watchdog — aborting before touching the live container" >&2; exit 1; }
 else
-  echo "note: $WATCHDOG does not exist at $TAG; no watchdog hold"
+  echo "note: $WATCHDOG does not exist at $TAG and none is installed; no watchdog hold"
 fi
 
 "$RT" stop "$CONTAINER"
@@ -1235,7 +1242,9 @@ PY
 # --- watchdog release + install (Item 108; tests/test_deploy_memora_all.py runs this block on its own) ---
 if [ -f "$WATCHDOG" ]; then
   python3 "$WATCHDOG" release --container "$CONTAINER"
-  if [ "${#LABEL_ARGS[@]}" -eq 0 ]; then
+  if [ "${#LABEL_ARGS[@]}" -eq 0 ] && [ ! -f "$REPO/scripts/install_memora_watchdog.sh" ]; then
+    echo "note: $TAG has no watchdog installer; the installed watchdog is left as it is"
+  elif [ "${#LABEL_ARGS[@]}" -eq 0 ]; then
     bash "$REPO/scripts/install_memora_watchdog.sh" "$CONTAINER" "$PORT" "$RT" \
       || { echo "DEPLOY VERIFIED, but the watchdog could not be installed (above): $CONTAINER has no supervisor" >&2; exit 1; }
   else

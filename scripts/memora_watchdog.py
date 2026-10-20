@@ -94,6 +94,7 @@ RUNTIMES = ("container", "docker", "podman")
 # The only verbs this process may send to a container runtime. No create/run/rm/volume verb exists here.
 ALLOWED_VERBS = frozenset({"list", "inspect", "stop", "kill", "start", "unpause"})
 DEFAULT_HOLD_MINUTES = 45
+HOLD_WAIT_S = 150.0         # a restart is one stop (up to the grace) plus a start plus a verification round
 RESTART_WINDOW_S = 3600.0
 
 
@@ -227,6 +228,27 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class RestartFailed(RuntimeError):
     pass
+
+
+class RestartHeld(RestartFailed):
+    """A hold appeared while a restart was in flight: it stopped before its next step. Not a failure."""
+
+
+def await_no_restart(hold_path: str, timeout_s: float, sleeper=time.sleep, clock=time.monotonic) -> bool:
+    """True once no restart transaction is in flight. `hold` calls this AFTER it wrote the hold file: the
+    watchdog takes this lock around a whole restart and re-checks the hold before every step, so when this
+    returns True the old restart has finished or stopped, and nothing starts a new one (the hold is live)."""
+    os.makedirs(os.path.dirname(hold_path), exist_ok=True)
+    deadline = clock() + timeout_s
+    with open(hold_path + ".busy", "a+") as fh:
+        while True:
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                if clock() >= deadline:
+                    return False
+                sleeper(0.2)
 
 
 class Watchdog:
@@ -413,6 +435,9 @@ class Watchdog:
             self._emit_alert(message)
             return "gave_up"
 
+        busy = self._take_restart_lock()
+        if busy is None:                    # a `hold` is waiting for the previous restart to end: nothing new starts
+            return "held"
         self.failures = 0
         self._attempts.append(now)
         try:
@@ -422,11 +447,18 @@ class Watchdog:
             # an event someone should be told about.
             self._emit_alert(f"restarted (#{self.restarts})")
             outcome = "restarted"
+        except RestartHeld as exc:
+            self._attempts.pop()
+            log.warning("%s restart stopped: %s", self.container, exc)
+            busy.close()
+            return "held"
         except RestartFailed as exc:
             self.failed_restarts += 1
             log.error("%s restart FAILED: %s", self.container, exc)
             self._emit_alert(str(exc))
             outcome = "restart_failed"
+        finally:
+            busy.close()
 
         # Backoff grows whether or not the restart worked. A failing recovery
         # must not retry at the shortest interval forever.
@@ -437,6 +469,25 @@ class Watchdog:
 
     # -- action --------------------------------------------------------------
 
+    def _take_restart_lock(self):
+        """Held for a whole restart; `hold` waits on it. None when a hold is already waiting for it."""
+        os.makedirs(os.path.dirname(self.hold_path), exist_ok=True)
+        fh = open(self.hold_path + ".busy", "a+")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return None
+        if self.held() is not None:         # the hold was written between tick()'s check and this lock
+            fh.close()
+            return None
+        return fh
+
+    def _guard(self) -> None:
+        """Before EVERY mutation (unpause, stop, kill, start) and every verification round."""
+        if self.held() is not None:
+            raise RestartHeld("a hold was set during the restart; stopped before the next step")
+
     def restart(self) -> None:
         """State-aware restart, verified by health. Raises RestartFailed."""
         state = self.container_state()
@@ -444,9 +495,8 @@ class Watchdog:
                   self.container, self.threshold, state)
         if state == "absent":
             raise RestartFailed(f"container {self.container!r} does not exist")
-        if self.held() is not None:
-            raise RestartFailed("a hold was set while this restart was being decided; nothing was done")
         if state == "paused":
+            self._guard()
             proc = self._cli("unpause", self.container)
             if proc.returncode != 0:
                 raise RestartFailed(f"unpause exit {proc.returncode}: {(proc.stderr or '').strip()[:200]}")
@@ -459,16 +509,19 @@ class Watchdog:
                 stop_args = ("stop", "--signal", "TERM", "--time", str(int(self.grace)), self.container)
             else:
                 stop_args = ("stop", "-t", str(int(self.grace)), self.container)
+            self._guard()
             proc = self._cli(*stop_args)
             if proc.returncode != 0:
                 log.warning("graceful stop exit %d: %s", proc.returncode,
                             (proc.stderr or "").strip()[:200])
             if self.container_state() == "running":
+                self._guard()
                 kill = self._cli("kill", self.container)
                 if kill.returncode != 0:
                     raise RestartFailed(
                         f"kill exit {kill.returncode}: {(kill.stderr or '').strip()[:200]}")
 
+        self._guard()
         start = self._cli("start", self.container)
         if start.returncode != 0:
             raise RestartFailed(
@@ -482,6 +535,7 @@ class Watchdog:
             if self.probe():
                 log.info("%s restarted and healthy", self.container)
                 return
+            self._guard()
             self._sleep(2)
         raise RestartFailed(f"started but /health did not become healthy within {self.startup}s")
 
@@ -543,6 +597,13 @@ def _hold_cli(argv) -> int:
             print("--minutes must be in (0, 1440]", file=sys.stderr)
             return 2
         hold = write_hold(path, now, args.minutes, args.reason)
+        # The hold is live; now wait until a restart that was already in flight has finished or stopped at its
+        # next step (it re-checks the hold before every mutation). Failing here keeps the hold (the safe
+        # direction) but tells the caller, so a deploy does not stop a container a restart is still working on.
+        if not await_no_restart(path, HOLD_WAIT_S):
+            print(f"watchdog hold for {args.container} is set, but a restart is still in flight after "
+                  f"{HOLD_WAIT_S:.0f}s; not safe to stop the container yet", file=sys.stderr)
+            return 3
         print(f"watchdog held for {args.container} until "
               f"{time.strftime('%H:%M:%S', time.localtime(hold['expires']))}: {args.reason}")
     elif args.action == "release":

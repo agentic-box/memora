@@ -680,7 +680,7 @@ class TestHold:
             return result
 
         ddog.container_state = state_then_hold
-        assert ddog.tick() == "restart_failed"
+        assert ddog.tick() == "held"
         assert [c[1] for c in ddog.docker.calls] == ["inspect"], "stopped a container a deploy was holding"
 
     def test_the_cli_holds_releases_and_reports(self, tmp_path, monkeypatch, capsys):
@@ -858,11 +858,12 @@ class TestInstaller:
         for needle in ("MEMORA_WATCHDOG_CONTAINER=memora-all", "MEMORA_WATCHDOG_URL=http://127.0.0.1:8920/health",
                        "MEMORA_WATCHDOG_RUNTIME=docker", "MEMORA_WATCHDOG_MAX_RESTARTS_PER_HOUR=3",
                        "MEMORA_WATCHDOG_THRESHOLD=3", "MEMORA_WATCHDOG_INTERVAL=10", "Restart=always",
-                       f"{home}/.local/libexec/memora/memora_watchdog_alert_clmux.sh",
+                       f"{home}/.local/libexec/memora/watchdog-memora-all/memora_watchdog_alert_clmux.sh",
                        f"EnvironmentFile=-{home}/.config/memora/watchdog.env"):
             assert needle in unit, needle
         assert "/health/db" not in unit
-        assert (home / ".local/libexec/memora/memora_watchdog.py").stat().st_mode & stat.S_IXUSR
+        assert (home / ".local/libexec/memora/watchdog-memora-all/memora_watchdog.py").stat().st_mode & stat.S_IXUSR
+        assert "memora-watchdog-alerts-memora-all.log" in unit
         assert sysctl[:3] == ["--user daemon-reload", "--user enable memora-watchdog-memora-all.service",
                               "--user restart memora-watchdog-memora-all.service"]
         assert "memora-watchdog-memora-all.service active" in proc.stdout
@@ -892,3 +893,145 @@ def test_the_embedding_host_switch_holds_the_watchdog_around_its_intentional_sto
     release = text.index("release --container memora-all")
     healthy = text.index('"$healthy" -ne 1')
     assert hold < stop < healthy < release
+
+
+class TestHoldDuringARestartInFlight:
+    """Review 12909: a hold taken AFTER restart() began must still stop it, and `hold` must not return while the
+    old restart is still working on the container."""
+
+    def _arm(self, w):
+        """Fail liveness until the threshold so the next tick restarts."""
+        w.probe = lambda: False
+        w.tick(); w.tick()
+
+    def test_a_hold_taken_during_the_stop_prevents_the_kill_and_the_start(self, ddog):
+        self._arm(ddog)
+        original = ddog.docker.__call__
+
+        def stop_that_gets_held(cmd, **kw):
+            result = original(cmd, **kw)
+            if cmd[1] == "stop":
+                watchdog.write_hold(ddog.hold_path, ddog.wall[0], 45, "deploy")   # the deploy's hold lands now
+                ddog.docker.state = "running"                                    # the kill branch would be next
+            return result
+
+        ddog._run = lambda cmd, **kw: stop_that_gets_held(cmd, **kw)
+        assert ddog.tick() == "held"
+        verbs = [c[1] for c in ddog.docker.calls]
+        assert "start" not in verbs and "kill" not in verbs, verbs
+        assert ddog.restarts == 0 and ddog.failed_restarts == 0 and ddog.alerts == []
+        assert ddog._attempts == [], "an aborted restart must not count toward the cap"
+
+    def test_a_hold_taken_during_the_verification_stops_the_waiting_loop(self, ddog):
+        self._arm(ddog)
+        rounds = []
+
+        def probe():
+            rounds.append(1)
+            if len(rounds) == 2:                                 # first verification round
+                watchdog.write_hold(ddog.hold_path, ddog.wall[0], 45, "deploy")
+            return False
+
+        ddog.probe = probe
+        assert ddog.tick() == "held" and len(rounds) <= 3
+        assert not [a for a in ddog.alerts]
+
+    def test_hold_waits_for_the_restart_in_flight_and_returns_only_after_it_stopped(self, ddog, tmp_path, monkeypatch):
+        import threading
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        ddog.hold_path = watchdog.default_hold_path("memora-all")
+        self._arm(ddog)
+        entered, release = threading.Event(), threading.Event()
+        original = ddog.docker.__call__
+
+        def blocking(cmd, **kw):
+            if cmd[1] == "stop":
+                entered.set()
+                assert release.wait(10)
+            return original(cmd, **kw)
+
+        ddog._run = lambda cmd, **kw: blocking(cmd, **kw)
+        outcome = []
+        t = threading.Thread(target=lambda: outcome.append(ddog.tick()))
+        t.start()
+        assert entered.wait(10)                                  # the restart is inside `docker stop`
+        result = []
+        h = threading.Thread(target=lambda: result.append(
+            watchdog.main(["hold", "--container", "memora-all", "--minutes", "5", "--reason", "deploy"])))
+        h.start()
+        h.join(1.0)
+        assert h.is_alive(), "hold returned while a restart was still in flight"
+        release.set()
+        t.join(10); h.join(10)
+        assert result == [0] and outcome == ["held"]
+        assert "start" not in [c[1] for c in ddog.docker.calls], "the old restart carried on into start after the hold"
+
+    def test_hold_fails_loudly_when_a_restart_will_not_finish(self, ddog, tmp_path, monkeypatch, capsys):
+        import fcntl
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        monkeypatch.setattr(watchdog, "HOLD_WAIT_S", 0.5)
+        path = watchdog.default_hold_path("memora-all")
+        os.makedirs(os.path.dirname(path))
+        with open(path + ".busy", "a+") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)      # a restart that never ends
+            rc = watchdog.main(["hold", "--container", "memora-all", "--minutes", "5"])
+        assert rc == 3 and "still in flight" in capsys.readouterr().err
+        assert os.path.exists(path), "the hold stays: the safe direction"
+
+    def test_a_tick_does_not_begin_a_restart_while_a_hold_is_waiting_for_the_lock(self, ddog, tmp_path, monkeypatch):
+        import fcntl
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        ddog.hold_path = watchdog.default_hold_path("memora-all")
+        os.makedirs(os.path.dirname(ddog.hold_path))
+        self._arm(ddog)
+        with open(ddog.hold_path + ".busy", "a+") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            assert ddog.tick() == "held"
+        assert ddog.docker.calls == []
+
+    def test_an_ordinary_restart_still_completes_and_releases_the_lock(self, ddog):
+        import fcntl
+        _up_after_start(ddog)
+        for _ in range(3):
+            out = ddog.tick()
+        assert out == "restarted"
+        with open(ddog.hold_path + ".busy", "a+") as busy:
+            fcntl.flock(busy, fcntl.LOCK_EX | fcntl.LOCK_NB)       # free again
+
+
+class TestInstallerIsolation:
+    def test_a_scratch_install_cannot_change_production_files(self, tmp_path):
+        import hashlib
+
+        def tree(root):
+            return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in sorted(pathlib.Path(root).rglob("*")) if p.is_file()}
+
+        a, b = tmp_path / "A", tmp_path / "B"
+        for d in (a, b):
+            d.mkdir()
+            for name in ("install_memora_watchdog.sh", "memora_watchdog.py", "memora_watchdog_alert_clmux.sh"):
+                (d / name).write_text((SCRIPTS / name).read_text())
+        (b / "memora_watchdog_alert_clmux.sh").write_text("#!/bin/bash\necho SCRATCH-VERSION\n")
+        (b / "memora_watchdog.py").write_text("# scratch checkout\n" + (SCRIPTS / "memora_watchdog.py").read_text())
+        home = tmp_path / "home"
+        home.mkdir()
+        _fake_bin(tmp_path, "systemctl", "exit 0\n")
+        _fake_bin(tmp_path, "loginctl", "echo Linger=yes\n")
+        env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+        def install(src, container, port):
+            return subprocess.run(["bash", str(src / "install_memora_watchdog.sh"), container, port, "docker"], env=env,
+                                  capture_output=True, text=True, timeout=60)
+
+        assert install(a, "memora-all", "8920").returncode == 0
+        production = tree(home)
+        assert install(b, "scratch-wd", "18921").returncode == 0
+        after = tree(home)
+        for path, digest in production.items():
+            assert after[path] == digest, f"the scratch install changed production's {path}"
+        assert (home / ".local/libexec/memora/watchdog-scratch-wd/memora_watchdog_alert_clmux.sh").read_text().count("SCRATCH") == 1
+        assert "SCRATCH" not in (home / ".local/libexec/memora/watchdog-memora-all/memora_watchdog_alert_clmux.sh").read_text()
+        unit = (home / ".config/systemd/user/memora-watchdog-scratch-wd.service").read_text()
+        assert "watchdog-scratch-wd/memora_watchdog.py" in unit and "watchdog-memora-all" not in unit
+        assert "alerts-scratch-wd.log" in unit

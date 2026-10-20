@@ -6,7 +6,8 @@
 # Run on the deploy host by scripts/deploy-memora-all.sh (from the tagged checkout), after the new
 # container is verified; safe to run again (it re-copies the files and restarts the service).
 # The unit is named memora-watchdog-<container>.service, so a rehearsal's scratch container never
-# touches the production unit. Why a systemd user service and not a timer or cron: the watchdog is
+# touches the production unit, its scripts (each container has its own copy under
+# ~/.local/libexec/memora/watchdog-<container>/) or its alert log. Why a systemd user service and not a timer or cron: the watchdog is
 # the already-reviewed daemon loop (scripts/memora_watchdog.py: exclusive lock, threshold, backoff,
 # post-start verification), and systemd restarts the watchdog itself (Restart=always); a timer
 # would be a second, weaker supervisor of the same decision. User lingering must be on.
@@ -19,7 +20,7 @@ printf '%s' "$C" | grep -Eqx '[A-Za-z0-9][A-Za-z0-9_.-]*' || { echo "bad contain
 printf '%s' "$PORT" | grep -Eqx '[0-9]{1,5}' || { echo "bad port '$PORT'" >&2; exit 1; }
 case "$RT" in docker|podman) ;; *) echo "runtime must be docker or podman, not '$RT'" >&2; exit 1 ;; esac
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB="$HOME/.local/libexec/memora"; UNITS="$HOME/.config/systemd/user"; VAR="$HOME/.local/var"
+LIB="$HOME/.local/libexec/memora/watchdog-$C"; UNITS="$HOME/.config/systemd/user"; VAR="$HOME/.local/var"
 mkdir -p "$LIB" "$UNITS" "$VAR/log" "$HOME/.local/state/memora-watchdog"
 cp "$HERE/memora_watchdog.py" "$HERE/memora_watchdog_alert_clmux.sh" "$LIB/"
 chmod 755 "$LIB/memora_watchdog.py" "$LIB/memora_watchdog_alert_clmux.sh"
@@ -45,7 +46,7 @@ Environment=MEMORA_WATCHDOG_BACKOFF_MAX=600
 Environment=MEMORA_WATCHDOG_MAX_RESTARTS_PER_HOUR=3
 EnvironmentFile=-$HOME/.config/memora/watchdog.env
 Environment=MEMORA_WATCHDOG_ALERT=$LIB/memora_watchdog_alert_clmux.sh
-Environment=MEMORA_WATCHDOG_ALERT_LOG=$VAR/log/memora-watchdog-alerts.log
+Environment=MEMORA_WATCHDOG_ALERT_LOG=$VAR/log/memora-watchdog-alerts-$C.log
 Environment=PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=10

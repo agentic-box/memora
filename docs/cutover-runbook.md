@@ -211,7 +211,7 @@ killed and memora-all stayed down until someone restarted it by hand). Two layer
      identity yet]"; anyone on the host could forge it. If clmux is unreachable it is logged and the
      watchdog carries on.
    - **Logs:** `~/.local/var/log/memora-watchdog-memora-all.log` (every decision),
-     `~/.local/var/log/memora-watchdog-alerts.log` (every alert); `systemctl --user status
+     `~/.local/var/log/memora-watchdog-alerts-memora-all.log` (every alert); `systemctl --user status
      memora-watchdog-memora-all`.
 3. **An intentional stop must hold the watchdog**, or it will be started again within about 30 s.
    The deploy does this itself (held before it stops the container, released after the new one is
@@ -220,9 +220,9 @@ killed and memora-all stayed down until someone restarted it by hand). Two layer
    `docker stop memora-all`):
 
    ```sh
-   python3 ~/.local/libexec/memora/memora_watchdog.py hold --container memora-all --minutes 45 --reason "rollback"
+   python3 ~/.local/libexec/memora/watchdog-memora-all/memora_watchdog.py hold --container memora-all --minutes 45 --reason "rollback"
    # ... stop, work, start ...
-   python3 ~/.local/libexec/memora/memora_watchdog.py release --container memora-all
+   python3 ~/.local/libexec/memora/watchdog-memora-all/memora_watchdog.py release --container memora-all
    ```
 
    While held the watchdog neither probes nor acts. A stale hold (past its expiry, or unreadable) is
