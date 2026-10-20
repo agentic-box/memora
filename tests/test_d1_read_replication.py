@@ -129,6 +129,59 @@ def test_an_api_error_fail_closes_and_is_not_cached(monkeypatch):
     assert _journal("db1").is_file()
 
 
+def test_a_message_less_metadata_error_still_refuses(monkeypatch, capsys):
+    """An empty error string must stay a refusal, not IndexError warned through."""
+
+    def hook(*_a):
+        raise RuntimeError()
+
+    server, calls = _server_main(monkeypatch, hook)
+    with pytest.raises(SystemExit) as exc:
+        server.main([])
+    err = capsys.readouterr().err
+    assert exc.value.code == 2
+    assert "Error:" in err and "RuntimeError" in err and "db1" in err
+    assert "Warning:" not in err and "IndexError" not in err
+    assert calls == []
+    storage._registry_cache = None
+
+
+def test_a_metadata_error_that_names_the_account_and_token_is_redacted(monkeypatch, capsys):
+    leaked = {"text": ""}
+
+    def hook(account, database, token):
+        leaked["text"] = f"GET accounts/{account}/d1/database/{database} Bearer {token}"
+        raise RuntimeError(leaked["text"])
+
+    monkeypatch.setattr(backends, "_replication_mode_hook", hook)
+    with pytest.raises(ReadReplicationRefused, match="db1") as exc:
+        D1Backend("acct", "db1", "sekret").connect()
+    text = str(exc.value)
+    assert "acct" in leaked["text"] and "sekret" in leaked["text"]
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+    assert "RuntimeError" in text and "[redacted]" in text and "db1" in text
+    assert "sekret" not in text and "acct" not in text
+    assert not _journal("db1").exists()
+    # The token straddles the 200-character cut. Redacting after the cut
+    # would leave the prefix "sekre".
+    cut = backends._redacted_exception_line(
+        RuntimeError("x" * 195 + "sekret"), "acct", "sekret")
+    assert cut == "x" * 195 + "[reda"
+    assert "sekret" not in cut and "sekre" not in cut and "acct" not in cut
+
+    server, calls = _server_main(monkeypatch, hook)
+    monkeypatch.setenv("CLOUDFLARE_API_TOKEN", "sekret")
+    with pytest.raises(SystemExit) as exit_exc:
+        server.main([])
+    err = capsys.readouterr().err
+    assert exit_exc.value.code == 2
+    assert "Error:" in err and "db1" in err and "[redacted]" in err
+    assert "Warning:" not in err
+    assert "sekret" not in err and "acct" not in err
+    assert calls == []
+    storage._registry_cache = None
+
+
 def test_override_skips_the_fetch_and_warns_once(monkeypatch, caplog):
     monkeypatch.setenv("MEMORA_D1_ALLOW_READ_REPLICATION", "1")
 

@@ -2208,6 +2208,23 @@ def require_read_replication_disabled(database_id: str, mode: str) -> None:
         f"while it is on. Set {ALLOW_READ_REPLICATION_ENV}=1 to start anyway.")
 
 
+def _redacted_exception_line(exc: BaseException, *hidden: str) -> str:
+    """The first line of ``exc``, with the account id and the token removed.
+
+    ``"".splitlines()`` is ``[]``. Indexing that raised ``IndexError`` while
+    building the refusal, and startup then reported it as a transient
+    pre-warm warning and kept serving. An empty message stays an empty line.
+    Secrets are removed before the line is cut, so a value that would have
+    straddled the cut is not left as a prefix. The refusal is raised after
+    this handler finishes, so the original exception is not its context.
+    """
+    lines = str(exc).splitlines()
+    detail = lines[0] if lines else ""
+    for secret in sorted((s for s in hidden if s), key=len, reverse=True):
+        detail = detail.replace(secret, "[redacted]")
+    return detail[:200]
+
+
 def _fetch_read_replication_mode(account_id: str, database_id: str, token: str) -> str:
     """The mode, or ReadReplicationRefused when the GET cannot be made.
 
@@ -2215,7 +2232,12 @@ def _fetch_read_replication_mode(account_id: str, database_id: str, token: str) 
     the documented object all refuse. The override is applied by the caller
     before this runs, so a dead metadata API cannot brick an explicit opt-in.
     The token is sent only as the Authorization header of the live GET.
+    A metadata error is reported as ReadReplicationRefused even when its own
+    text is empty. That text, when kept, has the account id and the token
+    removed.
     """
+    mode = None
+    failure: Optional[tuple] = None
     try:
         if _replication_mode_hook is not None:
             mode = _replication_mode_hook(account_id, database_id, token)
@@ -2226,12 +2248,14 @@ def _fetch_read_replication_mode(account_id: str, database_id: str, token: str) 
     except ReadReplicationRefused:
         raise
     except Exception as exc:
-        detail = str(exc).splitlines()[0][:200]
+        failure = (type(exc).__name__, _redacted_exception_line(exc, account_id, token))
+    if failure is not None:
+        name, detail = failure
         raise ReadReplicationRefused(
             f"D1 database {database_id}: cannot read read_replication.mode "
-            f"({type(exc).__name__}: {detail}). Refusing to start. "
+            f"({name}: {detail}). Refusing to start. "
             f"Set {ALLOW_READ_REPLICATION_ENV}=1 to start anyway."
-        ) from exc
+        )
     if not isinstance(mode, str) or mode == "":
         return "unknown"
     return mode
@@ -2252,6 +2276,12 @@ def ensure_read_replication_disabled(account_id: str, database_id: str, token: s
     The replicator is exempt. Its D1 connection is a write-only replica
     target (``D1SelectOnlyConnection.from_env`` in ``replicator.py``), and
     this check is not applied to ``D1SelectOnlyConnection`` itself.
+
+    Out of scope for this item, and not claimed safe: the permission probe,
+    rollback, resume, shadow-night, verify-replication, and embedding
+    preflight. The brief named bootstrap and compare as the direct readers
+    to cover and said not to widen to the others. They still read D1 and
+    do not run this check.
     """
     if read_replication_allowed():
         warn_read_replication_override(database_id)
