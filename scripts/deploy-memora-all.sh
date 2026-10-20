@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Full deploy of the live memora-all container (on DEPLOY_HOST) to v0.5.7.4: fetch +
+# Full deploy of the live memora-all container (on DEPLOY_HOST) to v0.5.7.5: fetch +
 # build the tagged image and recreate the container from it, then verify it.
 #
 # CONFIGURATION (CFG1): the deploy host, the graph's publish address, the
@@ -85,7 +85,7 @@
 # MEMORA_CORPUS_CACHE_BUDGET_MB stays unset. No schema change.
 #
 # Steps, all on deploy-host:
-#  1. git fetch + checkout the v0.5.7.4 tag in the deploy-host checkout, docker build.
+#  1. git fetch + checkout the v0.5.7.5 tag in the deploy-host checkout, docker build.
 #     The image currently tagged memora:latest is kept as memora:rollback-<ts>
 #     before the new one replaces it.
 #  2. Edit MEMORA_LLM_MODEL in ~/.config/memora/credentials.mcp.json (already
@@ -102,7 +102,7 @@
 #     as memora-all-grok-<ts> (the name predates the model switch being a
 #     no-op; it still means "the container before this deploy", and the
 #     rollback commands below depend on it).
-#  5. Wait for GET /health, check it reports version 0.5.7.4 (proves the new
+#  5. Wait for GET /health, check it reports version 0.5.7.5 (proves the new
 #     build is the one serving, not a stale image), then run one 3-fact
 #     dry-run memory_absorb call, one memory_semantic_search call and one
 #     memory_stats call, asserting no JSON-RPC error and a real session id at
@@ -163,6 +163,12 @@
 # NOT RUN by this repo or any agent — review and run it yourself:
 #   scripts/deploy-memora-all.sh
 #
+# Item 108: the watchdog service (memora-watchdog-<container>, installed at the end of this script) restarts
+# a container whose /health stops answering. This script holds it before it stops the container and
+# releases it after the new one is verified; a ROLLBACK or any other intentional stop must hold it by hand:
+#   ssh deploy-host 'python3 ~/.local/libexec/memora/memora_watchdog.py hold --container memora-all --minutes 45 --reason rollback'
+#   (and `release` when done); docs/cutover-runbook.md "Recovery: memora-all restarts itself".
+#
 # Rollback (for a store already cut over to local primary, follow the L6
 # runbook in docs/local-primary-implementation.md instead):
 #   ssh deploy-host 'docker rm -f memora-all && docker rename memora-all-grok-<ts> memora-all && docker start memora-all'
@@ -170,7 +176,7 @@
 #   restore ~/.config/memora/credentials.mcp.json.bak-llm-<ts> if MEMORA_LLM_MODEL itself needs reverting
 set -euo pipefail
 
-TAG="${DEPLOY_TAG:-v0.5.7.4}"
+TAG="${DEPLOY_TAG:-v0.5.7.5}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The production values that identify real infrastructure (CFG1) are NOT in
 # this public script: they come from the operator's git-ignored
@@ -250,7 +256,7 @@ OVERRIDDEN=()
 while IFS='|' read -r var label default; do
   [ "${!var}" = "$default" ] || OVERRIDDEN+=("$label")
 done <<DEFAULTS
-TAG|DEPLOY_TAG|v0.5.7.4
+TAG|DEPLOY_TAG|v0.5.7.5
 DEPLOY_HOST|DEPLOY_HOST|$CFG_DEPLOY_HOST
 RUNTIME|RUNTIME|docker
 DEPLOY_CONTAINER|DEPLOY_CONTAINER|memora-all
@@ -734,6 +740,17 @@ PF_RC=0
 "$RT" rm "$PF_ID" >/dev/null 2>&1 || echo "note: remove the embedding preflight container $PF_ID by hand ($RT rm $PF_ID)" >&2
 [ "$PF_RC" -eq 0 ] || { echo "embedding preflight refused (exit $PF_RC): a store would refuse semantic search under the new image (the lines above name it and the fix) — aborting before touching the live container" >&2; exit 1; }
 
+# Item 108: the watchdog must not fight this deploy. Held BEFORE the stop (a failed hold refuses here,
+# with the container untouched); it expires by itself after 45 minutes if the deploy dies, and is released
+# only when the new container has been verified (below). A tag without the watchdog script has nothing to hold.
+WATCHDOG="$REPO/scripts/memora_watchdog.py"
+if [ -f "$WATCHDOG" ]; then
+  python3 "$WATCHDOG" hold --container "$CONTAINER" --minutes 45 --reason "deploy $TAG" \
+    || { echo "cannot hold the watchdog — aborting before touching the live container" >&2; exit 1; }
+else
+  echo "note: $WATCHDOG does not exist at $TAG; no watchdog hold"
+fi
+
 "$RT" stop "$CONTAINER"
 
 # Copy the old /data into the named volume while memora-all is stopped
@@ -769,8 +786,17 @@ fi
 
 "$RT" rename "$CONTAINER" "$CONTAINER-grok-$TS"
 
+# Item 108: a Docker HEALTHCHECK on the cheap, database-free GET /health (liveness) on the container's own
+# port. Interval 30 s, timeout 10 s, 3 retries: unhealthy after about 90 s of a dead /health, slower than
+# the watchdog (10 s x 3) on purpose -- this status is for `docker ps` and the runtime, the watchdog acts.
+# Start period 120 s: a cold start (embedding warmup, the replicators starting) is verified healthy within
+# about 60 s, and a failed probe inside the start period does not count, so a cold start never flaps.
+# The timeout is generous for the same reason as the watchdog's 20 s (host contention is not a dead server).
+HEALTH_CMD='python -c "import urllib.request as u; u.urlopen(\"http://127.0.0.1:8000/health\", timeout=8)"'
+
 "$RT" run -d --name "$CONTAINER" ${LABEL_ARGS[@]+"${LABEL_ARGS[@]}"} \
   --restart unless-stopped \
+  --health-cmd "$HEALTH_CMD" --health-interval 30s --health-timeout 10s --health-retries 3 --health-start-period 120s \
   --memory 960m --cpus 4 \
   -p "0.0.0.0:$PORT:8000" \
   -p "$GRAPH_BIND:$GRAPH_PORT:8765" \
@@ -1201,4 +1227,20 @@ else:
             line += f"; {no_store} 403 (not listed)"
         print(line)
 PY
+
+# Item 108: the new container is verified, so the deploy hold is lifted, and the watchdog (systemd user
+# service memora-watchdog-<container>) is installed or refreshed from this tag. A rehearsal's scratch container
+# gets no service (the labels mark it); a failure here fails the deploy loudly: a verified container with
+# no supervisor is exactly the state this item removes.
+# --- watchdog release + install (Item 108; tests/test_deploy_memora_all.py runs this block on its own) ---
+if [ -f "$WATCHDOG" ]; then
+  python3 "$WATCHDOG" release --container "$CONTAINER"
+  if [ "${#LABEL_ARGS[@]}" -eq 0 ]; then
+    bash "$REPO/scripts/install_memora_watchdog.sh" "$CONTAINER" "$PORT" "$RT" \
+      || { echo "DEPLOY VERIFIED, but the watchdog could not be installed (above): $CONTAINER has no supervisor" >&2; exit 1; }
+  else
+    echo "rehearsal: watchdog service not installed"
+  fi
+fi
+# --- end watchdog release + install ---
 REMOTE

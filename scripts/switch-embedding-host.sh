@@ -149,6 +149,14 @@ while IFS='=' read -r key value; do
   ENV_ARGS+=(-e "$key=$value")
 done <<< "$ENV_LINES"
 
+# Item 108: hold the watchdog (installed by the deploy) so it does not restart the container this script
+# stops on purpose; the hold expires by itself after 45 minutes, and is released after /health answers below.
+WATCHDOG_BIN="$HOME/.local/libexec/memora/memora_watchdog.py"
+if [ -f "$WATCHDOG_BIN" ]; then
+  python3 "$WATCHDOG_BIN" hold --container memora-all --minutes 45 --reason "switch-embedding-host" \
+    || { echo "cannot hold the watchdog — aborting before touching the live container" >&2; exit 1; }
+fi
+
 docker stop memora-all
 docker rename memora-all "memora-all-embhost-$TS"
 
@@ -186,6 +194,7 @@ if [ "$healthy" -ne 1 ]; then
   echo "still not healthy after ~60s — check: docker logs memora-all" >&2
   exit 1
 fi
+if [ -f "$WATCHDOG_BIN" ]; then python3 "$WATCHDOG_BIN" release --container memora-all; fi
 
 python3 - <<'PY'
 import json, sys, time, urllib.request

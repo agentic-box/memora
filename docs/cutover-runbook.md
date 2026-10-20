@@ -169,6 +169,72 @@ live cutover.
 - Step f's checks (mode `write`, not halted, lag 0) and step g's compare
   are the gate before the thaw.
 
+## Recovery: memora-all restarts itself (Item 108)
+
+**The probe is the authority.** Whether memora-all is alive is decided by `GET /health` answering (the
+database-free liveness route), never by the runtime's state: a container can be "running" and dead
+(m1003, the Apple container runtime), and a container that was `docker kill`ed counts as a manual
+stop, so `--restart unless-stopped` leaves it down (2026-10-17: every container on the deploy host was
+killed and memora-all stayed down until someone restarted it by hand). Two layers:
+
+1. **A HEALTHCHECK on the container** (set by `scripts/deploy-memora-all.sh`): `GET /health` on the
+   container's own port 8000, every 30 s, timeout 10 s, 3 retries, start period 120 s. `docker ps`
+   shows `healthy`/`unhealthy`. A cold start (embedding warmup, the replicators starting) is verified
+   healthy within about 60 s, and a failed check inside the 120 s start period does not count, so a
+   start never flaps. Unhealthy takes about 90 s of a dead `/health`, deliberately slower than the
+   watchdog: this status is for people and the runtime, the watchdog acts.
+2. **A watchdog service on the deploy host** (`memora-watchdog-memora-all.service`, a systemd *user*
+   service, installed by the deploy from the tagged checkout; `scripts/memora_watchdog.py` is the
+   same reviewed supervisor the macOS launchd job uses). A service rather than a timer or cron
+   because the supervisor is already a loop with an exclusive lock, a failure threshold, backoff and
+   a post-start check, and systemd restarts the watchdog itself (`Restart=always`; user lingering is
+   on). It probes `/health` every 10 s with a 20 s timeout.
+   - **Dead or not running** (killed, exited, hung, 503): after 3 failed probes in a row it starts a
+     stopped container, or stops (TERM, then KILL after 15 s) and starts a running-but-dead one, then
+     requires `/health` to answer within 90 s. Detected and back within about 30 s of a kill, and
+     about 100 s of a hung process (3 probes of 20 s each plus the intervals). It issues only
+     `inspect`, `stop`, `kill`, `start`, `unpause`: never `rm`, `run` or `create`, and nothing on a
+     volume. A container that does not exist is reported, not created.
+   - **A degraded store never restarts it**: only `/health`, never `/health/db`.
+   - **Backoff and cap:** 30 s doubling to 600 s between attempts, and at most 3 attempts (a failed one
+     counts, a successful one counts) in a rolling hour. The next one is not made: it alerts "GIVING
+     UP" once and takes no action until `/health` answers again. A given-up container is left down on
+     purpose; look at it, fix it, `docker start memora-all` (the service resumes by itself) or restart
+     the service to reset the count.
+   - **Alerts:** one clmux message to the leader on each restart attempt (success or failure) and on
+     giving up, from `scripts/memora_watchdog_alert_clmux.sh` (no token can travel in it; long
+     token-like strings are redacted). The recipient is NOT in the repo: put
+     `MEMORA_WATCHDOG_ALERT_TO=<node>/<agent>` in `~/.config/memora/watchdog.env` on the deploy host (the
+     installer warns when it is missing; alerts are then only logged). **The sender is unverified:** clmux
+     has no identity path for a non-interactive service yet, so the message arrives as "unknown sender,
+     claimed from memora-watchdog" and its text starts with "[UNVERIFIED sender, no clmux service
+     identity yet]"; anyone on the host could forge it. If clmux is unreachable it is logged and the
+     watchdog carries on.
+   - **Logs:** `~/.local/var/log/memora-watchdog-memora-all.log` (every decision),
+     `~/.local/var/log/memora-watchdog-alerts.log` (every alert); `systemctl --user status
+     memora-watchdog-memora-all`.
+3. **An intentional stop must hold the watchdog**, or it will be started again within about 30 s.
+   The deploy does this itself (held before it stops the container, released after the new one is
+   verified; a deploy that fails leaves the hold, which expires on its own after 45 minutes). For
+   anything else (a rollback, the stopped-required phases of `local_primary.py`, a manual
+   `docker stop memora-all`):
+
+   ```sh
+   python3 ~/.local/libexec/memora/memora_watchdog.py hold --container memora-all --minutes 45 --reason "rollback"
+   # ... stop, work, start ...
+   python3 ~/.local/libexec/memora/memora_watchdog.py release --container memora-all
+   ```
+
+   While held the watchdog neither probes nor acts. A stale hold (past its expiry, or unreadable) is
+   ignored and removed, so a forgotten hold never blocks recovery for more than its length.
+   `scripts/switch-embedding-host.sh` holds and releases by itself.
+
+Rehearsed on the deploy host with a scratch container (not memora-all) and the real installer: a
+`docker kill` was back in 26-28 s; a process answering 503 in 38 s; a hung process in 97 s; a held kill
+stayed down for the whole hold and was restarted 26 s after the release; a stale hold was ignored; a
+crash loop got 3 attempts, then GIVING UP, then no further action. Every restart and the give-up
+reached the leader's inbox.
+
 ## Rollback
 
 **Before the thaw (steps a–g; the store is still frozen).**

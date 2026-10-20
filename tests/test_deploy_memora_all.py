@@ -95,6 +95,17 @@ def deploy(tmp_path):
     (old / "freeze").mkdir()
     (old / "freeze" / "alpha").write_text("")
 
+    # Item 108: the deploy-host checkout carries the watchdog scripts; stubs record their calls in the
+    # runtime call log, so the ORDER against stop/run is visible. (The real ones: tests/test_watchdog.py.)
+    wd_dir = home / "repos" / "memora" / "scripts"
+    wd_dir.mkdir()
+    _exe(wd_dir / "memora_watchdog.py",
+         '#!/usr/bin/env python3\nimport os, sys\n'
+         'open(os.environ["CALL_LOG"], "a").write("WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n'
+         'sys.exit(int(os.environ.get("WATCHDOG_HOLD_RC", "0")) if sys.argv[1:2] == ["hold"] else 0)\n')
+    _exe(wd_dir / "install_memora_watchdog.sh",
+         '#!/bin/bash\nprintf "INSTALL\\x1f%s\\x1f\\x1e" "$*" >> "$CALL_LOG"\nexit "${WATCHDOG_INSTALL_RC:-0}"\n')
+
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     tool_log = tmp_path / "tools.txt"
@@ -360,15 +371,15 @@ def test_memory_limit_is_the_measured_gate(deploy):
 # ---------------------------------------------------------------- R1: rehearsal parameters
 
 def test_the_defaults_are_the_production_deploy(deploy):
-    """Unparameterised: ssh to deploy-host, docker, the v0.5.7.4 checkout, memora-all
+    """Unparameterised: ssh to deploy-host, docker, the v0.5.7.5 checkout, memora-all
     on 8920 with memora-all-data and memora:latest, the tokens from
     ~/.config/memora-lp."""
     proc, calls, cfg = deploy()
     tools = deploy.tools.read_text().splitlines()
     assert tools[0] == "ssh deploy-host"
     assert ("deploy target: host=deploy-host runtime=docker container=memora-all volume=memora-all-data "
-            "image=memora:latest port=8920 graph=100.64.0.10:8766 tag=v0.5.7.4 secrets=~/.config/memora-lp") in proc.stdout
-    assert any(t.startswith("git ") and "checkout v0.5.7.4" in t for t in tools)
+            "image=memora:latest port=8920 graph=100.64.0.10:8766 tag=v0.5.7.5 secrets=~/.config/memora-lp") in proc.stdout
+    assert any(t.startswith("git ") and "checkout v0.5.7.5" in t for t in tools)
     run = _new_container_run(calls)
     assert run[run.index("--name") + 1] == "memora-all" and run[-1] == "memora:latest"
     assert "0.0.0.0:8920:8000" in _flag_values(run, "-p")
@@ -874,6 +885,7 @@ def poststart(deploy, tmp_path):
             "DEPLOY_ENV_FILE": str(envf), "DEPLOY_PORT": str(fake.port), "DEPLOY_TAG": "v0.5.0",
             "DEPLOY_GRAPH_PORT": str(fake.port),
             "DEPLOY_REPO": str(deploy.home / "repos" / "memora"), "DEPLOY_STORE_WAIT_S": "2"})
+        run.calls = calls
         return proc, fake
 
     yield run
@@ -1031,7 +1043,7 @@ class TestRemoteArguments:
         line = (tmp_path / "ssh-command.txt").read_text().strip()
         params = _decode_blob(line)
         assert len(params) == N_REMOTE_ARGS
-        assert params[0] == "v0.5.7.4" and params[3] == "docker" and params[4] == "memora-all"
+        assert params[0] == "v0.5.7.5" and params[3] == "docker" and params[4] == "memora-all"
         assert params[12] == ""                      # DEPLOY_LABELS: empty in production
         assert params[13] == "~/.config/memora-lp"
         assert params[17] == ""                      # MEMORA_REPLICAS_B64: empty (dark)
@@ -1431,3 +1443,82 @@ class TestApiSmokeCheck:
         proc, _ = poststart({"gamma": {"replication": REPL_OK}}, api={self.SMOKE: ["memora"]},
                             smoke_token=self.SMOKE, server_api=False)
         assert proc.returncode != 0 and "without a token answered 404, not 401" in proc.stderr
+
+
+class TestWatchdogWiring:
+    """Item 108: the deploy holds the watchdog, gives the container a HEALTHCHECK, then installs the watchdog."""
+
+    def test_hold_before_stop_and_release_after_the_verification(self, poststart):
+        proc, _ = poststart({"gamma": {**FROZEN, "replication": REPL_OK}})
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        calls = poststart.calls
+        hold = _index(calls, lambda c: c[0] == "WATCHDOG" and c[1].startswith("hold"))
+        stop = _index(calls, lambda c: c == ["stop", "memora-rh"])
+        run = _index(calls, lambda c: c[:2] == ["run", "-d"])
+        release = _index(calls, lambda c: c[0] == "WATCHDOG" and c[1].startswith("release"))
+        assert hold < stop < run < release, [c[0] for c in calls]
+        assert calls[hold][1] == "hold --container memora-rh --minutes 45 --reason deploy v0.5.0"
+        assert calls[release][1] == "release --container memora-rh"
+        assert "rehearsal: watchdog service not installed" in proc.stdout     # labelled: no service
+        assert not [c for c in calls if c[0] == "INSTALL"]
+
+    def test_the_container_gets_a_healthcheck_on_its_own_liveness_endpoint(self, deploy):
+        proc, calls, _ = deploy()
+        cmd = _flag_values(_new_container_run(calls), "--health-cmd")
+        assert len(cmd) == 1 and "127.0.0.1:8000/health\\\"" in cmd[0] and "/health/db" not in cmd[0]
+        run = _new_container_run(calls)
+        assert _flag_values(run, "--health-interval") == ["30s"] and _flag_values(run, "--health-timeout") == ["10s"]
+        assert _flag_values(run, "--health-retries") == ["3"] and _flag_values(run, "--health-start-period") == ["120s"]
+
+    def test_a_hold_that_cannot_be_set_refuses_before_the_stop(self, deploy):
+        proc, calls, _ = deploy(runtime_env={"WATCHDOG_HOLD_RC": "1"})
+        assert proc.returncode != 0 and "cannot hold the watchdog" in proc.stderr
+        assert not [c for c in calls if c[:1] == ["stop"] or c[:2] == ["run", "-d"] or c[:1] == ["rename"]]
+
+    def test_a_deploy_that_fails_verification_leaves_the_hold_and_installs_nothing(self, deploy):
+        proc, calls, _ = deploy()                   # nothing answers /health: the deploy fails after the run
+        assert proc.returncode != 0 and [c for c in calls if c[:2] == ["run", "-d"]]
+        assert [c for c in calls if c[0] == "WATCHDOG" and c[1].startswith("hold")]
+        assert not [c for c in calls if c[0] == "INSTALL" or (c[0] == "WATCHDOG" and c[1].startswith("release"))]
+
+    def test_a_tag_without_the_watchdog_script_is_deployed_with_a_note(self, deploy):
+        (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").unlink()
+        proc, calls, _ = deploy()
+        assert "no watchdog hold" in proc.stdout
+        assert [c for c in calls if c[:2] == ["run", "-d"]]
+        assert not [c for c in calls if c[0] in ("WATCHDOG", "INSTALL")]
+
+    def _tail(self, tmp_path, *, labels, install_rc=0, script=True):
+        """The release+install block of the remote script, run on its own with stubs."""
+        text = Path(SCRIPT).read_text()
+        block = text[text.index("# --- watchdog release + install"):text.index("# --- end watchdog release + install")]
+        repo = tmp_path / "tailrepo"
+        (repo / "scripts").mkdir(parents=True)
+        log = tmp_path / "tail.log"
+        if script:
+            _exe(repo / "scripts" / "memora_watchdog.py", f'#!/usr/bin/env python3\nimport sys\n'
+                 f'open("{log}", "a").write("watchdog " + " ".join(sys.argv[1:]) + "\\n")\n')
+        _exe(repo / "scripts" / "install_memora_watchdog.sh",
+             f'#!/bin/bash\necho "install $*" >> "{log}"\nexit {install_rc}\n')
+        label = "LABEL_ARGS=(--label x=y)" if labels else "LABEL_ARGS=()"
+        prog = (f'set -euo pipefail\nREPO={repo}\nWATCHDOG=$REPO/scripts/memora_watchdog.py\nCONTAINER=memora-all\n'
+                f'PORT=8920\nRT=docker\n{label}\n{block}\necho tail-done\n')
+        proc = subprocess.run(["bash", "-c", prog], capture_output=True, text=True, timeout=30)
+        return proc, (log.read_text().splitlines() if log.exists() else [])
+
+    def test_production_releases_the_hold_then_installs_the_service(self, tmp_path):
+        proc, lines = self._tail(tmp_path, labels=False)
+        assert proc.returncode == 0 and lines == ["watchdog release --container memora-all", "install memora-all 8920 docker"]
+
+    def test_a_failed_install_fails_a_verified_deploy_loudly(self, tmp_path):
+        proc, lines = self._tail(tmp_path, labels=False, install_rc=1)
+        assert proc.returncode != 0 and "memora-all has no supervisor" in proc.stderr and "tail-done" not in proc.stdout
+
+    def test_a_rehearsal_label_installs_nothing(self, tmp_path):
+        proc, lines = self._tail(tmp_path, labels=True)
+        assert proc.returncode == 0 and lines == ["watchdog release --container memora-all"]
+        assert "rehearsal: watchdog service not installed" in proc.stdout
+
+    def test_without_the_script_the_block_does_nothing(self, tmp_path):
+        proc, lines = self._tail(tmp_path, labels=False, script=False)
+        assert proc.returncode == 0 and lines == []

@@ -99,3 +99,12 @@ tail -f ~/.local/var/log/memora-watchdog-alerts.log
 
 Replace the script to route elsewhere; it is invoked as
 `<cmd> <container> <message>` and must exit 0 on delivery.
+
+## Linux deploy host (Item 108)
+
+The same `scripts/memora_watchdog.py` also supervises memora-all under Docker as a systemd user service,
+installed by `scripts/deploy-memora-all.sh` (`scripts/install_memora_watchdog.sh`). It adds a deploy **hold**
+(`memora_watchdog.py hold|release --container C`), a **cap** of restart attempts per hour
+(`MEMORA_WATCHDOG_MAX_RESTARTS_PER_HOUR`, 0 = off, which is this launchd job's behaviour), the runtime
+(`MEMORA_WATCHDOG_RUNTIME=docker`) and a clmux alert hook. See "Recovery: memora-all restarts itself" in
+`docs/cutover-runbook.md`.
