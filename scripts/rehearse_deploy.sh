@@ -357,7 +357,9 @@ check "a write to the frozen store is refused" bash -c "! \"$RT\" exec -i \"$NEW
 from memora import storage
 c = storage.backend_for(\"memora\").connect(); c.execute(\"INSERT INTO memories (content) VALUES (1)\"); c.commit()'"
 STORE_HOST="$("$RT" volume inspect "$VOL" --format '{{.Mountpoint}}')/memora.db"
-MEMORA_D1_READ_TOKEN=unused "${LP[@]}" compare memora --mode barrier --store "$STORE_HOST" --account none \
+# Item 110's D1 read-replication check runs before the "replication is not installed" refusal this step looks for,
+# and this rehearsal has no D1 to ask (account "none"): the documented override skips only that check.
+MEMORA_D1_ALLOW_READ_REPLICATION=1 MEMORA_D1_READ_TOKEN=unused "${LP[@]}" compare memora --mode barrier --store "$STORE_HOST" --account none \
   --database-id none --no-record "${TOK[@]}" --out-dir "$RH_ROOT/compare" > "$RH_ROOT/compare.json" 2>&1
 grep -q "replication is not installed" "$RH_ROOT/compare.json" \
   && pass "compare --mode barrier reaches the live store and refuses: no replication installed (D1 steps skipped: no D1 here)" \
