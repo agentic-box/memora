@@ -376,10 +376,18 @@ def _compare(args) -> int:
     memora-all's admin route, or directly with --service-stopped). Exit 0
     clean, 5 diffs, 6 skipped (nightly: the acks did not reach H)."""
     from memora import compare as cmp
-    from memora.backends import D1SelectOnlyConnection
+    from memora.backends import D1SelectOnlyConnection, ReadReplicationRefused, ensure_read_replication_disabled
     from memora.replicator import iter_log
 
-    reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, lp.read_token(args.read_token_file)))
+    # This compare reads the D1 primary. The check stays here, not on
+    # D1SelectOnlyConnection: the replicator uses that class for a write-only
+    # replica and must not grow this refusal.
+    token = lp.read_token(args.read_token_file)
+    try:
+        ensure_read_replication_disabled(args.account, args.database_id, token)
+    except ReadReplicationRefused as exc:
+        raise lp.L5Refused(str(exc)) from exc
+    reader = lp.D1Reader(D1SelectOnlyConnection(args.account, args.database_id, token))
     admin = None
     if args.admin_token_file:
         if not args.health_token_file:

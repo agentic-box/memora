@@ -46,9 +46,13 @@ class Rig:
 
     def _info(self):
         self.info_calls += 1
-        if self.info_hook:
-            return self.info_hook(self.info_calls)
-        return dict(self.info)
+        raw = self.info_hook(self.info_calls) if self.info_hook else self.info
+        info = dict(raw)
+        # Production fail-closes when the metadata has no mode. This rig is an
+        # identity fixture: a missing mode means disabled, so existing cases
+        # still reach the gate they test. An explicit mode is left alone.
+        info.setdefault("read_replication_mode", "disabled")
+        return info
 
     def _writer(self):
         w = ads.GuardedScratchD1Connection(self.path, ACCT, DBID)
@@ -207,6 +211,14 @@ def test_a_wrong_id_is_refused_before_any_write(tmp_path, rig):
     with pytest.raises(AddStoreRefused):
         rig.run(tmp_path)
     assert rig.writers == []
+
+
+def test_read_replication_on_is_refused_before_any_write(tmp_path, rig):
+    rig.info = {"uuid": DBID, "name": NAME, "read_replication_mode": "auto"}
+    with pytest.raises(AddStoreRefused, match="read_replication"):
+        rig.run(tmp_path)
+    assert rig.writers == []
+    assert ads.read_state("newstore", tmp_path / "data") is None
 
 
 def test_an_id_already_configured_is_refused(tmp_path, rig):

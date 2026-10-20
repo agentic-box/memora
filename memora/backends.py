@@ -2168,6 +2168,120 @@ class _NoResponse(Exception):
         self.cause = cause
 
 
+class ReadReplicationRefused(RuntimeError):
+    """A d1:// primary has read replication on, or its mode could not be read.
+
+    Session bookmarks (``cf-d1-session-token``) are not REST read-your-writes
+    while read replication is enabled. The message names the database id and
+    the override, never the account id or the token.
+    """
+
+
+ALLOW_READ_REPLICATION_ENV = "MEMORA_D1_ALLOW_READ_REPLICATION"
+
+# Tests set this to (account_id, database_id, token) -> mode. Production
+# leaves it None, which calls shadow.read_replication_mode (the live GET).
+_replication_mode_hook = None
+
+
+def read_replication_allowed() -> bool:
+    """True only for the exact value ``1``. ``true`` and ``yes`` do not override."""
+    return os.environ.get(ALLOW_READ_REPLICATION_ENV) == "1"
+
+
+def warn_read_replication_override(database_id: str) -> None:
+    logger.warning(
+        "D1 database %s: %s=1, starting without checking read replication",
+        database_id, ALLOW_READ_REPLICATION_ENV)
+
+
+def require_read_replication_disabled(database_id: str, mode: str) -> None:
+    """Raise unless ``mode`` is exactly ``disabled``. Empty or missing is unknown."""
+    if not isinstance(mode, str) or mode == "":
+        mode = "unknown"
+    if mode == "disabled":
+        return
+    raise ReadReplicationRefused(
+        f"D1 database {database_id} has read_replication.mode={mode!r}; "
+        f"turn read replication off (set it to disabled) before using this "
+        f"database as a primary. Session bookmarks are not read-your-writes "
+        f"while it is on. Set {ALLOW_READ_REPLICATION_ENV}=1 to start anyway.")
+
+
+def _fetch_read_replication_mode(account_id: str, database_id: str, token: str) -> str:
+    """The mode, or ReadReplicationRefused when the GET cannot be made.
+
+    Fail closed: a network error, a permission error, or a body that is not
+    the documented object all refuse. The override is applied by the caller
+    before this runs, so a dead metadata API cannot brick an explicit opt-in.
+    The token is sent only as the Authorization header of the live GET.
+    """
+    try:
+        if _replication_mode_hook is not None:
+            mode = _replication_mode_hook(account_id, database_id, token)
+        else:
+            from .shadow import read_replication_mode
+
+            mode = read_replication_mode(account_id, database_id, token)
+    except ReadReplicationRefused:
+        raise
+    except Exception as exc:
+        detail = str(exc).splitlines()[0][:200]
+        raise ReadReplicationRefused(
+            f"D1 database {database_id}: cannot read read_replication.mode "
+            f"({type(exc).__name__}: {detail}). Refusing to start. "
+            f"Set {ALLOW_READ_REPLICATION_ENV}=1 to start anyway."
+        ) from exc
+    if not isinstance(mode, str) or mode == "":
+        return "unknown"
+    return mode
+
+
+def ensure_read_replication_disabled(account_id: str, database_id: str, token: str) -> None:
+    """Refuse unless this database's read replication is disabled.
+
+    Fail closed for a primary. ``MEMORA_D1_ALLOW_READ_REPLICATION=1`` skips
+    the GET and logs a warning, so a dead metadata API cannot brick a start
+    the operator explicitly allowed. Any other value does not override.
+
+    Call sites that READ a d1:// primary: ``D1Backend.connect`` (and
+    ``BootstrapD1Backend.connect``), server startup for every configured
+    d1:// primary, add-store bootstrap (the mode ``fetch_d1_info`` already
+    parsed), and ``local_primary.py compare`` before it builds a reader.
+
+    The replicator is exempt. Its D1 connection is a write-only replica
+    target (``D1SelectOnlyConnection.from_env`` in ``replicator.py``), and
+    this check is not applied to ``D1SelectOnlyConnection`` itself.
+    """
+    if read_replication_allowed():
+        warn_read_replication_override(database_id)
+        return
+    require_read_replication_disabled(
+        database_id, _fetch_read_replication_mode(account_id, database_id, token))
+
+
+def check_configured_d1_primaries() -> None:
+    """Refuse startup when any configured d1:// primary has read replication on.
+
+    Local paths are skipped. With no registry, only a d1:// ``STORAGE_BACKEND``
+    is checked. A missing token or a bad registry still raises
+    ``DatabaseRegistryError`` from storage. A store the data-volume check
+    already refused is still checked: that refusal keeps the process up, and
+    must not hide this one or look like a transient prewarm failure. The
+    replicator is not visited.
+    """
+    from .storage import STORAGE_BACKEND, _backend_for_unchecked, database_registry
+
+    registry = database_registry()
+    if not registry:
+        if isinstance(STORAGE_BACKEND, D1Backend):
+            STORAGE_BACKEND._require_read_replication_disabled()
+        return
+    for name, uri in registry.items():
+        if str(uri).startswith("d1://"):
+            _backend_for_unchecked(name)._require_read_replication_disabled()
+
+
 class D1Backend(StorageBackend):
     """Cloudflare D1 backend - uses D1 as primary database via HTTP API.
 
@@ -2181,7 +2295,8 @@ class D1Backend(StorageBackend):
     the advanced bookmark on each successful HTTP call. Concurrent writers race
     on the final assignment (last-writer-wins), which is fine because D1
     bookmarks are monotonically advancing — any surviving bookmark is a valid
-    continuation point.
+    continuation point. Those bookmarks are not REST read-your-writes while
+    read replication is enabled, so connect refuses unless the mode is disabled.
     """
 
     def __init__(self, account_id: str, database_id: str, api_token: str):
@@ -2198,6 +2313,11 @@ class D1Backend(StorageBackend):
         self._latest_bookmark: Optional[str] = None
         self._bookmark_lock = threading.Lock()
         self._transports = threading.local()
+        # A passing read-replication check (disabled, or the explicit
+        # override) is remembered for this instance. A refusal or a failed
+        # GET is not, so the next connect tries again.
+        self._replication_lock = threading.Lock()
+        self._read_replication_cleared = False
         # The registry name (set by storage.backend_for); None when the
         # backend was built directly -- the journal is then keyed by the
         # database id.
@@ -2243,15 +2363,36 @@ class D1Backend(StorageBackend):
         first use; see memora/intent_journal.py)."""
         return journal_for(self.store_name or self.database_id)
 
+    def _require_read_replication_disabled(self) -> None:
+        """Refuse this primary unless read replication is disabled.
+
+        Runs before the intent journal is opened. The override skips the GET
+        and warns once per instance. A passing check is cached; a refusal or
+        an unreadable mode is not.
+        """
+        with self._replication_lock:
+            if self._read_replication_cleared:
+                return
+            if read_replication_allowed():
+                warn_read_replication_override(self.database_id)
+                self._read_replication_cleared = True
+                return
+            mode = _fetch_read_replication_mode(self.account_id, self.database_id, self.api_token)
+            require_read_replication_disabled(self.database_id, mode)
+            self._read_replication_cleared = True
+
     def connect(self, *, check_same_thread: bool = True) -> D1Connection:
         """Return a D1 connection seeded with the backend's latest bookmark.
 
+        Refuses first (``ReadReplicationRefused``) when this database's read
+        replication is not disabled, before the intent journal is opened.
         When the store's intent journal cannot be used (held by another
         process, no writable data dir, corrupt before its final line, or
         broken), the connection is READ-ONLY: SELECTs work, every mutation
         raises StoreReadOnlyError, and schema.connect skips schema setup.
         A connection whose journal breaks later refuses mutations too (the
         gate refuses while the journal is broken)."""
+        self._require_read_replication_disabled()
         journal = self.journal()
         unusable = journal.fatal or journal.broken
         self.write_gate()

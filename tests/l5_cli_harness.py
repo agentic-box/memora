@@ -34,6 +34,9 @@ def main() -> int:
         return replica.reader_post(body)
 
     backends.D1SelectOnlyConnection._post = reader_post
+    # The fake database is a local file, so it has no read-replication metadata.
+    # compare refuses a d1:// primary before it builds this reader; report disabled.
+    backends._replication_mode_hook = lambda *_a: "disabled"
 
     mode = os.environ.get("L5_TEST_D1_WRITES", "")
 

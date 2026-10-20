@@ -581,6 +581,27 @@ def applier_for(name: str) -> ShadowApplier:
         return app
 
 
+def replication_mode_of(body: object) -> str:
+    """``read_replication.mode`` from a D1 database GET body.
+
+    The one parser for the shadow applier and for a ``d1://`` primary. A
+    missing, empty, or non-object body, result, or ``read_replication`` is
+    ``"unknown"`` (a primary then refuses). A present mode is returned as text.
+    """
+    if not isinstance(body, dict):
+        return "unknown"
+    result = body.get("result")
+    if not isinstance(result, dict):
+        return "unknown"
+    replication = result.get("read_replication")
+    if not isinstance(replication, dict):
+        return "unknown"
+    mode = replication.get("mode")
+    if mode is None or mode == "":
+        return "unknown"
+    return str(mode)
+
+
 def read_replication_mode(account_id: str, database_id: str, token: str) -> str:
     """D1's read_replication.mode for a database, from the REST API."""
     import urllib.request
@@ -589,7 +610,7 @@ def read_replication_mode(account_id: str, database_id: str, token: str) -> str:
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = json.loads(resp.read().decode())
-    return str(((body.get("result") or {}).get("read_replication") or {}).get("mode") or "unknown")
+    return replication_mode_of(body)
 
 
 def start_shadow_appliers(*, reader_factory=None, replication_mode=None) -> Dict[str, Dict[str, Any]]:

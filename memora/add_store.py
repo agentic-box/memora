@@ -41,7 +41,14 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
-from .backends import D1Backend, D1Connection
+from .backends import (
+    D1Backend,
+    D1Connection,
+    ReadReplicationRefused,
+    read_replication_allowed,
+    require_read_replication_disabled,
+    warn_read_replication_override,
+)
 from .local_primary import L5Refused, _user_table
 from .sql_classify import READ, classify_statement
 
@@ -122,9 +129,11 @@ class BootstrapD1Connection(_GuardMixin, D1Connection):
 
 class BootstrapD1Backend(D1Backend):
     """A D1Backend whose connections are guarded. Everything else (gate,
-    journal, bookmarks) is the stock backend."""
+    journal, bookmarks, the read-replication refusal) is the stock backend.
+    ``connect`` does not call ``super().connect``; it calls the same check."""
 
     def connect(self, *, check_same_thread: bool = True) -> D1Connection:
+        self._require_read_replication_disabled()
         journal = self.journal()
         unusable = journal.fatal or journal.broken
         self.write_gate()
@@ -298,7 +307,11 @@ def _save_state(db: str, state: Dict[str, Any], data_dir: Optional[Path]) -> Non
 
 def fetch_d1_info(account_id: str, database_id: str, token: str, *, timeout: float = 30.0,
                   opener: Callable[..., Any] = urllib.request.urlopen) -> Dict[str, Any]:
-    """The database's {uuid, name} from Cloudflare's REST API (read token)."""
+    """The database's {uuid, name, read_replication_mode} from Cloudflare's REST API (read token).
+
+    The mode uses ``shadow.replication_mode_of`` (the same parser as a d1:// primary). A network
+    or permission failure is ``AddStoreRefused``; a missing mode is ``"unknown"`` and the identity
+    check then refuses."""
     url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/d1/database/{database_id}"
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
     try:
@@ -309,8 +322,11 @@ def fetch_d1_info(account_id: str, database_id: str, token: str, *, timeout: flo
                               "cannot see it (is the token's account scope right?); nothing was changed")
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise AddStoreRefused(f"cannot read the pinned database's identity: {exc}; nothing was changed")
+    from .shadow import replication_mode_of
+
     result = body.get("result") or {}
-    return {"uuid": result.get("uuid"), "name": result.get("name")}
+    return {"uuid": result.get("uuid"), "name": result.get("name"),
+            "read_replication_mode": replication_mode_of(body)}
 
 
 # ------------------------------------------------------------------ bootstrap
@@ -381,11 +397,30 @@ def _verify_initialised(deps: BootstrapDeps, *, want: Optional[Dict[str, Any]] =
     return {"tables": sorted(counts), "meta": [EPOCH_KEY]}
 
 
+def _refuse_read_replication(info: Dict[str, Any], database_id: str) -> None:
+    """Refuse a primary whose mode (already parsed by ``fetch_d1_info``) is not disabled.
+
+    Missing or empty is ``unknown``, which refuses. The override skips the refuse and warns.
+    Called only after the uuid and name match, so a wrong database stays an identity error.
+    """
+    if read_replication_allowed():
+        warn_read_replication_override(database_id)
+        return
+    mode = info.get("read_replication_mode")
+    if not isinstance(mode, str) or mode == "":
+        mode = "unknown"
+    try:
+        require_read_replication_disabled(database_id, mode)
+    except ReadReplicationRefused as exc:
+        raise AddStoreRefused(f"{exc}; nothing was changed") from exc
+
+
 def _check_identity(deps: BootstrapDeps, database_id: str, d1_name: str, where: str) -> None:
     info = deps.info()
     if info.get("uuid") != database_id or info.get("name") != d1_name:
         raise AddStoreRefused(f"the database at the pinned id is {info.get('name')!r}/{info.get('uuid')!r}, not the "
                               f"pinned {d1_name!r}/{database_id!r} {where}; nothing was changed")
+    _refuse_read_replication(info, database_id)
 
 
 def bootstrap_d1(db: str, *, account_id: str, database_id: str, d1_name: str, deps: BootstrapDeps) -> Dict[str, Any]:

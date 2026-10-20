@@ -237,6 +237,8 @@ Add to `.mcp.json` in your project root:
 
 With D1, use `--no-graph` to disable the local visualization server. Instead, use the hosted graph at your Cloudflare Pages URL (see [Cloud Graph](#cloud-graph)).
 
+A `d1://` primary refuses to start unless that database's read replication is disabled (session bookmarks are not REST read-your-writes while it is on). `MEMORA_D1_ALLOW_READ_REPLICATION=1` starts anyway and logs a warning.
+
 **Cloud DB (S3/R2) - Sync mode:**
 ```json
 {
@@ -286,6 +288,7 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_DATABASES`     | JSON object `{name: uri}` mapping each store this process serves. Names are one URL path segment (`/mcp/<name>`): letters, digits, `-`, `_`, `.` only. Duplicate keys, empty values, unsafe names, or non-objects refuse to start rather than silently picking a store. Unset = single-store (legacy). See [Multi-database routing](#multi-database-routing). |
 | `MEMORA_DEFAULT_DB`    | Registry name a bare `/mcp` uses. Required when the registry has more than one database; with exactly one name, that name is the default. A value not in the registry refuses to start. |
 | `CLOUDFLARE_API_TOKEN` | API token for D1 (`d1://` URI). `CF_API_TOKEN` is accepted as an alias. |
+| `MEMORA_D1_ALLOW_READ_REPLICATION` | Set to `1` to start a `d1://` primary when read replication is on, or when its mode cannot be read. Any other value still refuses. Logs a warning on every start. |
 | `MEMORA_CLOUD_ENCRYPT` | Encrypt the local file before uploading to S3/R2. Unset/`false` = off; `1`/`true`/`yes` = on. |
 | `MEMORA_CLOUD_COMPRESS`| Compress the local file before uploading to S3/R2. Unset/`false` = off; `1`/`true`/`yes` = on. |
 | `MEMORA_CACHE_DIR`     | Local cache directory for an S3/R2-synced database. Unset: the backend picks a cache path. |

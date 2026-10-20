@@ -598,6 +598,7 @@ def send(self, sql, params=None):
     c = sqlite3.connect(db); c.execute(sql, tuple(params or ())); c.commit(); c.close()
     os._exit(137)   # killed between the server-side commit and the response
 backends.D1Connection._send = send
+backends._replication_mode_hook = lambda *a: "disabled"
 b = backends.D1Backend('acct', 'db1', 'tok'); b.store_name = 's1'
 b.connect().execute("INSERT INTO memories (content) VALUES (?)", ('committed, response lost',))
 """
@@ -726,6 +727,7 @@ def send(self, sql, params=None):
     rows = [dict(r) for r in c.execute(sql, tuple(params or ())).fetchall()]; c.close()
     return {{"success": True, "result": [{{"results": rows, "meta": {{}}}}]}}
 backends.D1Connection._send = send
+backends._replication_mode_hook = lambda *a: "disabled"
 b = backends.D1Backend('acct', 'db1', 'tok'); b.store_name = 's1'
 conn = schema.connect(b)
 out = {{"read_only": conn.read_only, "rows": conn.execute("SELECT content FROM memories").fetchall()[0]["content"]}}

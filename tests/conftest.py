@@ -25,6 +25,13 @@ def _isolated_write_gate_state(tmp_path_factory, monkeypatch):
 
     monkeypatch.setenv("MEMORA_DATA_DIR", str(tmp_path_factory.mktemp("memora-data")))
     monkeypatch.delenv("MEMORA_READONLY_DBS", raising=False)
+    monkeypatch.delenv("MEMORA_D1_ALLOW_READ_REPLICATION", raising=False)
+    # D1Backend.connect reads read_replication.mode. Tests that build a real
+    # D1Backend must not call Cloudflare. A test that wants another mode, or
+    # the live GET, replaces this hook.
+    from memora import backends as _backends
+
+    monkeypatch.setattr(_backends, "_replication_mode_hook", lambda *_a, **_k: "disabled")
     write_gate._reset_for_tests()
     intent_journal._reset_for_tests()
     # server.main() records /data refusals and installs the admin auth hook

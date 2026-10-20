@@ -3705,9 +3705,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         _fence_live_primaries_or_exit()
 
         # Pre-warm database connection (triggers cloud sync if needed)
-        # This prevents "connection failed" on first MCP connection
+        # This prevents "connection failed" on first MCP connection.
+        # A d1:// primary whose read replication is on, or whose mode cannot
+        # be read, is configuration: the server must not start. A transient
+        # failure of connect() itself still warns.
+        from .backends import ReadReplicationRefused, check_configured_d1_primaries
+
         try:
             print("Initializing database...", file=sys.stderr)
+            check_configured_d1_primaries()
             conn = connect()
             conn.close()
             print("Database ready.", file=sys.stderr)
@@ -3717,6 +3723,9 @@ def main(argv: Optional[list[str]] = None) -> None:
             # running whose storage tools fail on every call -- and it must not
             # reach start_graph_server or mcp.run first. Same rule, and same
             # reason, as an unknown MEMORA_TOOL_PROFILE.
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(2)
+        except ReadReplicationRefused as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(2)
         except Exception as e:
