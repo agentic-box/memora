@@ -2277,11 +2277,10 @@ def ensure_read_replication_disabled(account_id: str, database_id: str, token: s
     target (``D1SelectOnlyConnection.from_env`` in ``replicator.py``), and
     this check is not applied to ``D1SelectOnlyConnection`` itself.
 
-    Out of scope for this item, and not claimed safe: the permission probe,
-    rollback, resume, shadow-night, verify-replication, and embedding
-    preflight. The brief named bootstrap and compare as the direct readers
-    to cover and said not to widen to the others. They still read D1 and
-    do not run this check.
+    This item checks add-store bootstrap and ``local_primary.py compare``
+    only, by leader decision. The permission probe, rollback, resume,
+    shadow-night, verify-replication, and embedding preflight are an
+    unchecked follow-up: neither exempt nor claimed safe.
     """
     if read_replication_allowed():
         warn_read_replication_override(database_id)

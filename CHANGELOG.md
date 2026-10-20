@@ -17,6 +17,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 A d1:// primary refuses to start when D1 read replication is on (Item 110).
 
 - Opening a d1:// database as the primary reads `read_replication.mode` from the D1 REST metadata (the same parser the shadow applier uses). Anything other than `disabled`, including a mode that cannot be read, refuses startup and names the database id. `MEMORA_D1_ALLOW_READ_REPLICATION=1` starts anyway and logs a warning. The same check covers add-store bootstrap and `local_primary.py compare`. The replicator is unchanged: its D1 connection is a write-only replica target. A metadata error whose own text is empty still refuses (startup does not treat it as a transient pre-warm warning). The refusal drops the account id and the token when that error included them.
+- This item checks add-store bootstrap and `local_primary.py compare` only, by leader decision. The permission probe, rollback, resume, shadow-night, verify-replication, and embedding preflight are an unchecked follow-up: neither exempt nor claimed safe.
 
 ## 0.5.7.4 — 2026-10-18
 
