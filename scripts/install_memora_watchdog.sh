@@ -22,10 +22,16 @@ case "$RT" in docker|podman) ;; *) echo "runtime must be docker or podman, not '
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LIB="$HOME/.local/libexec/memora/watchdog-$C"; UNITS="$HOME/.config/systemd/user"; VAR="$HOME/.local/var"
 mkdir -p "$LIB" "$UNITS" "$VAR/log" "$HOME/.local/state/memora-watchdog"
-cp "$HERE/memora_watchdog.py" "$HERE/memora_watchdog_alert_clmux.sh" "$LIB/"
-chmod 755 "$LIB/memora_watchdog.py" "$LIB/memora_watchdog_alert_clmux.sh"
+# Atomic replacement: write a temp file in the same directory, then rename it over the target, so a service that
+# runs the alert hook (or restarts) mid-install sees the old complete file or the new complete one, never a
+# half-copied executable. Each container has its OWN directory, so no other container's files are touched.
+for f in memora_watchdog.py memora_watchdog_alert_clmux.sh; do
+  tmp="$(mktemp "$LIB/.$f.XXXXXX")"
+  cp "$HERE/$f" "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$LIB/$f" || { rm -f "$tmp"; echo "cannot install $f" >&2; exit 1; }
+done
 UNIT="memora-watchdog-$C.service"
-cat > "$UNITS/$UNIT" <<UNIT_EOF
+UNIT_TMP="$(mktemp "$UNITS/.$UNIT.XXXXXX")"
+cat > "$UNIT_TMP" <<UNIT_EOF
 [Unit]
 Description=memora watchdog for $C (restarts it when /health stops answering)
 
@@ -56,6 +62,7 @@ StandardError=append:$VAR/log/memora-watchdog-$C.log
 [Install]
 WantedBy=default.target
 UNIT_EOF
+mv -f "$UNIT_TMP" "$UNITS/$UNIT"
 systemctl --user daemon-reload
 systemctl --user enable "$UNIT" >/dev/null 2>&1
 systemctl --user restart "$UNIT"

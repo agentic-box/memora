@@ -77,6 +77,7 @@ anything on a volume (the data volume holds the primaries), enforced in _cli, no
 from __future__ import annotations
 
 import argparse
+import calendar
 import fcntl
 import json
 import logging
@@ -103,33 +104,88 @@ def default_hold_path(container: str) -> str:
     return os.path.join(base, "memora-watchdog", f"{container}.hold")
 
 
-def read_hold(path: str, now: float):
-    """The live hold as a dict, else None. An expired or unreadable hold is removed: it never blocks recovery."""
+class _HoldLock:
+    """A short-lived exclusive lock that serialises every CHANGE to the hold file (create, release, stale cleanup),
+    so stale cleanup can never delete a hold created after it looked."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path + ".lock"
+
+    def __enter__(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        self.fh = open(self.path, "a+")
+        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.fh.close()
+
+
+_after_stale_read = None        # test hook: runs between "I saw a stale hold" and "I take the lock to remove it"
+
+
+def _load_hold(path: str):
+    """(hold or None, live?) -- live only when it parses and its expiry is in the future; FileNotFoundError passes up."""
+    with open(path) as fh:
+        raw = fh.read()
     try:
-        with open(path) as fh:
-            hold = json.load(fh)
+        hold = json.loads(raw)
         expires = hold["expires"]
-        if isinstance(expires, (int, float)) and expires > now:
-            return hold
+        if isinstance(expires, (int, float)):
+            return raw, hold, expires
+    except (ValueError, KeyError, TypeError):
+        pass
+    return raw, None, None
+
+
+def read_hold(path: str, now: float):
+    """The live hold as a dict, else None. A stale or unreadable hold is removed -- under the hold lock and only if
+    the file still holds the SAME bytes this call judged stale: a hold a deploy replaced in between survives."""
+    try:
+        raw, hold, expires = _load_hold(path)
     except FileNotFoundError:
         return None
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    try:
-        os.unlink(path)
     except OSError:
-        pass
+        raw, hold, expires = None, None, None
+    if hold is not None and expires > now:
+        return hold
+    if _after_stale_read is not None:
+        _after_stale_read()
+    with _HoldLock(path):
+        try:
+            raw2, hold2, expires2 = _load_hold(path)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            return None
+        if hold2 is not None and expires2 > now:
+            return hold2                       # replaced by a fresh hold: leave it
+        if raw2 == raw or raw is None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
     return None
 
 
 def write_hold(path: str, now: float, minutes: float, reason: str) -> dict:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     hold = {"created": now, "expires": now + minutes * 60.0, "reason": reason}
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w") as fh:
-        json.dump(hold, fh)
-    os.replace(tmp, path)
+    with _HoldLock(path):
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(hold, fh)
+        os.replace(tmp, path)
     return hold
+
+
+def release_hold(path: str) -> bool:
+    with _HoldLock(path):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return False
 
 
 class ConfigError(SystemExit):
@@ -285,6 +341,7 @@ class Watchdog:
         self._attempts: list = []
         self.gave_up = False
         self._held_logged = False
+        self._warm_epochs: dict = {}        # StartedAt -> when its start-up grace was first given
         if backoff_max < backoff:
             raise ConfigError("MEMORA_WATCHDOG_BACKOFF_MAX must be >= MEMORA_WATCHDOG_BACKOFF")
         self.container = container
@@ -380,6 +437,32 @@ class Watchdog:
 
     # -- decision ------------------------------------------------------------
 
+    def _warming_up(self) -> bool:
+        """A container that STARTED less than `startup` seconds ago may still be warming (embedding warmup, the
+        replicators starting): its failed probes do not count, so a host or service cold start is not restarted at
+        30 s. Docker/podman only. One grace per StartedAt, and none when another StartedAt got one in the last
+        10 minutes: a crash loop starts afresh every few seconds and must still be restarted."""
+        if self.runtime == "container":
+            return False
+        try:
+            proc = self._cli("inspect", "-f", "{{.State.StartedAt}}", self.container)
+            raw = (proc.stdout or "").strip() if proc.returncode == 0 else ""
+            started = calendar.timegm(time.strptime(raw.split(".")[0].rstrip("Z"), "%Y-%m-%dT%H:%M:%S"))
+        except Exception:
+            return False
+        age = self._wall() - started
+        if not 0 <= age < self.startup:
+            return False
+        now = self._clock()
+        self._warm_epochs = {k: t for k, t in self._warm_epochs.items() if now - t < 600}
+        if raw in self._warm_epochs:
+            return True
+        if self._warm_epochs:
+            return False                    # a different start already had its grace: a loop, not a cold start
+        self._warm_epochs[raw] = now
+        log.info("%s started %.0fs ago; failed probes do not count until %.0fs", self.container, age, self.startup)
+        return True
+
     def held(self):
         """The live hold (a deploy, a rollback, an intentional stop), else None."""
         return read_hold(self.hold_path, self._wall())
@@ -414,6 +497,8 @@ class Watchdog:
             return "healthy"
 
         self.healthy_streak = 0
+        if self._warming_up():
+            return "warming"
         self.failures += 1
         if self.failures < self.threshold:
             log.warning("%s liveness failure %d/%d", self.container, self.failures, self.threshold)
@@ -607,11 +692,7 @@ def _hold_cli(argv) -> int:
         print(f"watchdog held for {args.container} until "
               f"{time.strftime('%H:%M:%S', time.localtime(hold['expires']))}: {args.reason}")
     elif args.action == "release":
-        existed = os.path.exists(path)
-        try:
-            os.unlink(path)
-        except FileNotFoundError:
-            pass
+        existed = release_hold(path)
         print("hold released" if existed else "no hold was set")
     else:
         hold = read_hold(path, now)

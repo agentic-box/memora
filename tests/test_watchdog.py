@@ -529,8 +529,13 @@ class _Docker:
         self.calls = []
         self.fail = {}
         self.on_start = None
+        self.started_at = "2020-01-01T00:00:00.000000000Z"      # long ago: not warming up
+        self.started_queries = 0
 
     def __call__(self, cmd, **kw):
+        if cmd[1] == "inspect" and "{{.State.StartedAt}}" in cmd:      # the warm-up query: not a mutation, not recorded
+            self.started_queries += 1
+            return _Proc(stdout=self.started_at + "\n")
         self.calls.append(cmd)
         verb = cmd[1]
         rigged = self.fail.get(verb)
@@ -1035,3 +1040,185 @@ class TestInstallerIsolation:
         unit = (home / ".config/systemd/user/memora-watchdog-scratch-wd.service").read_text()
         assert "watchdog-scratch-wd/memora_watchdog.py" in unit and "watchdog-memora-all" not in unit
         assert "alerts-scratch-wd.log" in unit
+
+    def test_updating_and_removing_scratch_files_leaves_production_byte_identical(self, tmp_path):
+        import hashlib, shutil
+        home = tmp_path / "home"
+        home.mkdir()
+        _fake_bin(tmp_path, "systemctl", "exit 0\n")
+        _fake_bin(tmp_path, "loginctl", "echo Linger=yes\n")
+        env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+
+        def install(container, port):
+            return subprocess.run(["bash", str(SCRIPTS / "install_memora_watchdog.sh"), container, port, "docker"],
+                                  env=env, capture_output=True, text=True, timeout=60)
+
+        def prod():
+            files = [home / ".config/systemd/user/memora-watchdog-memora-all.service"] + sorted(
+                (home / ".local/libexec/memora/watchdog-memora-all").iterdir())
+            return {str(f): hashlib.sha256(f.read_bytes()).hexdigest() for f in files}
+
+        assert install("memora-all", "8920").returncode == 0
+        before = prod()
+        assert install("rehearsal-x", "18921").returncode == 0
+        assert install("rehearsal-x", "18922").returncode == 0                      # an update
+        shutil.rmtree(home / ".local/libexec/memora/watchdog-rehearsal-x")           # its cleanup
+        (home / ".config/systemd/user/memora-watchdog-rehearsal-x.service").unlink()
+        assert prod() == before
+
+    def test_a_reinstall_replaces_atomically_an_open_old_file_keeps_its_content(self, tmp_path):
+        home = tmp_path / "home"
+        home.mkdir()
+        _fake_bin(tmp_path, "systemctl", "exit 0\n")
+        _fake_bin(tmp_path, "loginctl", "echo Linger=yes\n")
+        env = dict(os.environ, HOME=str(home), PATH=f"{tmp_path / 'bin'}:{os.environ['PATH']}")
+        src = tmp_path / "src"
+        src.mkdir()
+        for name in ("install_memora_watchdog.sh", "memora_watchdog.py", "memora_watchdog_alert_clmux.sh"):
+            (src / name).write_text((SCRIPTS / name).read_text())
+
+        def install():
+            return subprocess.run(["bash", str(src / "install_memora_watchdog.sh"), "memora-all", "8920", "docker"],
+                                  env=env, capture_output=True, text=True, timeout=60)
+
+        assert install().returncode == 0
+        target = home / ".local/libexec/memora/watchdog-memora-all/memora_watchdog_alert_clmux.sh"
+        with open(target) as old:
+            (src / "memora_watchdog_alert_clmux.sh").write_text("#!/bin/bash\necho NEW\n")
+            assert install().returncode == 0
+            assert "NEW" not in old.read(), "the running file was rewritten in place"
+        assert "NEW" in target.read_text()
+        assert not [p for p in target.parent.iterdir() if p.name.startswith(".")], "temp files left behind"
+
+
+class TestHoldFileRaces:
+    def test_a_hold_replaced_between_the_stale_read_and_the_cleanup_survives(self, tmp_path):
+        path = str(tmp_path / "w.hold")
+        pathlib.Path(path).write_text(json.dumps({"expires": 10.0, "reason": "old"}))
+        fresh = {}
+
+        def deploy_replaces_it():
+            fresh.update(watchdog.write_hold(path, 1000.0, 45, "deploy"))     # atomically, after the stale read
+
+        watchdog._after_stale_read = deploy_replaces_it
+        try:
+            got = watchdog.read_hold(path, 1000.0)
+        finally:
+            watchdog._after_stale_read = None
+        assert got is not None and got["reason"] == "deploy", "the stale-cleanup deleted the NEW hold"
+        assert json.loads(pathlib.Path(path).read_text())["reason"] == "deploy"
+
+    def test_an_unreadable_hold_replaced_in_between_survives_too(self, tmp_path):
+        path = str(tmp_path / "w.hold")
+        pathlib.Path(path).write_text("garbage")
+        watchdog._after_stale_read = lambda: watchdog.write_hold(path, 1000.0, 45, "deploy")
+        try:
+            assert watchdog.read_hold(path, 1000.0)["reason"] == "deploy"
+        finally:
+            watchdog._after_stale_read = None
+        assert os.path.exists(path)
+
+    def test_a_stale_hold_is_still_removed_when_nothing_replaces_it(self, tmp_path):
+        path = str(tmp_path / "w.hold")
+        pathlib.Path(path).write_text(json.dumps({"expires": 10.0}))
+        assert watchdog.read_hold(path, 1000.0) is None and not os.path.exists(path)
+
+    def test_stale_cleanup_waits_for_a_hold_being_created(self, tmp_path):
+        """The hold lock serialises create, release and cleanup: a cleanup cannot run inside a create."""
+        import threading
+        path = str(tmp_path / "w.hold")
+        pathlib.Path(path).write_text(json.dumps({"expires": 10.0}))
+        order = []
+        inside = threading.Event()
+        proceed = threading.Event()
+
+        def creator():
+            with watchdog._HoldLock(path):
+                inside.set()
+                assert proceed.wait(10)
+                order.append("create")
+                watchdog.os.replace(_write_tmp(path), path)
+
+        def _write_tmp(p):
+            tmp = p + ".t"
+            pathlib.Path(tmp).write_text(json.dumps({"expires": 5000.0, "reason": "deploy"}))
+            return tmp
+
+        t = threading.Thread(target=creator)
+        t.start()
+        assert inside.wait(10)
+        result = []
+        r = threading.Thread(target=lambda: result.append(watchdog.read_hold(path, 1000.0)))
+        r.start()
+        r.join(0.5)
+        assert r.is_alive(), "the cleanup ran while a hold was being created"
+        proceed.set()
+        t.join(10); r.join(10)
+        assert result[0] is not None and result[0]["reason"] == "deploy"
+
+    def test_release_is_serialised_and_idempotent(self, tmp_path):
+        path = str(tmp_path / "w.hold")
+        watchdog.write_hold(path, 1000.0, 5, "x")
+        assert watchdog.release_hold(path) is True and watchdog.release_hold(path) is False
+
+
+class TestHoldBeforeStart:
+    def test_a_hold_arriving_after_the_stop_and_before_the_start_prevents_the_start(self, ddog):
+        ddog.probe = lambda: False
+        ddog.tick(); ddog.tick()
+        original = ddog.docker.__call__
+        seen = {"inspects": 0}
+
+        def runner(cmd, **kw):
+            out = original(cmd, **kw)
+            if cmd[1] == "inspect":
+                seen["inspects"] += 1
+                if seen["inspects"] == 2:             # the state read right after the stop: the hold lands before `start`
+                    watchdog.write_hold(ddog.hold_path, ddog.wall[0], 45, "deploy")
+            return out
+
+        ddog._run = lambda cmd, **kw: runner(cmd, **kw)
+        assert ddog.tick() == "held"
+        assert "start" not in [c[1] for c in ddog.docker.calls]
+
+
+class TestColdStart:
+    def _failing(self, w):
+        w.probe = lambda: False
+
+    def test_a_container_that_just_started_is_not_restarted_while_it_warms_up(self, ddog):
+        ddog.docker.started_at = time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime(ddog.wall[0] - 3))
+        self._failing(ddog)
+        outcomes = [ddog.tick() for _ in range(6)]
+        assert set(outcomes) == {"warming"} and ddog.docker.calls == [] and ddog._attempts == []
+        ddog.probe = lambda: True
+        assert ddog.tick() == "healthy"
+
+    def test_the_grace_ends_with_the_startup_window(self, ddog):
+        ddog.docker.started_at = time.strftime("%Y-%m-%dT%H:%M:%S.000000000Z", time.gmtime(ddog.wall[0] - 3))
+        self._failing(ddog)
+        assert ddog.tick() == "warming"
+        ddog.wall[0] += ddog.startup + 1
+        assert ddog.tick() == "below_threshold"
+
+    def test_a_hung_old_process_is_not_graced(self, ddog):
+        self._failing(ddog)                                          # started in 2020
+        assert [ddog.tick() for _ in range(3)][-1] in ("restarted", "restart_failed")
+
+    def test_a_crash_loop_gets_no_second_grace(self, ddog):
+        self._failing(ddog)
+        fmt = "%Y-%m-%dT%H:%M:%S.000000000Z"
+        ddog.docker.started_at = time.strftime(fmt, time.gmtime(ddog.wall[0] - 3))
+        assert ddog.tick() == "warming"
+        ddog.wall[0] += 20
+        ddog.docker.started_at = time.strftime(fmt, time.gmtime(ddog.wall[0] - 3))      # restarted again by docker
+        assert ddog.tick() == "below_threshold"
+
+    def test_an_unreadable_started_at_means_no_grace(self, ddog):
+        ddog.docker.started_at = "not a time"
+        self._failing(ddog)
+        assert ddog.tick() == "below_threshold"
+
+    def test_the_apple_runtime_never_asks(self):
+        w = watchdog.Watchdog("memora-all", "http://127.0.0.1:8920/health")
+        assert w._warming_up() is False

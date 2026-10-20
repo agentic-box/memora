@@ -195,6 +195,9 @@ killed and memora-all stayed down until someone restarted it by hand). Two layer
      about 100 s of a hung process (3 probes of 20 s each plus the intervals). It issues only
      `inspect`, `stop`, `kill`, `start`, `unpause`: never `rm`, `run` or `create`, and nothing on a
      volume. A container that does not exist is reported, not created.
+   - **A cold start is not a failure:** a container that started less than 90 s ago (the startup window)
+     gets its failed probes ignored ("warming"), once per start. A crash loop, where docker starts it afresh
+     every few seconds, gets no second grace and is restarted as usual; a hung old process is never graced.
    - **A degraded store never restarts it**: only `/health`, never `/health/db`.
    - **Backoff and cap:** 30 s doubling to 600 s between attempts, and at most 3 attempts (a failed one
      counts, a successful one counts) in a rolling hour. The next one is not made: it alerts "GIVING
@@ -214,8 +217,8 @@ killed and memora-all stayed down until someone restarted it by hand). Two layer
      `~/.local/var/log/memora-watchdog-alerts-memora-all.log` (every alert); `systemctl --user status
      memora-watchdog-memora-all`.
 3. **An intentional stop must hold the watchdog**, or it will be started again within about 30 s.
-   The deploy does this itself (held before it stops the container, released after the new one is
-   verified; a deploy that fails leaves the hold, which expires on its own after 45 minutes). For
+   The deploy does this itself (held before it stops the container, with the installed watchdog's own
+   `hold` when the tag predates the watchdog; released after the new one is verified; a deploy that fails leaves the hold, which expires on its own after 45 minutes). For
    anything else (a rollback, the stopped-required phases of `local_primary.py`, a manual
    `docker stop memora-all`):
 
@@ -225,8 +228,11 @@ killed and memora-all stayed down until someone restarted it by hand). Two layer
    python3 ~/.local/libexec/memora/watchdog-memora-all/memora_watchdog.py release --container memora-all
    ```
 
-   While held the watchdog neither probes nor acts. A stale hold (past its expiry, or unreadable) is
-   ignored and removed, so a forgotten hold never blocks recovery for more than its length.
+   `hold` returns only after any restart that was already in flight has finished or stopped at its next
+   step (the watchdog re-checks the hold before every `unpause`, `stop`, `kill` and `start`, and each
+   verification round, and `hold` waits on the lock the restart holds; it fails with exit 3 if that takes
+   more than 150 s, keeping the hold). While held the watchdog neither probes nor acts. A stale hold (past its expiry, or unreadable) is
+   ignored and removed under the hold lock, only if it is still the file that was judged stale, so a forgotten hold never blocks recovery for more than its length.
    `scripts/switch-embedding-host.sh` holds and releases by itself.
 
 Rehearsed on the deploy host with a scratch container (not memora-all) and the real installer: a

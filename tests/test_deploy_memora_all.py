@@ -100,7 +100,7 @@ def deploy(tmp_path):
     wd_dir = home / "repos" / "memora" / "scripts"
     wd_dir.mkdir()
     _exe(wd_dir / "memora_watchdog.py",
-         '#!/usr/bin/env python3\nimport os, sys\n'
+         '#!/usr/bin/env python3\n# stub with a hold CLI: _hold_cli\nimport os, sys\n'
          'open(os.environ["CALL_LOG"], "a").write("WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n'
          'sys.exit(int(os.environ.get("WATCHDOG_HOLD_RC", "0")) if sys.argv[1:2] == ["hold"] else 0)\n')
     _exe(wd_dir / "install_memora_watchdog.sh",
@@ -1490,9 +1490,38 @@ class TestWatchdogWiring:
              '#!/usr/bin/env python3\nimport os, sys\n'
              'open(os.environ["CALL_LOG"], "a").write("INSTALLED-WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n')
         proc, calls, _ = deploy()
-        assert "holding the installed one" in proc.stdout
+        assert "holding the installed watchdog" in proc.stdout
         hold = _index(calls, lambda c: c[0] == "INSTALLED-WATCHDOG" and c[1].startswith("hold --container memora-all"))
         assert hold < _index(calls, lambda c: c == ["stop", "memora-all"])
+
+    def test_the_installed_watchdog_is_held_even_when_the_checkout_has_one(self, deploy):
+        installed = deploy.home / ".local" / "libexec" / "memora" / "watchdog-memora-all"
+        installed.mkdir(parents=True)
+        _exe(installed / "memora_watchdog.py",
+             '#!/usr/bin/env python3\nimport os, sys\n'
+             'open(os.environ["CALL_LOG"], "a").write("INSTALLED-WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n')
+        proc, calls, _ = deploy()
+        assert [c for c in calls if c[0] == "INSTALLED-WATCHDOG" and c[1].startswith("hold ")]
+        assert not [c for c in calls if c[0] == "WATCHDOG"]
+
+    def test_an_old_checkout_script_without_a_hold_cli_is_not_called_and_an_installed_one_is(self, deploy):
+        (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").write_text(
+            "#!/usr/bin/env python3\n# the launchd-era watchdog: no hold\nraise SystemExit(2)\n")
+        installed = deploy.home / ".local" / "libexec" / "memora" / "watchdog-memora-all"
+        installed.mkdir(parents=True)
+        _exe(installed / "memora_watchdog.py",
+             '#!/usr/bin/env python3\nimport os, sys\n'
+             'open(os.environ["CALL_LOG"], "a").write("INSTALLED-WATCHDOG\\x1f" + " ".join(sys.argv[1:]) + "\\x1f\\x1e")\n')
+        proc, calls, _ = deploy()
+        assert [c for c in calls if c[0] == "INSTALLED-WATCHDOG" and c[1].startswith("hold ")]
+        assert [c for c in calls if c[:2] == ["run", "-d"]]
+
+    def test_an_old_checkout_script_without_a_hold_cli_and_nothing_installed_is_deployed_with_a_note(self, deploy):
+        (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").write_text(
+            "#!/usr/bin/env python3\n# the launchd-era watchdog: no hold\nraise SystemExit(2)\n")
+        proc, calls, _ = deploy()
+        assert "has no hold CLI and no watchdog is installed" in proc.stdout
+        assert [c for c in calls if c[:2] == ["run", "-d"]]
 
     def test_a_tag_without_the_watchdog_script_and_none_installed_is_deployed_with_a_note(self, deploy):
         (deploy.home / "repos" / "memora" / "scripts" / "memora_watchdog.py").unlink()
