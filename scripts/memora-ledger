@@ -179,6 +179,8 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     # join: a decision's calls are the telemetry between its draft and its label, narrowed
     # to its --store / --caller when the draft names them
     win: Dict[str, Any] = {d: (parse_ts(drafts[d]["ts"]), parse_ts(l["ts"])) for d, l in labels.items()}
+    # every draft has a window: an unlabeled one is still open (until now)
+    allwin: Dict[str, Any] = {d: win.get(d, (parse_ts(dr["ts"]), now)) for d, dr in drafts.items()}
     per: Dict[str, List[Dict[str, Any]]] = {}
     for did, (lo, hi) in win.items():
         dr = drafts[did]
@@ -192,7 +194,11 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     for did, (lo, hi) in win.items():
         why: List[str] = []
         dr = drafts[did]
-        if not dr.get("caller") and any(o != did and win[o][0] <= hi and lo <= win[o][1] for o in win):
+        # overlapping another decision (labeled or still open) is ambiguous unless BOTH name
+        # DIFFERENT callers: one shared caller does not single out one decision
+        if any(o != did and allwin[o][0] <= hi and lo <= allwin[o][1]
+               and not (dr.get("caller") and drafts[o].get("caller") and dr["caller"] != drafts[o]["caller"])
+               for o in allwin):
             why.append("overlaps another decision")
         stores = {t["store"] for t in per[did] if t.get("store")}
         callers = {t["caller"] for t in per[did] if t.get("caller")}
@@ -206,13 +212,13 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
             amb[did] = why
     searches = [t for calls in per.values() for t in calls if t.get("tool") in SEARCH_TOOLS]
     lat = sorted(float(t["latency_ms"]) for t in searches if isinstance(t.get("latency_ms"), (int, float)))
-    w(f"searches joined to {len(labels)} labeled decision(s): {len(searches)} "
+    w(f"searches joined to {len(labels)} labeled decision(s): {len(searches)} per-decision occurrence(s), not unique calls: "
       f"(memory_hybrid_search/memory_semantic_search/memory_list)")
     for did in sorted(per):
         n = sum(1 for t in per[did] if t.get("tool") in SEARCH_TOOLS)
         w(f"  {did}: {n} search(es)" + (" [ambiguous]" if did in amb else ""))
     if lat:
-        w(f"search latency ms over {len(lat)} call(s): p50 {pct_rank(lat, 0.5):g}  p95 {pct_rank(lat, 0.95):g}  max {lat[-1]:g}")
+        w(f"search latency ms over {len(lat)} per-decision occurrence(s): p50 {pct_rank(lat, 0.5):g}  p95 {pct_rank(lat, 0.95):g}  max {lat[-1]:g}")
     else:
         w("search latency ms: no joined search calls")
     w("")
@@ -221,7 +227,7 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     for did, lab in labels.items():
         if did in amb:
             continue
-        returned = {m["id"] for t in per[did] for m in t.get("memories", []) if isinstance(m, dict) and "id" in m}
+        returned = {m["id"] for t in per[did] if not t.get("error") for m in t.get("memories", []) if isinstance(m, dict) and "id" in m}
         cited = set(lab.get("memories") or [])
         cited_total += len(cited)
         cited_returned += len(cited & returned)

@@ -37,7 +37,7 @@ search query.
 
 The line is built after the read and handed to one writer thread through a
 bounded queue (1000 lines), so a slow disk never delays a read or the event
-loop. A full queue drops the new line (one warning, then silence); any write
+loop. A line over half the cap is dropped (warned once). Queued lines are best effort: the writer is a daemon thread and is not flushed at shutdown, so a restart or redeploy can lose the last few. A full queue drops the new line (one warning, then silence); any write
 error is swallowed the same way. The ids are taken before `fields=` or content
 projection, so they survive both. A response of more than 200 memories logs the
 first 200 ids and `"truncated": <true count>`; the report treats such a decision
@@ -89,7 +89,7 @@ read; misleading and missed counts; and the audit list for the reviewer (every
 A decision's reads are the telemetry calls between its `draft` and its `label`
 time, narrowed to `draft --store S` and `--caller C` when given. A decision is
 **ambiguous**, and its cited ids are not counted, when its reads cannot be
-attributed: it overlaps another decision (and names no `--caller`), the window
+attributed: it overlaps another decision, labeled or still open (unless both name different `--caller`s), the window
 holds reads from several stores (no `--store`) or callers (no `--caller`), or
 a read was truncated. The report lists each ambiguous decision with the reason.
 The first read of a memory is taken over all time, so a read-back before the

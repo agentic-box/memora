@@ -94,7 +94,9 @@ def _append(path: str, data: bytes, cap: int) -> None:
             os.unlink(old)
     fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.write(fd, data)
+        view = memoryview(data)
+        while view:                      # os.write may be short: finish the line
+            view = view[os.write(fd, view):]
     finally:
         os.close(fd)
 
@@ -120,6 +122,10 @@ def _run_worker() -> None:
 
 def _enqueue(path: str, data: bytes, cap: int) -> None:
     global _worker, _dropped
+    if len(data) > cap // 2:             # enforced here, whatever the input shapes: never written
+        _dropped += 1
+        _warn_once(f"line of {len(data)} bytes exceeds half the {cap}-byte cap, dropped")
+        return
     if _worker is None or not _worker.is_alive():
         with _start_lock:
             if _worker is None or not _worker.is_alive():
@@ -176,7 +182,7 @@ def _refs(entries: List[Any]) -> List[Dict[str, Any]]:
         if isinstance(m, dict) and isinstance(m.get("id"), int):
             ref: Dict[str, Any] = {"id": m["id"]}
             if isinstance(m.get("updated_at"), str):
-                ref["v"] = m["updated_at"]
+                ref["v"] = m["updated_at"][:40]
             out.append(ref)
         elif isinstance(m, int) and not isinstance(m, bool):
             out.append({"id": m})
@@ -191,7 +197,7 @@ def build_line(tool: str, args: Dict[str, Any], result: Any, latency_ms: float,
     row: Dict[str, Any] = {
         "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "tool": tool,
-        "store": store,
+        "store": store[:80] if isinstance(store, str) else None,
     }
     if caller:
         row["caller"] = caller[:80]
@@ -253,7 +259,8 @@ def ledgered(tool: str, store_fn: Callable[[], Optional[str]] = lambda: None,
             finally:
                 _CAPTURE.reset(token)
             ms = (time.perf_counter() - t0) * 1000
-            record(tool, _bound(sig, a, kw), result, ms, store_fn, caller_fn, entries=holder.get("entries"))
+            failed = isinstance(result, dict) and "error" in result   # an error returned nothing, whatever was noted
+            record(tool, _bound(sig, a, kw), result, ms, store_fn, caller_fn, entries=[] if failed else holder.get("entries"))
             return result
         return wrapper
     return deco

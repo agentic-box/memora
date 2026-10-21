@@ -209,3 +209,37 @@ def test_first_read_is_all_time_even_when_reporting_a_later_window(led, tmp_path
     # negative control: an all-time window shows the same first read, without the marker
     out = led("report", "--telemetry", str(tmp_path / "none"), "--now", NOW)[1]
     assert "memory 50: first read 1.0 h after creation\n" in out
+
+
+def test_same_caller_overlap_and_open_drafts_are_still_ambiguous(led, tmp_path):
+    base = [
+        {"ts": "2026-10-20T10:00:00Z", "type": "draft", "id": "A", "text": "t", "caller": "alice", "store": "s1"},
+        {"ts": "2026-10-20T10:01:00Z", "type": "draft", "id": "B", "text": "t", "caller": "alice", "store": "s1"},
+        {"ts": "2026-10-20T10:10:00Z", "type": "label", "id": "A", "label": "changed", "memories": [1], "text": "a"},
+        {"ts": "2026-10-20T10:11:00Z", "type": "label", "id": "B", "label": "changed", "memories": [1], "text": "b"},
+    ]
+    tel = tmp_path / "t.jsonl"
+    _w(tel, [{"ts": "2026-10-20T10:05:00Z", "tool": "memory_hybrid_search", "latency_ms": 10, "caller": "alice", "store": "s1", "memories": [{"id": 1}]}])
+    _w(led.path, base)
+    out = led("report", "--telemetry", str(tel), "--now", NOW)[1]
+    assert "over 0 unambiguous decision(s)" in out and "A: overlaps another decision" in out
+    # an UNLABELED draft overlaps a labeled one too
+    _w(led.path, [base[0], {**base[1], "id": "OPEN"}, base[2], {"ts": "2026-10-20T10:12:00Z", "type": "label", "id": "A", "label": "changed", "memories": [1], "text": "a"}][:3])
+    out = led("report", "--telemetry", str(tel), "--now", NOW)[1]
+    assert "A: overlaps another decision" in out
+    # controls: different callers, or no overlap, are attributed
+    _w(led.path, [base[0], {**base[1], "caller": "bob"}, base[2], base[3]])
+    assert "ambiguous decisions, not counted above: 0" in led("report", "--telemetry", str(tel), "--now", NOW)[1]
+    _w(led.path, [base[0], base[2], {**base[1], "ts": "2026-10-20T10:20:00Z"}, {**base[3], "ts": "2026-10-20T10:30:00Z"}])
+    assert "ambiguous decisions, not counted above: 0" in led("report", "--telemetry", str(tel), "--now", NOW)[1]
+
+
+def test_a_read_that_returned_an_error_does_not_count_as_returned(led, tmp_path):
+    led("draft", "e", "x")
+    led("label", "e", "changed", "--memory", "9", "c")
+    ts = json.loads(led.path.read_text().splitlines()[0])["ts"]
+    tel = tmp_path / "t.jsonl"
+    _w(tel, [{"ts": ts, "tool": "memory_get", "latency_ms": 1, "memories": [{"id": 9}], "error": "invalid_fields"}])
+    assert "over 1 unambiguous decision(s): 0 of 1" in led("report", "--telemetry", str(tel))[1]
+    _w(tel, [{"ts": ts, "tool": "memory_get", "latency_ms": 1, "memories": [{"id": 9}]}])
+    assert "over 1 unambiguous decision(s): 1 of 1" in led("report", "--telemetry", str(tel))[1]

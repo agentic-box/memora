@@ -329,3 +329,48 @@ def test_caller_label_comes_from_the_hook_and_is_optional(tmp_path, monkeypatch)
     a, b = _lines(path)
     assert a["caller"] == "ab-leader" and "caller" not in b
     assert server._ledger_caller() is None  # no request in scope: no label, no error
+
+
+def test_an_oversized_line_is_dropped_at_the_write_boundary(tmp_path, monkeypatch, caplog):
+    path = tmp_path / "led.jsonl"
+    monkeypatch.setenv("MEMORA_READ_LEDGER", str(path))
+    monkeypatch.setenv("MEMORA_READ_LEDGER_MAX_BYTES", str(read_ledger.MIN_MAX_BYTES))
+    seen = _watch_total(monkeypatch, path)
+    huge = "日" * 200_000
+    with caplog.at_level(logging.WARNING, logger="memora.read_ledger"):
+        read_ledger.record("memory_get", {}, {"memory": {"id": 1, "updated_at": huge}}, 1.0, store_fn=lambda: huge)
+        read_ledger.record("memory_get", {}, {"memory": {"id": 2}}, 1.0)
+        assert read_ledger.flush(10)
+    rows = _lines(path)
+    assert [r["memories"][0]["id"] for r in rows] == [1, 2]       # bounded strings keep the line small
+    assert len(rows[0]["store"]) == 80 and len(rows[0]["memories"][0]["v"]) == 40
+    assert max(seen) <= read_ledger.MIN_MAX_BYTES
+    # the string bounds hold the oversized fixture to a short line; a line that still exceeds
+    # half the cap is refused by _enqueue itself
+    written = []
+    monkeypatch.setattr(read_ledger, "_append", lambda p, d, c: written.append(d))
+    read_ledger._enqueue(str(path), b"x" * (read_ledger.MIN_MAX_BYTES // 2 + 1), read_ledger.MIN_MAX_BYTES)
+    assert read_ledger.flush(10) and written == [] and read_ledger._dropped >= 1
+    read_ledger._enqueue(str(path), b"x" * (read_ledger.MIN_MAX_BYTES // 2), read_ledger.MIN_MAX_BYTES)   # control
+    assert read_ledger.flush(10) and len(written) == 1
+
+
+def test_a_short_os_write_still_produces_one_whole_line(tmp_path, monkeypatch):
+    path = tmp_path / "led.jsonl"
+    real = os.write
+    monkeypatch.setattr(os, "write", lambda fd, b: real(fd, bytes(b)[:7]))   # every write is short
+    read_ledger._append(str(path), b'{"a":1234567890}\n', 100_000)
+    monkeypatch.undo()
+    assert path.read_bytes() == b'{"a":1234567890}\n'
+
+
+def test_a_validation_error_after_note_logs_no_ids(local_db, tmp_path, monkeypatch):
+    mid = _mk("some note")
+    path = tmp_path / "led.jsonl"
+    monkeypatch.setenv("MEMORA_READ_LEDGER", str(path))
+    r = asyncio.run(server.memory_get(mid, fields=["no_such_field"]))
+    assert "error" in r
+    (row,) = _lines(path)
+    assert row["memories"] == [] and row["error"] == "invalid_fields"
+    asyncio.run(server.memory_get(mid))                      # control: a good read logs its id
+    assert [m["id"] for m in _lines(path)[-1]["memories"]] == [mid]
