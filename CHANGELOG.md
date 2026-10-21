@@ -12,7 +12,7 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
-## 0.5.7.6 — unreleased
+## 0.5.7.6 — 2026-10-21
 
 A read effectiveness ledger (Item 118), off by default.
 
