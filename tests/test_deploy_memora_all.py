@@ -1018,7 +1018,7 @@ class TestDataDirPinned:
 
 # ---------------------------------------------------------------- REL2: the remote arguments survive ssh
 
-N_REMOTE_ARGS = 27
+N_REMOTE_ARGS = 28
 
 
 def _decode_blob(line):
@@ -1053,6 +1053,29 @@ class TestRemoteArguments:
         import base64
         assert json.loads(base64.b64decode(params[24])) == PROJECTS    # CFG1: from deploy.env
         assert params[25:27] == ["api-tokens.json", "api-smoke.token"]  # API1: the file names
+        assert params[27] == ""                      # Item 118: DEPLOY_READ_LEDGER_DIR, off
+
+    def test_read_ledger_dir_is_mounted_and_switches_the_ledger_on(self, deploy, tmp_path):
+        led = tmp_path / "ledger-dir"
+        proc, calls, _ = deploy(runtime_env={"DEPLOY_READ_LEDGER_DIR": str(led)})
+        run = _new_container_run(calls)
+        assert _flag_values(run, "-v") == ["memora-all-data:/data", f"{deploy.secrets}:{SECRETS_MOUNT}:ro",
+                                           f"{led}:/ledger"]
+        assert "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl" in _flag_values(run, "-e")
+        assert led.is_dir()
+        assert _decode_blob((tmp_path / "ssh-command.txt").read_text().strip())[27] == str(led)
+
+    def test_read_ledger_is_off_without_the_key(self, deploy):
+        proc, calls, _ = deploy()
+        run = _new_container_run(calls)
+        assert not [v for v in _flag_values(run, "-v") if "/ledger" in v]
+        assert not [e for e in _flag_values(run, "-e") if e.startswith("MEMORA_READ_LEDGER")]
+
+    @pytest.mark.parametrize("bad", ["relative/dir", "/srv/../etc", "/a b", "/x:y"])
+    def test_a_bad_read_ledger_dir_is_refused_before_anything_runs(self, deploy, bad):
+        proc, calls, _ = deploy(runtime_env={"DEPLOY_READ_LEDGER_DIR": bad})
+        assert proc.returncode != 0 and "DEPLOY_READ_LEDGER_DIR" in proc.stderr and "nothing was done" in proc.stderr
+        assert calls == []
 
     def test_spaces_survive_the_transport(self, deploy, tmp_path):
         root = tmp_path / "rh root"

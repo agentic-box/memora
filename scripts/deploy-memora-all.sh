@@ -203,6 +203,20 @@ while IFS= read -r -d '' v; do CFG_TOKEN+=("$v"); done \
       DEPLOY_CLOUDFLARE_TOKEN_FILE DEPLOY_D1_READ_TOKEN_FILE DEPLOY_D1_REPLICATOR_TOKEN_FILE \
       DEPLOY_GRAPH_TOKEN_FILE DEPLOY_API_TOKENS_FILE DEPLOY_API_SMOKE_TOKEN_FILE)
 [ "${#CFG_TOKEN[@]}" -eq 6 ] || { echo "refused: cannot read the token file names from $CONFIG_FILE — nothing was done" >&2; exit 1; }
+# Item 118: the read-effectiveness ledger. OPTIONAL: a host directory (from the
+# environment or instances/deploy.env) bind-mounted at /ledger in the container,
+# with MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl. Absent = no ledger, no mount.
+# It is NOT the data volume: the ledger must survive a redeploy, /data is off limits.
+CFG_LEDGER=()
+while IFS= read -r -d '' v; do CFG_LEDGER+=("$v"); done \
+  < <(python3 "$ROOT/scripts/deploy_config.py" --optional "$CONFIG_FILE" DEPLOY_READ_LEDGER_DIR)
+[ "${#CFG_LEDGER[@]}" -eq 1 ] || { echo "refused: cannot read DEPLOY_READ_LEDGER_DIR from $CONFIG_FILE — nothing was done" >&2; exit 1; }
+DEPLOY_READ_LEDGER_DIR="${DEPLOY_READ_LEDGER_DIR:-${CFG_LEDGER[0]}}"   # expanded on the target host
+if [ -n "$DEPLOY_READ_LEDGER_DIR" ]; then
+  printf '%s' "$DEPLOY_READ_LEDGER_DIR" | grep -Eqx '(~|/)[A-Za-z0-9._/~+-]*' \
+    && ! printf '%s' "$DEPLOY_READ_LEDGER_DIR" | grep -Eq '(^|/)\.\.(/|$)' \
+    || { echo "refused: DEPLOY_READ_LEDGER_DIR must be an absolute or ~ path of plain characters, no .. (got '$DEPLOY_READ_LEDGER_DIR') — nothing was done" >&2; exit 1; }
+fi
 # Rehearsal parameters (R1): every default is the production value (from the
 # deploy configuration), so an unparameterised run is exactly the production
 # deploy. scripts/rehearse_deploy.sh sets them to run the same steps against
@@ -390,7 +404,7 @@ MIGRATE_B64="$(base64 < "$ROOT/scripts/migrate_data_volume.sh" | tr -d '\n')"
 # preceded by the blob's sha256 as a second word (review 7889: a changed
 # character that keeps the field count must refuse too). The remote script
 # checks the digest, decodes (a decoder error refuses), requires exactly
-# the 27 parameters it reads, and only then restores $1..$27. A localhost
+# the 28 parameters it reads, and only then restores $1..$28. A localhost
 # rehearsal sends the SAME command line through `sh -c`, i.e. the same
 # re-parsing a remote shell does.
 REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_CONTAINER"
@@ -399,10 +413,10 @@ REMOTE_ARGS=("$TAG" "$MEMORA_DATABASES_B64" "$MIGRATE_B64" "$RUNTIME" "$DEPLOY_C
   "$DEPLOY_CLOUDFLARE_TOKEN_FILE" "$DEPLOY_D1_READ_TOKEN_FILE" "$DEPLOY_D1_REPLICATOR_TOKEN_FILE"
   "$MEMORA_REPLICAS_B64" "$MEMORA_REPLICATION" "$REPL_TIMING" "$DEPLOY_STORE_WAIT_S"
   "$DEPLOY_GRAPH_BIND" "$DEPLOY_GRAPH_PORT" "$DEPLOY_GRAPH_TOKEN_FILE" "$MEMORA_PROJECTS_B64"
-  "$DEPLOY_API_TOKENS_FILE" "$DEPLOY_API_SMOKE_TOKEN_FILE")
+  "$DEPLOY_API_TOKENS_FILE" "$DEPLOY_API_SMOKE_TOKEN_FILE" "$DEPLOY_READ_LEDGER_DIR")
 PARAMS_B64="$(printf '%s\0' "${REMOTE_ARGS[@]}" | base64 | tr -d '\n')"
 PARAMS_SHA="$(printf '%s' "$PARAMS_B64" | python3 -c 'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())')"
-[ "${#REMOTE_ARGS[@]}" -eq 27 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 27" >&2; exit 1; }
+[ "${#REMOTE_ARGS[@]}" -eq 28 ] || { echo "deploy: internal error: ${#REMOTE_ARGS[@]} remote parameters, not 28" >&2; exit 1; }
 REMOTE_CMD="bash -s -- $PARAMS_SHA $PARAMS_B64"
 if [ "$DEPLOY_HOST" = localhost ]; then
   TARGET=(sh -c "$REMOTE_CMD")
@@ -422,7 +436,7 @@ printf '%s' "$2" | base64 -d > "$DECODED" 2>/dev/null || { rm -f "$DECODED"; bro
 P=()
 while IFS= read -r -d '' v; do P+=("$v"); done < "$DECODED"
 rm -f "$DECODED"
-[ "${#P[@]}" -eq 27 ] || broken "${#P[@]} parameters arrived, not 27"
+[ "${#P[@]}" -eq 28 ] || broken "${#P[@]} parameters arrived, not 28"
 set -- "${P[@]}"
 TAG="$1"
 MEMORA_DATABASES="$(printf '%s' "$2" | base64 -d)"
@@ -437,6 +451,7 @@ CF_TOKEN_NAME="${15}"; READ_TOKEN_NAME="${16}"; REPL_TOKEN_NAME="${17}"
 MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
 GRAPH_BIND="${22}"; GRAPH_PORT="${23}"; GRAPH_TOKEN_NAME="${24}"
 API_TOKENS_NAME="${26}"; API_SMOKE_NAME="${27}"
+LEDGER_DIR="${28/#\~/$HOME}"
 MEMORA_PROJECTS="$(printf '%s' "${25}" | base64 -d)"
 SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
@@ -799,6 +814,16 @@ fi
 
 "$RT" rename "$CONTAINER" "$CONTAINER-grok-$TS"
 
+# Item 118: the optional read ledger (see DEPLOY_READ_LEDGER_DIR above). The
+# directory is created here (never the data volume); the container runs as root.
+# Absent = no mount and no variable.
+LEDGER_ARGS=()
+if [ -n "$LEDGER_DIR" ]; then
+  mkdir -p "$LEDGER_DIR"
+  LEDGER_OPT=""; [ "$SECRETS_OPTS" = ro ] || LEDGER_OPT=":z"   # SELinux relabel, like the secrets mount
+  LEDGER_ARGS=(-v "$LEDGER_DIR:/ledger$LEDGER_OPT" -e "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl")
+fi
+
 # Item 108: a Docker HEALTHCHECK on the cheap, database-free GET /health (liveness) on the container's own
 # port. Interval 30 s, timeout 10 s, 3 retries: unhealthy after about 90 s of a dead /health, slower than
 # the watchdog (10 s x 3) on purpose -- this status is for `docker ps` and the runtime, the watchdog acts.
@@ -815,6 +840,7 @@ HEALTH_CMD='python -c "import urllib.request as u; u.urlopen(\"http://127.0.0.1:
   -p "$GRAPH_BIND:$GRAPH_PORT:8765" \
   -v "$DATA_VOLUME:/data" \
   -v "$SECRETS_DIR:$SECRETS_MOUNT:$SECRETS_OPTS" \
+  ${LEDGER_ARGS[@]+"${LEDGER_ARGS[@]}"} \
   "${CONTAINER_ENV[@]}" \
   "$IMAGE"
 

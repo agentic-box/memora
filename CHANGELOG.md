@@ -12,6 +12,13 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.6 — unreleased
+
+A read effectiveness ledger (Item 118), off by default.
+
+- `MEMORA_READ_LEDGER=<path>` makes the server append one JSON line per `memory_hybrid_search`, `memory_semantic_search`, `memory_list`, `memory_get` and `memory_related` call (time, caller label, store, tool, query hash and the first 200 characters of the query, returned ids and `updated_at`, count, latency). No memory content, tags, metadata or tokens. A failing append warns once and never fails the read; the file is size-capped with one rotation. `scripts/deploy-memora-all.sh` takes an optional `DEPLOY_READ_LEDGER_DIR` (bind-mounted at `/ledger`, never the data volume), which makes the remote parameters 28.
+- `scripts/memora-ledger` keeps the leader's decision ledger (`draft`, `label`, `missed`, `read-back`) and prints the `report` that joins it with the telemetry. See `docs/read-ledger.md` for what is logged and the decision rule.
+
 ## 0.5.7.5 — 2026-10-20
 
 A d1:// primary refuses to start when D1 read replication is on (Item 110).

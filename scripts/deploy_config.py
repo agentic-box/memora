@@ -45,6 +45,9 @@ KEYS = (
     "DEPLOY_GRAPH_TOKEN_FILE",
     "DEPLOY_API_TOKENS_FILE",
     "DEPLOY_API_SMOKE_TOKEN_FILE",
+    # deploy-memora-all.sh only, optional: a host directory for the read ledger
+    # (Item 118), bind-mounted at /ledger. Absent = no ledger.
+    "DEPLOY_READ_LEDGER_DIR",
 )
 OPTIONAL_KEYS = KEYS[KEYS.index("DEPLOY_CLOUDFLARE_TOKEN_FILE"):]
 _LINE = re.compile(r"^([A-Z][A-Z0-9_]*)=(.*)$")

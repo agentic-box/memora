@@ -1,0 +1,83 @@
+# Read ledger (Item 118)
+
+Measures whether memora reads change decisions. Two local pieces: read
+telemetry on the server (off by default) and a decision ledger kept by the
+leader. `scripts/memora-ledger report` joins them. Nothing here touches D1, the
+data volume or the database.
+
+## Decision rule
+
+Run for about 4 weeks. The verdict comes after **40 or more leader decisions**:
+keep memora when there are **at least 4 independently verified wins**
+(a decision labelled `changed` or `avoided-repeat` that the reviewer confirms
+from the audit list) and the benefit outweighs the cost; scale back when there
+are fewer.
+
+## Read telemetry (server)
+
+Off unless `MEMORA_READ_LEDGER=<path>` is set. Each call of
+`memory_hybrid_search`, `memory_semantic_search`, `memory_list`, `memory_get`
+and `memory_related` appends one JSON line:
+
+| field | meaning |
+|---|---|
+| `ts` | UTC, millisecond |
+| `caller` | the request's `X-Memora-Caller` header, when present |
+| `store`, `project` | the store the call resolved to; `project` only when `metadata_filters.project` was given |
+| `tool` | the tool name |
+| `query_hash`, `query` | sha256 prefix of the whole query, and the query text cut to 200 characters |
+| `requested_id` | `memory_id` for `memory_get` and `memory_related` |
+| `memories` | `[{id, v}]` of the returned memories; `v` is `updated_at` when the response carries it |
+| `count`, `latency_ms` | result count; the read's own duration |
+| `error` | the error code, when the call returned or raised one |
+
+Never logged: memory content, tags, metadata, tokens, credentials or any other
+header. The query text IS logged (200 characters), so do not put a secret in a
+search query.
+
+The append runs after the read, is one small write, and cannot fail it: on any
+error the server logs one warning (`memora.read_ledger`) and carries on. The
+file is capped by `MEMORA_READ_LEDGER_MAX_BYTES` (default 20 MiB) with ONE
+rotation to `<path>.1`; the older file is overwritten by the next rotation.
+
+Turn it on for memora-all: set `DEPLOY_READ_LEDGER_DIR` in
+`instances/deploy.env` (or the environment of `scripts/deploy-memora-all.sh`) to
+a directory on the deploy host. The deploy bind-mounts it at `/ledger` and sets
+`MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl`, so the file survives a redeploy
+and is not on the data volume. Turn it off by removing the key and deploying
+again (the file stays where it is). Outside memora-all, set the variable in the
+server's environment.
+
+## Decision ledger (leader)
+
+`scripts/memora-ledger` writes a local JSONL file, `$MEMORA_DECISION_LEDGER` or
+`.ledger/decisions.jsonl` (git-ignored). Decision ids are free text
+(`item-118-brief`, `item-117-esc-1`).
+
+```
+memora-ledger draft <id> "<one-sentence provisional decision>"     # BEFORE the search
+memora-ledger label <id> unchanged|changed|avoided-repeat|misleading [--memory N ...] "<change or skipped work>"
+memora-ledger missed <id> --memory N "<what was missed>"            # a relevant memory that was not found
+memora-ledger read-back --memory N [--created ISO] "<why it was read>"
+```
+
+`label` and `missed` refuse a decision with no draft; a draft is written once;
+the last `label` of a decision wins. `--memory` is the memory ids the label
+cites. `--created` is the memory's creation time, for the read-back timing.
+
+## Report
+
+```
+memora-ledger report [--since 7d] [--telemetry PATH]
+```
+
+`--telemetry` defaults to `$MEMORA_READ_LEDGER`, then `.ledger/read-ledger.jsonl`;
+copy the server's file (and `.1`) there. The report reads local files only and
+prints counts: decisions by label; searches per decision and latency (p50, p95,
+max); cited vs returned memory ids; read-backs and hours from creation to first
+read; misleading and missed counts; and the audit list for the reviewer (every
+`changed`, `avoided-repeat` and `misleading` id, plus a random 20% of all ids).
+
+A decision's searches are the telemetry calls between its `draft` and its
+`label` time. Decisions that overlap in time share those calls; keep drafts and
+labels close together.

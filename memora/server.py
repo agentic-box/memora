@@ -249,6 +249,26 @@ _LAST_CALL_PROFILE: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextva
 )
 
 
+def _ledger_store() -> Optional[str]:
+    from .storage import effective_database_name
+    return effective_database_name()
+
+
+def _ledger_caller() -> Optional[str]:
+    """The request's X-Memora-Caller label, when the request carries one."""
+    try:
+        req = mcp.get_context().request_context.request
+        return req.headers.get("x-memora-caller")
+    except Exception:  # noqa: BLE001 - no request (stdio, tests): no label
+        return None
+
+
+def _read_ledgered(tool: str):
+    """Read telemetry (MEMORA_READ_LEDGER, memora/read_ledger.py); off = no-op."""
+    from .read_ledger import ledgered
+    return ledgered(tool, _ledger_store, _ledger_caller)
+
+
 def _last_call_profile() -> Optional[Dict[str, Any]]:
     return _LAST_CALL_PROFILE.get()
 
@@ -1452,6 +1472,7 @@ def _apply_content_projection(
 
 
 @mcp.tool()
+@_read_ledgered("memory_list")
 async def memory_list(
     query: Optional[str] = None,
     metadata_filters: Optional[Dict[str, Any]] = None,
@@ -2022,6 +2043,7 @@ def _apply_search_fields_projection(
 
 
 @mcp.tool()
+@_read_ledgered("memory_get")
 async def memory_get(
     memory_id: int,
     include_images: bool = False,
@@ -2283,6 +2305,7 @@ def _record_model_if_unrecorded(conn) -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_read_ledgered("memory_semantic_search")
 async def memory_semantic_search(
     query: str,
     top_k: Optional[int] = None,
@@ -2352,6 +2375,7 @@ async def memory_semantic_search(
 
 
 @mcp.tool()
+@_read_ledgered("memory_hybrid_search")
 async def memory_hybrid_search(
     query: str,
     semantic_weight: float = 0.6,
@@ -2571,6 +2595,7 @@ async def memory_rebuild_embeddings() -> Dict[str, Any]:
 
 
 @mcp.tool()
+@_read_ledgered("memory_related")
 async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any]:
     """Return cross-referenced memories for a given entry.
 
