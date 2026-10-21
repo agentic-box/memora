@@ -101,7 +101,7 @@ def test_report_on_fixtures(led, tmp_path):
     assert "1 of 3 cited memory id(s)" not in out
     assert "2 of 3 cited memory id(s) were returned" in out     # 10 and 12 returned; 11 is outside the window
     assert "misleading: 1   missed: 1 event(s) on 1 decision(s)" in out
-    assert "item-record read-backs: 2 event(s), 1 distinct memory id(s)" in out
+    assert "item-record read-backs: 2 event(s) in the window, 1 distinct memory id(s)" in out
     assert "memory 50: first read 12.0 h after creation" in out
     for forced in ("d1  [changed]", "d3  [misleading]"):
         assert forced in out
@@ -136,3 +136,76 @@ def test_report_refuses_a_bad_since_and_a_corrupt_ledger(led):
     assert led("report")[0] == 2
     led.path.write_text("")
     assert led("report")[0] == 0
+
+
+def _w(path, rows):
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def _overlap_fixture(led, tmp_path, draft_extra=None):
+    """Two OVERLAPPING decisions, two callers, two stores that BOTH contain id 1."""
+    ex = draft_extra or {}
+    _w(led.path, [
+        {"ts": "2026-10-20T10:00:00Z", "type": "draft", "id": "A", "text": "t", **ex.get("A", {})},
+        {"ts": "2026-10-20T10:01:00Z", "type": "draft", "id": "B", "text": "t", **ex.get("B", {})},
+        {"ts": "2026-10-20T10:10:00Z", "type": "label", "id": "A", "label": "changed", "memories": [1], "text": "a"},
+        {"ts": "2026-10-20T10:11:00Z", "type": "label", "id": "B", "label": "changed", "memories": [1], "text": "b"},
+    ])
+    tel = tmp_path / "t.jsonl"
+    _w(tel, [
+        {"ts": "2026-10-20T10:05:00Z", "tool": "memory_hybrid_search", "latency_ms": 10, "caller": "alice", "store": "s1", "memories": [{"id": 1}]},
+        {"ts": "2026-10-20T10:06:00Z", "tool": "memory_hybrid_search", "latency_ms": 20, "caller": "bob", "store": "s2", "memories": [{"id": 2}]},
+    ])
+    return tel
+
+
+def test_ambiguous_attribution_is_not_counted_as_cited_returned(led, tmp_path):
+    tel = _overlap_fixture(led, tmp_path)
+    rc, out, err = led("report", "--telemetry", str(tel), "--now", NOW)
+    assert rc == 0, err
+    assert "cited vs returned over 0 unambiguous decision(s): 0 of 0 cited" in out
+    assert "ambiguous decisions, not counted above: 2" in out
+    assert "A: overlaps another decision; reads from stores s1,s2; reads from callers alice,bob" in out
+    assert "  A: 2 search(es) [ambiguous]" in out
+    # negative control: naming the caller and store on each draft attributes the reads, and the
+    # other caller's / store's id 1 is not credited
+    tel = _overlap_fixture(led, tmp_path, {"A": {"caller": "alice", "store": "s1"}, "B": {"caller": "bob", "store": "s2"}})
+    out = led("report", "--telemetry", str(tel), "--now", NOW)[1]
+    assert "cited vs returned over 2 unambiguous decision(s): 1 of 2 cited" in out   # A: id 1 returned; B: id 1 is s1's
+    assert "ambiguous decisions, not counted above: 0" in out
+    assert "  A: 1 search(es)" in out and "  B: 1 search(es)" in out
+
+
+def test_draft_records_store_and_caller(led):
+    assert led("draft", "d", "x", "--store", "memora", "--caller", "ab-leader")[0] == 0
+    row = json.loads(led.path.read_text())
+    assert row["store"] == "memora" and row["caller"] == "ab-leader"
+    assert led("draft", "e", "x")[0] == 0
+    assert "store" not in json.loads(led.path.read_text().splitlines()[1])
+
+
+def test_a_truncated_read_makes_the_decision_ambiguous(led, tmp_path):
+    led("draft", "t", "x")
+    led("label", "t", "changed", "--memory", "9", "c")
+    ts = json.loads(led.path.read_text().splitlines()[0])["ts"]
+    tel = tmp_path / "t.jsonl"
+    _w(tel, [{"ts": ts, "tool": "memory_list", "latency_ms": 5, "memories": [{"id": 1}], "count": 500, "truncated": 500}])
+    out = led("report", "--telemetry", str(tel))[1]
+    assert "t: a read returned more ids than were logged" in out and "unambiguous decision(s): 0 of 0" in out
+    _w(tel, [{"ts": ts, "tool": "memory_list", "latency_ms": 5, "memories": [{"id": 9}], "count": 1}])   # control
+    assert "unambiguous decision(s): 1 of 1" in led("report", "--telemetry", str(tel))[1]
+
+
+def test_first_read_is_all_time_even_when_reporting_a_later_window(led, tmp_path):
+    _w(led.path, [
+        {"ts": "2026-10-01T10:00:00Z", "type": "readback", "memories": [50], "created": "2026-10-01T09:00:00Z", "text": "r"},
+        {"ts": "2026-10-20T10:00:00Z", "type": "readback", "memories": [50], "text": "again"},
+        {"ts": "2026-10-20T11:00:00Z", "type": "readback", "memories": [51], "created": "2026-10-20T10:00:00Z", "text": "r"},
+    ])
+    out = led("report", "--since", "7d", "--telemetry", str(tmp_path / "none"), "--now", NOW)[1]
+    assert "2 event(s) in the window, 2 distinct memory id(s)" in out
+    assert "memory 50: first read 1.0 h after creation (before the window)" in out   # not the 10-20 read
+    assert "memory 51: first read 1.0 h after creation" in out and "memory 51: first read 1.0 h after creation (before" not in out
+    # negative control: an all-time window shows the same first read, without the marker
+    out = led("report", "--telemetry", str(tmp_path / "none"), "--now", NOW)[1]
+    assert "memory 50: first read 1.0 h after creation\n" in out

@@ -263,6 +263,12 @@ def _ledger_caller() -> Optional[str]:
         return None
 
 
+def _ledger_note(entries: Any) -> None:
+    """Hand the read ledger the unprojected entries (ids survive `fields=`)."""
+    from .read_ledger import note
+    note(entries)
+
+
 def _read_ledgered(tool: str):
     """Read telemetry (MEMORA_READ_LEDGER, memora/read_ledger.py); off = no-op."""
     from .read_ledger import ledgered
@@ -1528,6 +1534,7 @@ async def memory_list(
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
+    _ledger_note(items)
     items = _apply_content_projection(items, content_mode, preview_chars)
     response: Dict[str, Any] = {"count": len(items)}
     if fields:
@@ -2095,6 +2102,7 @@ async def memory_get(
         for hist_mem in record.get("history", []):
             _strip_images(hist_mem)
 
+    _ledger_note(record)
     if fields:
         try:
             record = _project_fields(record, fields, is_search=False)
@@ -2356,6 +2364,7 @@ async def memory_semantic_search(
         if fault := _integrity_fault_response(exc):
             return fault
         raise
+    _ledger_note(results)
     # Project content at tool boundary — search results are [{score, memory}, ...]
     for entry in results:
         if "memory" in entry:
@@ -2451,6 +2460,7 @@ async def memory_hybrid_search(
         if fault := _integrity_fault_response(exc):
             return fault
         raise
+    _ledger_note(results)
     # Project content at tool boundary — search results are [{score, memory}, ...]
     for entry in results:
         if "memory" in entry:
@@ -2615,6 +2625,7 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
     """
 
     related = await _get_related(memory_id, refresh)
+    _ledger_note(related)
     return {"id": memory_id, "related": related, "profile": _last_call_profile()}
 
 

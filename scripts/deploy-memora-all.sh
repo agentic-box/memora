@@ -452,6 +452,17 @@ MEMORA_REPLICAS="$(printf '%s' "${18}" | base64 -d)"; MEMORA_REPLICATION="${19}"
 GRAPH_BIND="${22}"; GRAPH_PORT="${23}"; GRAPH_TOKEN_NAME="${24}"
 API_TOKENS_NAME="${26}"; API_SMOKE_NAME="${27}"
 LEDGER_DIR="${28/#\~/$HOME}"
+# Item 118: the optional read ledger (DEPLOY_READ_LEDGER_DIR). Checked HERE, before any token is
+# minted and before any container is touched: the directory (created 0700 when missing; an
+# existing one is left as it is) must be a writable directory. Never the data volume.
+LEDGER_ARGS=()
+if [ -n "$LEDGER_DIR" ]; then
+  { mkdir -p -m 0700 "$LEDGER_DIR" 2>/dev/null && [ -d "$LEDGER_DIR" ] && [ ! -L "$LEDGER_DIR" ] && [ -w "$LEDGER_DIR" ]; } \
+    || { echo "refused: DEPLOY_READ_LEDGER_DIR $LEDGER_DIR is not a writable directory (not a symlink) — nothing was done" >&2; exit 1; }
+  LEDGER_OPT=""
+  if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then LEDGER_OPT=":z"; fi   # SELinux relabel, like the secrets mount
+  LEDGER_ARGS=(-v "$LEDGER_DIR:/ledger$LEDGER_OPT" -e "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl")
+fi
 MEMORA_PROJECTS="$(printf '%s' "${25}" | base64 -d)"
 SECRETS_MOUNT=/run/secrets/memora
 TS=$(date +%s)
@@ -813,16 +824,6 @@ if [ "$OLD_VOLUME" != "$DATA_VOLUME" ]; then
 fi
 
 "$RT" rename "$CONTAINER" "$CONTAINER-grok-$TS"
-
-# Item 118: the optional read ledger (see DEPLOY_READ_LEDGER_DIR above). The
-# directory is created here (never the data volume); the container runs as root.
-# Absent = no mount and no variable.
-LEDGER_ARGS=()
-if [ -n "$LEDGER_DIR" ]; then
-  mkdir -p -m 0700 "$LEDGER_DIR"   # 0700 when created here; an existing directory is left as it is
-  LEDGER_OPT=""; [ "$SECRETS_OPTS" = ro ] || LEDGER_OPT=":z"   # SELinux relabel, like the secrets mount
-  LEDGER_ARGS=(-v "$LEDGER_DIR:/ledger$LEDGER_OPT" -e "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl")
-fi
 
 # Item 108: a Docker HEALTHCHECK on the cheap, database-free GET /health (liveness) on the container's own
 # port. Interval 30 s, timeout 10 s, 3 retries: unhealthy after about 90 s of a dead /health, slower than

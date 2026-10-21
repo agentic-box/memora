@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Leader decision ledger and effectiveness report (Item 118; docs/read-ledger.md).
 
-  memora-ledger draft <decision-id> "<provisional decision>"      (BEFORE the search)
+  memora-ledger draft <decision-id> "<provisional decision>" [--store S] [--caller C]
+                                                                  (BEFORE the search)
   memora-ledger label <decision-id> unchanged|changed|avoided-repeat|misleading
                       [--memory N ...] "<concrete change or skipped work>"
   memora-ledger missed <decision-id> --memory N "<what was missed>"
@@ -99,7 +100,12 @@ def cmd_draft(args, path: Path) -> str:
     rows = read_jsonl(path, strict=True)
     if any(r.get("type") == "draft" and r.get("id") == did for r in rows):
         raise LedgerError(f"decision {did!r} already has a draft (a draft is written once, before the search)")
-    append(path, {"type": "draft", "id": did, "text": text})
+    row = {"type": "draft", "id": did, "text": text}
+    if args.store:
+        row["store"] = args.store
+    if args.caller:
+        row["caller"] = args.caller
+    append(path, row)
     return f"draft {did}"
 
 
@@ -170,18 +176,41 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     w(f"  unlabeled: {len(drafts) - len(labels)}")
     w("")
 
-    # join: a decision's searches are the telemetry calls between its draft and its label
+    # join: a decision's calls are the telemetry between its draft and its label, narrowed
+    # to its --store / --caller when the draft names them
+    win: Dict[str, Any] = {d: (parse_ts(drafts[d]["ts"]), parse_ts(l["ts"])) for d, l in labels.items()}
     per: Dict[str, List[Dict[str, Any]]] = {}
-    for did, lab in labels.items():
-        lo, hi = parse_ts(drafts[did]["ts"]), parse_ts(lab["ts"])
-        per[did] = [t for t in telemetry if "ts" in t and lo <= parse_ts(t["ts"]) <= hi]
+    for did, (lo, hi) in win.items():
+        dr = drafts[did]
+        per[did] = [t for t in telemetry if "ts" in t and lo <= parse_ts(t["ts"]) <= hi
+                    and (not dr.get("store") or t.get("store") == dr["store"])
+                    and (not dr.get("caller") or t.get("caller") == dr["caller"])]
+    # a decision is AMBIGUOUS (its matches are not counted as cited/returned) when the telemetry
+    # cannot be attributed to it: overlapping decisions without --caller, several stores without
+    # --store, several callers without --caller, or a call whose id list was truncated
+    amb: Dict[str, List[str]] = {}
+    for did, (lo, hi) in win.items():
+        why: List[str] = []
+        dr = drafts[did]
+        if not dr.get("caller") and any(o != did and win[o][0] <= hi and lo <= win[o][1] for o in win):
+            why.append("overlaps another decision")
+        stores = {t["store"] for t in per[did] if t.get("store")}
+        callers = {t["caller"] for t in per[did] if t.get("caller")}
+        if not dr.get("store") and len(stores) > 1:
+            why.append("reads from stores " + ",".join(sorted(stores)))
+        if not dr.get("caller") and len(callers) > 1:
+            why.append("reads from callers " + ",".join(sorted(callers)))
+        if any(t.get("truncated") for t in per[did]):
+            why.append("a read returned more ids than were logged")
+        if why:
+            amb[did] = why
     searches = [t for calls in per.values() for t in calls if t.get("tool") in SEARCH_TOOLS]
     lat = sorted(float(t["latency_ms"]) for t in searches if isinstance(t.get("latency_ms"), (int, float)))
     w(f"searches joined to {len(labels)} labeled decision(s): {len(searches)} "
       f"(memory_hybrid_search/memory_semantic_search/memory_list)")
     for did in sorted(per):
         n = sum(1 for t in per[did] if t.get("tool") in SEARCH_TOOLS)
-        w(f"  {did}: {n} search(es)")
+        w(f"  {did}: {n} search(es)" + (" [ambiguous]" if did in amb else ""))
     if lat:
         w(f"search latency ms over {len(lat)} call(s): p50 {pct_rank(lat, 0.5):g}  p95 {pct_rank(lat, 0.95):g}  max {lat[-1]:g}")
     else:
@@ -190,26 +219,38 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
 
     cited_total = cited_returned = returned_total = 0
     for did, lab in labels.items():
+        if did in amb:
+            continue
         returned = {m["id"] for t in per[did] for m in t.get("memories", []) if isinstance(m, dict) and "id" in m}
         cited = set(lab.get("memories") or [])
         cited_total += len(cited)
         cited_returned += len(cited & returned)
         returned_total += len(returned)
-    w(f"cited vs returned: {cited_returned} of {cited_total} cited memory id(s) were returned by a joined read; "
-      f"{returned_total} distinct-per-decision id(s) returned in all")
+    w(f"cited vs returned over {len(labels) - len(amb)} unambiguous decision(s): {cited_returned} of {cited_total} "
+      f"cited memory id(s) were returned by a joined read; {returned_total} distinct-per-decision id(s) returned in all")
+    w(f"ambiguous decisions, not counted above: {len(amb)}")
+    for did in sorted(amb):
+        w(f"  {did}: {'; '.join(amb[did])}")
     w("")
 
-    w(f"item-record read-backs: {len(readbacks)} event(s), {len({m for r in readbacks for m in r['memories']})} distinct memory id(s)")
+    allreads = [r for r in rows if r.get("type") == "readback"]   # all time: the FIRST read may predate the window
     first: Dict[int, Dict[str, Any]] = {}
-    for r in sorted(readbacks, key=lambda r: r["ts"]):
+    created_of: Dict[int, str] = {}
+    for r in sorted(allreads, key=lambda r: r["ts"]):
         for m in r["memories"]:
             first.setdefault(m, r)
-    for m, r in sorted(first.items()):
-        if r.get("created"):
-            hrs = (parse_ts(r["ts"]) - parse_ts(r["created"])).total_seconds() / 3600
-            w(f"  memory {m}: first read {hrs:.1f} h after creation")
+            if r.get("created"):
+                created_of.setdefault(m, r["created"])
+    inwin_mem = sorted({m for r in readbacks for m in r["memories"]})
+    w(f"item-record read-backs: {len(readbacks)} event(s) in the window, {len(inwin_mem)} distinct memory id(s)")
+    for m in inwin_mem:
+        r = first[m]
+        before = " (before the window)" if start and parse_ts(r["ts"]) < start else ""
+        if m in created_of:
+            hrs = (parse_ts(r["ts"]) - parse_ts(created_of[m])).total_seconds() / 3600
+            w(f"  memory {m}: first read {hrs:.1f} h after creation{before}")
         else:
-            w(f"  memory {m}: first read at {r['ts']} (no --created given)")
+            w(f"  memory {m}: first read at {r['ts']} (no --created given){before}")
     w("")
     w(f"misleading: {sum(1 for l in labels.values() if l['label'] == 'misleading')}   "
       f"missed: {len(missed)} event(s) on {len({r['id'] for r in missed})} decision(s)")
@@ -243,6 +284,8 @@ def parser() -> argparse.ArgumentParser:
     d = sub.add_parser("draft")
     d.add_argument("decision_id")
     d.add_argument("text")
+    d.add_argument("--store", help="attribute only this store's reads to the decision")
+    d.add_argument("--caller", help="attribute only reads carrying this X-Memora-Caller")
     lb = sub.add_parser("label")
     lb.add_argument("decision_id")
     lb.add_argument("label")

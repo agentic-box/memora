@@ -1071,6 +1071,24 @@ class TestRemoteArguments:
         assert not [v for v in _flag_values(run, "-v") if "/ledger" in v]
         assert not [e for e in _flag_values(run, "-e") if e.startswith("MEMORA_READ_LEDGER")]
 
+    def test_an_unusable_read_ledger_dir_refuses_before_any_container_is_touched(self, deploy, tmp_path):
+        a_file = tmp_path / "plain-file"
+        a_file.write_text("x")
+        link = tmp_path / "link"
+        link.symlink_to(tmp_path)
+        cases = [str(a_file), str(link)]
+        ro = tmp_path / "ro"
+        ro.mkdir(mode=0o500)
+        if os.geteuid() != 0:
+            cases.append(str(ro))
+        for bad in cases:
+            proc, calls, _ = deploy(runtime_env={"DEPLOY_READ_LEDGER_DIR": bad})
+            assert proc.returncode != 0 and "is not a writable directory" in proc.stderr and "nothing was done" in proc.stderr, bad
+            assert calls == [], f"{bad}: the runtime was called ({calls})"   # no rename, stop or run
+        # negative control: a usable directory is accepted and the old container is replaced
+        proc, calls, _ = deploy(runtime_env={"DEPLOY_READ_LEDGER_DIR": str(tmp_path / "good")})
+        assert calls and _new_container_run(calls)
+
     @pytest.mark.parametrize("bad", ["relative/dir", "/srv/../etc", "/a b", "/x:y"])
     def test_a_bad_read_ledger_dir_is_refused_before_anything_runs(self, deploy, bad):
         proc, calls, _ = deploy(runtime_env={"DEPLOY_READ_LEDGER_DIR": bad})

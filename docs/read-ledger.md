@@ -35,11 +35,17 @@ Never logged: memory content, tags, metadata, tokens, credentials or any other
 header. The query text IS logged (200 characters), so do not put a secret in a
 search query.
 
-The append runs after the read, is one small write, and cannot fail it: on any
-error the server logs one warning (`memora.read_ledger`) and carries on. The
-total size is capped by `MEMORA_READ_LEDGER_MAX_BYTES` (default 20 MiB for the live
-file and `<path>.1` together): each is held to half, with ONE rotation to
-`<path>.1`; the older file is overwritten by the next rotation.
+The line is built after the read and handed to one writer thread through a
+bounded queue (1000 lines), so a slow disk never delays a read or the event
+loop. A full queue drops the new line (one warning, then silence); any write
+error is swallowed the same way. The ids are taken before `fields=` or content
+projection, so they survive both. A response of more than 200 memories logs the
+first 200 ids and `"truncated": <true count>`; the report treats such a decision
+as ambiguous. The total size is capped by `MEMORA_READ_LEDGER_MAX_BYTES`
+(default 20 MiB, never below 64 KiB) as bytes of the live file and `<path>.1`
+together: each is held to half, with ONE rotation to `<path>.1` (the older file
+is overwritten by the next rotation; files left over from a larger cap are
+discarded).
 
 Turn it on for memora-all: set `DEPLOY_READ_LEDGER_DIR` in
 `instances/deploy.env` (or the environment of `scripts/deploy-memora-all.sh`) to
@@ -57,7 +63,7 @@ server's environment.
 (`item-118-brief`, `item-117-esc-1`).
 
 ```
-memora-ledger draft <id> "<one-sentence provisional decision>"     # BEFORE the search
+memora-ledger draft <id> "<one-sentence provisional decision>" [--store S] [--caller C]   # BEFORE the search
 memora-ledger label <id> unchanged|changed|avoided-repeat|misleading [--memory N ...] "<change or skipped work>"
 memora-ledger missed <id> --memory N "<what was missed>"            # a relevant memory that was not found
 memora-ledger read-back --memory N [--created ISO] "<why it was read>"
@@ -80,6 +86,11 @@ max); cited vs returned memory ids; read-backs and hours from creation to first
 read; misleading and missed counts; and the audit list for the reviewer (every
 `changed`, `avoided-repeat` and `misleading` id, plus a random 20% of all ids).
 
-A decision's searches are the telemetry calls between its `draft` and its
-`label` time. Decisions that overlap in time share those calls; keep drafts and
-labels close together.
+A decision's reads are the telemetry calls between its `draft` and its `label`
+time, narrowed to `draft --store S` and `--caller C` when given. A decision is
+**ambiguous**, and its cited ids are not counted, when its reads cannot be
+attributed: it overlaps another decision (and names no `--caller`), the window
+holds reads from several stores (no `--store`) or callers (no `--caller`), or
+a read was truncated. The report lists each ambiguous decision with the reason.
+The first read of a memory is taken over all time, so a read-back before the
+window is marked "(before the window)" instead of being replaced by a later one.
