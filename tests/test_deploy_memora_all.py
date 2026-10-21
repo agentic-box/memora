@@ -1062,7 +1062,7 @@ class TestRemoteArguments:
         assert _flag_values(run, "-v") == ["memora-all-data:/data", f"{deploy.secrets}:{SECRETS_MOUNT}:ro",
                                            f"{led}:/ledger"]
         assert "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl" in _flag_values(run, "-e")
-        assert led.is_dir()
+        assert led.is_dir() and (led.stat().st_mode & 0o777) == 0o700   # created 0700
         assert _decode_blob((tmp_path / "ssh-command.txt").read_text().strip())[27] == str(led)
 
     def test_read_ledger_is_off_without_the_key(self, deploy):

@@ -37,12 +37,14 @@ search query.
 
 The append runs after the read, is one small write, and cannot fail it: on any
 error the server logs one warning (`memora.read_ledger`) and carries on. The
-file is capped by `MEMORA_READ_LEDGER_MAX_BYTES` (default 20 MiB) with ONE
-rotation to `<path>.1`; the older file is overwritten by the next rotation.
+total size is capped by `MEMORA_READ_LEDGER_MAX_BYTES` (default 20 MiB for the live
+file and `<path>.1` together): each is held to half, with ONE rotation to
+`<path>.1`; the older file is overwritten by the next rotation.
 
 Turn it on for memora-all: set `DEPLOY_READ_LEDGER_DIR` in
 `instances/deploy.env` (or the environment of `scripts/deploy-memora-all.sh`) to
-a directory on the deploy host. The deploy bind-mounts it at `/ledger` and sets
+a directory on the deploy host (it lives only in the git-ignored `deploy.env`; the
+script creates it 0700 when missing). The deploy bind-mounts it at `/ledger` and sets
 `MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl`, so the file survives a redeploy
 and is not on the data volume. Turn it off by removing the key and deploying
 again (the file stays where it is). Outside memora-all, set the variable in the

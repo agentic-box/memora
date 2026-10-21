@@ -142,7 +142,7 @@ def test_rotation_keeps_one_old_file_and_caps_the_live_one(tmp_path, monkeypatch
         read_ledger.record("memory_get", {"memory_id": i}, {"memory": {"id": i}}, 1.0)
     assert (tmp_path / "led.jsonl.1").exists()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["led.jsonl", "led.jsonl.1"]  # one rotation only
-    assert path.stat().st_size <= 1000 and (tmp_path / "led.jsonl.1").stat().st_size <= 1000
+    assert path.stat().st_size + (tmp_path / "led.jsonl.1").stat().st_size <= 1000  # the cap is the TOTAL
     ids = [r["requested_id"] for r in _lines(path)]
     assert ids[-1] == 59 and ids == sorted(ids)
     # negative control: the default cap does not rotate 60 small lines

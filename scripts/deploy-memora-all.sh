@@ -819,7 +819,7 @@ fi
 # Absent = no mount and no variable.
 LEDGER_ARGS=()
 if [ -n "$LEDGER_DIR" ]; then
-  mkdir -p "$LEDGER_DIR"
+  mkdir -p -m 0700 "$LEDGER_DIR"   # 0700 when created here; an existing directory is left as it is
   LEDGER_OPT=""; [ "$SECRETS_OPTS" = ro ] || LEDGER_OPT=":z"   # SELinux relabel, like the secrets mount
   LEDGER_ARGS=(-v "$LEDGER_DIR:/ledger$LEDGER_OPT" -e "MEMORA_READ_LEDGER=/ledger/read-ledger.jsonl")
 fi

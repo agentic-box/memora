@@ -74,7 +74,7 @@ def _warn_once(exc: BaseException) -> None:
 def _append(path: str, line: str, cap: int) -> None:
     with _lock:
         try:
-            if os.path.getsize(path) + len(line) > cap:
+            if os.path.getsize(path) + len(line) > cap // 2:
                 os.replace(path, path + ".1")
         except FileNotFoundError:
             pass
