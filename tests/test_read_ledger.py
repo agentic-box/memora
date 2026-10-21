@@ -29,9 +29,14 @@ def _mk(content, tags=("task",), metadata=None):
     return asyncio.run(server.memory_create(content=content, tags=list(tags), metadata=metadata))["memory"]["id"]
 
 
-def _lines(path):
+def _text(path):
+    """The ledger file after every queued line was written (the writer is asynchronous)."""
     assert read_ledger.flush(10)
-    return [json.loads(l) for l in path.read_text().splitlines()]
+    return path.read_text()
+
+
+def _lines(path):
+    return [json.loads(l) for l in _text(path).splitlines()]
 
 
 def test_off_by_default_writes_nothing(local_db, tmp_path, monkeypatch):
@@ -85,13 +90,13 @@ def test_no_memory_content_tags_or_metadata_in_the_log(local_db, tmp_path, monke
     asyncio.run(server.memory_hybrid_search("body"))
     asyncio.run(server.memory_get(mid))
     asyncio.run(server.memory_list(query="body", content_mode="full"))
-    text = path.read_text()
+    text = _text(path)
     assert text.count("\n") == 3 and '"id":%d' % mid in text
     for needle in (SECRET, "tag-sentinel-55", "meta-sentinel-66"):
         assert needle not in text
     # negative control: the scan can see a needle that is logged (the query text)
     asyncio.run(server.memory_hybrid_search(SECRET))
-    assert SECRET in path.read_text()
+    assert SECRET in _text(path)
 
 
 def test_query_text_is_truncated_and_hash_covers_the_whole_query(local_db, tmp_path, monkeypatch):
