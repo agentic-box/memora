@@ -383,14 +383,14 @@ def test_a_line_that_cannot_be_built_never_fails_the_read(local_db, tmp_path, mo
     def boom():
         raise RuntimeError("store lookup failed")
 
+    real_store = server._ledger_store
     monkeypatch.setattr(server, "_ledger_store", boom)
     with caplog.at_level(logging.WARNING, logger="memora.read_ledger"):
         r = asyncio.run(server.memory_get(mid))
     assert r["memory"]["id"] == mid
     assert len([x for x in caplog.records if x.name == "memora.read_ledger"]) == 1
     assert not (tmp_path / "led.jsonl").exists()
-    monkeypatch.undo()   # control: with a working store lookup the same read is logged
-    monkeypatch.setenv("MEMORA_READ_LEDGER", str(tmp_path / "led.jsonl"))
+    monkeypatch.setattr(server, "_ledger_store", real_store)   # control: the same read is logged
     asyncio.run(server.memory_get(mid))
     assert len(_lines(tmp_path / "led.jsonl")) == 1
 
