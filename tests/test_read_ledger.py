@@ -374,3 +374,33 @@ def test_a_validation_error_after_note_logs_no_ids(local_db, tmp_path, monkeypat
     assert row["memories"] == [] and row["error"] == "invalid_fields"
     asyncio.run(server.memory_get(mid))                      # control: a good read logs its id
     assert [m["id"] for m in _lines(path)[-1]["memories"]] == [mid]
+
+
+def test_a_line_that_cannot_be_built_never_fails_the_read(local_db, tmp_path, monkeypatch, caplog):
+    mid = _mk("stable note")
+    monkeypatch.setenv("MEMORA_READ_LEDGER", str(tmp_path / "led.jsonl"))
+
+    def boom():
+        raise RuntimeError("store lookup failed")
+
+    monkeypatch.setattr(server, "_ledger_store", boom)
+    with caplog.at_level(logging.WARNING, logger="memora.read_ledger"):
+        r = asyncio.run(server.memory_get(mid))
+    assert r["memory"]["id"] == mid
+    assert len([x for x in caplog.records if x.name == "memora.read_ledger"]) == 1
+    assert not (tmp_path / "led.jsonl").exists()
+    monkeypatch.undo()   # control: with a working store lookup the same read is logged
+    monkeypatch.setenv("MEMORA_READ_LEDGER", str(tmp_path / "led.jsonl"))
+    asyncio.run(server.memory_get(mid))
+    assert len(_lines(tmp_path / "led.jsonl")) == 1
+
+
+def test_an_oversized_old_rotated_file_is_discarded_even_when_the_live_file_is_small(tmp_path, monkeypatch):
+    path = tmp_path / "led.jsonl"
+    monkeypatch.setenv("MEMORA_READ_LEDGER", str(path))
+    monkeypatch.setenv("MEMORA_READ_LEDGER_MAX_BYTES", str(read_ledger.MIN_MAX_BYTES))
+    (tmp_path / "led.jsonl.1").write_bytes(b"x" * 300_000)
+    path.write_bytes(b'{"small":1}\n')
+    seen = _watch_total(monkeypatch, path)
+    _record_many(1)
+    assert max(seen) <= read_ledger.MIN_MAX_BYTES and not (tmp_path / "led.jsonl.1").exists()

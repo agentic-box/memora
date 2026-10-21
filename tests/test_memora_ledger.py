@@ -243,3 +243,19 @@ def test_a_read_that_returned_an_error_does_not_count_as_returned(led, tmp_path)
     assert "over 1 unambiguous decision(s): 0 of 1" in led("report", "--telemetry", str(tel))[1]
     _w(tel, [{"ts": ts, "tool": "memory_get", "latency_ms": 1, "memories": [{"id": 9}]}])
     assert "over 1 unambiguous decision(s): 1 of 1" in led("report", "--telemetry", str(tel))[1]
+
+
+def test_a_decision_with_a_store_only_credits_that_stores_reads(led, tmp_path):
+    def run(store):
+        led.path.unlink(missing_ok=True)
+        led("draft", "s", "x", *(["--store", store] if store else []))
+        led("label", "s", "changed", "--memory", "5", "c")
+        ts = json.loads(led.path.read_text().splitlines()[0])["ts"]
+        tel = tmp_path / "t.jsonl"
+        _w(tel, [{"ts": ts, "tool": "memory_get", "latency_ms": 1, "store": "s1", "memories": [{"id": 1}]},
+                 {"ts": ts, "tool": "memory_get", "latency_ms": 1, "store": "s2", "memories": [{"id": 5}]}])
+        return led("report", "--telemetry", str(tel))[1]
+
+    assert "over 1 unambiguous decision(s): 0 of 1" in run("s1")      # id 5 came from s2: not credited
+    assert "over 1 unambiguous decision(s): 1 of 1" in run("s2")      # control
+    assert "over 0 unambiguous decision(s)" in run(None)              # unnamed store, two stores: ambiguous
