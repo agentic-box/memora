@@ -471,7 +471,16 @@ def build_graph_app(host: str):
             if limit is _INVALID_LIMIT:
                 return JSONResponse({"error": "invalid_limit"}, status_code=400)
             include_docs = request.query_params.get("docs") == "1"
-            result = get_graph_data(min_score, rebuild=rebuild, limit=limit, include_docs=include_docs)
+            # The build is synchronous SQLite and CPU work (seconds on a large
+            # store, far longer with ?rebuild=true): run it on a worker thread so
+            # it does not stall every other request this server is handling.
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None,
+                _in_context(functools.partial(
+                    get_graph_data, min_score, rebuild=rebuild, limit=limit, include_docs=include_docs,
+                )),
+            )
             return _graph_json(result)
         except Exception as e:
             logger.exception("Graph API request failed: %s", e)
