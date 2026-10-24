@@ -133,9 +133,9 @@ def test_report_reads_the_rotated_telemetry_and_tolerates_a_torn_line(led, tmp_p
 def test_report_refuses_a_bad_since_and_a_corrupt_ledger(led):
     assert led("report", "--since", "7x")[0] == 2
     led.path.write_text("not json\n")
-    assert led("report")[0] == 2
+    assert led("report", "--no-telemetry")[0] == 2
     led.path.write_text("")
-    assert led("report")[0] == 0
+    assert led("report", "--no-telemetry")[0] == 0
 
 
 def _w(path, rows):
@@ -202,12 +202,12 @@ def test_first_read_is_all_time_even_when_reporting_a_later_window(led, tmp_path
         {"ts": "2026-10-20T10:00:00Z", "type": "readback", "memories": [50], "text": "again"},
         {"ts": "2026-10-20T11:00:00Z", "type": "readback", "memories": [51], "created": "2026-10-20T10:00:00Z", "text": "r"},
     ])
-    out = led("report", "--since", "7d", "--telemetry", str(tmp_path / "none"), "--now", NOW)[1]
+    out = led("report", "--since", "7d", "--no-telemetry", "--now", NOW)[1]
     assert "2 event(s) in the window, 2 distinct memory id(s)" in out
     assert "memory 50: first read 1.0 h after creation (before the window)" in out   # not the 10-20 read
     assert "memory 51: first read 1.0 h after creation" in out and "memory 51: first read 1.0 h after creation (before" not in out
     # negative control: an all-time window shows the same first read, without the marker
-    out = led("report", "--telemetry", str(tmp_path / "none"), "--now", NOW)[1]
+    out = led("report", "--no-telemetry", "--now", NOW)[1]
     assert "memory 50: first read 1.0 h after creation\n" in out
 
 
