@@ -76,11 +76,25 @@ cites. `--created` is the memory's creation time, for the read-back timing.
 ## Report
 
 ```
-memora-ledger report [--since 7d] [--telemetry PATH]
+memora-ledger report [--since 7d] [--telemetry PATH | --no-telemetry]
 ```
 
-`--telemetry` defaults to `$MEMORA_READ_LEDGER`, then `.ledger/read-ledger.jsonl`;
-copy the server's file (and `.1`) there. The report reads local files only and
+**Fetch the telemetry.** The server's file is root-only (0600) inside the
+container, so copy it with `docker exec`, then point the report at it:
+
+```
+mkdir -p .ledger
+docker exec <container> cat /ledger/read-ledger.jsonl > .ledger/read-ledger.jsonl
+docker exec <container> cat /ledger/read-ledger.jsonl.1 > .ledger/read-ledger.jsonl.1   # if it exists
+memora-ledger report --telemetry .ledger/read-ledger.jsonl
+```
+
+`--telemetry` defaults to `$MEMORA_READ_LEDGER`, then `.ledger/read-ledger.jsonl`.
+If neither that file nor its `.1` exists, `report` exits non-zero and names the
+path it looked for. `--no-telemetry` prints a labels-only report: the search,
+latency and cited-vs-returned sections read "not measured". If the file has no
+line inside the decisions' overall time span, `report` prints one warning (a
+stale copy). The report reads local files only and
 prints counts: decisions by label; searches per decision and latency (p50, p95,
 max); cited vs returned memory ids; read-backs and hours from creation to first
 read; misleading and missed counts; and the audit list for the reviewer (every

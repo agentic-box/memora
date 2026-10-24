@@ -7,12 +7,13 @@
                       [--memory N ...] "<concrete change or skipped work>"
   memora-ledger missed <decision-id> --memory N "<what was missed>"
   memora-ledger read-back --memory N [--created ISO] "<why it was read>"
-  memora-ledger report [--since 7d] [--telemetry PATH]
+  memora-ledger report [--since 7d] [--telemetry PATH | --no-telemetry]
 
 The ledger is a local JSONL file, git-ignored: $MEMORA_DECISION_LEDGER, else
 <repo>/.ledger/decisions.jsonl. The report joins it with the server's read
 telemetry ($MEMORA_READ_LEDGER, --telemetry; the rotated <path>.1 too) by time
-window and memory id. Local files only: no D1, no server. Counts, not bare
+window and memory id; it exits non-zero when that file is missing (--no-telemetry
+prints a labels-only report). Local files only: no D1, no server. Counts, not bare
 percentages. Standard library only.
 """
 from __future__ import annotations
@@ -169,6 +170,12 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     out: List[str] = []
     w = out.append
     w(f"memora ledger report  window: {'since ' + iso(start) if start else 'all time'}  now: {iso(now)}")
+    if telemetry is not None and drafts:
+        lo = min(parse_ts(d["ts"]) for d in drafts.values())
+        hi = max([parse_ts(l["ts"]) for l in labels.values()] + [now for d in drafts if d not in labels] + [lo])
+        if not any("ts" in t and lo <= parse_ts(t["ts"]) <= hi for t in telemetry):
+            w(f"WARNING: the telemetry has no line between {iso(lo)} and {iso(hi)} (the decisions' span); "
+              f"it may be a stale copy, so the joins below can read 0")
     w("")
     w(f"decisions drafted: {len(drafts)}")
     for lab in LABELS:
@@ -178,6 +185,8 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
 
     # join: a decision's calls are the telemetry between its draft and its label, narrowed
     # to its --store / --caller when the draft names them
+    nomeasure = telemetry is None
+    telemetry = telemetry or []
     win: Dict[str, Any] = {d: (parse_ts(drafts[d]["ts"]), parse_ts(l["ts"])) for d, l in labels.items()}
     # every draft has a window: an unlabeled one is still open (until now)
     allwin: Dict[str, Any] = {d: win.get(d, (parse_ts(dr["ts"]), now)) for d, dr in drafts.items()}
@@ -210,17 +219,22 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
             why.append("a read returned more ids than were logged")
         if why:
             amb[did] = why
+    NM = "not measured (--no-telemetry)"
     searches = [t for calls in per.values() for t in calls if t.get("tool") in SEARCH_TOOLS]
     lat = sorted(float(t["latency_ms"]) for t in searches if isinstance(t.get("latency_ms"), (int, float)))
-    w(f"searches joined to {len(labels)} labeled decision(s): {len(searches)} per-decision occurrence(s), not unique calls: "
-      f"(memory_hybrid_search/memory_semantic_search/memory_list)")
-    for did in sorted(per):
-        n = sum(1 for t in per[did] if t.get("tool") in SEARCH_TOOLS)
-        w(f"  {did}: {n} search(es)" + (" [ambiguous]" if did in amb else ""))
-    if lat:
-        w(f"search latency ms over {len(lat)} per-decision occurrence(s): p50 {pct_rank(lat, 0.5):g}  p95 {pct_rank(lat, 0.95):g}  max {lat[-1]:g}")
+    if nomeasure:
+        w(f"searches joined to {len(labels)} labeled decision(s): {NM}")
+        w(f"search latency ms: {NM}")
     else:
-        w("search latency ms: no joined search calls")
+        w(f"searches joined to {len(labels)} labeled decision(s): {len(searches)} per-decision occurrence(s), not unique calls: "
+          f"(memory_hybrid_search/memory_semantic_search/memory_list)")
+        for did in sorted(per):
+            n = sum(1 for t in per[did] if t.get("tool") in SEARCH_TOOLS)
+            w(f"  {did}: {n} search(es)" + (" [ambiguous]" if did in amb else ""))
+        if lat:
+            w(f"search latency ms over {len(lat)} per-decision occurrence(s): p50 {pct_rank(lat, 0.5):g}  p95 {pct_rank(lat, 0.95):g}  max {lat[-1]:g}")
+        else:
+            w("search latency ms: no joined search calls")
     w("")
 
     cited_total = cited_returned = returned_total = 0
@@ -232,11 +246,14 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
         cited_total += len(cited)
         cited_returned += len(cited & returned)
         returned_total += len(returned)
-    w(f"cited vs returned over {len(labels) - len(amb)} unambiguous decision(s): {cited_returned} of {cited_total} "
-      f"cited memory id(s) were returned by a joined read; {returned_total} distinct-per-decision id(s) returned in all")
-    w(f"ambiguous decisions, not counted above: {len(amb)}")
-    for did in sorted(amb):
-        w(f"  {did}: {'; '.join(amb[did])}")
+    if nomeasure:
+        w(f"cited vs returned: {NM}")
+    else:
+        w(f"cited vs returned over {len(labels) - len(amb)} unambiguous decision(s): {cited_returned} of {cited_total} "
+          f"cited memory id(s) were returned by a joined read; {returned_total} distinct-per-decision id(s) returned in all")
+        w(f"ambiguous decisions, not counted above: {len(amb)}")
+        for did in sorted(amb):
+            w(f"  {did}: {'; '.join(amb[did])}")
     w("")
 
     allreads = [r for r in rows if r.get("type") == "readback"]   # all time: the FIRST read may predate the window
@@ -278,8 +295,16 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
 
 def cmd_report(args, path: Path) -> str:
     since = parse_since(args.since) if args.since else None
-    tpath = args.telemetry or os.environ.get("MEMORA_READ_LEDGER") or str(ROOT / ".ledger" / "read-ledger.jsonl")
-    tel = read_jsonl(Path(tpath + ".1")) + read_jsonl(Path(tpath))
+    if args.no_telemetry and args.telemetry:
+        raise LedgerError("--telemetry and --no-telemetry are mutually exclusive")
+    tel: Optional[List[Dict[str, Any]]] = None
+    if not args.no_telemetry:
+        tpath = args.telemetry or os.environ.get("MEMORA_READ_LEDGER") or str(ROOT / ".ledger" / "read-ledger.jsonl")
+        if not (Path(tpath).exists() or Path(tpath + ".1").exists()):
+            raise LedgerError(f"no telemetry file at {tpath} (nor {tpath}.1): fetch the server's read ledger and pass "
+                              f"--telemetry PATH (docs/read-ledger.md, \"Fetch the telemetry\"), or use --no-telemetry "
+                              f"for a labels-only report")
+        tel = read_jsonl(Path(tpath + ".1")) + read_jsonl(Path(tpath))
     now = parse_ts(args.now) if args.now else now_utc()
     return build_report(read_jsonl(path, strict=True), tel, now, since, args.seed)
 
@@ -308,6 +333,7 @@ def parser() -> argparse.ArgumentParser:
     rp = sub.add_parser("report")
     rp.add_argument("--since")
     rp.add_argument("--telemetry")
+    rp.add_argument("--no-telemetry", action="store_true", help="labels-only report; search/latency/cited-vs-returned are not measured")
     rp.add_argument("--now", help=argparse.SUPPRESS)
     rp.add_argument("--seed", type=int, help=argparse.SUPPRESS)
     return p

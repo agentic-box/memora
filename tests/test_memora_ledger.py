@@ -259,3 +259,49 @@ def test_a_decision_with_a_store_only_credits_that_stores_reads(led, tmp_path):
     assert "over 1 unambiguous decision(s): 0 of 1" in run("s1")      # id 5 came from s2: not credited
     assert "over 1 unambiguous decision(s): 1 of 1" in run("s2")      # control
     assert "over 0 unambiguous decision(s)" in run(None)              # unnamed store, two stores: ambiguous
+
+
+def _decided(led):
+    led("draft", "x", "t")
+    led("label", "x", "unchanged", "--memory", "4", "kept")
+    return json.loads(led.path.read_text().splitlines()[0])["ts"]
+
+
+def test_report_without_a_telemetry_file_fails_and_names_the_path(led, tmp_path):
+    _decided(led)
+    missing = tmp_path / "nope.jsonl"
+    rc, out, err = led("report", "--telemetry", str(missing))
+    assert rc == 2 and out == ""
+    assert str(missing) in err and "--telemetry PATH" in err and "--no-telemetry" in err
+    # default path: no env, no .ledger file -> still an error (never "joined: 0")
+    rc, out, err = led("report", "--telemetry", str(tmp_path / "x" / "read-ledger.jsonl"))
+    assert rc == 2 and "searches joined" not in out
+    # a rotated file alone counts as present
+    (tmp_path / "nope.jsonl.1").write_text("")
+    assert led("report", "--telemetry", str(missing))[0] == 0
+
+
+def test_report_no_telemetry_says_not_measured(led, tmp_path):
+    _decided(led)
+    rc, out, err = led("report", "--no-telemetry")
+    assert rc == 0, err
+    assert "decisions drafted: 1" in out and "  unchanged: 1" in out
+    assert out.count("not measured") == 3
+    assert "0 of 1" not in out and "search(es)" not in out and "WARNING" not in out
+    assert led("report", "--no-telemetry", "--telemetry", str(tmp_path / "t"))[0] == 2
+
+
+def test_report_warns_once_on_a_stale_telemetry_file(led, tmp_path):
+    ts = _decided(led)
+    tel = tmp_path / "t.jsonl"
+    tel.write_text(json.dumps({"ts": "2020-01-01T00:00:00Z", "tool": "memory_hybrid_search", "memories": []}) + "\n")
+    rc, out, err = led("report", "--telemetry", str(tel))
+    assert rc == 0, err
+    assert out.count("WARNING") == 1 and "stale" in out
+    # normal path: a line inside the span -> no warning
+    tel.write_text(json.dumps({"ts": ts, "tool": "memory_hybrid_search", "latency_ms": 7, "memories": [{"id": 4}]}) + "\n")
+    out = led("report", "--telemetry", str(tel))[1]
+    assert "WARNING" not in out and "1 of 1 cited memory id(s) were returned" in out
+    # an empty file is stale too
+    tel.write_text("")
+    assert led("report", "--telemetry", str(tel))[1].count("WARNING") == 1
