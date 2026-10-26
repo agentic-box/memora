@@ -65,7 +65,8 @@ server's environment.
 ```
 memora-ledger draft <id> "<one-sentence provisional decision>" [--store S] [--caller C]   # BEFORE the search
 memora-ledger label <id> unchanged|changed|avoided-repeat|misleading [--memory N ...] [--time-saved "<what>"] "<change or skipped work>"
-memora-ledger audit <id> confirm|reject|relabel <label> "<reason>" [--by <name>]   # the reviewer's verdict
+memora-ledger audit <id> confirm|reject "<reason>" [--by <name>]            # the reviewer's verdict
+memora-ledger audit <id> relabel unchanged|changed|avoided-repeat|misleading "<reason>" [--by <name>]
 memora-ledger missed <id> --memory N "<what was missed>"            # a relevant memory that was not found
 memora-ledger read-back --memory N [--created ISO] "<why it was read>"
 ```
@@ -80,13 +81,18 @@ change the label (it belongs to the decision's last `label` row).
 ### Audit
 
 `audit` appends the reviewer's verdict on a decision that already has a draft
-and a label, and records who decided (`--by`). `confirm` and `reject` judge the
-leader's current label; `relabel <label>` sets the **effective label**. The last
-audit of a decision wins, and an audit beats the leader's label whatever order
-they were written. A decision is a **verified win** when its effective label is
-`changed` or `avoided-repeat` and its last audit is a `relabel` to that label,
-or a `confirm` of it (a `confirm` of a label the leader has since replaced does
-not count). A win with no audit is **unaudited**; a `reject` is counted apart.
+and a label, and records who decided (`--by`). `confirm` and `reject` take only
+a reason; `relabel` takes the new label first. Every audit is stamped with the
+**revision** of the leader's claim it judged (each `label` row is a revision, even
+with the same category), and only audits of the latest revision count: a later
+`label` leaves them in the file but stale, so a revised claim is never counted
+as verified without a new audit (the report lists it as a **stale win**).
+
+The **effective label** is the last current `relabel` audit, else the leader's
+label; a later `confirm` or `reject` keeps it. A decision is a **verified win**
+when its effective label is `changed` or `avoided-repeat` and its last current
+audit is a `relabel` to it or a `confirm` of it. A win with no audit is
+**unaudited**; a `reject` is counted apart (the label count is kept).
 The reviewer works from the report's audit list (below) and writes these rows.
 
 ## Report
@@ -113,7 +119,7 @@ line inside the decisions' overall time span, `report` prints one warning (a
 stale copy). The report reads local files only and
 prints counts: decisions by label; searches per decision and latency (p50, p95,
 max); cited vs returned memory ids; read-backs and hours from creation to first
-read; misleading and missed counts; verified, unaudited and rejected wins, the
+read; misleading and missed counts; verified, unaudited, stale and rejected wins, the
 time-saved count and progress against the decision rule (N of 40 decisions, M
 of 4 verified wins; a ledger with no audit rows reports zeros); and the audit list for the reviewer (every
 `changed`, `avoided-repeat` and `misleading` id by effective label, with any audit shown, plus a random 20% of all ids).

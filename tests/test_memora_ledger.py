@@ -345,19 +345,19 @@ def test_audit_relabel_confirm_reject_drive_the_counts(led):
         assert led("audit", d, "relabel", "unchanged", "no real change", "--by", "ab-reviewer")[0] == 0
     _lab(led, "i125", "unchanged")
     assert led("audit", "i125", "relabel", "avoided-repeat", "skipped a rerun")[0] == 0
-    _lab(led, "i129", "changed")
+    _lab(led, "i129", "unchanged")
     assert led("audit", "i129", "confirm", "diff matches")[0] == 0
     _lab(led, "i130", "changed")
     assert led("audit", "i130", "reject", "not supported")[0] == 0
     _lab(led, "i140", "avoided-repeat")
     out = led("report", "--no-telemetry")[1]
-    assert "  unchanged: 4" in out and "  changed: 2" in out and "  avoided-repeat: 2" in out
-    assert "verified wins (changed/avoided-repeat, reviewer-confirmed or relabelled to one): 2" in out
+    assert "  unchanged: 5" in out and "  changed: 1" in out and "  avoided-repeat: 2" in out
+    assert "reviewer-confirmed or relabelled to one): 1" in out
     assert "unaudited wins (changed/avoided-repeat, no audit yet): 1" in out
     assert "rejected wins (reviewer rejected the leader's label): 1" in out
-    assert "2 of 4 verified wins" in out and "8 of 40 decisions" in out
+    assert "1 of 4 verified wins" in out and "8 of 40 decisions" in out
     # the audit list shows effective labels and who audited
-    assert "i125  [avoided-repeat]" in out and "(audited: confirm)" in out
+    assert "i125  [avoided-repeat] did it  (audited: relabel)" in out
     assert "i120  [unchanged]" not in out.split("every changed")[1].split("random sample")[0]
 
 
@@ -381,3 +381,60 @@ def test_time_saved_is_counted_apart_and_keeps_the_label(led):
     assert "time saved (label carries --time-saved): 1" in out
     assert "t: found the handler without grepping" in out
     assert "  unchanged: 1" in out and "0 of 4 verified wins" in out
+
+
+def _counts(led):
+    out = led("report", "--no-telemetry")[1]
+    pick = lambda k: int(out.split(k)[1].split(":")[1].split()[0])  # noqa: E731
+    return {"verified": pick("verified wins"), "unaudited": pick("unaudited wins"),
+            "stale": pick("stale wins"), "rejected": pick("rejected wins"), "out": out}
+
+
+def test_confirm_or_reject_after_a_relabel_keeps_the_reviewers_classification(led):
+    _lab(led, "a", "changed")
+    led("audit", "a", "relabel", "unchanged", "no change")
+    assert led("audit", "a", "confirm", "agree")[0] == 0
+    c = _counts(led)
+    assert c["verified"] == 0 and "  unchanged: 1" in c["out"] and "  changed: 0" in c["out"]
+    assert json.loads(led.path.read_text().splitlines()[-1])["label"] == "unchanged"
+    _lab(led, "b", "changed")
+    led("audit", "b", "relabel", "unchanged", "no change")
+    assert led("audit", "b", "reject", "not even that")[0] == 0
+    out = led("report", "--no-telemetry")[1]
+    assert "  unchanged: 2" in out and "  changed: 0" in out
+    # control: relabel to a win then confirm stays a verified win
+    _lab(led, "c", "unchanged")
+    led("audit", "c", "relabel", "changed", "real change")
+    led("audit", "c", "confirm", "agree")
+    assert _counts(led)["verified"] == 1
+
+
+def test_a_revised_leader_label_makes_older_audits_stale(led):
+    _lab(led, "b", "changed", "--memory", "1")
+    led("audit", "b", "confirm", "ok", "--by", "r")
+    assert _counts(led)["verified"] == 1                    # control
+    led("label", "b", "avoided-repeat", "mid")
+    c = _counts(led)
+    assert (c["verified"], c["stale"], c["unaudited"]) == (0, 1, 0)
+    led("label", "b", "changed", "--memory", "9", "claim two")   # A -> B -> A, same category
+    c = _counts(led)
+    assert (c["verified"], c["stale"], c["unaudited"]) == (0, 1, 0)
+    assert "audit stale" in c["out"]
+    # a same-category revision straight after a confirm is stale too
+    _lab(led, "d", "changed")
+    led("audit", "d", "confirm", "ok")
+    led("label", "d", "changed", "different claim")
+    assert _counts(led)["stale"] == 2
+    # a fresh audit of the latest revision verifies it again
+    led("audit", "b", "confirm", "ok on claim two")
+    c = _counts(led)
+    assert (c["verified"], c["stale"]) == (1, 1)
+    # and the rows of the old audit are kept
+    assert sum(1 for l in led.path.read_text().splitlines() if '"type": "audit"' in l and '"id": "b"' in l) == 2
+
+
+def test_the_random_sample_shows_the_audit_too(led):
+    _lab(led, "s", "unchanged")
+    led("audit", "s", "confirm", "agree", "--by", "r")
+    out = led("report", "--no-telemetry")[1]
+    assert "s  [unchanged]  (audited: confirm by r)" in out.split("random sample")[1]

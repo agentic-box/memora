@@ -101,6 +101,26 @@ def need_draft(rows: List[Dict[str, Any]], did: str) -> None:
         raise LedgerError(f"no draft for decision {did!r}: write `draft {did} \"...\"` BEFORE the search")
 
 
+def judgment(rows: List[Dict[str, Any]], did: str):
+    """(rev, effective label, current audits, has_audits) of a decision.
+
+    rev is the number of leader label rows: each is one revision of the leader's claim, and an
+    audit (stamped with the rev it judged) only counts while it matches the latest rev. The
+    effective label is the last current relabel audit, else the leader's last label; a later
+    confirm/reject keeps it. History is never rewritten: stale audits stay in the file."""
+    labs = [r for r in rows if r.get("type") == "label" and r.get("id") == did]
+    allaud = [r for r in rows if r.get("type") == "audit" and r.get("id") == did]
+    if not labs:
+        return 0, None, [], bool(allaud)
+    rev = len(labs)
+    cur = [a for a in allaud if a.get("rev") == rev]
+    eff = labs[-1]["label"]
+    for a in cur:
+        if a.get("verdict") == "relabel":
+            eff = a["label"]
+    return rev, eff, cur, bool(allaud)
+
+
 def cmd_draft(args, path: Path) -> str:
     did = need_text(args.decision_id, "decision-id")
     text = need_text(args.text, "the provisional decision")
@@ -148,12 +168,14 @@ def cmd_audit(args, path: Path) -> str:
     by = need_text(args.by, "--by") if args.by is not None else None
     rows = read_jsonl(path, strict=True)
     need_draft(rows, did)
-    leader = [r for r in rows if r.get("type") == "label" and r.get("id") == did]
-    if not leader:
+    rev, eff, _, _ = judgment(rows, did)
+    if not rev:
         raise LedgerError(f"decision {did!r} has no label to {args.verdict}: label it first")
     row: Dict[str, Any] = {"type": "audit", "id": did, "verdict": args.verdict, "text": text}
-    # confirm/reject name the leader label they judged, so a later relabel by the leader voids a stale confirm
-    row["label"] = new_label or leader[-1]["label"]
+    # the audit names the leader revision it judged and the classification it ends on, so a later
+    # leader label (even the same category) leaves it stale instead of re-verifying the new claim
+    row["rev"] = rev
+    row["label"] = new_label or eff
     if by:
         row["by"] = by
     append(path, row)
@@ -204,27 +226,26 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     for r in rows:  # last label wins
         if r.get("type") == "label" and r.get("id") in drafts:
             labels[r["id"]] = r
-    audits: Dict[str, Dict[str, Any]] = {}
-    for r in rows:  # last audit wins
-        if r.get("type") == "audit" and r.get("id") in drafts:
-            audits[r["id"]] = r
-    # effective label: a relabel audit beats the leader's label; confirm/reject leave it
-    eff: Dict[str, str] = {d: l["label"] for d, l in labels.items()}
-    for d, a in audits.items():
-        if a.get("verdict") == "relabel":
-            eff[d] = a["label"]
+    eff: Dict[str, str] = {}
+    audits: Dict[str, Dict[str, Any]] = {}   # the last audit of the CURRENT leader revision
+    stale: set = set()                        # audited, but only an older revision
+    for d in labels:
+        _, eff[d], cur, any_audit = judgment(rows, d)
+        if cur:
+            audits[d] = cur[-1]
+        elif any_audit:
+            stale.add(d)
 
     def verified(d: str) -> bool:
         a = audits.get(d)
         if eff.get(d) not in WINS or not a:
             return False
-        if a["verdict"] == "relabel":
-            return True
-        return a["verdict"] == "confirm" and a.get("label") == eff[d]
+        return a["verdict"] == "relabel" or (a["verdict"] == "confirm" and a.get("label") == eff[d])
     wins = [d for d in eff if eff[d] in WINS]
     n_verified = sum(1 for d in wins if verified(d))
     n_rejected = sum(1 for d in wins if audits.get(d, {}).get("verdict") == "reject")
-    n_unaudited = sum(1 for d in wins if d not in audits)
+    n_stale = sum(1 for d in wins if d in stale)
+    n_unaudited = sum(1 for d in wins if d not in audits and d not in stale)
     n_time = sum(1 for d in drafts if d in labels and labels[d].get("time_saved"))
     missed = [r for r in rows if r.get("type") == "missed" and r.get("id") in drafts]
     readbacks = [r for r in rows if r.get("type") == "readback" and inwin(r["ts"])]
@@ -245,6 +266,7 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     w("(labels are effective: a reviewer `relabel` audit beats the leader's label)")
     w(f"verified wins (changed/avoided-repeat, reviewer-confirmed or relabelled to one): {n_verified}")
     w(f"unaudited wins (changed/avoided-repeat, no audit yet): {n_unaudited}")
+    w(f"stale wins (the leader label changed after the audit; needs a renewed audit): {n_stale}")
     w(f"rejected wins (reviewer rejected the leader's label): {n_rejected}")
     w(f"time saved (label carries --time-saved): {n_time} decision(s)")
     for d in sorted(drafts):
@@ -350,6 +372,11 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
       f"missed: {len(missed)} event(s) on {len({r['id'] for r in missed})} decision(s)")
     w("")
 
+    def audit_mark(d: str) -> str:
+        a = audits.get(d)
+        if a:
+            return f"  (audited: {a['verdict']}{' by ' + a['by'] if a.get('by') else ''})"
+        return "  (audit stale: label changed since)" if d in stale else ""
     forced = sorted(d for d, v in eff.items() if v in AUDIT)
     ids = sorted(drafts)
     k = math.ceil(0.2 * len(ids)) if ids else 0
@@ -357,12 +384,10 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     w(f"audit list for the reviewer: {len(set(forced) | set(sample))} decision id(s)")
     w(f"  every changed/avoided-repeat/misleading ({len(forced)}):")
     for d in forced:
-        a = audits.get(d)
-        mark = f"  (audited: {a['verdict']}{' by ' + a['by'] if a.get('by') else ''})" if a else ""
-        w(f"    {d}  [{eff[d]}] {labels[d]['text']}{mark}")
+        w(f"    {d}  [{eff[d]}] {labels[d]['text']}{audit_mark(d)}")
     w(f"  random sample, ceil(20% of {len(ids)}) = {k}:")
     for d in sample:
-        w(f"    {d}  [{eff[d] if d in eff else 'unlabeled'}]")
+        w(f"    {d}  [{eff[d] if d in eff else 'unlabeled'}]{audit_mark(d)}")
     return "\n".join(out)
 
 
