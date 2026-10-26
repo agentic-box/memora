@@ -4,7 +4,9 @@
   memora-ledger draft <decision-id> "<provisional decision>" [--store S] [--caller C]
                                                                   (BEFORE the search)
   memora-ledger label <decision-id> unchanged|changed|avoided-repeat|misleading
-                      [--memory N ...] "<concrete change or skipped work>"
+                      [--memory N ...] [--time-saved "<what lookup it saved>"] "<concrete change or skipped work>"
+  memora-ledger audit <decision-id> confirm|reject|relabel <label> "<reason>" [--by NAME]
+                      (the reviewer's verdict on a labelled decision; only `relabel` takes a label)
   memora-ledger missed <decision-id> --memory N "<what was missed>"
   memora-ledger read-back --memory N [--created ISO] "<why it was read>"
   memora-ledger report [--since 7d] [--telemetry PATH | --no-telemetry]
@@ -31,6 +33,10 @@ from typing import Any, Dict, List, Optional
 LABELS = ("unchanged", "changed", "avoided-repeat", "misleading")
 SEARCH_TOOLS = ("memory_hybrid_search", "memory_semantic_search", "memory_list")
 AUDIT = ("changed", "avoided-repeat", "misleading")
+WINS = ("changed", "avoided-repeat")
+VERDICTS = ("confirm", "reject", "relabel")
+TARGET_DECISIONS = 40   # the decision rule in docs/read-ledger.md
+TARGET_WINS = 4
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -117,8 +123,41 @@ def cmd_label(args, path: Path) -> str:
     text = need_text(args.text, "the concrete change or skipped work")
     rows = read_jsonl(path, strict=True)
     need_draft(rows, did)
-    append(path, {"type": "label", "id": did, "label": args.label, "memories": sorted(set(args.memory or [])), "text": text})
+    row = {"type": "label", "id": did, "label": args.label, "memories": sorted(set(args.memory or [])), "text": text}
+    if args.time_saved is not None:
+        row["time_saved"] = need_text(args.time_saved, "--time-saved")
+    append(path, row)
     return f"label {did} {args.label}"
+
+
+def cmd_audit(args, path: Path) -> str:
+    if args.verdict not in VERDICTS:
+        raise LedgerError(f"unknown audit verdict {args.verdict!r} (one of: {', '.join(VERDICTS)})")
+    did = need_text(args.decision_id, "decision-id")
+    rest = list(args.rest)
+    new_label = None
+    if args.verdict == "relabel":
+        if len(rest) != 2:
+            raise LedgerError('relabel takes a label and a reason: audit <id> relabel <label> "<reason>"')
+        new_label = rest[0]
+        if new_label not in LABELS:
+            raise LedgerError(f"unknown label {new_label!r} (one of: {', '.join(LABELS)})")
+    elif len(rest) != 1:
+        raise LedgerError(f'{args.verdict} takes only a reason: audit <id> {args.verdict} "<reason>"')
+    text = need_text(rest[-1], "the reason")
+    by = need_text(args.by, "--by") if args.by is not None else None
+    rows = read_jsonl(path, strict=True)
+    need_draft(rows, did)
+    leader = [r for r in rows if r.get("type") == "label" and r.get("id") == did]
+    if not leader:
+        raise LedgerError(f"decision {did!r} has no label to {args.verdict}: label it first")
+    row: Dict[str, Any] = {"type": "audit", "id": did, "verdict": args.verdict, "text": text}
+    # confirm/reject name the leader label they judged, so a later relabel by the leader voids a stale confirm
+    row["label"] = new_label or leader[-1]["label"]
+    if by:
+        row["by"] = by
+    append(path, row)
+    return f"audit {did} {args.verdict}" + (f" {new_label}" if new_label else "")
 
 
 def cmd_missed(args, path: Path) -> str:
@@ -165,6 +204,28 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     for r in rows:  # last label wins
         if r.get("type") == "label" and r.get("id") in drafts:
             labels[r["id"]] = r
+    audits: Dict[str, Dict[str, Any]] = {}
+    for r in rows:  # last audit wins
+        if r.get("type") == "audit" and r.get("id") in drafts:
+            audits[r["id"]] = r
+    # effective label: a relabel audit beats the leader's label; confirm/reject leave it
+    eff: Dict[str, str] = {d: l["label"] for d, l in labels.items()}
+    for d, a in audits.items():
+        if a.get("verdict") == "relabel":
+            eff[d] = a["label"]
+
+    def verified(d: str) -> bool:
+        a = audits.get(d)
+        if eff.get(d) not in WINS or not a:
+            return False
+        if a["verdict"] == "relabel":
+            return True
+        return a["verdict"] == "confirm" and a.get("label") == eff[d]
+    wins = [d for d in eff if eff[d] in WINS]
+    n_verified = sum(1 for d in wins if verified(d))
+    n_rejected = sum(1 for d in wins if audits.get(d, {}).get("verdict") == "reject")
+    n_unaudited = sum(1 for d in wins if d not in audits)
+    n_time = sum(1 for d in drafts if d in labels and labels[d].get("time_saved"))
     missed = [r for r in rows if r.get("type") == "missed" and r.get("id") in drafts]
     readbacks = [r for r in rows if r.get("type") == "readback" and inwin(r["ts"])]
     out: List[str] = []
@@ -179,8 +240,18 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
     w("")
     w(f"decisions drafted: {len(drafts)}")
     for lab in LABELS:
-        w(f"  {lab}: {sum(1 for l in labels.values() if l['label'] == lab)}")
-    w(f"  unlabeled: {len(drafts) - len(labels)}")
+        w(f"  {lab}: {sum(1 for v in eff.values() if v == lab)}")
+    w(f"  unlabeled: {len(drafts) - len(eff)}")
+    w("(labels are effective: a reviewer `relabel` audit beats the leader's label)")
+    w(f"verified wins (changed/avoided-repeat, reviewer-confirmed or relabelled to one): {n_verified}")
+    w(f"unaudited wins (changed/avoided-repeat, no audit yet): {n_unaudited}")
+    w(f"rejected wins (reviewer rejected the leader's label): {n_rejected}")
+    w(f"time saved (label carries --time-saved): {n_time} decision(s)")
+    for d in sorted(drafts):
+        if d in labels and labels[d].get("time_saved"):
+            w(f"    {d}: {labels[d]['time_saved']}")
+    w(f"progress against the rule: {len(drafts)} of {TARGET_DECISIONS} decisions, "
+      f"{n_verified} of {TARGET_WINS} verified wins")
     w("")
 
     # join: a decision's calls are the telemetry between its draft and its label, narrowed
@@ -275,21 +346,23 @@ def build_report(rows, telemetry, now, since: Optional[timedelta], seed=None) ->
         else:
             w(f"  memory {m}: first read at {r['ts']} (no --created given){before}")
     w("")
-    w(f"misleading: {sum(1 for l in labels.values() if l['label'] == 'misleading')}   "
+    w(f"misleading: {sum(1 for v in eff.values() if v == 'misleading')}   "
       f"missed: {len(missed)} event(s) on {len({r['id'] for r in missed})} decision(s)")
     w("")
 
-    forced = sorted(d for d, l in labels.items() if l["label"] in AUDIT)
+    forced = sorted(d for d, v in eff.items() if v in AUDIT)
     ids = sorted(drafts)
     k = math.ceil(0.2 * len(ids)) if ids else 0
     sample = sorted(random.Random(seed).sample(ids, k)) if k else []
     w(f"audit list for the reviewer: {len(set(forced) | set(sample))} decision id(s)")
     w(f"  every changed/avoided-repeat/misleading ({len(forced)}):")
     for d in forced:
-        w(f"    {d}  [{labels[d]['label']}] {labels[d]['text']}")
+        a = audits.get(d)
+        mark = f"  (audited: {a['verdict']}{' by ' + a['by'] if a.get('by') else ''})" if a else ""
+        w(f"    {d}  [{eff[d]}] {labels[d]['text']}{mark}")
     w(f"  random sample, ceil(20% of {len(ids)}) = {k}:")
     for d in sample:
-        w(f"    {d}  [{labels[d]['label'] if d in labels else 'unlabeled'}]")
+        w(f"    {d}  [{eff[d] if d in eff else 'unlabeled'}]")
     return "\n".join(out)
 
 
@@ -321,7 +394,13 @@ def parser() -> argparse.ArgumentParser:
     lb.add_argument("decision_id")
     lb.add_argument("label")
     lb.add_argument("--memory", type=int, action="append")
+    lb.add_argument("--time-saved", help="recall saved lookup time (does not change the label)")
     lb.add_argument("text")
+    au = sub.add_parser("audit")
+    au.add_argument("decision_id")
+    au.add_argument("verdict")
+    au.add_argument("rest", nargs="+", metavar="[LABEL] REASON")
+    au.add_argument("--by", help="who decided (e.g. ab-reviewer)")
     m = sub.add_parser("missed")
     m.add_argument("decision_id")
     m.add_argument("--memory", type=int, action="append")
@@ -341,7 +420,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = parser().parse_args(argv)
-    handler = {"draft": cmd_draft, "label": cmd_label, "missed": cmd_missed,
+    handler = {"draft": cmd_draft, "label": cmd_label, "audit": cmd_audit, "missed": cmd_missed,
                "read-back": cmd_read_back, "report": cmd_report}[args.cmd]
     try:
         print(handler(args, ledger_file()))

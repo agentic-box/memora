@@ -64,14 +64,30 @@ server's environment.
 
 ```
 memora-ledger draft <id> "<one-sentence provisional decision>" [--store S] [--caller C]   # BEFORE the search
-memora-ledger label <id> unchanged|changed|avoided-repeat|misleading [--memory N ...] "<change or skipped work>"
+memora-ledger label <id> unchanged|changed|avoided-repeat|misleading [--memory N ...] [--time-saved "<what>"] "<change or skipped work>"
+memora-ledger audit <id> confirm|reject|relabel <label> "<reason>" [--by <name>]   # the reviewer's verdict
 memora-ledger missed <id> --memory N "<what was missed>"            # a relevant memory that was not found
 memora-ledger read-back --memory N [--created ISO] "<why it was read>"
 ```
 
 `label` and `missed` refuse a decision with no draft; a draft is written once;
 the last `label` of a decision wins. `--memory` is the memory ids the label
-cites. `--created` is the memory's creation time, for the read-back timing.
+cites. `--time-saved` notes that memora pointed to something the code held and
+saved navigation; it is counted separately from changed decisions and does not
+change the label (it belongs to the decision's last `label` row).
+`--created` is the memory's creation time, for the read-back timing.
+
+### Audit
+
+`audit` appends the reviewer's verdict on a decision that already has a draft
+and a label, and records who decided (`--by`). `confirm` and `reject` judge the
+leader's current label; `relabel <label>` sets the **effective label**. The last
+audit of a decision wins, and an audit beats the leader's label whatever order
+they were written. A decision is a **verified win** when its effective label is
+`changed` or `avoided-repeat` and its last audit is a `relabel` to that label,
+or a `confirm` of it (a `confirm` of a label the leader has since replaced does
+not count). A win with no audit is **unaudited**; a `reject` is counted apart.
+The reviewer works from the report's audit list (below) and writes these rows.
 
 ## Report
 
@@ -97,8 +113,10 @@ line inside the decisions' overall time span, `report` prints one warning (a
 stale copy). The report reads local files only and
 prints counts: decisions by label; searches per decision and latency (p50, p95,
 max); cited vs returned memory ids; read-backs and hours from creation to first
-read; misleading and missed counts; and the audit list for the reviewer (every
-`changed`, `avoided-repeat` and `misleading` id, plus a random 20% of all ids).
+read; misleading and missed counts; verified, unaudited and rejected wins, the
+time-saved count and progress against the decision rule (N of 40 decisions, M
+of 4 verified wins; a ledger with no audit rows reports zeros); and the audit list for the reviewer (every
+`changed`, `avoided-repeat` and `misleading` id by effective label, with any audit shown, plus a random 20% of all ids).
 
 A decision's reads are the telemetry calls between its `draft` and its `label`
 time, narrowed to `draft --store S` and `--caller C` when given. A decision is

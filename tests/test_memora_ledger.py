@@ -305,3 +305,79 @@ def test_report_warns_once_on_a_stale_telemetry_file(led, tmp_path):
     # an empty file is stale too
     tel.write_text("")
     assert led("report", "--telemetry", str(tel))[1].count("WARNING") == 1
+
+
+def _lab(led, did, label, *extra):
+    assert led("draft", did, "x")[0] == 0
+    assert led("label", did, label, *extra, "did it")[0] == 0
+
+
+def test_audit_needs_a_labelled_decision_and_valid_args(led):
+    assert led("audit", "i1", "confirm", "ok")[0] == 2        # no draft
+    led("draft", "i1", "x")
+    rc, _, err = led("audit", "i1", "confirm", "ok")
+    assert rc == 2 and "no label" in err                       # drafted, unlabelled
+    led("label", "i1", "changed", "did it")
+    assert led("audit", "i1", "maybe", "ok")[0] == 2
+    assert led("audit", "i1", "relabel", "bogus", "r")[0] == 2
+    assert led("audit", "i1", "relabel", "r")[0] == 2          # relabel needs a label
+    assert led("audit", "i1", "confirm", "unchanged", "r")[0] == 2
+    assert led("audit", "i1", "confirm", "  ")[0] == 2
+    assert len(led.path.read_text().splitlines()) == 2         # nothing written by refusals
+    assert led("audit", "i1", "confirm", "seen in diff", "--by", "ab-reviewer")[0] == 0
+    row = json.loads(led.path.read_text().splitlines()[-1])
+    assert row["type"] == "audit" and row["by"] == "ab-reviewer" and row["label"] == "changed"
+
+
+def test_report_without_audit_rows_has_zero_counts(led):
+    _lab(led, "a", "changed")
+    out = led("report", "--no-telemetry")[1]
+    assert "verified wins" in out and ": 0\n" in out.split("verified wins")[1]
+    assert "unaudited wins (changed/avoided-repeat, no audit yet): 1" in out
+    assert "time saved (label carries --time-saved): 0" in out
+    assert "progress against the rule: 1 of 40 decisions, 0 of 4 verified wins" in out
+    assert "  changed: 1" in out
+
+
+def test_audit_relabel_confirm_reject_drive_the_counts(led):
+    for d in ("i120", "i123", "i127", "i131"):
+        _lab(led, d, "changed")
+        assert led("audit", d, "relabel", "unchanged", "no real change", "--by", "ab-reviewer")[0] == 0
+    _lab(led, "i125", "unchanged")
+    assert led("audit", "i125", "relabel", "avoided-repeat", "skipped a rerun")[0] == 0
+    _lab(led, "i129", "changed")
+    assert led("audit", "i129", "confirm", "diff matches")[0] == 0
+    _lab(led, "i130", "changed")
+    assert led("audit", "i130", "reject", "not supported")[0] == 0
+    _lab(led, "i140", "avoided-repeat")
+    out = led("report", "--no-telemetry")[1]
+    assert "  unchanged: 4" in out and "  changed: 2" in out and "  avoided-repeat: 2" in out
+    assert "verified wins (changed/avoided-repeat, reviewer-confirmed or relabelled to one): 2" in out
+    assert "unaudited wins (changed/avoided-repeat, no audit yet): 1" in out
+    assert "rejected wins (reviewer rejected the leader's label): 1" in out
+    assert "2 of 4 verified wins" in out and "8 of 40 decisions" in out
+    # the audit list shows effective labels and who audited
+    assert "i125  [avoided-repeat]" in out and "(audited: confirm)" in out
+    assert "i120  [unchanged]" not in out.split("every changed")[1].split("random sample")[0]
+
+
+def test_last_audit_wins_and_a_stale_confirm_does_not_count(led):
+    _lab(led, "a", "changed")
+    led("audit", "a", "reject", "no")
+    led("audit", "a", "confirm", "yes after all")
+    assert "2 of" not in led("report", "--no-telemetry")[1]
+    assert "1 of 4 verified wins" in led("report", "--no-telemetry")[1]
+    # leader relabels after the confirm: the confirm judged "changed", so it is stale
+    led("label", "a", "avoided-repeat", "re-thought")
+    out = led("report", "--no-telemetry")[1]
+    assert "0 of 4 verified wins" in out and "unaudited wins (changed/avoided-repeat, no audit yet): 0" in out
+
+
+def test_time_saved_is_counted_apart_and_keeps_the_label(led):
+    _lab(led, "t", "unchanged", "--time-saved", "found the handler without grepping")
+    rc, _, err = led("label", "t", "unchanged", "--time-saved", " ", "again")
+    assert rc == 2
+    out = led("report", "--no-telemetry")[1]
+    assert "time saved (label carries --time-saved): 1" in out
+    assert "t: found the handler without grepping" in out
+    assert "  unchanged: 1" in out and "0 of 4 verified wins" in out
