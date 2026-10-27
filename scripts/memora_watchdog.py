@@ -78,18 +78,59 @@ from __future__ import annotations
 
 import argparse
 import calendar
-import fcntl
 import json
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows
+    msvcrt = None
+
 log = logging.getLogger("memora.watchdog")
+
+
+def _lock_file(fh, *, non_blocking=False):
+    if fcntl is not None:
+        operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if non_blocking else 0)
+        fcntl.flock(fh, operation)
+        return
+    if msvcrt is not None:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write("\0")
+            fh.flush()
+        fh.seek(0)
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if non_blocking:
+                    raise
+                time.sleep(0.1)
+    raise ConfigError(f"file locking is unavailable on this platform: {sys.platform!r}")
+
+
+def _unlock_file(fh):
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    elif msvcrt is not None:
+        fh.seek(0)
+        msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+
 
 RUNTIMES = ("container", "docker", "podman")
 # The only verbs this process may send to a container runtime. No create/run/rm/volume verb exists here.
@@ -114,7 +155,7 @@ class _HoldLock:
     def __enter__(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         self.fh = open(self.path, "a+")
-        fcntl.flock(self.fh, fcntl.LOCK_EX)
+        _lock_file(self.fh)
         return self
 
     def __exit__(self, *exc) -> None:
@@ -299,7 +340,7 @@ def await_no_restart(hold_path: str, timeout_s: float, sleeper=time.sleep, clock
     with open(hold_path + ".busy", "a+") as fh:
         while True:
             try:
-                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_file(fh, non_blocking=True)
                 return True
             except OSError:
                 if clock() >= deadline:
@@ -559,7 +600,7 @@ class Watchdog:
         os.makedirs(os.path.dirname(self.hold_path), exist_ok=True)
         fh = open(self.hold_path + ".busy", "a+")
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_file(fh, non_blocking=True)
         except OSError:
             fh.close()
             return None
@@ -642,6 +683,38 @@ class Watchdog:
                       (getattr(proc, "stderr", "") or "").strip()[:200])
 
 
+class _WatchdogLock:
+    def __init__(self, pid_path: str, lock_path: str):
+        self.pid_path = pid_path
+        self.lock_path = lock_path
+        self.pid_fh = open(pid_path, "a+")
+        self.lock_fh = open(lock_path, "a+")
+        self._locked = False
+
+    def acquire(self):
+        try:
+            _lock_file(self.lock_fh, non_blocking=True)
+        except OSError:
+            self.close()
+            raise ConfigError(f"another watchdog already holds {self.lock_path}")
+        self._locked = True
+        self.pid_fh.seek(0)
+        self.pid_fh.truncate()
+        self.pid_fh.write(f"{os.getpid()}\n")
+        self.pid_fh.flush()
+        return self
+
+    def close(self):
+        if self._locked and msvcrt is not None:
+            try:
+                _unlock_file(self.lock_fh)
+            except OSError:
+                pass
+        self.lock_fh.close()
+        self.pid_fh.close()
+        self._locked = False
+
+
 def acquire_lock(path: str):
     """Exclusive, non-blocking, held for the process lifetime.
 
@@ -649,20 +722,14 @@ def acquire_lock(path: str):
     every workspace down; with a single shared container that is the whole
     fleet.
     """
-    # "a" (create, no truncate): opening "w" wiped the CURRENT holder's pid
-    # before the loser discovered it had lost, leaving an empty file exactly
-    # when an operator needs to know who holds it.
-    fh = open(path, "a+")
-    try:
-        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        fh.close()
-        raise ConfigError(f"another watchdog already holds {path}")
-    fh.seek(0)
-    fh.truncate()
-    fh.write(f"{os.getpid()}\n")
-    fh.flush()
-    return fh
+    # Use a separate lock file so the pid file itself remains readable while the
+    # lock is held. On Windows, locking the pid file causes the same file to be
+    # unavailable to other open() calls, which breaks the diagnostics test that
+    # expects the holder pid file to stay readable.
+    lock_path = f"{path}.lock"
+    holder = _WatchdogLock(path, lock_path)
+    holder.acquire()
+    return holder
 
 
 def _hold_cli(argv) -> int:
@@ -716,7 +783,9 @@ def main(argv=None) -> int:
         filename=os.environ.get("MEMORA_WATCHDOG_LOG") or None,
     )
 
-    lock_path = os.environ.get("MEMORA_WATCHDOG_LOCK") or f"/tmp/memora-watchdog-{container}.lock"
+    lock_path = os.environ.get("MEMORA_WATCHDOG_LOCK") or os.path.join(
+        tempfile.gettempdir(), f"memora-watchdog-{container}.lock"
+    )
     lock = acquire_lock(lock_path)          # held for the process lifetime
 
     dog = Watchdog(
