@@ -84,18 +84,27 @@ jobs:
         # fine, and every query failed with "no such table: memories".
         run: npx wrangler d1 execute memora-graph --local --persist-to=.wrangler/state --file=tests/fixture.sql
 
-      - name: Resolve the index.html symlink
-        # public/index.html and public/_graph_limit.mjs are symlinks into
-        # memora/graph/. `wrangler pages dev` does NOT serve symlinked assets
-        # (the page 404s), while deploys DO follow them. Swapping in resolved
-        # copies serves identical bytes.
+      - name: Resolve the public/ symlinks
+        # Every file in public/ that is a symlink points into memora/graph/
+        # (index.html, force-graph.html, _graph_limit.mjs, _selection.mjs, ...).
+        # `wrangler pages dev` does NOT serve symlinked assets (the page 404s),
+        # while deploys DO follow them. Swapping in resolved copies serves
+        # identical bytes. This resolves whatever is a symlink, so a page added
+        # later is not silently left unserved (force-graph.html and
+        # _selection.mjs were, and the browser test timed out on a page that
+        # never loaded).
         run: |
-          for f in public/index.html public/_graph_limit.mjs; do
+          n=0
+          for f in $(find public -maxdepth 1 -type l); do
             cp -L "$f" "/tmp/$(basename "$f").real"
             rm "$f"
             cp "/tmp/$(basename "$f").real" "$f"
             test -f "$f" && ! test -L "$f"
+            n=$((n+1))
           done
+          echo "resolved $n symlinks"
+          test "$n" -ge 4
+          ! find public -type l | grep .
 
       - name: Start wrangler pages dev
         run: |
