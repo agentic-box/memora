@@ -113,7 +113,7 @@ def _claim_and_ev(text="commit abc1234 exists on dev"):
 def test_valid_answer_is_confirmed_control():
     claims, ev = _claim_and_ev()
     out, corr, prob = dream.parse_verdicts(
-        json.dumps({"claims": [{"id": "c1", "verdict": "confirmed", "evidence": "exists on dev"}]}), claims, ev, "n")
+        json.dumps({"claims": [{"id": "c1", "verdict": "confirmed", "evidence": "exists on dev"}], "correction": None}), claims, ev, "n")
     assert out["c1"]["verdict"] == "confirmed" and prob is None
 
 
@@ -496,17 +496,19 @@ def _row(i, v="confirmed", q="exists"):
 
 
 @pytest.mark.parametrize("answer", [
-    {"claims": [_row("c1")]},                                               # c2 omitted
-    {"claims": [_row("c1"), _row("c2"), _row("c3")]},                        # unknown id next to valid rows
-    {"claims": [_row("c1"), _row("c2"), "junk"]},                            # a non-object row
-    {"claims": [_row("c1"), {**_row("c2"), "extra": 1}]},                    # extra key in a row
-    {"claims": [_row("c1"), _row("c2")], "other": 1},                        # extra top-level key
-    {"claims": [_row("c1"), _row([])]},                                      # unhashable id (list)
-    {"claims": [_row("c1"), _row({})]},                                      # unhashable id (dict)
-    {"claims": [_row("c1"), _row(7)]},                                       # non-string id
-    {"claims": [_row("c1"), _row("c2", v=["confirmed"])]},                   # unhashable verdict
-    {"claims": [_row("c1"), _row("c2", q=5)]},                               # non-string quote
-    {"claims": [_row("c1"), _row("c1"), _row("c2")]},                        # repeated id
+    {"claims": [_row("c1")], "correction": None},                                # c2 omitted
+    {"claims": [_row("c1"), _row("c2"), _row("c3")], "correction": None},    # unknown id next to valid rows
+    {"claims": [_row("c1"), _row("c2"), "junk"], "correction": None},                            # a non-object row
+    {"claims": [_row("c1"), {**_row("c2"), "extra": 1}], "correction": None},                    # extra key in a row
+    {"claims": [_row("c1"), _row("c2")], "correction": None, "other": 1},    # extra top-level key
+    {"claims": [_row("c1"), _row("c2")]},                                    # correction key missing
+    {"claims": [_row("c1"), _row("c2")], "correction": 5},                   # wrongly typed correction
+    {"claims": [_row("c1"), _row([])], "correction": None},                                      # unhashable id (list)
+    {"claims": [_row("c1"), _row({})], "correction": None},                                      # unhashable id (dict)
+    {"claims": [_row("c1"), _row(7)], "correction": None},                                       # non-string id
+    {"claims": [_row("c1"), _row("c2", v=["confirmed"])], "correction": None},                   # unhashable verdict
+    {"claims": [_row("c1"), _row("c2", q=5)], "correction": None},                               # non-string quote
+    {"claims": [_row("c1"), _row("c1"), _row("c2")], "correction": None},                        # repeated id
 ])
 def test_one_bad_row_makes_every_claim_unverifiable_and_unstamped(answer):
     claims, ev = _two_claims()
@@ -516,7 +518,7 @@ def test_one_bad_row_makes_every_claim_unverifiable_and_unstamped(answer):
 
 def test_well_formed_answer_control():
     claims, ev = _two_claims()
-    out, _c, prob = dream.parse_verdicts(json.dumps({"claims": [_row("c1"), _row("c2")]}), claims, ev, "n")
+    out, _c, prob = dream.parse_verdicts(json.dumps({"claims": [_row("c1"), _row("c2")], "correction": None}), claims, ev, "n")
     assert prob is None and {v["verdict"] for v in out.values()} == {"confirmed"}
 
 
@@ -548,7 +550,7 @@ def test_judge_omitting_an_id_is_not_stamped(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
     _add(f"Landed as {sha[:12]} in Item 242")
     def judge(prompt, timeout=None):
-        return json.dumps({"claims": [{"id": "c1", "verdict": "confirmed", "evidence": _ev_line("c1", prompt)[:30]}]})
+        return json.dumps({"claims": [{"id": "c1", "verdict": "confirmed", "evidence": _ev_line("c1", prompt)[:30]}], "correction": None})
     f = _dry(_cfg(tmp_path, repos, git_dir), judge)["findings"][0]
     assert f["problem"] and not f["proposals"] and {c["verdict"] for c in f["claims"]} == {"unverifiable"}
 
@@ -626,9 +628,14 @@ def test_apply_stops_starting_writes_after_the_deadline(tmp_path, gitrepo):
         _add(f"note {i} landed as {sha[:12]}")
     r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
              _answer(lambda c, p: ("confirmed", _quote_first_evidence(c, p))))
-    t = iter(range(0, 1000, 10))
-    out = dream.apply_plan(r, Limits(max_writes=50, max_seconds=25), clock=lambda: float(next(t)))
-    assert len(out["applied"]) < 4 and any(d["why"] == "max_seconds" for d in out["deferred"])
+    c = [0.0]
+
+    def clk():
+        c[0] += 3.0
+        return c[0]
+    out = dream.apply_plan(r, Limits(max_writes=50, max_seconds=25), clock=clk)
+    assert len(out["applied"]) < 4 and (out["aborted"] == "max_seconds" or any(d["why"] == "max_seconds" for d in out["deferred"]))
+    assert not any(e.get("dispatched") and e.get("end") is None for e in out["dispatch_log"][:-1])
 
 
 def test_openai_judge_has_no_sdk_retries(monkeypatch):
@@ -800,7 +807,7 @@ def test_dup_scan_work_is_capped():
     mems = [Mem(i, "the very same long note about the nightly job and its schedule number %d ok yes" % 7, {}, [], None, None, [])
             for i in range(1, 60)]
     assert len(dream.dup_scan(mems, set(), 5)) == 5
-    assert dream.dup_scan(mems, set(), 5, max_compares=3) != dream.dup_scan(mems, set(), 5) or True
+    assert len(dream.dup_scan(mems, set(), 5, max_compares=3)) < 5            # the work cap bites
     calls = []
     dream.dup_scan(mems, set(), 5, max_compares=10**9, expired=lambda: calls.append(1) or True)
     assert calls                                                               # the deadline is consulted inside the scan
@@ -933,3 +940,172 @@ def test_truncated_judge_answer_is_no_answer(monkeypatch):
         j("p")
     choice.finish_reason, msg.content = "stop", '{"claims": []}'
     assert j("p") == '{"claims": []}'
+
+
+# ----------------------------------------------------------------------------- round 3: traces for the repeated classes
+
+
+def _supersede_plan(tmp_path, repos, git_dir, sha, text=None):
+    mid = _add(text or f"landed {sha[:12]} v9.9.9")
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
+             _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="corrected note text"))
+    assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
+    return mid, r
+
+
+def _edges(mid):
+    with storage.connect() as conn:
+        row = conn.execute("SELECT related FROM memories_crossrefs WHERE memory_id=?", (mid,)).fetchone()
+    return json.loads(row[0]) if row and row[0] else []
+
+
+def _count():
+    with storage.connect() as conn:
+        return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+
+def test_deadline_crossed_during_add_memory_never_dispatches_the_edge(tmp_path, gitrepo, monkeypatch, capsys):
+    import time as _t
+    repos, git_dir, sha, _src = gitrepo
+    mid, r = _supersede_plan(tmp_path, repos, git_dir, sha)
+    real = storage.add_memory
+    done = []
+
+    def slow_add(conn, **kw):
+        _t.sleep(0.8)                                   # the "backend" outlives the deadline
+        res = real(conn, **kw)
+        done.append(res)
+        return res
+
+    monkeypatch.setattr(storage, "add_memory", slow_add)
+    out = dream.apply_plan(r, Limits(max_writes=10, max_seconds=0.4))
+    print("TRACE a:", json.dumps({k: out[k] for k in ("aborted", "ambiguous", "writes_charged", "dispatch_log")}))
+    assert out["aborted"] == "max_seconds" and out["ambiguous"][0]["op"] == "add_memory"
+    assert out["writes_charged"] == 2 and out["applied"] == [{"memory_id": mid, "action": "annotate", "keys": ["unconfirmed"]}] or \
+        all(a["action"] != "supersede" for a in out["applied"])
+    ops = [e["op"] for e in out["dispatch_log"] if e["dispatched"]]
+    assert "guarded_edge" not in ops and "add_link" not in ops
+    last = [e for e in out["dispatch_log"] if e["op"] == "add_memory"][0]
+    assert last["end"] is None                           # never returned to the caller
+    for _ in range(50):                                  # the abandoned call may still finish; give it time
+        if done:
+            break
+        _t.sleep(0.1)
+    assert done
+    assert not any(e.get("edge_type") in ("supersedes", "superseded_by") for e in _edges(mid))
+    assert not any(e.get("edge_type") == "supersedes" for e in _edges(done[0]["id"] if "id" in done[0] else done[0]["memory"]["id"]))
+
+
+@pytest.mark.parametrize("race", ["content", "item-record"])
+def test_race_at_the_link_boundary_hides_nothing(tmp_path, gitrepo, monkeypatch, race):
+    repos, git_dir, sha, _src = gitrepo
+    mid, r = _supersede_plan(tmp_path, repos, git_dir, sha)
+    real = dream._guarded_edge
+    fired = []
+
+    def racing(conn, storage_mod, holder, peer, edge_type, old, raw_old, with_edge_check):
+        if not fired:
+            fired.append(1)                              # a writer lands AFTER our last read, BEFORE the edge
+            if race == "content":
+                storage.update_memory(conn, mid, content="edited by somebody else just now")
+            else:
+                storage.update_memory(conn, mid, metadata={"kind": "item-record"})
+        return real(conn, storage_mod, holder, peer, edge_type, old, raw_old, with_edge_check)
+
+    monkeypatch.setattr(dream, "_guarded_edge", racing)
+    out = dream.apply_plan(r, Limits(max_writes=10))
+    sup = [s for s in out["skipped"] if "link boundary" in s["why"]]
+    print("TRACE b:", race, json.dumps({"skipped": out["skipped"], "applied": out["applied"]}),
+          "edges_old", _edges(mid))
+    assert len(sup) == 1 and not any(a.get("action") == "supersede" for a in out["applied"])
+    assert not any(e.get("edge_type") in ("superseded_by", "supersedes") for e in _edges(mid))   # old memory still visible
+    with storage.connect() as conn:
+        assert not storage._is_superseded(conn, mid)
+    new_id = sup[0]["new_id"]
+    assert not any(e.get("edge_type") == "supersedes" for e in _edges(new_id))
+
+
+def test_guarded_edge_writes_when_nothing_raced_control(tmp_path, gitrepo):
+    repos, git_dir, sha, _src = gitrepo
+    mid, r = _supersede_plan(tmp_path, repos, git_dir, sha)
+    out = dream.apply_plan(r, Limits(max_writes=10))
+    done = [a for a in out["applied"] if a["action"] == "supersede"][0]
+    assert done["edge"] == "supersedes" and "partial" not in done
+    with storage.connect() as conn:
+        assert storage._is_superseded(conn, mid)
+    assert any(e["edge_type"] == "supersedes" and e["id"] == mid for e in _edges(done["new_id"]))
+
+
+def test_forward_only_supersession_counts_as_retired(tmp_path, gitrepo):
+    repos, git_dir, sha, _src = gitrepo
+    mid, r = _supersede_plan(tmp_path, repos, git_dir, sha)
+    other = _add("someone else already replaced the first note")
+    with storage.connect() as conn:
+        storage.add_link(conn, other, mid, edge_type="supersedes", bidirectional=False)   # forward-only
+    n = _count()
+    out = dream.apply_plan(r, Limits(max_writes=10))
+    print("TRACE retired:", json.dumps({"skipped": out["skipped"], "applied": out["applied"], "writes": out["writes"]}))
+    assert out["applied"] == [] and "retired" in out["skipped"][0]["why"] and out["writes"] == 0
+    assert _count() == n                                  # no correction, no second hiding edge
+
+
+def test_failed_branch_and_tag_calls_after_a_resolved_sha_are_unknown_not_none(tmp_path, gitrepo):
+    repos, git_dir, sha, _src = gitrepo
+    real = subprocess.run
+    seen = []
+
+    def runner(cmd, **kw):
+        if "for-each-ref" in cmd or ("log" in cmd and "-1" in cmd):
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal")
+        return real(cmd, **kw)
+
+    s = dream.GitSource(_cfg(tmp_path, repos, git_dir), runner=runner)
+    s.prepare()
+    ev = s.evidence(Mem(1, "x", {}, ["proj"], None, None, []), Claim("c1", "sha", sha[:12], sha[:12]))
+    print("TRACE c1:", ev.text)
+    assert ev.available is True and sha in ev.text           # the SHA itself resolved
+    assert "on branches: unknown (git failed)" in ev.text and "in tags: unknown (git failed)" in ev.text
+    assert "none" not in ev.text and "commit details unavailable" in ev.text
+    # the judge cannot turn the failure into a verdict by quoting an absence that is not there
+    claims = [Claim("c1", "sha", sha[:12], sha[:12])]
+    out, *_ = dream.parse_verdicts(json.dumps({"claims": [{"id": "c1", "verdict": "wrong",
+              "evidence": "on branches: none"}], "correction": "x"}), claims, {"c1": ev}, "orig")
+    assert out["c1"]["verdict"] == "unverifiable"
+
+
+def test_symbol_beyond_the_read_cap_is_unknown_and_show_uses_the_resolved_commit(tmp_path, gitrepo, monkeypatch):
+    repos, git_dir, sha, src = gitrepo
+    (src / "memora" / "big.py").write_text("x = 1\n" * 100 + "def tail_fn():\n    pass\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-qm", "big file")
+    full = _git(src, "rev-parse", "HEAD")
+    real = subprocess.run
+    shows = []
+    s = dream.GitSource(_cfg(tmp_path, repos, git_dir), runner=lambda cmd, **kw: (shows.append(cmd) if "show" in cmd else None) or real(cmd, **kw))
+    s.prepare()
+    m = Mem(1, "memora/big.py has `tail_fn` and `nowhere_fn`", {}, ["proj"], None, None, [])
+    claim = Claim("c1", "path", "memora/big.py", "memora/big.py")
+    ev = s.evidence(m, claim)
+    assert "symbol `tail_fn` in the file: def tail_fn" in ev.text and "symbol `nowhere_fn` in the file: NOT PRESENT" in ev.text
+    assert any(c[-1] == f"{full}:memora/big.py" for c in shows)             # the recorded commit identifies the bytes
+    assert f"at commit {full}" in ev.text
+    monkeypatch.setattr(dream.GitSource, "_MAX_SHOW", 100)                   # file now over the read cap
+    s2 = dream.GitSource(_cfg(tmp_path, repos, git_dir))
+    s2.prepare()
+    ev2 = s2.evidence(m, claim)
+    print("TRACE c2:", ev2.text[-260:])
+    assert "symbols unknown" in ev2.text and "NOT PRESENT" not in ev2.text
+
+
+def test_truncated_file_list_makes_absence_unknown(tmp_path, gitrepo, monkeypatch):
+    repos, git_dir, sha, src = gitrepo
+    (src / "a.txt").write_text("a")
+    (src / "b.txt").write_text("b")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-qm", "more files")
+    monkeypatch.setattr(dream.GitSource, "_TREE_CAP", 1)
+    s = dream.GitSource(_cfg(tmp_path, repos, git_dir))
+    s.prepare()
+    m = Mem(1, "x", {}, ["proj"], None, None, [])
+    ev = s.evidence(m, Claim("c1", "path", "nope/missing.py", "nope/missing.py"))
+    assert ev.available is False and "truncated" in ev.text

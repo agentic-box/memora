@@ -58,7 +58,10 @@ The report is the plan. `--apply` refuses a plan whose digest (over the whole re
 longer matches, or older than 48 h. At each write it re-reads the memory and skips it unless
 content, tags and non-provenance metadata are still what was judged and it is not retired;
 whether it is an item record is read **then**, never taken from the plan; metadata updates carry
-`expected_row`, a precondition on the UPDATE statement itself. Only the leader runs `--apply`,
+`expected_row`, a precondition on the UPDATE statement itself. The edge that hides a memory is one statement that also
+requires the memory to be exactly the judged row (content, metadata, tags, updated_at, crossrefs blob, no tombstone,
+no existing supersedes edge), so a writer that got in between leaves nothing hidden. Retirement is any of: a
+tombstone, `superseded_by` to a live memory, or a forward-only `supersedes` edge held by a live memory. Only the leader runs `--apply`,
 after reading the dry run.
 
 `--apply` only **adds**, through memora's own storage functions (per-key
@@ -86,7 +89,7 @@ Part of the design, in `limits` of the config and tested:
 |---|---|---|
 | `max_memories` | 25 | memories judged per run |
 | `max_llm_calls` | 25 | judge calls per run (one per memory) |
-| `max_seconds` | 900 | ONE deadline for the whole run: every git, history and judge call gets at most what is left (no SDK retries), the scans are skipped once it passes, and a dry run is killed (exit 4) 30 s after it. `--apply` checks it before each write and never interrupts a started write |
+| `max_seconds` | 900 | ONE deadline for the whole run: every git, history and judge call gets at most what is left (no SDK retries), the scans are skipped once it passes, and a dry run is killed (exit 4) 30 s after it. `--apply` runs every store call on a worker bounded by what is left: if the deadline passes inside a call the apply stops waiting, nothing further is dispatched (the edge after a corrected copy is never started), the call is listed under `ambiguous` (it may still commit), `aborted` is set and the exit code is 4 |
 | `max_writes` | 20 | storage write calls per `--apply`, charged BEFORE the call (a write that commits and then raises still counts); the rest is `deferred` |
 | `max_clone_mb` | 500 | a mirror above this is never fetched (checked before the fetch) |
 | `recheck_days` | 14 | a checked memory is left alone this long |

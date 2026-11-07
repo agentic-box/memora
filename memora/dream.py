@@ -8,8 +8,8 @@ each claim against ONLY that evidence, and records what it found.
 
 Two phases, never mixed (the wall-time cap, ``max_seconds``, is one monotonic deadline carried into
 every phase and every git, history and judge call; a dry run is also killed by a watchdog shortly
-after it, because it has nothing to roll back; an apply checks the deadline before each write and
-never interrupts one that has started, since cutting a multi-statement write half-way is worse):
+after it, because it has nothing to roll back; an apply runs every store call on a worker bounded by the remaining time; when the deadline passes in a
+call, that call is reported AMBIGUOUS, nothing further is dispatched and the process exits non-zero):
 
   dry run (default)   reads the store, runs git and the judge, writes NOTHING to
                       the store. It writes a report (also a plan) to --out.
@@ -404,7 +404,7 @@ class GitSource:
         self.cfg, self._run, self._remaining = cfg, runner, remaining
         self.status: Dict[str, str] = {}
         self._dirs: Dict[str, Optional[Path]] = {}
-        self._tree_cache: Dict[str, Optional[List[str]]] = {}
+        self._tree_cache: Dict[str, Tuple[Optional[List[str]], bool]] = {}
         self.calls = 0
 
     # -- the mirror boundary: inside git_dir, bare, a plain directory
@@ -500,27 +500,44 @@ class GitSource:
     def _ref(self, name: str) -> str:
         return str(self.cfg.repos[name].get("ref") or "HEAD")
 
-    def _tree(self, name: str) -> Optional[List[str]]:
+    _TREE_CAP = 200000
+
+    def _tree(self, name: str) -> Tuple[Optional[List[str]], bool]:
+        """(file list, complete). A list cut at the cap is usable for a positive match only."""
         if name not in self._tree_cache:
             r = self.git(name, "ls-tree", "-r", "--name-only", self._ref(name))
-            self._tree_cache[name] = r.out.splitlines()[:200000] if (r.ok and r.rc == 0) else None
+            if r.ok and r.rc == 0:
+                lines = r.out.splitlines()
+                self._tree_cache[name] = (lines[: self._TREE_CAP], len(lines) <= self._TREE_CAP)
+            else:
+                self._tree_cache[name] = (None, False)
         return self._tree_cache[name]
 
-    def _file_view(self, name: str, path: str, m: Mem) -> str:
-        """Bounded bytes of the file at the recorded commit, plus where the note's `symbols` occur."""
-        sha = self.git(name, "rev-parse", "--verify", "--quiet", f"{self._ref(name)}^{{commit}}").out.strip()
-        r = self.git(name, "show", f"{self._ref(name)}:{path}")
+    _MAX_SHOW = 1 << 20   # a file above this is not read at all (bounds what a subprocess can buffer)
+
+    def _file_view(self, name: str, path: str, m: Mem, commit: str) -> str:
+        """The file's bytes at the RESOLVED commit, plus where the note's `symbols` occur. A symbol is
+        reported NOT PRESENT only when the whole file was searched; otherwise it is unknown."""
+        spec = f"{commit}:{path}"
+        sz = self.git(name, "cat-file", "-s", spec)
+        if not (sz.ok and sz.rc == 0 and sz.out.strip().isdigit()):
+            return f"file {path} at commit {commit}: content unavailable (git failed); symbols unknown"
+        size = int(sz.out.strip())
+        if size > self._MAX_SHOW:
+            return (f"file {path} at commit {commit}: {size} bytes, over the {self._MAX_SHOW}-byte read cap, "
+                    f"content not inspected; symbols unknown")
+        r = self.git(name, "show", spec)
         if not (r.ok and r.rc == 0):
-            return "file content unavailable"
-        body = r.out[:400000]
+            return f"file {path} at commit {commit}: content unavailable (git failed); symbols unknown"
+        body = r.out
         lim = self.cfg.limits.max_file_chars
         head = body[:lim].replace("\r", "")
         syms = [x for x in dict.fromkeys(_SYMBOL.findall(m.content)) if x != path][:6]
         lines = []
-        for sym in syms:
+        for sym in syms:   # the WHOLE file is searched (size <= cap), so absence here is complete
             hits = [ln.strip()[:160] for ln in body.splitlines() if sym in ln][:2]
             lines.append(f"symbol `{sym}` in the file: " + (" | ".join(hits) if hits else "NOT PRESENT"))
-        return (f"file {path} at commit {sha or '?'} (first {lim} chars):\n{head}\n" + "\n".join(lines))
+        return f"file {path} at commit {commit} (first {lim} chars of {len(body)}):\n{head}\n" + "\n".join(lines)
 
     # -- evidence per claim kind
     def evidence(self, m: Mem, c: Claim) -> Evidence:
@@ -549,11 +566,16 @@ class GitSource:
                         f"[{n}] {c.kind} {c.value} not found{note}")
                 else:
                     full = r.out.strip()
-                    info = self.git(n, "log", "-1", "--format=%H%n%ad%n%s", "--date=short", full).out.splitlines()
-                    br = self.git(n, "for-each-ref", "--contains", full, "--format=%(refname:short)", "refs/heads").out.split()[:6]
-                    tg = self.git(n, "for-each-ref", "--contains", full, "--format=%(refname:short)", "refs/tags").out.split()[:6]
-                    found.append(f"[{n}] {c.kind} {c.value} -> {' | '.join(info)}; on branches: "
-                                 f"{', '.join(br) or 'none'}; in tags: {', '.join(tg) or 'none'}{note}")
+                    li = self.git(n, "log", "-1", "--format=%H%n%ad%n%s", "--date=short", full)
+                    info = full + " | " + (" | ".join(li.out.splitlines()[1:]) if (li.ok and li.rc == 0)
+                                          else "commit details unavailable (git failed)")
+                    def field(args, what):
+                        g = self.git(n, "for-each-ref", "--contains", full, "--format=%(refname:short)", args)
+                        if not (g.ok and g.rc == 0):
+                            return f"{what}: unknown (git failed)"
+                        return f"{what}: {', '.join(g.out.split()[:6]) or 'none'}"
+                    found.append(f"[{n}] {c.kind} {c.value} -> {info}; {field('refs/heads', 'on branches')}; "
+                                 f"{field('refs/tags', 'in tags')}{note}")
             elif c.kind == "item":
                 pat = rf"item[ -]?{c.value}([^0-9]|$)"
                 r = self.git(n, "log", "--all", "-i", "-E", f"--grep={pat}", "-n", "5", "--format=%h %ad %s", "--date=short")
@@ -564,14 +586,17 @@ class GitSource:
                 else:
                     (neg if authoritative else unknown).append(f"[{n}] no commit mentions item {c.value}{note}")
             elif c.kind == "path":
-                tree = self._tree(n)
+                tree, complete = self._tree(n)
                 if tree is None:
                     unknown.append(f"[{n}] file list unavailable")
                     continue
                 hits = [p for p in tree if p == c.value or p.endswith("/" + c.value)][:3]
                 if hits:
-                    found.append(f"[{n}] files matching {c.value} at {self._ref(n)}: {', '.join(hits)}{note}\n"
-                                 + self._file_view(n, hits[0], m))
+                    commit = self.git(n, "rev-parse", "--verify", "--quiet", f"{self._ref(n)}^{{commit}}").out.strip()
+                    view = self._file_view(n, hits[0], m, commit) if commit else "file content unavailable: ref not resolved"
+                    found.append(f"[{n}] files matching {c.value} at {self._ref(n)}: {', '.join(hits)}{note}\n{view}")
+                elif not complete:
+                    unknown.append(f"[{n}] file list truncated at {self._TREE_CAP} entries; absence of {c.value} unknown")
                 else:
                     (neg if authoritative else unknown).append(
                         f"[{n}] no file matches {c.value} at {self._ref(n)}{note}")
@@ -647,8 +672,10 @@ def parse_verdicts(text: Any, claims: Sequence[Claim], ev: Dict[str, Evidence], 
         obj = json.loads(t)
     except ValueError:
         return base, None, "judge answer is not JSON"
-    if not isinstance(obj, dict) or not set(obj) <= {"claims", "correction"} or not isinstance(obj.get("claims"), list):
+    if not isinstance(obj, dict) or set(obj) != {"claims", "correction"} or not isinstance(obj["claims"], list):
         return base, None, "judge answer has the wrong shape"
+    if obj["correction"] is not None and not isinstance(obj["correction"], str):
+        return base, None, "judge answer has a wrongly typed correction"
     expected = {c.id for c in claims}
     rows: Dict[str, Dict[str, Any]] = {}
     for item in obj["claims"]:
@@ -989,19 +1016,115 @@ def _fresh(conn: Any, mid: int) -> Optional[Tuple[Mem, Dict[str, Any]]]:
     related = rel[0] if rel else None
     m = Mem(mid, row[0] or "", _json(row[1], {}), [t for t in _json(row[2], []) if isinstance(t, str)],
             row[3], row[4], [x for x in _json(related, []) if isinstance(x, dict)])
-    return m, {"content": row[0], "metadata": row[1], "tags": row[2], "updated_at": row[3], "related": related}
+    return m, {"content": row[0], "metadata": row[1], "tags": row[2], "updated_at": row[3], "related": related,
+               "has_related_row": rel is not None}
 
 
-def _retired(conn: Any, mid: int) -> bool:
-    """superseded NOW, by a memory that still exists (any direction of record)."""
+def _retired(conn: Any, mid: int, storage_mod: Any) -> bool:
+    """Retired NOW by any source storage honours: a tombstone, a local superseded_by to a live memory, or a
+    forward-only `supersedes` edge held by a live memory (also what a partial link write leaves)."""
     got = _fresh(conn, mid)
     if got is None:
         return True
+    for t in ("tombstones", "tombstone_components"):
+        if conn.execute(f"SELECT 1 FROM {t} WHERE memory_id = ?", (mid,)).fetchone():
+            return True
     for ref in got[0].refs:
         if ref.get("edge_type") == "superseded_by" and isinstance(ref.get("id"), int) and \
                 conn.execute("SELECT 1 FROM memories WHERE id = ?", (ref["id"],)).fetchone():
             return True
+    sql = storage_mod._SUPERSEDES_EDGE_TO_SQL.replace("SELECT 1 FROM", "SELECT c.memory_id FROM", 1)
+    for (src,) in conn.execute(sql, (mid,)).fetchall():
+        if conn.execute("SELECT 1 FROM memories WHERE id = ?", (src,)).fetchone():
+            return True
     return False
+
+
+def _state_guard(storage_mod: Any, mid: int, raw: Dict[str, Any], with_edge_check: bool) -> Tuple[str, tuple]:
+    """One SQL predicate: memory `mid` is exactly the judged row, not tombstoned, its crossrefs blob is
+    unchanged and (optionally) nothing already supersedes it. Used INSIDE the statement that writes the
+    hiding edge, so there is no gap between the check and the write (D1 has no transaction)."""
+    sql = ("EXISTS (SELECT 1 FROM memories WHERE id = ? AND content = ? AND metadata IS ? AND tags IS ? "
+           "AND updated_at IS ?) AND NOT EXISTS (SELECT 1 FROM tombstones WHERE memory_id = ?) "
+           "AND NOT EXISTS (SELECT 1 FROM tombstone_components WHERE memory_id = ?) "
+           "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ?")
+    params: tuple = (mid, raw["content"], raw["metadata"], raw["tags"], raw["updated_at"], mid, mid, mid,
+                     raw["related"])
+    if with_edge_check:
+        sql += " AND NOT EXISTS (" + storage_mod._SUPERSEDES_EDGE_TO_SQL + ")"
+        params += (mid,)
+    return sql, params
+
+
+def _guarded_edge(conn: Any, storage_mod: Any, holder: int, peer: int, edge_type: str, old: int,
+                  raw_old: Dict[str, Any], with_edge_check: bool) -> bool:
+    """Write `holder --edge_type--> peer` onto holder's crossrefs row in ONE statement that also requires
+    the OLD memory to still be the judged row. Returns False when the guard refused (nothing written)."""
+    exists = conn.execute("SELECT related FROM memories_crossrefs WHERE memory_id = ?", (holder,)).fetchone()
+    raw = exists[0] if exists else None
+    cur = [r for r in _json(raw, []) if isinstance(r, dict) and r.get("id") != peer]
+    cur.append({"id": peer, "score": 1.0, "edge_type": edge_type})
+    blob = json.dumps(cur, ensure_ascii=False)
+    g_sql, g_params = _state_guard(storage_mod, old, raw_old, with_edge_check)
+    if exists is not None:
+        res = conn.execute("UPDATE memories_crossrefs SET related = ? WHERE memory_id = ? AND related IS ? AND " + g_sql,
+                           (blob, holder, raw, *g_params))
+    else:
+        res = conn.execute("INSERT INTO memories_crossrefs(memory_id, related) SELECT ?, ? WHERE " + g_sql,
+                           (holder, blob, *g_params))
+    conn.commit()
+    return getattr(res, "rowcount", 0) == 1
+
+
+class _Deadline(Exception):
+    def __init__(self, op: str, started: bool):
+        super().__init__(op)
+        self.op, self.started = op, started
+
+
+class _Writer:
+    """Runs every store call of an apply on ONE worker thread, each bounded by the run's remaining time.
+    When the deadline passes while a call is in flight, the caller stops waiting and nothing further is
+    dispatched: the in-flight call is AMBIGUOUS (it may still commit) and is reported as such. A call
+    that cannot start in time is never started."""
+
+    def __init__(self, clock: Callable[[], float], t0: float, max_seconds: float):
+        import queue  # noqa: PLC0415
+        self._q: "queue.Queue" = queue.Queue()
+        self._clock, self._t0, self._max = clock, t0, max_seconds
+        self.stuck = False
+        self.log: List[Dict[str, Any]] = []
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self) -> None:
+        while True:
+            fn, ev, box = self._q.get()
+            try:
+                box["v"] = fn()
+            except BaseException as e:  # noqa: BLE001 - handed to the caller
+                box["e"] = e
+            ev.set()
+
+    def remaining(self) -> float:
+        return self._max - (self._clock() - self._t0)
+
+    def run(self, op: str, fn: Callable[[], Any]) -> Any:
+        rem = self.remaining()
+        t = round(self._clock() - self._t0, 3)
+        if self.stuck or rem <= 0:
+            self.log.append({"op": op, "t": t, "dispatched": False})
+            raise _Deadline(op, False)
+        ev, box = threading.Event(), {}
+        entry = {"op": op, "t": t, "dispatched": True, "end": None}
+        self.log.append(entry)
+        self._q.put((fn, ev, box))
+        if not ev.wait(rem):
+            self.stuck = True
+            raise _Deadline(op, True)
+        entry["end"] = round(self._clock() - self._t0, 3)
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
 
 
 def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
@@ -1009,75 +1132,98 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
     """Add-only writes through memora's own storage functions (per-key statements, the write gate,
     the D1 path). No delete, no content edit, no unlink anywhere in this function.
 
-    Every write re-reads the memory first and refuses unless it is still what the dry run judged
-    (content, non-provenance metadata and tags), it is not retired, and its protection (item record)
-    is read NOW, never from the plan. Metadata updates carry expected_row, a precondition on the
-    UPDATE statement itself. A write is charged to max_writes BEFORE it is dispatched, so one that
-    commits and then raises still counts. The deadline is checked before each write; a started write
-    is never interrupted."""
+    * Every store call runs on a worker thread bounded by the remaining max_seconds. If the deadline
+      passes during a call the apply stops there: the call is reported AMBIGUOUS (it may still
+      commit), later calls (such as the edge after a corrected copy) are never dispatched, and the
+      result says `aborted`.
+    * Each memory is re-read before each write and must still match the dry run (state_sha), not be
+      retired (tombstone, superseded_by, or a forward-only supersedes edge) and its protection is read
+      then, never from the plan.
+    * The edge that hides a memory is ONE statement that also requires the memory to still be the row
+      judged (content, metadata, tags, updated_at, crossrefs blob, no tombstone, no existing supersedes
+      edge); if a writer got in between, nothing is hidden. Metadata updates carry expected_row.
+    * A write is charged to max_writes BEFORE it is dispatched."""
     if storage_mod is None:
         from . import storage as storage_mod  # noqa: PLC0415
     applied: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     deferred: List[Dict[str, Any]] = []
+    ambiguous: List[Dict[str, Any]] = []
     t0, writes = clock(), 0
+    W = _Writer(clock, t0, limits.max_seconds)
+    aborted: Optional[str] = None
 
     def reserve(n: int) -> Optional[str]:
         nonlocal writes
-        if clock() - t0 >= limits.max_seconds:
+        if W.stuck or W.remaining() <= 0:
             return "max_seconds"
         if writes + n > limits.max_writes:
             return "max_writes"
         writes += n
         return None
 
-    def changed(m: Mem, want_sha: str) -> bool:
-        return m.state_sha != want_sha
-
-    with storage_mod.connect() as conn:
+    try:
+        conn = W.run("open", lambda: storage_mod.connect(check_same_thread=False))
         for f in plan["findings"]:
             mid = f["memory_id"]
-            # annotate first: a superseded memory is retired, and the stamp is still worth recording on it.
-            # Both share one state_sha, which ignores this module's own provenance keys.
             order = sorted(f["proposals"], key=lambda p: 0 if p["action"] == "annotate" else 1)
             for p in order:
-                got = _fresh(conn, mid)
-                if got is None or changed(got[0], f["state_sha"]):
+                got = W.run("read", lambda: _fresh(conn, mid))
+                if got is None or got[0].state_sha != f["state_sha"]:
                     skipped.append({"memory_id": mid, "why": "memory changed or is gone since the dry run"})
                     break
                 m, raw = got
-                if _retired(conn, mid):
+                if W.run("read", lambda: _retired(conn, mid, storage_mod)):
                     skipped.append({"memory_id": mid, "why": "memory was retired since the dry run"})
                     break
-                need = 2 if p["action"] == "supersede" else 1
-                why = reserve(need)
+                why = reserve(2 if p["action"] == "supersede" else 1)
                 if why:
                     deferred.append({"memory_id": mid, "action": p["action"], "why": why})
                     continue
                 try:
                     if p["action"] == "annotate":
                         meta = {k: v for k, v in p["metadata"].items() if k in ("verified", "unconfirmed")}
-                        storage_mod.update_memory(conn, mid, metadata=meta, expected_row=raw)
+                        W.run("update_memory", lambda: storage_mod.update_memory(conn, mid, metadata=meta, expected_row=raw))
                         applied.append({"memory_id": mid, "action": "annotate", "keys": sorted(meta)})
                     elif p["action"] == "supersede":
                         meta = {k: v for k, v in m.metadata.items() if k not in _OWN_KEYS and k != "project"}
                         meta["dream"] = {"corrects": mid, "run": plan["run_id"], "at": plan["created_at"]}
-                        new = storage_mod.add_memory(conn, content=p["content"], metadata=meta,
-                                                     tags=list(p.get("tags") or []), project=p.get("project"))
+                        new = W.run("add_memory", lambda: storage_mod.add_memory(
+                            conn, content=p["content"], metadata=meta, tags=list(p.get("tags") or []),
+                            project=p.get("project")))
                         nid = new["id"] if isinstance(new, dict) and "id" in new else new["memory"]["id"]
-                        again = _fresh(conn, mid)       # re-check right before the edge that hides the old one
-                        if again is None or changed(again[0], f["state_sha"]) or _retired(conn, mid):
+                        again = W.run("read", lambda: _fresh(conn, mid))
+                        if again is None or again[0].state_sha != f["state_sha"] or \
+                                W.run("read", lambda: _retired(conn, mid, storage_mod)):
                             skipped.append({"memory_id": mid, "new_id": nid, "why":
                                             "memory changed after the corrected copy was added; no edge written"})
                             continue
-                        edge = "related_to" if again[0].protected else "supersedes"   # protection read NOW
-                        storage_mod.add_link(conn, nid, mid, edge_type=edge)
-                        applied.append({"memory_id": mid, "action": "supersede", "new_id": nid, "edge": edge})
+                        if again[0].protected:                       # read NOW: never hidden, only related
+                            W.run("add_link", lambda: storage_mod.add_link(conn, nid, mid, edge_type="related_to"))
+                            applied.append({"memory_id": mid, "action": "supersede", "new_id": nid, "edge": "related_to"})
+                            continue
+                        raw2 = again[1]
+                        ok1 = W.run("guarded_edge", lambda: _guarded_edge(
+                            conn, storage_mod, nid, mid, "supersedes", mid, raw2, True))
+                        if not ok1:
+                            skipped.append({"memory_id": mid, "new_id": nid, "why":
+                                            "memory changed at the link boundary; no hiding edge written"})
+                            continue
+                        # the reverse record is guarded by the same row state; a refusal leaves the
+                        # forward-only edge, a state storage itself supports and _retired() recognises
+                        ok2 = W.run("guarded_edge", lambda: _guarded_edge(
+                            conn, storage_mod, mid, nid, "superseded_by", mid, raw2, False))
+                        applied.append({"memory_id": mid, "action": "supersede", "new_id": nid, "edge": "supersedes",
+                                        **({} if ok2 else {"partial": "reverse record refused; forward edge only"})})
+                except _Deadline:
+                    raise
                 except Exception as e:  # one failure never blocks the rest; nothing is retried blindly
                     skipped.append({"memory_id": mid, "why": f"{p['action']} failed (counted as written): "
                                     f"{type(e).__name__}: {e}"[:300]})
+                    if p["action"] == "annotate":
+                        break          # the memory changed: do not go on to hide it
         for d in plan.get("duplicates", []):
-            a, b = _fresh(conn, d["older"]), _fresh(conn, d["newer"])
+            a, b = W.run("read", lambda: _fresh(conn, d["older"])), W.run("read", lambda: _fresh(conn, d["newer"]))
             if not a or not b or a[0].state_sha != d["older_sha"] or b[0].state_sha != d["newer_sha"]:
                 skipped.append({"duplicate": [d["older"], d["newer"]], "why": "changed since the dry run"})
                 continue
@@ -1086,12 +1232,14 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
                 deferred.append({"duplicate": [d["older"], d["newer"]], "why": why})
                 continue
             try:
-                storage_mod.add_link(conn, d["newer"], d["older"], edge_type="related_to")
+                W.run("add_link", lambda: storage_mod.add_link(conn, d["newer"], d["older"], edge_type="related_to"))
                 applied.append({"duplicate": [d["older"], d["newer"]], "edge": "related_to"})
+            except _Deadline:
+                raise
             except Exception as e:
                 skipped.append({"duplicate": [d["older"], d["newer"]], "why": f"link failed: {type(e).__name__}"[:300]})
         for d in plan.get("dangling", []):
-            got = _fresh(conn, d["memory_id"])
+            got = W.run("read", lambda: _fresh(conn, d["memory_id"]))
             if got is None or got[0].state_sha != d["state_sha"]:
                 skipped.append({"memory_id": d["memory_id"], "why": "changed since the dry run"})
                 continue
@@ -1100,13 +1248,27 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
                 deferred.append({"memory_id": d["memory_id"], "action": "dangling_links", "why": why})
                 continue
             try:
-                storage_mod.update_memory(conn, d["memory_id"], expected_row=got[1], metadata={"dangling_links": {
-                    "ids": d["missing_ids"], "at": plan["created_at"], "run": plan["run_id"]}})
+                W.run("update_memory", lambda: storage_mod.update_memory(
+                    conn, d["memory_id"], expected_row=got[1], metadata={"dangling_links": {
+                        "ids": d["missing_ids"], "at": plan["created_at"], "run": plan["run_id"]}}))
                 applied.append({"memory_id": d["memory_id"], "action": "dangling_links"})
+            except _Deadline:
+                raise
             except Exception as e:
                 skipped.append({"memory_id": d["memory_id"], "why": f"dangling note failed: {type(e).__name__}"[:300]})
+    except _Deadline as d:
+        aborted = "max_seconds"
+        if d.started:
+            ambiguous.append({"op": d.op, "why": "in flight when the deadline passed; it may still commit"})
+    finally:
+        if not W.stuck:
+            try:
+                W.run("close", conn.close)      # type: ignore[name-defined]
+            except Exception:  # noqa: BLE001
+                pass
     return {"mode": "apply", "run_id": plan["run_id"], "writes_charged": writes, "writes": writes,
-            "max_writes": limits.max_writes, "applied": applied, "skipped": skipped, "deferred": deferred}
+            "max_writes": limits.max_writes, "aborted": aborted, "ambiguous": ambiguous,
+            "applied": applied, "skipped": skipped, "deferred": deferred, "dispatch_log": W.log}
 
 
 # --------------------------------------------------------------------------- CLI
@@ -1159,7 +1321,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     raise DreamError("--apply needs --plan FILE and never takes --db (it writes the configured store)")
                 out = apply_plan(load_plan(args.plan), cfg.limits)
                 print(json.dumps(out, indent=2))
-                return 0
+                return 4 if out["aborted"] else 0
             if args.plan:
                 raise DreamError("--plan is only for --apply")
             judge, note, model = None, "ok", ""
