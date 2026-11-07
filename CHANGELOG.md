@@ -12,6 +12,15 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.8 — 2026-11-07
+
+`memora-dream` no longer flags true notes as wrong (Item 244, found by the first live dry run of 0.5.7.7).
+
+- Absence is never `wrong` by default. A reference that is not found is `missing` (reported, never corrected). `wrong`/`stale` needs an affirmative, non-negated, non-historical membership phrase tied, in the same clause, to the repository the evidence came from ("tagged in the <repo> repo", "landed on dev", "in this repo").
+- Pre-squash and review-round commits (`squash of X`, `round N`, `PASS` lines), references whose context names another project (`ghostty`, `upstream`, `pin`, ...) and bare file names that are not a path are `unverifiable`.
+- A proposed correction is dropped, with its reason in `correction_rejected`, when it contains the judge prompt envelope, is not a full rewrite, or removes most of the note. Corrections are **off by default**: set `"corrections": true` in the dream config to get `supersede` proposals.
+- `--apply` honours the config (no supersede unless corrections are on), re-checks each correction and its claims, and refuses a plan made by an older version (`rules` field); run a new dry run.
+
 ## 0.5.7.7 — 2026-11-07
 
 The "dreaming" pass: re-check the REFERENCES in stored memories against their sources (Item 242). It checks that the commits, tags, files and item numbers a note mentions exist; it does not verify behaviour or assertions and writes no "verified" stamp (the metadata is `references_checked`).

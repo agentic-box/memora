@@ -62,6 +62,7 @@ JUDGE_VERDICTS = ("confirmed", "stale", "wrong", "unverifiable")   # what the ju
 # exists in a repository the pass checked, so its absence is reported and never corrected.
 VERDICTS = (*JUDGE_VERDICTS, "missing")
 PLAN_VERSION = 1
+RULES_VERSION = 2     # Item 244: a plan made under older claim/correction rules is never applied
 SCOPE_NOTE = ("References only: this checks that the commits, tags, files and item numbers a note mentions exist or "
               "resolve. It does NOT verify behaviour or any assertion the note makes.")
 DEFAULT_CONFIG = "~/.config/memora/dream.json"
@@ -335,7 +336,8 @@ class Claim:
     text: str      # the token as written
     value: str     # normalised
     ctx: str = ""  # "" | history | foreign | bare: why its absence proves nothing (Item 244)
-    asserts: bool = False  # the note explicitly says it is tagged / on a branch / landed / present in a repo
+    asserts: bool = False  # an affirmative (not negated, not historical) membership phrase is nearby
+    tie: str = ""          # the clause around it; the repository the note means must be named in it
 
     def key(self) -> Tuple[str, str]:
         return (self.kind, self.value)
@@ -360,6 +362,13 @@ _ASSERTS = re.compile(
     re.IGNORECASE)
 
 
+_NEGATED = re.compile(
+    r"\b(?:not|never|no|nor|none|without|untagged|unreleased|unmerged|unpushed|nonexistent|non-existent|"
+    r"was|were|used to|formerly|previously|once|earlier|old|former|renamed|removed|deleted|dropped|reverted)\b|n't",
+    re.IGNORECASE)
+_THIS_REPO = re.compile(r"\b(?:this|the same) repo(?:sitory)?\b", re.IGNORECASE)
+
+
 def _window(text: str, start: int, end: int, before: int, after: int) -> str:
     """The text around a token: same line and same clause (cut at `;` or a sentence end)."""
     ls = text.rfind("\n", 0, start) + 1
@@ -379,7 +388,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
     a path (bare). `asserts` is true only when the note explicitly places it in a repository."""
     own = {k: v for k, v in (metadata or {}).items() if k not in _OWN_KEYS}   # never our own run ids
     text = content + "\n" + json.dumps(own, sort_keys=True, default=str)
-    found: List[Tuple[str, str, str, str, bool]] = []
+    found: List[Tuple[str, str, str, str, bool, str]] = []
 
     def add(kind: str, m: "re.Match", tok: str, val: str, bare: bool = False) -> None:
         s0, e0 = m.start(), m.end()
@@ -390,7 +399,9 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
             ctx = "foreign"
         elif bare:
             ctx = "bare"
-        found.append((kind, tok, val, ctx, ctx == "" and bool(_ASSERTS.search(_window(text, s0, e0, 35, 20)))))
+        near = _window(text, s0, e0, 35, 20)
+        aff = ctx == "" and bool(_ASSERTS.search(near)) and not _NEGATED.search(near)
+        found.append((kind, tok, val, ctx, aff, _window(text, s0, e0, 80, 40)))
 
     for m in _RE_SHA.finditer(text):
         tok = m.group(1)
@@ -401,7 +412,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
     for m in _RE_ITEM.finditer(text):
         add("item", m, m.group(0), m.group(1))
     for m in _RE_MSG.finditer(text):
-        found.append(("msg", m.group(0), m.group(1), "", False))
+        found.append(("msg", m.group(0), m.group(1), "", False, ""))
     for m in _RE_PATH.finditer(text):
         tok = m.group(1)
         if "/" in tok or tok.count(".") == 1:
@@ -410,17 +421,17 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
             add("path", m, tok, tok, bare="/" not in tok)
     order: Dict[Tuple[str, str], int] = {}
     rows: List[List[Any]] = []
-    for kind, tok, val, ctx, asserts in found:
+    for kind, tok, val, ctx, asserts, tie in found:
         k = (kind, val)
-        if k in order:                      # one claim per reference; an unrestricted mention wins
-            r = rows[order[k]]
-            if ctx == "" and r[3] != "":
-                r[3], r[4] = "", asserts
-            elif ctx == "" and r[3] == "":
-                r[4] = r[4] or asserts
+        if k in order:                      # fail closed: ANY restricted mention restricts the claim,
+            r = rows[order[k]]              # and every unrestricted mention must assert it
+            if r[3] == "" and ctx != "":
+                r[3], r[4] = ctx, False
+            elif r[3] == "":
+                r[4] = r[4] and asserts
             continue
         order[k] = len(rows)
-        rows.append([kind, tok, val, ctx, asserts])
+        rows.append([kind, tok, val, ctx, asserts, tie])
     return [Claim(f"c{i + 1}", *r) for i, r in enumerate(rows[:limit])]
 
 
@@ -557,6 +568,20 @@ class GitSource:
         mirror is consulted for a POSITIVE match, but "not found" there proves nothing about the claim."""
         want = {str(m.metadata.get("repo") or ""), str(m.metadata.get("project") or ""), *m.tags}
         return [n for n in self.cfg.repos if n in want or want & set(self.cfg.repos[n].get("projects") or [])]
+
+    def asserted(self, m: Mem, c: Claim) -> bool:
+        """The note affirmatively says this reference is in a repository this pass checked: an affirmative
+        membership phrase (no negation, nothing historical) AND, in the same clause, that repository's own
+        name, project alias or ref, or "this repo". An unknown subject ("WidgetSDK released v1.4.0") fails."""
+        if c.ctx or not c.asserts:
+            return False
+        if _THIS_REPO.search(c.tie):
+            return True
+        for n in self._named(m):
+            names = {n, self._ref(n), *[str(x) for x in (self.cfg.repos[n].get("projects") or [])]}
+            if any(x and re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", c.tie, re.IGNORECASE) for x in names):
+                return True
+        return False
 
     def _ref(self, name: str) -> str:
         return str(self.cfg.repos[name].get("ref") or "HEAD")
@@ -954,14 +979,15 @@ def correction_problem(corr: str, original: str) -> Optional[str]:
     return None
 
 
-def _guard_verdicts(claims: Sequence[Claim], parsed: Dict[str, Dict[str, str]]) -> None:
+def _guard_verdicts(claims: Sequence[Claim], parsed: Dict[str, Dict[str, str]],
+                    asserted: Callable[[Claim], bool]) -> None:
     """Absence is never wrong by default (Item 244). wrong/stale stands only for a reference the note
-    explicitly places in a repository (tagged, on a branch, landed, present in it); history, other-project
+    affirmatively places in a repository the evidence came from (source.asserted); history, other-project
     and bare-name references are unverifiable; other not-found references are only `missing`."""
     by = {c.id: c for c in claims}
     for cid, r in parsed.items():
         c = by[cid]
-        if r["verdict"] not in ("wrong", "stale") or c.asserts and c.ctx == "":
+        if r["verdict"] not in ("wrong", "stale") or (c.ctx == "" and asserted(c)):
             continue
         if c.ctx:
             parsed[cid] = {"verdict": "unverifiable", "evidence": "",
@@ -997,7 +1023,7 @@ def judge_one(m: Mem, claims: List[Claim], source: GitSource, judge: Optional[Ca
                 if r["verdict"] in ("wrong", "stale"):
                     parsed[cid] = {"verdict": "unverifiable", "evidence": "", "reason": why}
             correction = None
-        _guard_verdicts(askable, parsed)
+        _guard_verdicts(askable, parsed, lambda c: source.asserted(m, c))
         if correction is not None:
             if not any(r["verdict"] in ("stale", "wrong") for r in parsed.values()):
                 rejected, correction = "no asserted reference is wrong or stale", None
@@ -1133,7 +1159,7 @@ def run_dry(conn: sqlite3.Connection, cfg: Config, judge: Optional[Callable[...,
     dups = [] if scans_skipped else dup_scan(mems, gone, lim.max_findings_listed, lim.max_dup_compares, budget.out_of_time)
     dangle = [] if scans_skipped else dangling_scan(mems, lim.max_findings_listed)
     report = {
-        "version": PLAN_VERSION, "run_id": run_id, "mode": "dry-run",
+        "version": PLAN_VERSION, "rules": RULES_VERSION, "run_id": run_id, "mode": "dry-run",
         "scope": SCOPE_NOTE, "created_at": _iso(now), "created_ts": now,
         "judge": {"status": judge_note, "model": model},
         "limits": dataclasses.asdict(lim), "git": dict(source.status),
@@ -1298,7 +1324,7 @@ class _Writer:
 
 
 def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
-               clock: Callable[[], float] = time.monotonic) -> Dict[str, Any]:
+               clock: Callable[[], float] = time.monotonic, corrections: bool = True) -> Dict[str, Any]:
     """Add-only writes through memora's own storage functions (per-key statements, the write gate,
     the D1 path). No delete, no content edit, no unlink anywhere in this function.
 
@@ -1313,6 +1339,8 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
       judged (content, metadata, tags, updated_at, crossrefs blob, no tombstone, no existing supersedes
       edge); if a writer got in between, nothing is hidden. Metadata updates carry expected_row.
     * A write is charged to max_writes BEFORE it is dispatched."""
+    if plan.get("rules") != RULES_VERSION:
+        raise DreamError("plan was made under older dream rules (Item 244); run a new dry run")
     if storage_mod is None:
         from . import storage as storage_mod  # noqa: PLC0415
     applied: List[Dict[str, Any]] = []
@@ -1347,7 +1375,10 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
                     skipped.append({"memory_id": mid, "why": "memory was retired since the dry run"})
                     break
                 if p["action"] == "supersede":
-                    bad = correction_problem(str(p.get("content") or ""), m.content)
+                    bad = (None if corrections else "corrections are off in the current config") or \
+                        (None if any(c.get("verdict") in ("wrong", "stale") and not c.get("ctx") for c in f.get("claims", []))
+                         else "no unrestricted wrong/stale claim backs it") or \
+                        correction_problem(str(p.get("content") or ""), m.content)
                     if bad:
                         skipped.append({"memory_id": mid, "why": f"correction refused: {bad}"})
                         continue
@@ -1495,7 +1526,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if args.apply:
                 if not args.plan or args.db:
                     raise DreamError("--apply needs --plan FILE and never takes --db (it writes the configured store)")
-                out = apply_plan(load_plan(args.plan), cfg.limits)
+                out = apply_plan(load_plan(args.plan), cfg.limits, corrections=cfg.corrections)
                 print(json.dumps(out, indent=2))
                 return 4 if out["aborted"] else 0
             if args.plan:

@@ -201,7 +201,7 @@ def test_cli_without_judge_is_exit_3_and_all_unverifiable(tmp_path, monkeypatch,
 def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
     good = _add(f"Item 242 landed as {sha[:12]}", metadata={"project": None})
-    bad = _add("The dream pass lives in memora/missing_file.py and shipped as v9.9.9", metadata={"project": None})
+    bad = _add("The dream pass lives in memora/missing_file.py in this repo and shipped as v9.9.9 in this repo", metadata={"project": None})
     cfg = _cfg(tmp_path, repos, git_dir)
     before = _state()
 
@@ -246,7 +246,7 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
 
 def test_item_record_is_never_superseded_only_linked_related(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    rec = _add(f"Item 7 landed as {sha[:12]} and shipped v9.9.9", tags=["item-record"], metadata={"kind": "item-record"})
+    rec = _add(f"Item 7 landed as {sha[:12]} and shipped v9.9.9 in this repo", tags=["item-record"], metadata={"kind": "item-record"})
     cfg = _cfg(tmp_path, repos, git_dir)
     judge = _answer(lambda cid, p: ("wrong", _quote_first_evidence(cid, p)), correction="AUTO")
     r = _dry(cfg, judge)
@@ -733,7 +733,7 @@ def _plan_confirming(tmp_path, repos, git_dir, judge=None):
 
 def test_conversion_to_item_record_after_the_dry_run_blocks_the_write(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9")
+    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
     r = _plan_confirming(tmp_path, repos, git_dir)
     assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
     with storage.connect() as conn:                                       # content unchanged, metadata converted
@@ -746,7 +746,7 @@ def test_conversion_to_item_record_after_the_dry_run_blocks_the_write(tmp_path, 
 
 def test_protection_is_read_at_write_time_not_from_the_plan(tmp_path, gitrepo, monkeypatch):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9")
+    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
     r = _plan_confirming(tmp_path, repos, git_dir)
     real_add = storage.add_memory
 
@@ -786,7 +786,7 @@ def test_concurrent_edit_between_check_and_stamp_is_refused_by_the_statement(tmp
 
 def test_own_stamp_does_not_invalidate_the_same_plan_and_retired_memory_is_skipped(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9")
+    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
     r = _plan_confirming(tmp_path, repos, git_dir)
     out = dream.apply_plan(r, Limits(max_writes=10))            # annotate first, then supersede, on the same memory
     assert {a["action"] for a in out["applied"]} == {"supersede", "annotate"} and not out["skipped"]
@@ -951,7 +951,7 @@ def test_truncated_judge_answer_is_no_answer(monkeypatch):
 
 
 def _supersede_plan(tmp_path, repos, git_dir, sha, text=None):
-    mid = _add(text or f"landed {sha[:12]} v9.9.9")
+    mid = _add(text or f"landed {sha[:12]} v9.9.9 in this repo")
     r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
              _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
     assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
@@ -1340,9 +1340,11 @@ def test_244_claims_know_where_absence_proves_nothing():
     assert more["v0.5.7.7"].asserts and more["1234abcd5678"].asserts and more["memora/dream.py"].ctx == ""
 
 
-def test_244_an_unrestricted_mention_wins_over_a_history_one():
+def test_244_any_restricted_mention_restricts_the_claim():
     got = _by_text(dream.extract_claims("squash of 5c5d7ebb. Later, 5c5d7ebb landed on dev."))
-    assert got["5c5d7ebb"].ctx == "" and got["5c5d7ebb"].asserts
+    assert got["5c5d7ebb"].ctx == "history" and not got["5c5d7ebb"].asserts
+    got = _by_text(dream.extract_claims("5c5d7ebb landed on dev. Also 5c5d7ebb is mentioned here."))
+    assert got["5c5d7ebb"].ctx == "" and not got["5c5d7ebb"].asserts      # every unrestricted mention must assert
 
 
 @pytest.mark.parametrize("ctx", ["history", "foreign", "bare"])
@@ -1350,7 +1352,7 @@ def test_244_an_unrestricted_mention_wins_over_a_history_one():
 def test_244_guard_makes_restricted_references_unverifiable(ctx, verdict):
     c = Claim("c1", "sha", "abc1234", "abc1234", ctx=ctx, asserts=True)
     parsed = {"c1": {"verdict": verdict, "evidence": "q", "reason": ""}}
-    dream._guard_verdicts([c], parsed)
+    dream._guard_verdicts([c], parsed, lambda c: c.asserts)
     assert parsed["c1"]["verdict"] == "unverifiable"
 
 
@@ -1359,10 +1361,10 @@ def test_244_guard_wrong_needs_an_assertion_stale_is_never_absence():
     asserted = Claim("c2", "tag", "v2.0.0", "v2.0.0", asserts=True)
     parsed = {"c1": {"verdict": "wrong", "evidence": "q", "reason": ""},
               "c2": {"verdict": "wrong", "evidence": "q", "reason": ""}}
-    dream._guard_verdicts([plain, asserted], parsed)
+    dream._guard_verdicts([plain, asserted], parsed, lambda c: c.asserts)
     assert parsed["c1"]["verdict"] == "missing" and parsed["c2"]["verdict"] == "wrong"
     parsed = {"c1": {"verdict": "stale", "evidence": "q", "reason": ""}}
-    dream._guard_verdicts([plain], parsed)
+    dream._guard_verdicts([plain], parsed, lambda c: c.asserts)
     assert parsed["c1"]["verdict"] == "unverifiable"
 
 
@@ -1485,3 +1487,100 @@ def test_244_apply_refuses_a_bad_supersede_proposal_from_an_older_plan(tmp_path,
     assert any("correction refused" in s.get("why", "") for s in out["skipped"])
     assert not any(a["action"] == "supersede" for a in out["applied"])
     assert out["writes_charged"] == 1                                            # only the annotate was charged
+
+
+def _wrong_judge(correction="AUTO"):
+    return _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction=correction)
+
+
+def _find(r, mid):
+    return next(x for x in r["findings"] if x["memory_id"] == mid)
+
+
+@pytest.mark.parametrize("text", [
+    "The old build name v0.4.16.1 is not a tag in any repository we ever used, per the release review notes.",
+    "Notes from the vendor call: WidgetSDK released v1.4.0 last month, according to their changelog posted online.",
+    "In the past v9.9.9 was tagged on the first try, but later that tag was removed during the cleanup of tags.",
+])
+def test_244_negated_historical_or_unknown_subject_membership_is_never_wrong(tmp_path, gitrepo, text):
+    repos, git_dir, _sha, _src = gitrepo
+    mid = _add(text)
+    f = _find(_dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _wrong_judge()), mid)
+    vs = {c["verdict"] for c in f["claims"] if c["kind"] == "tag"}
+    assert vs == {"missing"} or vs == {"unverifiable"}, f["claims"]
+    assert not any(p["action"] == "supersede" for p in f["proposals"])
+
+
+@pytest.mark.parametrize("text", [
+    "The release v9.9.9 is tagged in the proj repo, as agreed in the planning review notes of last week.",
+    "The release v9.9.9 is tagged in this repository, as agreed in the planning review notes of last week.",
+    "The change landed on dev as deadbeef12 according to the planning review notes of last week, a clear fact.",
+])
+def test_244_affirmative_membership_in_the_named_repo_is_still_wrong_control(tmp_path, gitrepo, text):
+    repos, git_dir, _sha, _src = gitrepo
+    mid = _add(text)
+    f = _find(_dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _wrong_judge()), mid)
+    assert any(c["verdict"] == "wrong" for c in f["claims"]), f["claims"]
+    assert any(p["action"] == "supersede" for p in f["proposals"])
+
+
+def _write_plan(tmp_path, report, drop_rules=False):
+    rep = dict(report)
+    if drop_rules:
+        rep.pop("rules")
+    rep["digest"] = dream.plan_digest(rep)
+    p = tmp_path / "plan.json"
+    p.write_text(json.dumps(rep, default=str))
+    return str(p)
+
+
+def _cfg_file(tmp_path, **extra):
+    f = tmp_path / "dream.json"
+    f.write_text(json.dumps({"state_dir": str(tmp_path / "state"), **extra}))
+    return str(f)
+
+
+def _unsafe_plan(tmp_path, gitrepo_):
+    repos, git_dir, _sha, _src = gitrepo_
+    mid = _add(_ORIGINAL_244)
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _wrong_judge())
+    return mid, r
+
+
+def test_244_main_apply_with_default_config_writes_no_corrected_copy(tmp_path, gitrepo, capsys):
+    mid, r = _unsafe_plan(tmp_path, gitrepo)
+    plan = _write_plan(tmp_path, r)
+    before = _count()
+    assert dream.main(["--config", _cfg_file(tmp_path), "--apply", "--plan", plan]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert _count() == before and not any(a["action"] == "supersede" for a in out["applied"])
+    assert any("corrections are off" in x.get("why", "") for x in out["skipped"])
+    assert out["writes_charged"] == 1                                       # only the annotation
+    assert not any(e.get("edge_type") in ("supersedes", "superseded_by") for e in _edges(mid))
+
+
+def test_244_main_apply_with_corrections_on_still_supersedes_control(tmp_path, gitrepo, capsys):
+    mid, r = _unsafe_plan(tmp_path, gitrepo)
+    plan = _write_plan(tmp_path, r)
+    assert dream.main(["--config", _cfg_file(tmp_path, corrections=True), "--apply", "--plan", plan]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert any(a["action"] == "supersede" for a in out["applied"])
+
+
+def test_244_a_legacy_plan_without_the_new_rules_is_refused(tmp_path, gitrepo, capsys):
+    _mid, r = _unsafe_plan(tmp_path, gitrepo)
+    plan = _write_plan(tmp_path, r, drop_rules=True)
+    before = _count()
+    assert dream.main(["--config", _cfg_file(tmp_path, corrections=True), "--apply", "--plan", plan]) == 2
+    assert "older dream rules" in capsys.readouterr().err and _count() == before
+
+
+def test_244_apply_refuses_a_supersede_backed_only_by_restricted_claims(tmp_path, gitrepo, capsys):
+    _mid, r = _unsafe_plan(tmp_path, gitrepo)
+    for c in r["findings"][0]["claims"]:
+        c["ctx"] = "history"                                   # a legacy-style verdict on a pre-squash reference
+    plan = _write_plan(tmp_path, r)
+    before = _count()
+    assert dream.main(["--config", _cfg_file(tmp_path, corrections=True), "--apply", "--plan", plan]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert _count() == before and any("no unrestricted" in x.get("why", "") for x in out["skipped"])
