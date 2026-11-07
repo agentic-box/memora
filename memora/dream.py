@@ -262,13 +262,17 @@ def _json(raw: Any, default: Any) -> Any:
 
 
 def open_readonly_file(path: str) -> sqlite3.Connection:
-    """A scratch/exported copy, opened so that a write is impossible."""
+    """A store file (a scratch or exported copy, or a live local store) opened for READING only, through
+    LocalSQLiteBackend.connect_read_only: the shared side of the store lock, never creating a file, and
+    refusing a database it cannot read safely. There is no raw sqlite3.connect in this module."""
+    from .backends import LocalSQLiteBackend  # noqa: PLC0415
     p = Path(path).resolve()
     if not p.is_file():
         raise DreamError(f"no database file at {p}")
-    conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        return LocalSQLiteBackend(p).connect_read_only()
+    except Exception as e:  # StoreMissingError, StoreLockedError, a corrupt file ...
+        raise DreamError(f"cannot open {p} read-only: {type(e).__name__}: {e}")
 
 
 def load_memories(conn: sqlite3.Connection) -> List[Mem]:

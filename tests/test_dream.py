@@ -1256,3 +1256,57 @@ def test_mirror_dir_outside_git_dir_is_refused_even_when_it_is_a_bare_repo(tmp_p
 def test_llm_call_cap_holds_in_the_budget_itself():
     b = dream.Budget(Limits(max_llm_calls=2))
     assert [b.take_llm_call() for _ in range(3)] == [True, True, False] and b.stopped_by == "max_llm_calls"
+
+
+# ----------------------------------------------------------------------------- store access goes through the store lock
+
+
+def test_dream_has_no_raw_sqlite_connect():
+    import ast, pathlib
+    tree = ast.parse(pathlib.Path(dream.__file__).read_text())
+    raw = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+           and n.func.attr == "connect" and getattr(n.func.value, "id", "") == "sqlite3"]
+    assert raw == []
+
+
+def test_live_store_and_db_file_are_read_on_the_shared_side_of_the_store_lock(tmp_path, monkeypatch):
+    """No --db (the live store, whatever backend is configured) and --db (a file) both read through
+    connect_read_only; the connection is the locked READER and cannot write."""
+    from memora import backends
+    _add("Item 4 note memora/a.py")
+    cfgp = tmp_path / "c.json"
+    cfgp.write_text(json.dumps({"state_dir": str(tmp_path / "s")}))
+    seen = []
+    real = dream.run_dry
+
+    def spy(conn, *a, **k):
+        seen.append(conn)
+        assert isinstance(conn, backends._LockedReaderConnection)
+        with pytest.raises(Exception):
+            conn.execute("INSERT INTO memories (content) VALUES ('x')")
+        return real(conn, *a, **k)
+
+    monkeypatch.setattr(dream, "run_dry", spy)
+    monkeypatch.delenv("MEMORA_DREAM_MODEL", raising=False)
+    assert dream.main(["--config", str(cfgp)]) == 3                                  # live store path
+    assert dream.main(["--config", str(cfgp), "--db", str(tmp_path / "memories.db")]) == 3   # file path
+    assert len(seen) == 2
+
+
+def test_readonly_file_read_holds_the_shared_lock_so_a_writer_cannot_open_meanwhile(tmp_path):
+    from memora import backends
+    _add("Item 4 note memora/a.py")
+    db = tmp_path / "memories.db"
+    conn = dream.open_readonly_file(str(db))
+    try:
+        with pytest.raises(RuntimeError, match="read-only connection"):    # the same thread would deadlock: refused
+            storage.connect()
+    finally:
+        conn.close()
+    storage.connect().close()                                               # released after close
+
+
+def test_missing_file_is_refused_not_created(tmp_path):
+    with pytest.raises(DreamError):
+        dream.open_readonly_file(str(tmp_path / "nope.db"))
+    assert not (tmp_path / "nope.db").exists()
