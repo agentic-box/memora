@@ -14,9 +14,9 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 
 ## 0.5.7.8 — 2026-11-07
 
-`memora-dream` no longer flags true notes as wrong (Item 244, found by the first live dry run of 0.5.7.7).
+`memora-dream` is much stricter about calling a note wrong (Item 244, after the first live dry run of 0.5.7.7 flagged true notes). The rules are heuristics that fail closed; a leader still reviews every proposal.
 
-- Absence is never `wrong` by default. A reference that is not found is `missing` (reported, never corrected). `wrong`/`stale` needs an affirmative, non-negated, non-historical membership phrase tied, in the same clause, to the repository the evidence came from ("tagged in the <repo> repo", "landed on dev", "in this repo").
+- Absence is never `wrong` by default. A reference that is not found is `missing` (reported, never corrected). `wrong`/`stale` needs a membership construction that joins that very reference to the repository the evidence came from ("<ref> is tagged in the <repo> repo", "tagged <ref> in this repo", "landed on dev as <ref>"), with no negation, history or other subject; a repository name merely nearby does not count.
 - Pre-squash and review-round commits (`squash of X`, `round N`, `PASS` lines), references whose context names another project (`ghostty`, `upstream`, `pin`, ...) and bare file names that are not a path are `unverifiable`.
 - A proposed correction is dropped, with its reason in `correction_rejected`, when it contains the judge prompt envelope, is not a full rewrite, or removes most of the note. Corrections are **off by default**: set `"corrections": true` in the dream config to get `supersede` proposals.
 - `--apply` honours the config (no supersede unless corrections are on), re-checks each correction and its claims, and refuses a plan made by an older version (`rules` field); run a new dry run.

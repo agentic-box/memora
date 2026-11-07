@@ -337,7 +337,8 @@ class Claim:
     value: str     # normalised
     ctx: str = ""  # "" | history | foreign | bare: why its absence proves nothing (Item 244)
     asserts: bool = False  # an affirmative (not negated, not historical) membership phrase is nearby
-    tie: str = ""          # the clause around it; the repository the note means must be named in it
+    pre: str = ""          # the clause text before / after the token (Item 244): the membership
+    post: str = ""         # construction that joins THIS reference to a repository is read from these
 
     def key(self) -> Tuple[str, str]:
         return (self.kind, self.value)
@@ -366,17 +367,23 @@ _NEGATED = re.compile(
     r"\b(?:not|never|no|nor|none|without|untagged|unreleased|unmerged|unpushed|nonexistent|non-existent|"
     r"was|were|used to|formerly|previously|once|earlier|old|former|renamed|removed|deleted|dropped|reverted)\b|n't",
     re.IGNORECASE)
-_THIS_REPO = re.compile(r"\b(?:this|the same) repo(?:sitory)?\b", re.IGNORECASE)
 
 
-def _window(text: str, start: int, end: int, before: int, after: int) -> str:
-    """The text around a token: same line and same clause (cut at `;` or a sentence end)."""
+def _around(text: str, start: int, end: int, before: int, after: int) -> Tuple[str, str]:
+    """The text before and after a token: same line and same clause (cut at `;` or a sentence end)."""
     ls = text.rfind("\n", 0, start) + 1
     le = text.find("\n", end)
     le = len(text) if le < 0 else le
     pre, post = text[max(ls, start - before):start], text[end:min(le, end + after)]
+    clipped = start - before > ls
     pre = re.split(r";|\.\s", pre)[-1]
-    post = re.split(r";|\.\s", post)[0]
+    if clipped and len(pre) >= before - 1:
+        pre = pre.split(None, 1)[1] if len(pre.split(None, 1)) > 1 else ""   # drop a word cut by the window
+    return pre, re.split(r";|\.\s", post)[0]
+
+
+def _window(text: str, start: int, end: int, before: int, after: int) -> str:
+    pre, post = _around(text, start, end, before, after)
     return pre + " " + post
 
 
@@ -388,7 +395,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
     a path (bare). `asserts` is true only when the note explicitly places it in a repository."""
     own = {k: v for k, v in (metadata or {}).items() if k not in _OWN_KEYS}   # never our own run ids
     text = content + "\n" + json.dumps(own, sort_keys=True, default=str)
-    found: List[Tuple[str, str, str, str, bool, str]] = []
+    found: List[Tuple[str, str, str, str, bool, Tuple[str, str]]] = []
 
     def add(kind: str, m: "re.Match", tok: str, val: str, bare: bool = False) -> None:
         s0, e0 = m.start(), m.end()
@@ -401,7 +408,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
             ctx = "bare"
         near = _window(text, s0, e0, 35, 20)
         aff = ctx == "" and bool(_ASSERTS.search(near)) and not _NEGATED.search(near)
-        found.append((kind, tok, val, ctx, aff, _window(text, s0, e0, 80, 40)))
+        found.append((kind, tok, val, ctx, aff, _around(text, s0, e0, 80, 40)))
 
     for m in _RE_SHA.finditer(text):
         tok = m.group(1)
@@ -412,7 +419,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
     for m in _RE_ITEM.finditer(text):
         add("item", m, m.group(0), m.group(1))
     for m in _RE_MSG.finditer(text):
-        found.append(("msg", m.group(0), m.group(1), "", False, ""))
+        found.append(("msg", m.group(0), m.group(1), "", False, ("", "")))
     for m in _RE_PATH.finditer(text):
         tok = m.group(1)
         if "/" in tok or tok.count(".") == 1:
@@ -431,7 +438,7 @@ def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limi
                 r[4] = r[4] and asserts
             continue
         order[k] = len(rows)
-        rows.append([kind, tok, val, ctx, asserts, tie])
+        rows.append([kind, tok, val, ctx, asserts, *tie])
     return [Claim(f"c{i + 1}", *r) for i, r in enumerate(rows[:limit])]
 
 
@@ -569,19 +576,40 @@ class GitSource:
         want = {str(m.metadata.get("repo") or ""), str(m.metadata.get("project") or ""), *m.tags}
         return [n for n in self.cfg.repos if n in want or want & set(self.cfg.repos[n].get("projects") or [])]
 
+    _VERB = r"(?:tagged|landed|merged|pushed|fast-forwarded|present|exists|lives|added)"
+    _FILLER = frozenset("""the a an it this that which release tag tags version commit sha change changes fix fixes patch
+        build file module script code helper is are has have been got now also then and item pr""".split())
+
     def asserted(self, m: Mem, c: Claim) -> bool:
-        """The note affirmatively says this reference is in a repository this pass checked: an affirmative
-        membership phrase (no negation, nothing historical) AND, in the same clause, that repository's own
-        name, project alias or ref, or "this repo". An unknown subject ("WidgetSDK released v1.4.0") fails."""
+        """The note affirmatively joins THIS reference to a repository this pass checked, by a membership
+        construction, not by a repository name merely being nearby: "<ref> is tagged in the proj repo",
+        "tagged <ref> in proj", "landed on dev as <ref>". Whatever else is in the clause (a different subject
+        such as "proj uses WidgetSDK tag <ref>", an incidental repo name) fails closed."""
         if c.ctx or not c.asserts:
             return False
-        if _THIS_REPO.search(c.tie):
-            return True
+        names = set(self._named(m))
         for n in self._named(m):
-            names = {n, self._ref(n), *[str(x) for x in (self.cfg.repos[n].get("projects") or [])]}
-            if any(x and re.search(rf"(?<![\w-]){re.escape(x)}(?![\w-])", c.tie, re.IGNORECASE) for x in names):
-                return True
-        return False
+            names |= {self._ref(n), *[str(x) for x in (self.cfg.repos[n].get("projects") or [])]}
+        alt = "|".join(re.escape(x) for x in sorted(names, key=len, reverse=True) if x)
+        np_ = (r"(?:(?:(?:the|this)\s+)?(?:%s)(?:\s+(?:repo|repository|branch))?|(?:this|the same)\s+repo(?:sitory)?)"
+               % (alt or r"(?!)"))
+        prep, V = r"(?:in|on|to|into|at|within)", self._VERB
+        pre, post = c.pre, c.post
+
+        def subject_ok(words: str) -> bool:
+            return all(w.lower() in self._FILLER or re.fullmatch(r"[\W\d_]*", w) for w in words.split())
+        flags = re.IGNORECASE
+        # 1. "<ref> [is|has been] tagged in <repo>"; the words before the ref must not name another subject
+        if subject_ok(pre) and re.match(rf"\s*[)\]\"'`,]*\s*(?:(?:is|are|has been|have been|got)\s+)?{V}\s+{prep}\s+{np_}(?![\w-])",
+                                       post, flags):
+            return True
+        # 2. "tagged <ref> in <repo>" / "lives in <path> in this repo" / "shipped as"-free forms
+        m2 = re.search(rf"(?:^|\s){V}\s+(?:(?:as|in|tag|the tag)\s+)*$", pre, flags)
+        if m2 and subject_ok(pre[:m2.start()]) and re.match(rf"\s*[)\]\"'`,]*\s*{prep}\s+{np_}(?![\w-])", post, flags):
+            return True
+        # 3. "landed on <repo> as <ref>"
+        m3 = re.search(rf"(?:^|\s){V}\s+{prep}\s+{np_}\s+(?:as|with|at)\s+(?:(?:tag|the tag)\s+)?$", pre, flags)
+        return bool(m3 and subject_ok(pre[:m3.start()]))
 
     def _ref(self, name: str) -> str:
         return str(self.cfg.repos[name].get("ref") or "HEAD")

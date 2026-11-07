@@ -201,7 +201,7 @@ def test_cli_without_judge_is_exit_3_and_all_unverifiable(tmp_path, monkeypatch,
 def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
     good = _add(f"Item 242 landed as {sha[:12]}", metadata={"project": None})
-    bad = _add("The dream pass lives in memora/missing_file.py in this repo and shipped as v9.9.9 in this repo", metadata={"project": None})
+    bad = _add("The helper lives in memora/missing_file.py in this repo. The release v9.9.9 is tagged in this repo", metadata={"project": None})
     cfg = _cfg(tmp_path, repos, git_dir)
     before = _state()
 
@@ -210,7 +210,7 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
         missing = ("none" in line) or ("not found" in line) or ("does not exist" in line)
         return ("wrong" if missing else "confirmed", line[:40])
 
-    judge = _answer(verdicts, correction="The dream pass lives in memora/dream.py and shipped as v0.5.7.7")
+    judge = _answer(verdicts, correction="The helper lives in memora/dream.py in this repo. The release v0.5.7.7 is tagged in this repo")
     # claims for `bad` carry 'none'/'does not exist' evidence; the judge quotes them
     r = _dry(cfg, judge)
     assert _state() == before                                    # dry run: no write at all
@@ -246,7 +246,7 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
 
 def test_item_record_is_never_superseded_only_linked_related(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    rec = _add(f"Item 7 landed as {sha[:12]} and shipped v9.9.9 in this repo", tags=["item-record"], metadata={"kind": "item-record"})
+    rec = _add(f"Item 7 landed as {sha[:12]}. The release v9.9.9 is tagged in this repo", tags=["item-record"], metadata={"kind": "item-record"})
     cfg = _cfg(tmp_path, repos, git_dir)
     judge = _answer(lambda cid, p: ("wrong", _quote_first_evidence(cid, p)), correction="AUTO")
     r = _dry(cfg, judge)
@@ -733,7 +733,7 @@ def _plan_confirming(tmp_path, repos, git_dir, judge=None):
 
 def test_conversion_to_item_record_after_the_dry_run_blocks_the_write(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
+    mid = _add(f"The release v9.9.9 is tagged in this repo, see {sha[:12]}")
     r = _plan_confirming(tmp_path, repos, git_dir)
     assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
     with storage.connect() as conn:                                       # content unchanged, metadata converted
@@ -746,7 +746,7 @@ def test_conversion_to_item_record_after_the_dry_run_blocks_the_write(tmp_path, 
 
 def test_protection_is_read_at_write_time_not_from_the_plan(tmp_path, gitrepo, monkeypatch):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
+    mid = _add(f"The release v9.9.9 is tagged in this repo, see {sha[:12]}")
     r = _plan_confirming(tmp_path, repos, git_dir)
     real_add = storage.add_memory
 
@@ -786,7 +786,7 @@ def test_concurrent_edit_between_check_and_stamp_is_refused_by_the_statement(tmp
 
 def test_own_stamp_does_not_invalidate_the_same_plan_and_retired_memory_is_skipped(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
-    mid = _add(f"landed {sha[:12]} v9.9.9 in this repo")
+    mid = _add(f"The release v9.9.9 is tagged in this repo, see {sha[:12]}")
     r = _plan_confirming(tmp_path, repos, git_dir)
     out = dream.apply_plan(r, Limits(max_writes=10))            # annotate first, then supersede, on the same memory
     assert {a["action"] for a in out["applied"]} == {"supersede", "annotate"} and not out["skipped"]
@@ -951,7 +951,7 @@ def test_truncated_judge_answer_is_no_answer(monkeypatch):
 
 
 def _supersede_plan(tmp_path, repos, git_dir, sha, text=None):
-    mid = _add(text or f"landed {sha[:12]} v9.9.9 in this repo")
+    mid = _add(text or f"The release v9.9.9 is tagged in this repo, see {sha[:12]}")
     r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
              _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
     assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
@@ -1417,8 +1417,8 @@ def test_244_a_directory_path_absent_from_a_fresh_named_mirror_is_wrong_only_whe
     assert not any(p["action"] == "supersede" for p in f[plain]["proposals"])
 
 
-_ORIGINAL_244 = ("The dream pass lives in memora/gone_helper.py in this repo and shipped as v9.9.9 after the "
-                 "review, with the judge model set separately and the report written to the out directory.")
+_ORIGINAL_244 = ("The helper lives in memora/gone_helper.py in this repo. The release v9.9.9 is tagged in this repo "
+                 "after the review, with the judge model set separately and the report written to the out directory.")
 
 
 def _echo(prompt):
@@ -1489,6 +1489,17 @@ def test_244_apply_refuses_a_bad_supersede_proposal_from_an_older_plan(tmp_path,
     assert out["writes_charged"] == 1                                            # only the annotate was charged
 
 
+def _show(text, f):
+    """Program output for the reviewer: `DREAM_SHOW=1 pytest -s -k 244`."""
+    if os.environ.get("DREAM_SHOW"):
+        print("\nNOTE:", text)
+        for c in dream.extract_claims(text, {"project": "proj"}):
+            print("  extracted:", {k: getattr(c, k) for k in ("kind", "text", "ctx", "asserts", "pre", "post")})
+        for c in f["claims"]:
+            print("  claim:", c["text"], "ctx=%r" % c["ctx"], "verdict=%s" % c["verdict"], "| evidence:", c["source"][:70].replace("\n", " "))
+        print("  correction_rejected:", f["correction_rejected"], "| proposals:", [p["action"] for p in f["proposals"]])
+
+
 def _wrong_judge(correction="AUTO"):
     return _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction=correction)
 
@@ -1501,11 +1512,18 @@ def _find(r, mid):
     "The old build name v0.4.16.1 is not a tag in any repository we ever used, per the release review notes.",
     "Notes from the vendor call: WidgetSDK released v1.4.0 last month, according to their changelog posted online.",
     "In the past v9.9.9 was tagged on the first try, but later that tag was removed during the cleanup of tags.",
+    "proj uses WidgetSDK tag v1.4.0 for builds, as noted in the planning review notes of last week, fine.",
+    "this repo uses WidgetSDK tag v1.4.0 for builds, as noted in the planning review notes of last week.",
+    "WidgetSDK tagged v1.4.0 in proj builds only, as noted in the planning review notes of last week, ok.",
+    "The proj team says WidgetSDK is tagged v1.4.0 upstream, noted in the planning review of last week.",
+    "The release v1.4.0 is tagged in its own repository while proj merely builds with it, per last week review.",
+    "The release v1.4.0 is tagged by WidgetSDK in the vendor repository; proj is only a consumer of the tag.",
 ])
 def test_244_negated_historical_or_unknown_subject_membership_is_never_wrong(tmp_path, gitrepo, text):
     repos, git_dir, _sha, _src = gitrepo
-    mid = _add(text)
+    mid = _add(text, metadata={"project": "proj"})
     f = _find(_dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _wrong_judge()), mid)
+    _show(text, f)
     vs = {c["verdict"] for c in f["claims"] if c["kind"] == "tag"}
     assert vs == {"missing"} or vs == {"unverifiable"}, f["claims"]
     assert not any(p["action"] == "supersede" for p in f["proposals"])
@@ -1514,12 +1532,14 @@ def test_244_negated_historical_or_unknown_subject_membership_is_never_wrong(tmp
 @pytest.mark.parametrize("text", [
     "The release v9.9.9 is tagged in the proj repo, as agreed in the planning review notes of last week.",
     "The release v9.9.9 is tagged in this repository, as agreed in the planning review notes of last week.",
+    "Tagged v9.9.9 in proj, as agreed in the planning review notes of last week, a clear and affirmative fact.",
     "The change landed on dev as deadbeef12 according to the planning review notes of last week, a clear fact.",
 ])
 def test_244_affirmative_membership_in_the_named_repo_is_still_wrong_control(tmp_path, gitrepo, text):
     repos, git_dir, _sha, _src = gitrepo
-    mid = _add(text)
+    mid = _add(text, metadata={"project": "proj"})
     f = _find(_dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _wrong_judge()), mid)
+    _show(text, f)
     assert any(c["verdict"] == "wrong" for c in f["claims"]), f["claims"]
     assert any(p["action"] == "supersede" for p in f["proposals"])
 
