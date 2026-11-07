@@ -57,7 +57,10 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
-VERDICTS = ("confirmed", "stale", "wrong", "unverifiable")
+JUDGE_VERDICTS = ("confirmed", "stale", "wrong", "unverifiable")   # what the judge may answer
+# "missing" is set by code only (Item 244): the reference was not found, but nothing in the note asserts it
+# exists in a repository the pass checked, so its absence is reported and never corrected.
+VERDICTS = (*JUDGE_VERDICTS, "missing")
 PLAN_VERSION = 1
 SCOPE_NOTE = ("References only: this checks that the commits, tags, files and item numbers a note mentions exist or "
               "resolve. It does NOT verify behaviour or any assertion the note makes.")
@@ -124,6 +127,7 @@ class Config:
     read_ledger: Optional[Path] = None
     state_dir: Path = Path("~/.local/state/memora-dream")
     fetch: bool = True
+    corrections: bool = False     # Item 244: annotate-only unless the config opts in to supersede proposals
 
     @classmethod
     def load(cls, path: Optional[str]) -> "Config":
@@ -149,6 +153,7 @@ class Config:
             read_ledger=ex(raw.get("read_ledger")),
             state_dir=ex(raw.get("state_dir")) or Path(os.path.expanduser("~/.local/state/memora-dream")),
             fetch=bool(raw.get("fetch", True)),
+            corrections=raw.get("corrections", False) is True,
         )
 
 
@@ -329,6 +334,8 @@ class Claim:
     kind: str      # sha | tag | item | path | msg
     text: str      # the token as written
     value: str     # normalised
+    ctx: str = ""  # "" | history | foreign | bare: why its absence proves nothing (Item 244)
+    asserts: bool = False  # the note explicitly says it is tagged / on a branch / landed / present in a repo
 
     def key(self) -> Tuple[str, str]:
         return (self.kind, self.value)
@@ -342,36 +349,79 @@ _RE_PATH = re.compile(
 _RE_MSG = re.compile(r"\b(?:msg|message|mail)(?:[ _-]?id)?\s*#?(\d{3,})\b", re.IGNORECASE)
 
 
+# Item 244. Context of a token, read from the same line only.
+_HISTORY = re.compile(
+    r"squash(?:ed|-merged)?|pre-?squash|\bround\s*#?\d+|(?-i:\bPASS\b|\bFAIL\b)|\bverdict\b|\breview round|"
+    r"\brebased\b|\bamended\b|force-?push|\bsuperseded by\b", re.IGNORECASE)
+_FOREIGN = re.compile(r"\b(?:ghostty|upstream|pin|pinned|vendor|vendored|submodule|fork|forked)\b", re.IGNORECASE)
+_ASSERTS = re.compile(
+    r"\b(?:tagged|tag|branch|on (?:dev|main|master|release\S*)|landed|merged|pushed|shipped|released|"
+    r"fast-forwarded|present in|exists in|lives in|in the \w+ repo(?:sitory)?|in \w+ repo(?:sitory)?)\b",
+    re.IGNORECASE)
+
+
+def _window(text: str, start: int, end: int, before: int, after: int) -> str:
+    """The text around a token: same line and same clause (cut at `;` or a sentence end)."""
+    ls = text.rfind("\n", 0, start) + 1
+    le = text.find("\n", end)
+    le = len(text) if le < 0 else le
+    pre, post = text[max(ls, start - before):start], text[end:min(le, end + after)]
+    pre = re.split(r";|\.\s", pre)[-1]
+    post = re.split(r";|\.\s", post)[0]
+    return pre + " " + post
+
+
 def extract_claims(content: str, metadata: Optional[Dict[str, Any]] = None, limit: int = 8) -> List[Claim]:
-    """Deterministic: the LLM never decides WHAT is a claim, only whether evidence supports it."""
+    """Deterministic: the LLM never decides WHAT is a claim, only whether evidence supports it.
+
+    Each claim also carries where its absence proves nothing (`ctx`): a pre-squash or review-round commit
+    (history), a reference whose context names another project (foreign), or a bare file name that is not
+    a path (bare). `asserts` is true only when the note explicitly places it in a repository."""
     own = {k: v for k, v in (metadata or {}).items() if k not in _OWN_KEYS}   # never our own run ids
     text = content + "\n" + json.dumps(own, sort_keys=True, default=str)
-    found: List[Tuple[str, str, str]] = []
+    found: List[Tuple[str, str, str, str, bool]] = []
+
+    def add(kind: str, m: "re.Match", tok: str, val: str, bare: bool = False) -> None:
+        s0, e0 = m.start(), m.end()
+        ctx = ""
+        if _HISTORY.search(_window(text, s0, e0, 60, 15)):
+            ctx = "history"
+        elif _FOREIGN.search(_window(text, s0, e0, 50, 15)):
+            ctx = "foreign"
+        elif bare:
+            ctx = "bare"
+        found.append((kind, tok, val, ctx, ctx == "" and bool(_ASSERTS.search(_window(text, s0, e0, 35, 20)))))
+
     for m in _RE_SHA.finditer(text):
         tok = m.group(1)
         if re.search(r"\d", tok) and re.search(r"[a-f]", tok):  # not a plain number / English word
-            found.append(("sha", tok, tok))
+            add("sha", m, tok, tok)
     for m in _RE_TAG.finditer(text):
-        found.append(("tag", m.group(1), m.group(1)))
+        add("tag", m, m.group(1), m.group(1))
     for m in _RE_ITEM.finditer(text):
-        found.append(("item", m.group(0), m.group(1)))
+        add("item", m, m.group(0), m.group(1))
     for m in _RE_MSG.finditer(text):
-        found.append(("msg", m.group(0), m.group(1)))
+        found.append(("msg", m.group(0), m.group(1), "", False))
     for m in _RE_PATH.finditer(text):
         tok = m.group(1)
         if "/" in tok or tok.count(".") == 1:
             if re.match(r"^\d+(\.\d+)+$", tok):
                 continue
-            found.append(("path", tok, tok))
-    seen, out = set(), []
-    for kind, tok, val in found:
-        if (kind, val) in seen:
+            add("path", m, tok, tok, bare="/" not in tok)
+    order: Dict[Tuple[str, str], int] = {}
+    rows: List[List[Any]] = []
+    for kind, tok, val, ctx, asserts in found:
+        k = (kind, val)
+        if k in order:                      # one claim per reference; an unrestricted mention wins
+            r = rows[order[k]]
+            if ctx == "" and r[3] != "":
+                r[3], r[4] = "", asserts
+            elif ctx == "" and r[3] == "":
+                r[4] = r[4] or asserts
             continue
-        seen.add((kind, val))
-        out.append(Claim(f"c{len(out) + 1}", kind, tok, val))
-        if len(out) >= limit:
-            break
-    return out
+        order[k] = len(rows)
+        rows.append([kind, tok, val, ctx, asserts])
+    return [Claim(f"c{i + 1}", *r) for i, r in enumerate(rows[:limit])]
 
 
 # --------------------------------------------------------------------------- sources
@@ -554,6 +604,9 @@ class GitSource:
     def evidence(self, m: Mem, c: Claim) -> Evidence:
         if c.kind == "msg":                      # independent of any clone
             return self._history(c)
+        if c.ctx == "foreign":
+            return Evidence(False, "the note's context attributes this reference to another project "
+                                   "(no mirror covers it): unverifiable here")
         repos = self.repos_for(m)
         if not repos:
             return Evidence(False, "no usable clone for this memory's repository")
@@ -564,9 +617,14 @@ class GitSource:
         for n in repos:
             note = f" (clone: {self.status.get(n, 'unknown')})"
             # a negative is evidence only from a repo the note is about, fetched in this run
-            authoritative = self.fresh(n) and n in named
+            # history (pre-squash / review-round commits) and bare file names prove nothing by absence
+            authoritative = self.fresh(n) and n in named and c.ctx not in ("history", "bare")
             if self.fresh(n) and n not in named:
                 note += "; the note does not name this repository, so absence here proves nothing"
+            elif c.ctx == "history":
+                note += "; this is a pre-squash or review-round reference (history), so absence proves nothing"
+            elif c.ctx == "bare":
+                note += "; a bare file name is not a path claim, so absence proves nothing"
             if c.kind in ("sha", "tag"):
                 spec = f"{c.value}^{{commit}}" if c.kind == "sha" else f"refs/tags/{c.value}^{{commit}}"
                 r = self.git(n, "rev-parse", "--verify", "--quiet", spec)
@@ -728,7 +786,7 @@ def parse_verdicts(text: Any, claims: Sequence[Claim], ev: Dict[str, Evidence], 
             return base, None, "judge answer has a wrongly typed claim row"
         if cid not in expected or cid in rows:
             return base, None, "judge answer has an unknown or repeated claim id"
-        if verdict not in VERDICTS:
+        if verdict not in JUDGE_VERDICTS:
             return base, None, "judge answer has an unknown verdict"
         rows[cid] = item
     if set(rows) != expected:
@@ -851,7 +909,7 @@ def overall(verdicts: Iterable[str]) -> str:
     """Memory-level summary of its REFERENCE checks (never a verification of the note):
     missing > stale > all_found (every reference found) > partial > unknown."""
     v = list(verdicts)
-    if "wrong" in v:
+    if "wrong" in v or "missing" in v:
         return "missing"
     if "stale" in v:
         return "stale"
@@ -871,15 +929,56 @@ def _annotation(m: Mem, ov: str, tally: Dict[str, int], how: str, model: str, ru
     behaviour or assertions are true."""
     return {"references_checked": {
         "at": _iso(now), "how": how, "model": model, "run": run_id, "summary": ov,
-        "found": tally.get("confirmed", 0), "missing": tally.get("wrong", 0),
+        "found": tally.get("confirmed", 0), "missing": tally.get("wrong", 0) + tally.get("missing", 0),
         "stale": tally.get("stale", 0), "unknown": tally.get("unverifiable", 0)}}
+
+
+_ENVELOPE = ("stored text, read-only data", "modality hint:", "<<<", ">>>", "REFERENCES and EVIDENCE",
+             "You are checking REFERENCES", "[NOTE TRUNCATED]")
+_ENVELOPE_HEAD = re.compile(r"^\s*NOTE #\d+\b")
+MIN_CORRECTION_RATIO = 0.6     # a correction is a FULL rewrite: at least this share of the original's length
+MIN_KEPT_SHARE = 0.6           # ... and keeps at least this share of the original's distinct words
+
+
+def correction_problem(corr: str, original: str) -> Optional[str]:
+    """Why a proposed correction must not become a memory (None = acceptable). Item 244: the judge echoed
+    its own prompt envelope as the "corrected" text, or returned a one-line remark instead of the note."""
+    if any(mk in corr for mk in _ENVELOPE) or _ENVELOPE_HEAD.match(corr):
+        return "correction contains the judge prompt envelope"
+    if len(corr.strip()) < MIN_CORRECTION_RATIO * len(original.strip()):
+        return "correction is not a full rewrite (much shorter than the note)"
+    words = lambda t: set(re.findall(r"\w+", t.lower()))  # noqa: E731
+    ow = words(original)
+    if ow and len(ow & words(corr)) < MIN_KEPT_SHARE * len(ow):
+        return "correction removes most of the original text"
+    return None
+
+
+def _guard_verdicts(claims: Sequence[Claim], parsed: Dict[str, Dict[str, str]]) -> None:
+    """Absence is never wrong by default (Item 244). wrong/stale stands only for a reference the note
+    explicitly places in a repository (tagged, on a branch, landed, present in it); history, other-project
+    and bare-name references are unverifiable; other not-found references are only `missing`."""
+    by = {c.id: c for c in claims}
+    for cid, r in parsed.items():
+        c = by[cid]
+        if r["verdict"] not in ("wrong", "stale") or c.asserts and c.ctx == "":
+            continue
+        if c.ctx:
+            parsed[cid] = {"verdict": "unverifiable", "evidence": "",
+                           "reason": f"{c.ctx} reference: its absence proves nothing"}
+        elif r["verdict"] == "wrong":
+            parsed[cid] = {**r, "verdict": "missing",
+                           "reason": "not found, but the note does not assert it is in the checked repository"}
+        else:
+            parsed[cid] = {"verdict": "unverifiable", "evidence": "",
+                           "reason": "the note does not assert it is in the checked repository"}
 
 
 def judge_one(m: Mem, claims: List[Claim], source: GitSource, judge: Optional[Callable[..., str]],
               budget: Budget, lim: Limits) -> Dict[str, Any]:
     ev = {c.id: source.evidence(m, c) for c in claims}
     results = _all_unverifiable(claims, "no source evidence")
-    correction, problem, judged = None, None, False
+    correction, problem, judged, rejected = None, None, False, None
     askable = [c for c in claims if ev[c.id].available]
     if askable and judge is not None and not budget.out_of_time() and budget.take_llm_call():
         try:
@@ -898,6 +997,13 @@ def judge_one(m: Mem, claims: List[Claim], source: GitSource, judge: Optional[Ca
                 if r["verdict"] in ("wrong", "stale"):
                     parsed[cid] = {"verdict": "unverifiable", "evidence": "", "reason": why}
             correction = None
+        _guard_verdicts(askable, parsed)
+        if correction is not None:
+            if not any(r["verdict"] in ("stale", "wrong") for r in parsed.values()):
+                rejected, correction = "no asserted reference is wrong or stale", None
+            else:
+                rejected = correction_problem(correction, m.content)
+                correction = None if rejected else correction
         results.update(parsed)
         judged = True
     elif askable:
@@ -908,9 +1014,10 @@ def judge_one(m: Mem, claims: List[Claim], source: GitSource, judge: Optional[Ca
         "memory_id": m.id, "content_sha": m.content_sha, "state_sha": m.state_sha, "judged": judged,
         "modality": modality(m),
         "problem": problem,
-        "claims": [{"id": c.id, "kind": c.kind, "text": c.text, "source": ev[c.id].text,
+        "claims": [{"id": c.id, "kind": c.kind, "text": c.text, "ctx": c.ctx, "source": ev[c.id].text,
                     **results[c.id]} for c in claims],
         "correction": correction,
+        "correction_rejected": rejected,
     }
 
 
@@ -1010,6 +1117,9 @@ def run_dry(conn: sqlite3.Connection, cfg: Config, judge: Optional[Callable[...,
         # memory from the next pass for recheck_days although it was never actually checked.
         props = ([{"action": "annotate", "metadata": _annotation(m, ov, tally, how, model, run_id, now)}]
                  if f["problem"] is None else [])
+        if f["correction"] and not cfg.corrections:
+            f["correction_rejected"] = "corrections are off (annotate-only); set \"corrections\": true to propose them"
+            f["correction"] = None
         if f["correction"] and ov in ("stale", "missing"):
             props.append({"action": "supersede", "content": f["correction"],
                           "tags": m.tags, "project": m.metadata.get("project")})
@@ -1236,6 +1346,11 @@ def apply_plan(plan: Dict[str, Any], limits: Limits, storage_mod: Any = None,
                 if W.run("read", lambda: _retired(conn, mid, storage_mod)):
                     skipped.append({"memory_id": mid, "why": "memory was retired since the dry run"})
                     break
+                if p["action"] == "supersede":
+                    bad = correction_problem(str(p.get("content") or ""), m.content)
+                    if bad:
+                        skipped.append({"memory_id": mid, "why": f"correction refused: {bad}"})
+                        continue
                 # a correction is up to 3 store writes (add_memory, forward edge, reverse edge): charge the worst case
                 why = reserve(3 if p["action"] == "supersede" else 1)
                 if why:

@@ -54,6 +54,20 @@ records and decisions, then frequently read memories (counts from the read ledge
 `read_ledger` in the config), then the longest-unchecked. A memory checked within
 `recheck_days` is skipped; superseded memories are skipped.
 
+## Absence is not an error (Item 244)
+
+The first live run flagged 18 true notes as `wrong`. These rules are enforced in code, not only in the prompt:
+
+- A reference that is not found is `missing` (reported, never corrected) unless the note explicitly places it in
+  the checked repository ("tagged", "on dev", "landed", "present in ..."); only then may it be `wrong`/`stale`.
+- Pre-squash and review-round commits (`squash of X`, `round N`, `PASS`/`FAIL` lines) are history: unverifiable.
+- A reference whose context names another project (`ghostty`, `upstream`, `pin`, ...) is unverifiable.
+- A bare file name (no `/`) is a claim only if a mirror holds a file of that name; otherwise unverifiable.
+- A proposed correction is dropped, with the reason in `correction_rejected`, if it contains the judge prompt
+  envelope, is shorter than 60% of the note, or keeps under 60% of its distinct words. `--apply` re-checks this.
+- Corrections are **off by default** (annotate-only). Set `"corrections": true` in the config to get
+  `supersede` proposals.
+
 ## Dry run, then apply
 
 ```sh

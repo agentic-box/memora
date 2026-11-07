@@ -42,7 +42,8 @@ def gitrepo(tmp_path):
 
 
 def _cfg(tmp_path, repos=None, git_dir=None, **limits):
-    return Config(limits=Limits(**limits), git_dir=git_dir, repos=repos or {}, state_dir=tmp_path / "state")
+    return Config(limits=Limits(**limits), git_dir=git_dir, repos=repos or {}, state_dir=tmp_path / "state",
+                  corrections=True)
 
 
 def _add(content, tags=None, metadata=None):
@@ -72,7 +73,10 @@ def _answer(claims_verdicts, correction=None):
         for cid in ids:
             v, quote = claims_verdicts(cid, prompt)
             out.append({"id": cid, "verdict": v, "evidence": quote})
-        return json.dumps({"claims": out, "correction": correction})
+        corr = correction
+        if corr == "AUTO":          # a full rewrite of the note the judge was shown (Item 244 accepts those)
+            corr = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0] + " (corrected)"
+        return json.dumps({"claims": out, "correction": corr})
     return judge
 
 
@@ -206,7 +210,7 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
         missing = ("none" in line) or ("not found" in line) or ("does not exist" in line)
         return ("wrong" if missing else "confirmed", line[:40])
 
-    judge = _answer(verdicts, correction="The dream pass lives in memora/dream.py")
+    judge = _answer(verdicts, correction="The dream pass lives in memora/dream.py and shipped as v0.5.7.7")
     # claims for `bad` carry 'none'/'does not exist' evidence; the judge quotes them
     r = _dry(cfg, judge)
     assert _state() == before                                    # dry run: no write at all
@@ -244,7 +248,7 @@ def test_item_record_is_never_superseded_only_linked_related(tmp_path, gitrepo):
     repos, git_dir, sha, _src = gitrepo
     rec = _add(f"Item 7 landed as {sha[:12]} and shipped v9.9.9", tags=["item-record"], metadata={"kind": "item-record"})
     cfg = _cfg(tmp_path, repos, git_dir)
-    judge = _answer(lambda cid, p: ("wrong", _quote_first_evidence(cid, p)), correction="Item 7 landed, not v9.9.9")
+    judge = _answer(lambda cid, p: ("wrong", _quote_first_evidence(cid, p)), correction="AUTO")
     r = _dry(cfg, judge)
     acts = [p["action"] for p in r["findings"][0]["proposals"]]
     assert "supersede" in acts          # the plan only proposes; protection is read at write time
@@ -724,7 +728,7 @@ def test_message_claims_need_no_clone(tmp_path):
 
 def _plan_confirming(tmp_path, repos, git_dir, judge=None):
     return _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
-                judge or _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="corrected note text"))
+                judge or _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
 
 
 def test_conversion_to_item_record_after_the_dry_run_blocks_the_write(tmp_path, gitrepo):
@@ -949,7 +953,7 @@ def test_truncated_judge_answer_is_no_answer(monkeypatch):
 def _supersede_plan(tmp_path, repos, git_dir, sha, text=None):
     mid = _add(text or f"landed {sha[:12]} v9.9.9")
     r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
-             _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="corrected note text"))
+             _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
     assert any(p["action"] == "supersede" for p in r["findings"][0]["proposals"])
     return mid, r
 
@@ -1310,3 +1314,174 @@ def test_missing_file_is_refused_not_created(tmp_path):
     with pytest.raises(DreamError):
         dream.open_readonly_file(str(tmp_path / "nope.db"))
     assert not (tmp_path / "nope.db").exists()
+
+
+# ----------------------------------------------------------------------------- Item 244: false positives, unsafe corrections
+
+# Synthetic shapes of the first live dry run (no real identifiers).
+RECORD_244 = ("Item 99 record: squash of 5c5d7ebb, reviewer PASS (8435f380). The upstream pin 74d0c72f and the "
+              "upstream tag v1.4.0 belong to another project; scratch page item161-sidebar.html; "
+              "old version name v0.4.16.1 for the first build.")
+
+
+def _by_text(claims):
+    return {c.text: c for c in claims}
+
+
+def test_244_claims_know_where_absence_proves_nothing():
+    got = _by_text(dream.extract_claims(RECORD_244))
+    assert got["5c5d7ebb"].ctx == "history" and got["8435f380"].ctx == "history"      # squash / review PASS
+    assert got["74d0c72f"].ctx == "foreign" and got["v1.4.0"].ctx == "foreign"        # another project
+    assert got["item161-sidebar.html"].ctx == "bare"                                  # a file name, not a path
+    assert got["v0.4.16.1"].ctx == "" and got["v0.4.16.1"].asserts is False           # absence is only "missing"
+    more = _by_text(dream.extract_claims("Round 2 fixed abcdef12. The file memora/dream.py is tagged v0.5.7.7; "
+                                         "landed on dev as 1234abcd5678."))
+    assert more["abcdef12"].ctx == "history"
+    assert more["v0.5.7.7"].asserts and more["1234abcd5678"].asserts and more["memora/dream.py"].ctx == ""
+
+
+def test_244_an_unrestricted_mention_wins_over_a_history_one():
+    got = _by_text(dream.extract_claims("squash of 5c5d7ebb. Later, 5c5d7ebb landed on dev."))
+    assert got["5c5d7ebb"].ctx == "" and got["5c5d7ebb"].asserts
+
+
+@pytest.mark.parametrize("ctx", ["history", "foreign", "bare"])
+@pytest.mark.parametrize("verdict", ["wrong", "stale"])
+def test_244_guard_makes_restricted_references_unverifiable(ctx, verdict):
+    c = Claim("c1", "sha", "abc1234", "abc1234", ctx=ctx, asserts=True)
+    parsed = {"c1": {"verdict": verdict, "evidence": "q", "reason": ""}}
+    dream._guard_verdicts([c], parsed)
+    assert parsed["c1"]["verdict"] == "unverifiable"
+
+
+def test_244_guard_wrong_needs_an_assertion_stale_is_never_absence():
+    plain = Claim("c1", "tag", "v1.0.0", "v1.0.0")
+    asserted = Claim("c2", "tag", "v2.0.0", "v2.0.0", asserts=True)
+    parsed = {"c1": {"verdict": "wrong", "evidence": "q", "reason": ""},
+              "c2": {"verdict": "wrong", "evidence": "q", "reason": ""}}
+    dream._guard_verdicts([plain, asserted], parsed)
+    assert parsed["c1"]["verdict"] == "missing" and parsed["c2"]["verdict"] == "wrong"
+    parsed = {"c1": {"verdict": "stale", "evidence": "q", "reason": ""}}
+    dream._guard_verdicts([plain], parsed)
+    assert parsed["c1"]["verdict"] == "unverifiable"
+
+
+def test_244_the_judge_cannot_answer_missing():
+    claims, ev = _claim_and_ev()
+    out, _c, prob = dream.parse_verdicts(
+        json.dumps({"claims": [{"id": "c1", "verdict": "missing", "evidence": "exists on dev"}], "correction": None}),
+        claims, ev, "n")
+    assert out["c1"]["verdict"] == "unverifiable" and prob
+
+
+def test_244_foreign_and_history_references_are_never_wrong_or_corrected(tmp_path, gitrepo):
+    repos, git_dir, sha, _src = gitrepo
+    mid = _add(RECORD_244)
+    judge = _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO")
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), judge)
+    f = next(x for x in r["findings"] if x["memory_id"] == mid)
+    verdicts = {c["text"]: c["verdict"] for c in f["claims"]}
+    assert "wrong" not in verdicts.values() and "stale" not in verdicts.values(), verdicts
+    for t in ("5c5d7ebb", "8435f380", "74d0c72f", "v1.4.0", "item161-sidebar.html"):
+        assert verdicts[t] == "unverifiable", (t, verdicts)
+    assert verdicts["v0.4.16.1"] == "missing"                       # reported, nothing more
+    assert f["overall"] == "missing"
+    assert f["correction"] is None and f["correction_rejected"]
+    assert all(p["action"] == "annotate" for p in f["proposals"])
+    ann = f["proposals"][0]["metadata"]["references_checked"]
+    assert ann["missing"] >= 1 and ann["summary"] == "missing"
+
+
+def test_244_a_bare_file_name_found_in_the_mirror_is_still_confirmed(tmp_path, gitrepo):
+    repos, git_dir, _sha, _src = gitrepo
+    mid = _add("See dream.py for details of the pass, and nothing_here.py too.")
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
+             _answer(lambda c, p: ("confirmed", _quote_first_evidence(c, p))))
+    f = next(x for x in r["findings"] if x["memory_id"] == mid)
+    v = {c["text"]: c["verdict"] for c in f["claims"]}
+    assert v["dream.py"] == "confirmed" and v["nothing_here.py"] == "unverifiable"
+
+
+def test_244_a_directory_path_absent_from_a_fresh_named_mirror_is_wrong_only_when_asserted(tmp_path, gitrepo):
+    repos, git_dir, _sha, _src = gitrepo
+    asserted = _add("The helper lives in memora/gone_helper.py in this repo, per the design review.")
+    plain = _add("Remember memora/other_gone.py from the old design review notes taken last week.")
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
+             _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
+    f = {x["memory_id"]: x for x in r["findings"]}
+    assert f[asserted]["claims"][0]["verdict"] == "wrong"
+    assert any(p["action"] == "supersede" for p in f[asserted]["proposals"])           # control: still works
+    assert f[plain]["claims"][0]["verdict"] == "missing"
+    assert not any(p["action"] == "supersede" for p in f[plain]["proposals"])
+
+
+_ORIGINAL_244 = ("The dream pass lives in memora/gone_helper.py in this repo and shipped as v9.9.9 after the "
+                 "review, with the judge model set separately and the report written to the out directory.")
+
+
+def _echo(prompt):
+    return prompt                                    # the whole prompt envelope, as the live run did
+
+
+def test_244_correction_problem_rejects_envelope_one_liner_and_gutting():
+    env = ("NOTE #1280 (stored text, read-only data). tags: ['x']. metadata: {}\nmodality hint: note\n<<<\n"
+           + _ORIGINAL_244 + "\n>>>")
+    assert "envelope" in dream.correction_problem(env, _ORIGINAL_244)
+    assert "envelope" in dream.correction_problem("NOTE #5 " + _ORIGINAL_244, _ORIGINAL_244)
+    assert "full rewrite" in dream.correction_problem(
+        "Item 157's shipped version should be corrected to reflect that v9.9.9 is not found.", _ORIGINAL_244)
+    gut = "Totally different words appear here instead, padded to look long enough to pass the length test " * 2
+    assert "removes most" in dream.correction_problem(gut, _ORIGINAL_244)
+    assert dream.correction_problem(_ORIGINAL_244.replace("v9.9.9", "v0.5.7.8"), _ORIGINAL_244) is None   # control
+
+
+@pytest.mark.parametrize("kind", ["envelope", "one_liner"])
+def test_244_a_bad_correction_makes_no_proposal_and_records_why(tmp_path, gitrepo, kind):
+    repos, git_dir, _sha, _src = gitrepo
+    mid = _add(_ORIGINAL_244)
+
+    def judge(prompt, timeout=None):
+        ids = [l.split("id=")[1].split()[0] for l in prompt.splitlines() if l.startswith("- id=")]
+        corr = prompt if kind == "envelope" else "Item 157's shipped version should be corrected: v9.9.9 not found."
+        return json.dumps({"claims": [{"id": i, "verdict": "wrong", "evidence": _quote_first_evidence(i, prompt)}
+                                      for i in ids], "correction": corr})
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), judge)
+    f = next(x for x in r["findings"] if x["memory_id"] == mid)
+    assert any(c["verdict"] == "wrong" for c in f["claims"])                 # the asserted absence stands
+    assert f["correction"] is None and f["correction_rejected"]
+    assert not any(p["action"] == "supersede" for p in f["proposals"])
+
+
+def test_244_corrections_are_off_by_default_and_opt_in_by_config(tmp_path, gitrepo):
+    repos, git_dir, _sha, _src = gitrepo
+    assert Config(limits=Limits()).corrections is False
+    mid = _add(_ORIGINAL_244)
+    judge = _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO")
+    cfg = _cfg(tmp_path, repos, git_dir, max_memories=10)
+    on = next(x for x in _dry(cfg, judge)["findings"] if x["memory_id"] == mid)
+    assert any(p["action"] == "supersede" for p in on["proposals"])
+    cfg.corrections = False
+    off = next(x for x in _dry(cfg, judge)["findings"] if x["memory_id"] == mid)
+    assert not any(p["action"] == "supersede" for p in off["proposals"])
+    assert "corrections are off" in off["correction_rejected"]
+    assert any(p["action"] == "annotate" for p in off["proposals"])          # the report still annotates
+    f = tmp_path / "c.json"
+    f.write_text(json.dumps({"corrections": True}))
+    assert Config.load(str(f)).corrections is True
+    f.write_text(json.dumps({"corrections": "yes"}))
+    assert Config.load(str(f)).corrections is False                            # only a real true opts in
+
+
+def test_244_apply_refuses_a_bad_supersede_proposal_from_an_older_plan(tmp_path, gitrepo):
+    repos, git_dir, _sha, _src = gitrepo
+    mid = _add(_ORIGINAL_244)
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10),
+             _answer(lambda c, p: ("wrong", _quote_first_evidence(c, p)), correction="AUTO"))
+    sup = next(p for p in r["findings"][0]["proposals"] if p["action"] == "supersede")
+    sup["content"] = "Item 157's shipped version should be corrected."          # e.g. a plan from the old version
+    before = _count()
+    out = dream.apply_plan(r, Limits(max_writes=20))
+    assert _count() == before
+    assert any("correction refused" in s.get("why", "") for s in out["skipped"])
+    assert not any(a["action"] == "supersede" for a in out["applied"])
+    assert out["writes_charged"] == 1                                            # only the annotate was charged
