@@ -21,10 +21,21 @@ An LLM then judges each claim as `confirmed`, `stale`, `wrong` or `unverifiable`
 using ONLY the evidence given, and must quote the evidence. It may propose a
 corrected text when a claim is stale or wrong.
 
-**Fail closed.** A claim is `confirmed` only if the judge answered, the answer is
-valid JSON of the exact shape, the claim id and verdict are known, and the quoted
-evidence occurs in the evidence we supplied. Anything else (no judge, an exception,
-malformed output, an invented quote, a duplicate answer) is `unverifiable`. There
+**Fail closed.** The judge's answer must be exactly `{"claims": [...], "correction": null|text}`
+with one `{"id","verdict","evidence"}` row per asked claim: no missing, unknown, repeated or
+non-string id, no extra key, no non-string verdict. ONE deviation makes every claim of that memory
+`unverifiable` and the attempt is not stamped. Inside a well-formed answer a claim is `confirmed`
+(or `stale` / `wrong`) only if its quote occurs in the evidence we supplied for that claim. No
+judge, an exception, malformed output or an invented quote is `unverifiable`. A memory is
+`verified` only when EVERY one of its claims is confirmed; some confirmed and some not is
+`unconfirmed` (`why: partial`).
+
+**Unknown is not "not found".** A git command that fails or times out gives no evidence. "Not found"
+(a SHA, tag, item or file) counts as evidence only when that mirror was fetched in THIS run; from an
+unfetched or failed-fetch mirror it is unknown and the claim stays `unverifiable`. For a path claim
+the judge sees the file's bytes (first `max_file_chars`) at a recorded commit, and where each
+`backticked` symbol of the note occurs in it (or `NOT PRESENT`). Message claims use `history_cmd`
+and need no clone. There
 is no default model: `MEMORA_DREAM_MODEL` must be set, with `OPENAI_API_KEY` and
 optionally `OPENAI_BASE_URL`; with none of them the run still reports, every claim
 `unverifiable`, and exits 3. A memory that was not actually judged is not stamped,
@@ -43,9 +54,12 @@ memora-dream --db copy.sqlite --out r.json  # same against a read-only copy of a
 memora-dream --apply --plan report.json   # applies exactly that report; no LLM, no git
 ```
 
-The report is the plan. `--apply` refuses a plan whose digest no longer matches
-(edited), older than 48 h, and skips any memory whose content changed after it was
-judged. Only the leader runs `--apply`, after reading the dry run.
+The report is the plan. `--apply` refuses a plan whose digest (over the whole report) no
+longer matches, or older than 48 h. At each write it re-reads the memory and skips it unless
+content, tags and non-provenance metadata are still what was judged and it is not retired;
+whether it is an item record is read **then**, never taken from the plan; metadata updates carry
+`expected_row`, a precondition on the UPDATE statement itself. Only the leader runs `--apply`,
+after reading the dry run.
 
 `--apply` only **adds**, through memora's own storage functions (per-key
 statements, the write gate and the D1 path unchanged):
@@ -53,9 +67,11 @@ statements, the write gate and the D1 path unchanged):
 - `verified` (all judged claims confirmed) or `unconfirmed` (anything else) metadata,
   with how, when, model, run id and claim tallies;
 - a corrected memory plus a `supersedes` edge to the wrong one. An **item record is
-  never superseded** (as in absorb): it gets the corrected memory with `related_to`;
-- near-duplicates (word 4-gram Jaccard >= 0.9): a `supersedes` edge newer -> older
-  (`related_to` when either is an item record);
+  never superseded** (as in absorb): it gets the corrected memory with `related_to`. A partial
+  failure (the copy was added, then the memory changed) writes no edge and says so;
+- near-duplicates (word 4-gram Jaccard >= 0.9, same project, same numbers): a `related_to`
+  edge only. Lexical overlap is a lead, not proof; hiding the older memory stays a leader
+  decision;
 - a dangling-link note (`dangling_links` metadata). The dead edge itself is **not**
   removed: that would be an edit in place.
 
@@ -70,14 +86,18 @@ Part of the design, in `limits` of the config and tested:
 |---|---|---|
 | `max_memories` | 25 | memories judged per run |
 | `max_llm_calls` | 25 | judge calls per run (one per memory) |
-| `max_seconds` | 900 | wall time; the run stops between memories |
-| `max_writes` | 20 | storage write calls per `--apply`; the rest is listed as `deferred` |
+| `max_seconds` | 900 | ONE deadline for the whole run: every git, history and judge call gets at most what is left (no SDK retries), the scans are skipped once it passes, and a dry run is killed (exit 4) 30 s after it. `--apply` checks it before each write and never interrupts a started write |
+| `max_writes` | 20 | storage write calls per `--apply`, charged BEFORE the call (a write that commits and then raises still counts); the rest is `deferred` |
 | `max_clone_mb` | 500 | a mirror above this is never fetched (checked before the fetch) |
 | `recheck_days` | 14 | a checked memory is left alone this long |
 | `nice` | 10 | plus `ionice -c 3` where available |
 
 One run at a time: a non-blocking file lock in `state_dir`; a second run refuses.
 The report says why a run stopped (`stopped_by`).
+
+A mirror's `dir` must be relative, contain no `..` and no symlink, resolve inside `git_dir` and be a
+bare repository (`HEAD` + `objects/`, no `.git`, `git rev-parse --is-bare-repository` true); otherwise
+it is refused and git never runs there. Fetch runs with submodule recursion, auto-gc and maintenance off.
 
 Git is plumbing only (`cat-file`, `rev-parse`, `log`, `ls-tree`, `for-each-ref`,
 `fetch`, ...), against mirror clones; anything else raises. No build, no test and
