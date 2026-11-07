@@ -1225,3 +1225,34 @@ def test_charges_follow_dispatched_writes_around_the_cap(tmp_path, gitrepo):
             assert out["writes_charged"] == 4
         if not expect_super:   # restore for the second pass: the annotate stamp is the only write so far
             pass
+
+
+# ----------------------------------------------------------------------------- post-PASS mutation survivors
+
+
+def test_apply_with_no_time_left_dispatches_nothing(tmp_path, gitrepo, monkeypatch):
+    repos, git_dir, sha, _src = gitrepo
+    _add(f"landed {sha[:12]}")
+    r = _dry(_cfg(tmp_path, repos, git_dir), _answer(lambda c, p: ("confirmed", _quote_first_evidence(c, p))))
+    opened = []
+    real = storage.connect
+    monkeypatch.setattr(storage, "connect", lambda *a, **k: opened.append(1) or real(*a, **k))
+    out = dream.apply_plan(r, Limits(max_writes=10, max_seconds=0))
+    assert out["aborted"] == "max_seconds" and out["writes"] == 0 and out["applied"] == []
+    assert opened == [] and not any(e["dispatched"] for e in out["dispatch_log"])
+
+
+def test_mirror_dir_outside_git_dir_is_refused_even_when_it_is_a_bare_repo(tmp_path, gitrepo):
+    repos, git_dir, sha, src = gitrepo
+    outside = tmp_path / "outside.git"
+    _git(tmp_path, "clone", "-q", "--mirror", str(src), str(outside))          # a perfectly good bare repo
+    cfg = _cfg(tmp_path, {"abs": {"dir": str(outside)}, "dots": {"dir": "../outside.git"}}, git_dir)
+    s = dream.GitSource(cfg)
+    s.prepare()
+    assert s.status["abs"].startswith("refused") and s.status["dots"].startswith("refused")
+    assert s.git("abs", "rev-parse", "HEAD").ok is False and s.git("dots", "rev-parse", "HEAD").ok is False
+
+
+def test_llm_call_cap_holds_in_the_budget_itself():
+    b = dream.Budget(Limits(max_llm_calls=2))
+    assert [b.take_llm_call() for _ in range(3)] == [True, True, False] and b.stopped_by == "max_llm_calls"
