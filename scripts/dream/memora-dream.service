@@ -1,0 +1,15 @@
+# Template. Copy to ~/.config/systemd/user/, edit the two paths, then `systemctl --user daemon-reload`.
+# Runs the DRY RUN only. --apply is never scheduled: the leader applies a report by hand.
+[Unit]
+Description=memora dream pass (dry run, writes a report)
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# the config is git-ignored and holds the host-specific paths (docs/dream.md)
+Environment=MEMORA_DREAM_CONFIG=%h/.config/memora/dream.json
+EnvironmentFile=%h/.config/memora/dream.env
+WorkingDirectory=%h/memora
+ExecStart=%h/memora/.venv/bin/python -m memora.dream --out-dir %h/.local/state/memora-dream/reports
+TimeoutStartSec=1500

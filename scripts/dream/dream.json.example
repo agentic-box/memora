@@ -1,0 +1,19 @@
+{
+  "limits": {
+    "max_memories": 25,
+    "max_llm_calls": 25,
+    "max_seconds": 900,
+    "max_writes": 20,
+    "max_clone_mb": 500,
+    "recheck_days": 14,
+    "nice": 10
+  },
+  "git_dir": "/path/to/dream-mirrors",
+  "repos": {
+    "alpha": {"dir": "alpha.git", "ref": "dev", "projects": ["alpha"]}
+  },
+  "history_cmd": null,
+  "read_ledger": "/path/to/read-ledger.jsonl",
+  "state_dir": "~/.local/state/memora-dream",
+  "fetch": true
+}

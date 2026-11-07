@@ -1,0 +1,11 @@
+# Template: once a night, off-peak. Install with `systemctl --user enable --now memora-dream.timer`.
+[Unit]
+Description=memora dream pass, nightly
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+RandomizedDelaySec=900
+Persistent=false
+
+[Install]
+WantedBy=timers.target

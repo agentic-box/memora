@@ -12,6 +12,15 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.7 — 2026-11-07
+
+The "dreaming" pass: re-check stored memories against their sources (Item 242).
+
+- `memora-dream` (`python -m memora.dream`) picks a bounded batch of memories, extracts the claims a source can settle (commit SHAs, version tags, "Item N", repo file paths, clmux message ids), gathers evidence from read-only mirror clones (plumbing git only, no build or test) and an optional message-history command, and has an LLM judge each claim as `confirmed`, `stale`, `wrong` or `unverifiable` against ONLY that evidence. Volatile facts, item records and decisions, and frequently read memories (from the read ledger) are checked first.
+- The default is a **dry run**: it reads the store and writes a report (also the plan) to `--out`. `--apply --plan FILE` applies exactly that report and only ever adds: `verified` / `unconfirmed` provenance metadata, a corrected memory with a `supersedes` edge (an item record gets `related_to`), and near-duplicate / dangling-link notes. It never deletes a memory, edits content in place or removes an edge, and runs no LLM and no git.
+- Fails closed: no judge, an exception, malformed JSON, an unknown id or verdict, or a quote that is not in the supplied evidence all leave the claim `unverifiable`. There is no default model (`MEMORA_DREAM_MODEL` is required) and no fallback provider.
+- Hard limits: one run at a time (file lock), `nice` / `ionice`, caps per run on memories, LLM calls, wall time and writes, and a mirror-size cap checked before every fetch. Scheduled-job templates and the runbook are in `docs/dream.md`; nothing installs them.
+
 ## 0.5.7.6 — 2026-10-21
 
 A read effectiveness ledger (Item 118), off by default.

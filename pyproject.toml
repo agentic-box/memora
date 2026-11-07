@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memora-mcp"
-version = "0.5.7.6"
+version = "0.5.7.7"
 description = "MCP-compatible memory server backed by SQLite"
 license = "MIT"
 readme = "README.md"
@@ -39,6 +39,7 @@ dev = [
 
 [project.scripts]
 memora-server = "memora.server:main"
+memora-dream = "memora.dream:main"
 
 [tool.ruff]
 line-length = 120

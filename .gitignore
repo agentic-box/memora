@@ -48,3 +48,7 @@ instances/.operator-config.lock
 # scripts/repoint_mcp_config.py writes its backup next to the workspace config.
 .mcp.json.bak*
 .ledger/
+
+# Dream pass: per-host config and reports (host names, clone paths)
+dream.json
+dream-reports/
