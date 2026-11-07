@@ -1,6 +1,10 @@
 # The dream pass (Item 242)
 
-`memora-dream` re-checks stored memories against their sources. memora dedups and
+> **Scope, plainly.** This checks **references**: that the commits, tags, files and item numbers a
+> note mentions exist or resolve. It does **not** verify behaviour or any assertion the note makes,
+> and it never writes a "verified" stamp. The metadata it writes is `references_checked`.
+
+`memora-dream` re-checks the references in stored memories against their sources. memora dedups and
 supersedes when it writes, but never re-checks a stored claim; a wrong note keeps
 misleading later sessions. This pass finds such notes and records provenance.
 
@@ -17,18 +21,22 @@ For a bounded batch it extracts the claims a source can settle, **deterministica
 | repo file path | git mirror | file(s) matching the path at the repo's `ref` |
 | message id (`mail #N`, `msg id N`) | `history_cmd` | what the command prints for that id |
 
-An LLM then judges each claim as `confirmed`, `stale`, `wrong` or `unverifiable`,
-using ONLY the evidence given, and must quote the evidence. It may propose a
-corrected text when a claim is stale or wrong.
+An LLM then judges each REFERENCE as `confirmed` (it exists / resolves as the note uses it), `stale`,
+`wrong` or `unverifiable`, using ONLY the evidence given, and must quote the evidence. It sees the
+whole note with its tags, metadata and a deterministic modality hint (`note`, `open_task`,
+`proposal`). A reference may be `wrong` only when the note asserts that the thing exists or landed;
+a note that proposes it, plans it, lists it as an open task or recalls it as history never makes
+absence an error (and for `open_task` / `proposal` notes the code refuses `wrong` / `stale` itself).
+It may propose a corrected text when a reference is stale or wrong.
 
 **Fail closed.** The judge's answer must be exactly `{"claims": [...], "correction": null|text}`
 with one `{"id","verdict","evidence"}` row per asked claim: no missing, unknown, repeated or
 non-string id, no extra key, no non-string verdict. ONE deviation makes every claim of that memory
 `unverifiable` and the attempt is not stamped. Inside a well-formed answer a claim is `confirmed`
 (or `stale` / `wrong`) only if its quote occurs in the evidence we supplied for that claim. No
-judge, an exception, malformed output or an invented quote is `unverifiable`. A memory is
-`verified` only when EVERY one of its claims is confirmed; some confirmed and some not is
-`unconfirmed` (`why: partial`).
+judge, an exception, malformed output or an invented quote is `unverifiable`. The memory-level summary is `all_found` (every reference found),
+`partial`, `missing`, `stale` or `unknown`. A found file proves the file exists, nothing about what
+the note says of it.
 
 **Unknown is not "not found".** A git command that fails or times out gives no evidence. "Not found"
 (a SHA, tag, item or file) counts as evidence only when that mirror was fetched in THIS run; from an
@@ -67,8 +75,8 @@ after reading the dry run.
 `--apply` only **adds**, through memora's own storage functions (per-key
 statements, the write gate and the D1 path unchanged):
 
-- `verified` (all judged claims confirmed) or `unconfirmed` (anything else) metadata,
-  with how, when, model, run id and claim tallies;
+- `references_checked` metadata: when, how, model, run id, `summary`, and counts of references
+  `found`, `missing`, `stale` and `unknown`;
 - a corrected memory plus a `supersedes` edge to the wrong one. An **item record is
   never superseded** (as in absorb): it gets the corrected memory with `related_to`. A partial
   failure (the copy was added, then the memory changed) writes no edge and says so;
@@ -90,7 +98,7 @@ Part of the design, in `limits` of the config and tested:
 | `max_memories` | 25 | memories judged per run |
 | `max_llm_calls` | 25 | judge calls per run (one per memory) |
 | `max_seconds` | 900 | ONE deadline for the whole run: every git, history and judge call gets at most what is left (no SDK retries), the scans are skipped once it passes, and a dry run is killed (exit 4) 30 s after it. `--apply` runs every store call on a worker bounded by what is left: if the deadline passes inside a call the apply stops waiting, nothing further is dispatched (the edge after a corrected copy is never started), the call is listed under `ambiguous` (it may still commit), `aborted` is set and the exit code is 4 |
-| `max_writes` | 20 | storage write calls per `--apply`, charged BEFORE the call (a write that commits and then raises still counts); the rest is `deferred` |
+| `max_writes` | 20 | store writes per `--apply`, charged BEFORE dispatch: a metadata stamp 1, a correction its worst case 3 (copy + two edge statements; unused charge is not refunded); the rest is `deferred` |
 | `max_clone_mb` | 500 | a mirror above this is never fetched (checked before the fetch) |
 | `recheck_days` | 14 | a checked memory is left alone this long |
 | `nice` | 10 | plus `ionice -c 3` where available |

@@ -211,9 +211,9 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
     r = _dry(cfg, judge)
     assert _state() == before                                    # dry run: no write at all
     by_id = {f["memory_id"]: f for f in r["findings"]}
-    assert by_id[good]["overall"] == "confirmed"
-    assert by_id[good]["proposals"][0]["metadata"]["verified"]["how"] == "git+llm"
-    assert by_id[bad]["overall"] == "wrong"
+    assert by_id[good]["overall"] == "all_found"
+    assert by_id[good]["proposals"][0]["metadata"]["references_checked"]["how"] == "git+llm"
+    assert by_id[bad]["overall"] == "missing"
     assert any(p["action"] == "supersede" for p in by_id[bad]["proposals"])
     assert r["git"]["proj"] == "fetched"
     assert r["counts"]["claims"]["confirmed"] >= 1 and r["counts"]["claims"]["wrong"] >= 1
@@ -234,7 +234,7 @@ def test_dry_run_confirms_stale_and_writes_nothing(tmp_path, gitrepo):
         meta_good = json.loads(conn.execute("SELECT metadata FROM memories WHERE id=?", (good,)).fetchone()[0])
     assert n_after == n_before + 1                                # one corrected memory added, none deleted
     assert all(content_after[i] == content_before[i] for i in content_before)   # no in-place content edit
-    assert "verified" in meta_good
+    assert "references_checked" in meta_good and "verified" not in meta_good
     new_id = [a["new_id"] for a in out["applied"] if a.get("new_id")][0]
     assert any(x.get("edge_type") == "supersedes" and x["id"] == bad for x in refs[new_id])
     assert any(x.get("edge_type") == "superseded_by" and x["id"] == new_id for x in refs[bad])
@@ -260,7 +260,7 @@ def test_apply_refuses_edited_plan_and_changed_memory(tmp_path, gitrepo):
     mid = _add(f"landed {sha[:12]}")
     r = _dry(_cfg(tmp_path, repos, git_dir), _answer(lambda c, p: ("confirmed", _quote_first_evidence(c, p))))
     path = tmp_path / "p.json"
-    r["findings"][0]["proposals"][0]["metadata"]["verified"]["how"] = "tampered"
+    r["findings"][0]["proposals"][0]["metadata"]["references_checked"]["how"] = "tampered"
     path.write_text(json.dumps(r, default=str))
     with pytest.raises(DreamError, match="digest"):
         dream.load_plan(str(path))
@@ -389,7 +389,7 @@ def test_priority_volatile_and_item_records_first_and_recent_checks_skipped():
         Mem(1, "A note about v0.5.7.6 on branch dev", {}, [], None, None, []),
         Mem(2, "Item 5 plain session note about memora/x.py", {}, [], None, None, []),
         Mem(3, "Item 6 record memora/y.py", {"kind": "item-record"}, ["item-record"], None, None, []),
-        Mem(4, "Item 7 checked memora/z.py", {"verified": {"at": dream._iso(now - 86400)}}, [], None, None, []),
+        Mem(4, "Item 7 checked memora/z.py", {"references_checked": {"at": dream._iso(now - 86400)}}, [], None, None, []),
         Mem(5, "no claims", {}, [], None, None, []),
         Mem(6, "Item 9 old memora/q.py", {}, [], None, None, [{"edge_type": "superseded_by", "id": 1}]),
     ]
@@ -523,12 +523,12 @@ def test_well_formed_answer_control():
 
 
 def test_overall_needs_every_claim_confirmed():
-    assert dream.overall(["confirmed", "confirmed"]) == "confirmed"
+    assert dream.overall(["confirmed", "confirmed"]) == "all_found"
     assert dream.overall(["confirmed", "unverifiable"]) == "partial"
-    assert dream.overall(["unverifiable"]) == "unverifiable"
+    assert dream.overall(["unverifiable"]) == "unknown"
     assert dream.overall(["confirmed", "stale", "unverifiable"]) == "stale"
-    assert dream.overall(["confirmed", "wrong"]) == "wrong"
-    assert dream.overall([]) == "unverifiable"
+    assert dream.overall(["confirmed", "wrong"]) == "missing"
+    assert dream.overall([]) == "unknown"
 
 
 def test_mixed_coverage_is_unconfirmed_not_verified(tmp_path, gitrepo):
@@ -543,7 +543,8 @@ def test_mixed_coverage_is_unconfirmed_not_verified(tmp_path, gitrepo):
     f = r["findings"][0]
     assert f["overall"] == "partial" and r["counts"]["memories"]["partial"] == 1
     meta = f["proposals"][0]["metadata"]
-    assert "verified" not in meta and meta["unconfirmed"]["why"] == "partial"
+    rc = meta["references_checked"]
+    assert "verified" not in meta and rc["summary"] == "partial" and rc["found"] == 1 and rc["unknown"] == 1
 
 
 def test_judge_omitting_an_id_is_not_stamped(tmp_path, gitrepo):
@@ -879,7 +880,7 @@ def test_digest_binds_the_whole_envelope(tmp_path, gitrepo):
 
 
 def test_own_provenance_is_not_fed_back_as_claims():
-    meta = {"verified": {"run": "abcdef123456", "at": "2026-11-07T00:00:00Z"}, "unconfirmed": {"run": "0123456789ab"},
+    meta = {"references_checked": {"run": "abcdef123456", "at": "2026-11-07T00:00:00Z"},
             "dream": {"corrects": 5, "run": "fedcba987654"}, "sha": "1234abc"}
     got = {(c.kind, c.value) for c in dream.extract_claims("plain", meta)}
     assert got == {("sha", "1234abc")}
@@ -981,8 +982,8 @@ def test_deadline_crossed_during_add_memory_never_dispatches_the_edge(tmp_path, 
     out = dream.apply_plan(r, Limits(max_writes=10, max_seconds=0.4))
     print("TRACE a:", json.dumps({k: out[k] for k in ("aborted", "ambiguous", "writes_charged", "dispatch_log")}))
     assert out["aborted"] == "max_seconds" and out["ambiguous"][0]["op"] == "add_memory"
-    assert out["writes_charged"] == 2 and out["applied"] == [{"memory_id": mid, "action": "annotate", "keys": ["unconfirmed"]}] or \
-        all(a["action"] != "supersede" for a in out["applied"])
+    assert out["writes_charged"] == 4                  # annotate 1 + a correction's worst case 3
+    assert all(a["action"] != "supersede" for a in out["applied"])
     ops = [e["op"] for e in out["dispatch_log"] if e["dispatched"]]
     assert "guarded_edge" not in ops and "add_link" not in ops
     last = [e for e in out["dispatch_log"] if e["op"] == "add_memory"][0]
@@ -1109,3 +1110,118 @@ def test_truncated_file_list_makes_absence_unknown(tmp_path, gitrepo, monkeypatc
     m = Mem(1, "x", {}, ["proj"], None, None, [])
     ev = s.evidence(m, Claim("c1", "path", "nope/missing.py", "nope/missing.py"))
     assert ev.available is False and "truncated" in ev.text
+
+
+# ----------------------------------------------------------------------------- round 4: references, not truth
+
+
+def _real_note_repo(src):
+    (src / "src" / "clmux").mkdir(parents=True, exist_ok=True)
+    (src / "src" / "cli").mkdir(parents=True, exist_ok=True)
+    (src / "src" / "clmux" / "socket_server.zig").write_text("// handleWorkspaceActivityStop\n")
+    (src / "src" / "cli" / "tui.zig").write_text("// isAgentActive\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-qm", "files")
+
+
+NOTE_589 = ("**Findings** High - Pane-specific `activity stop` is still workspace-global. In "
+            "[src/clmux/socket_server.zig](/x/src/clmux/socket_server.zig):2296, `handleWorkspaceActivityStop` always "
+            "sets ws.agent_turn_open = false. The TUI dot reads src/cli/tui.zig:278.")
+META_589 = {"source": "review_done", "closing_note": "Primary High finding is fixed in current code; the others may be unresolved."}
+NOTE_344 = ("## Research: Most Prolific clmux Enhancements\n\n| Claim | Sources |\n|---|---|\n"
+            "| Durable orchestration is top priority | review_session.zig (no serialization, critic verified) |\n"
+            "Reviewer adapters are hardcoded in src/clmux/socket_server.zig and there is no decomposition.")
+NOTE_30 = ("Video Support Implementation\n\n**Video Storage Module (`memora/video_storage.py`)**\n"
+           "- [ ] Create `R2VideoStorage` class mirroring image_storage.py patterns\n- [ ] `upload_video()`")
+
+
+def _yes_judge(prompt, timeout=None):
+    """A judge as lenient as the real one was on #589/#344: confirms every reference whose file exists."""
+    ids = [l.split("id=")[1].split()[0] for l in prompt.splitlines() if l.startswith("- id=")]
+    rows = []
+    for i in ids:
+        line = _ev_line(i, prompt)
+        miss = "no file matches" in line or "not found" in line
+        rows.append({"id": i, "verdict": "wrong" if miss else "confirmed", "evidence": line[:40]})
+    return json.dumps({"claims": rows, "correction": "rewritten note"})
+
+
+def test_589_and_344_get_reference_counts_never_a_verified_stamp(tmp_path, gitrepo):
+    repos, git_dir, sha, src = gitrepo
+    _real_note_repo(src)
+    a = _add(NOTE_589, tags=["codex"], metadata=META_589)
+    b = _add(NOTE_344, tags=["clmux/research"])
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), _yes_judge)
+    by = {f["memory_id"]: f for f in r["findings"]}
+    for mid in (a, b):
+        meta = by[mid]["proposals"][0]["metadata"]
+        assert set(meta) == {"references_checked"}                       # no `verified` key, ever
+        rc = meta["references_checked"]
+        assert rc["found"] >= 1 and set(rc) >= {"at", "found", "missing", "unknown", "summary"}
+    assert "does NOT verify behaviour" in r["scope"]
+    assert "verified" not in json.dumps([f["proposals"] for f in r["findings"]])
+    # the judge was told what it is checking, and saw the whole note with its metadata
+    seen = []
+    _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), lambda p, timeout=None: seen.append(p) or _yes_judge(p))
+    p589 = next(p for p in seen if "Pane-specific" in p)
+    assert "NOT checking whether anything the note says about behaviour is true" in p589
+    assert "closing_note" in p589 and "tags: ['codex'" in p589 and "modality hint: note" in p589
+
+
+def test_30_an_open_task_is_not_wrong_for_the_file_it_proposes(tmp_path, gitrepo):
+    repos, git_dir, sha, src = gitrepo
+    (src / "memora").mkdir(exist_ok=True)
+    (src / "memora" / "image_storage.py").write_text("x=1\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-qm", "image")
+    mid = _add(NOTE_30, tags=["memora/todos"], metadata={"type": "todo", "status": "open", "category": "video-support"})
+    with storage.connect() as conn:
+        m = next(x for x in dream.load_memories(conn) if x.id == mid)
+    assert dream.modality(m) == "open_task"
+    seen = []
+    r = _dry(_cfg(tmp_path, repos, git_dir, max_memories=10), lambda p, timeout=None: seen.append(p) or _yes_judge(p))
+    f = r["findings"][0]
+    assert f["modality"] == "open_task" and "modality hint: open_task" in seen[0]
+    assert "wrong" not in {c["verdict"] for c in f["claims"]}            # the judge said wrong; the backstop refused it
+    assert f["overall"] != "missing" and f["correction"] is None
+    assert not any(p["action"] == "supersede" for p in f["proposals"])
+    vid = next(c for c in f["claims"] if c["text"] == "memora/video_storage.py")
+    assert vid["verdict"] == "unverifiable" and "proposes or plans" in vid["reason"]
+
+
+def test_modality_hints():
+    mk = lambda c, md=None, tags=None: Mem(1, c, md or {}, tags or [], None, None, [])  # noqa: E731
+    assert dream.modality(mk("did x", {"type": "todo", "status": "open"})) == "open_task"
+    assert dream.modality(mk("did x", {"type": "todo", "status": "done"})) == "note"
+    assert dream.modality(mk("x\n- [ ] later")) == "open_task"
+    assert dream.modality(mk("Proposal: add y")) == "proposal"
+    assert dream.modality(mk("plain finding")) == "note"
+
+
+def test_a_missing_reference_the_note_asserts_is_still_wrong(tmp_path, gitrepo):
+    repos, git_dir, sha, src = gitrepo
+    mid = _add("The dream pass shipped in memora/never_existed.py and is live.", tags=["memora/documents"])
+    r = _dry(_cfg(tmp_path, repos, git_dir), _yes_judge)
+    f = r["findings"][0]
+    assert f["modality"] == "note" and f["overall"] == "missing"
+    assert f["proposals"][0]["metadata"]["references_checked"]["missing"] == 1
+
+
+def test_charges_follow_dispatched_writes_around_the_cap(tmp_path, gitrepo):
+    repos, git_dir, sha, _src = gitrepo
+    mid, r = _supersede_plan(tmp_path, repos, git_dir, sha)
+    for cap, expect_super in ((3, False), (4, True)):
+        out = dream.apply_plan(json.loads(json.dumps(r, default=str)), Limits(max_writes=cap))
+        ops = [e["op"] for e in out["dispatch_log"] if e["dispatched"]]
+        writes = [o for o in ops if o in ("update_memory", "add_memory", "add_link", "guarded_edge")]
+        print("TRACE writes cap=%d charged=%d dispatched_writes=%s deferred=%s" % (cap, out["writes_charged"], writes, out["deferred"]))
+        assert out["writes_charged"] >= len(writes)                     # never more dispatched than charged
+        assert out["writes_charged"] <= cap
+        assert any(a["action"] == "supersede" for a in out["applied"]) is expect_super
+        if not expect_super:
+            assert out["deferred"][0]["why"] == "max_writes" and "add_memory" not in writes
+        else:
+            assert writes == ["update_memory", "add_memory", "guarded_edge", "guarded_edge"]
+            assert out["writes_charged"] == 4
+        if not expect_super:   # restore for the second pass: the annotate stamp is the only write so far
+            pass
