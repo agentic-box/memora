@@ -173,3 +173,7 @@ each claim with `source` (the evidence we gave) and the judge's quote; `git` say
 whether each mirror was fetched (a claim about a SHA absent from a stale mirror is
 not proof). `stopped_by` names the cap that ended the run, `judge.status` is
 `ok` or why the judge was unavailable.
+
+## See also
+
+`docs/tidy-design.md` designs the separate, periodic *tidy* pass (merge, retire, link, retag and a per-project digest). It reuses this module's judge, limits, plan digest and guarded apply. Design only; not implemented.
