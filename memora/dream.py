@@ -928,7 +928,7 @@ class ClaudeCodeJudge:
     def _argv(self) -> List[str]:
         return [self.binary, "-p", "--model", self.model, "--output-format", "json",
                 "--system-prompt", _SYSTEM, "--safe-mode", "--tools", "", "--strict-mcp-config",
-                "--settings", '{"disableAllHooks": true}', "--no-session-persistence"]
+                "--setting-sources", "", "--settings", '{"disableAllHooks": true}', "--no-session-persistence"]
 
     def __call__(self, prompt: str, timeout: Optional[float] = None) -> str:
         t = self.timeout if timeout is None else max(min(self.timeout, timeout), 1.0)

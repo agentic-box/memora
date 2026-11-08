@@ -1679,6 +1679,8 @@ def test_claude_judge_prompt_on_stdin_not_argv_and_flags(monkeypatch, tmp_path):
     assert a[a.index("--system-prompt") + 1] == dream._SYSTEM
     assert a[a.index("--tools") + 1] == "" and "--strict-mcp-config" in a and "--no-session-persistence" in a
     assert "--safe-mode" in a and "disableAllHooks" in a[a.index("--settings") + 1]
+    assert a[a.index("--setting-sources") + 1] == ""      # BOTH isolation mechanisms: safe mode and no settings sources
+    assert not any(x.startswith("--mcp-config") or x == "--bare" for x in a)
     assert "--bare" not in a
     assert seen["empty"] == [] and seen["pgid_own"] is True
     assert not os.path.exists(seen["cwd"])      # private cwd removed afterwards
