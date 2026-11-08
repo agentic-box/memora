@@ -138,6 +138,17 @@ it stopped), `max_writes` for links (2 each) and tags (1 each). The result is wr
 `<plan>.apply-<UTC time>.json` with `applied`, `skipped`, `deferred`, `ambiguous` (ids and reasons) and counts.
 Rerunning the same plan and decisions applies nothing new.
 
+**The replay journal.** Next to the plan the apply keeps `<plan>.applied.json` (0600, bound to the report's
+digest; another report's journal is ignored). A step that rewrites a memory changes the state sha that later steps
+of the same plan were judged against, so before each such write the apply records, durably, the sha the sealed
+mutation will produce (write-ahead, fsynced). A rerun, after a cap, a deadline, an ambiguous call or a crash at any
+point, accepts for that memory exactly the judged sha or a recorded predicted sha and nothing else: a foreign edit
+still refuses ("state sha mismatch"), and a step already finished is "already done". If the journal cannot be
+written, nothing is written. The journal is trusted state, not a secret: keep it with the plan; deleting it only
+makes later steps on already-changed memories refuse (a new dry run then re-plans). **The directory of the plan must
+be writable** (the result and the journal go there); with a read-only plan mount, copy the plan to a work directory
+first.
+
 Procedure (design 5.5; the leader runs it, the unit never does):
 
 1. Rehearse on a **new, writable, consistent copy** of the store (an online backup, or a copy made with the

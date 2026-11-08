@@ -180,19 +180,33 @@ class _Ctx:
         self.backfill = 0
         # (id, sha judged in the plan) -> sha after OUR exact write; persisted in the journal so a rerun can tell
         # our earlier effects from a foreign edit
-        self.alias: Dict[Tuple[int, str], str] = {}
+        self.alias: Dict[Tuple[int, str], set] = {}
         self.journal: Optional[Path] = None
         self.digest: Optional[str] = None
 
     def save_journal(self) -> None:
         if self.journal is None:
             return
-        body = {"report_digest": self.digest, "post": {f"{m}:{w}": v for (m, w), v in sorted(self.alias.items())}}
+        body = {"report_digest": self.digest,
+                "post": {f"{m}:{w}": sorted(v) for (m, w), v in sorted(self.alias.items())}}
         tmp = self.journal.with_name(self.journal.name + ".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(body, indent=1))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.journal)
+
+    def intend(self, mid: int, want: Optional[str], post_sha: str) -> Optional[str]:
+        """WRITE-AHEAD: record the state sha the sealed mutation WILL produce, durably, BEFORE it is dispatched. A
+        crash, a deadline or a failed journal write after the commit can then never lose it: a rerun accepts exactly
+        that predicted state (and the judged one), nothing else. None = recorded; else the reason (write nothing)."""
+        self.alias.setdefault((mid, want), set()).add(post_sha)
+        try:
+            self.save_journal()
+        except OSError as e:
+            return f"the replay journal is not writable ({type(e).__name__}); nothing written"
+        return None
 
     def load_journal(self) -> None:
         if self.journal is None or not self.journal.is_file():
@@ -203,8 +217,8 @@ class _Ctx:
                 return
             for k, v in raw["post"].items():
                 m, w = k.split(":", 1)
-                if isinstance(v, str):
-                    self.alias[(int(m), w)] = v
+                if isinstance(v, list) and all(isinstance(x, str) for x in v):
+                    self.alias[(int(m), w)] = set(v)
         except (OSError, ValueError, KeyError, AttributeError):
             self.alias.clear()      # an unreadable journal only means later steps are checked against the original state
 
@@ -230,7 +244,12 @@ class _Ctx:
 
     def sha_ok(self, mid: int, m: Any, step: Dict[str, Any]) -> bool:
         want = step["expect"].get(str(mid))
-        return m.state_sha == want or self.alias.get((mid, want)) == m.state_sha
+        return m.state_sha == want or m.state_sha in self.alias.get((mid, want), ())
+
+
+def _predict_sha(m: Any, metadata: Dict[str, Any], tags: Sequence[str]) -> str:
+    """The state sha of `m` after a mutation to these metadata and tags (content never changes)."""
+    return dream.Mem(m.id, m.content, dict(metadata), list(tags), m.updated_at, m.created_at, list(m.refs)).state_sha
 
 
 def _norm(tags: Sequence[str]) -> List[str]:
@@ -256,6 +275,12 @@ def _do_set_project(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     why = cx.reserve("set_project")
     if why:
         return {"defer": why}
+    new_meta = {**m.metadata, "project": proj}
+    resolved = cx.st._resolve_project(None, m.tags, new_meta, strict=False)
+    post = _predict_sha(m, new_meta, cx.st._retarget_typed_tags(list(m.tags), resolved, new_meta))
+    bad = cx.intend(mid, step["expect"].get(str(mid)), post)
+    if bad:
+        return {"skip": bad}
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
         cx.conn, mid, metadata={"project": proj}, expected_row=raw, embed=False))
     return _after(cx, step, mid, m, res, {"project": proj}, {"project": proj})
@@ -286,6 +311,9 @@ def _do_retag(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     why = cx.reserve("retag")
     if why:
         return {"defer": why}
+    bad = cx.intend(mid, step["expect"].get(str(mid)), _predict_sha(m, m.metadata, result))
+    if bad:
+        return {"skip": bad}
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
         cx.conn, mid, tags=want, expected_row=raw, embed=False))
     extra: Dict[str, Any] = {"added": missing}
@@ -309,7 +337,7 @@ def _after(cx: _Ctx, step: Dict[str, Any], mid: int, m: Any, res: Any, meta_patc
              and {k: v for k, v in f.metadata.items() if k not in own} == exp_meta
              and (step["op"] == "set_project" or set(m.tags) <= set(f.tags)))
     if exact:
-        cx.alias[(mid, step["expect"].get(str(mid)))] = f.state_sha
+        cx.alias.setdefault((mid, step["expect"].get(str(mid))), set()).add(f.state_sha)
         cx.save_journal()
         if step["op"] == "set_project" and sorted(f.tags) != sorted(m.tags):
             out["tags_retargeted"] = sorted(set(f.tags) ^ set(m.tags))
@@ -376,7 +404,7 @@ def _do_link(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
                 or gb2[1]["related"] != raw_b["related"] \
                 or not any(r.get("id") == b and r.get("edge_type") == et for r in ga2[0].refs):
             return {"skip": "partial: an endpoint changed after the forward edge; the reverse edge was not written "
-                            "(a rerun completes it)"}
+                            "(a rerun completes it unless someone else changed an endpoint: then a new plan is needed)"}
         if not cx.W.run("guarded_edge", lambda: _guarded_edge(cx.conn, cx.st, b, a, rev, gb2[1], ga2[1])):
             return {"skip": "partial: an endpoint changed at the reverse write; only the forward edge exists "
                             "(a rerun completes it)"}
@@ -411,6 +439,11 @@ def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mo
         cx = _Ctx(W, storage_mod, conn, lim)
         cx.journal, cx.digest = journal, plan.get("digest")
         cx.load_journal()
+        if journal is not None:
+            try:
+                cx.save_journal()        # fail before any write when the replay journal cannot be written
+            except OSError as e:
+                raise TidyError(f"the replay journal {journal} is not writable ({e}); nothing was written")
         for st in sel["run"]:
             cur = st
             row = {"id": st["id"], "op": st["op"]}

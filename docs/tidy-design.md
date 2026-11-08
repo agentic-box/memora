@@ -544,6 +544,8 @@ opposite of its quote. Two causes, two fixes.
 - **Caps.** Charged before dispatch: `set_project` 1 against `max_backfill`; `link` 2 and `retag` 1 against
   `max_writes`. The remainder is `deferred` and a rerun picks it up. Deadline (`max_seconds`) as in dream: an
   in-flight call is `ambiguous`, nothing further is dispatched.
+- **Replay.** `<plan>.applied.json` holds, per memory and judged sha, the shas this apply's own mutations produce, written
+  ahead of each write (docs/tidy.md); the plan directory must be writable.
 - **Result.** `<plan>.apply-<UTC time>.json` next to the plan (0600): `applied`, `skipped`, `deferred`, `ambiguous`
   with step ids and reasons, plus counts. Rerunning the same plan and decisions applies nothing: finished steps are
   skipped as "already done".

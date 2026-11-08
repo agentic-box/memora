@@ -515,3 +515,109 @@ def test_a_deadline_inside_a_write_is_ambiguous_with_its_step_id_and_not_deferre
     res = ta.apply_report(plan, dec_for(plan, tmp_path, approve_ops=ALL), TidyLimits(max_seconds=0.2))
     assert res["aborted"] == "max_seconds" and [x["id"] for x in res["ambiguous"]] == ["b1"]
     assert {d["id"] for d in res["deferred"]} == {"b2"}
+
+
+# ------------------------------------------------------------------ round 2: the commit-to-journal window
+
+class Crash(BaseException):
+    """A process death: not an Exception, so nothing in the apply loop swallows it."""
+
+
+def _journal(tmp_path):
+    return json.loads((tmp_path / "plan.applied.json").read_text())
+
+
+def test_crash_after_the_retag_commit_before_the_post_read_replays_to_completion(store, tmp_path, monkeypatch):
+    a, b = add("a note"), add("b note")
+    plan = seal([rt("s1", a, ["t"]), lk("s2", a, b)])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    j = tmp_path / "plan.applied.json"
+    def die(*x, **k):
+        raise Crash()
+    real_after = ta._after
+    monkeypatch.setattr(ta, "_after", die)
+    with pytest.raises(Crash):
+        ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    monkeypatch.setattr(ta, "_after", real_after)
+    assert "t" in mem(a).tags                                       # the retag committed
+    jr = _journal(tmp_path)
+    assert jr["report_digest"] == plan["digest"] and list(jr["post"].values())[0] == [sha(a)]   # intent was durable first
+    r2 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert reasons(r2)["s1"].startswith("already done") and [x["id"] for x in r2["applied"]] == ["s2"]
+    n = len(outbox())
+    r3 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert not r3["applied"] and len(outbox()) == n                  # third replay: zero additional rows
+
+
+def test_deadline_in_set_project_that_commits_later_is_settled_then_replayed(store, tmp_path, monkeypatch):
+    import time as _t
+    a = add("a note")
+    plan = seal([sp("b1", a), rt("s2", a, ["t"])])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    j = tmp_path / "plan.applied.json"
+    real = storage.update_memory
+    def slow(*x, **k):
+        _t.sleep(0.6)
+        return real(*x, **k)
+    monkeypatch.setattr(storage, "update_memory", slow)
+    r1 = ta.apply_report(plan, dec, TidyLimits(max_seconds=0.2), journal=j)
+    assert r1["aborted"] == "max_seconds" and [x["id"] for x in r1["ambiguous"]] == ["b1"]
+    for _ in range(50):                                               # settle the in-flight call
+        if mem(a).metadata.get("project"):
+            break
+        _t.sleep(0.1)
+    monkeypatch.setattr(storage, "update_memory", real)
+    assert mem(a).metadata.get("project") == "memora"
+    r2 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert reasons(r2)["b1"].startswith("already done") and [x["id"] for x in r2["applied"]] == ["s2"]
+    n = len(outbox())
+    assert not ta.apply_report(plan, dec, TidyLimits(), journal=j)["applied"] and len(outbox()) == n
+
+
+@pytest.mark.parametrize("window", ["committed", "never_committed"])
+def test_foreign_edits_in_each_recovery_window_still_refuse(store, tmp_path, monkeypatch, window):
+    a, b = add("a note"), add("b note")
+    plan = seal([rt("s1", a, ["t"]), lk("s2", a, b), rt("s3", a, ["u"])])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    j = tmp_path / "plan.applied.json"
+    def die(*x, **k):
+        raise Crash()
+    real_after, real_upd = ta._after, storage.update_memory
+    if window == "committed":
+        monkeypatch.setattr(ta, "_after", die)
+    else:
+        monkeypatch.setattr(storage, "update_memory", die)          # dies after the intent, before the commit
+    with pytest.raises(Crash):
+        ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    monkeypatch.setattr(ta, "_after", real_after)
+    monkeypatch.setattr(storage, "update_memory", real_upd)
+    with storage.connect() as conn:
+        storage.update_memory(conn, a, metadata={"foreign": 1}, embed=False)     # someone else edits A
+    r = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert not r["applied"] and all("state sha" in reasons(r)[i] or reasons(r)[i].startswith("already done")
+                                    for i in ("s1", "s2", "s3"))
+    assert "references" not in _edge_types(a, b) and "u" not in mem(a).tags
+    if window == "never_committed":
+        assert "t" not in mem(a).tags
+
+
+def test_an_unwritable_journal_writes_nothing(store, tmp_path):
+    a = add("a note")
+    plan = seal([sp("b1", a)])
+    with pytest.raises(TidyError, match="journal"):
+        ta.apply_report(plan, dec_for(plan, tmp_path, approve_ops=ALL), TidyLimits(),
+                        journal=tmp_path / "no-such-dir" / "j.json")
+    assert mem(a).metadata.get("project") is None
+
+
+def test_retag_refuses_to_retarget_a_legacy_typed_tag(store, tmp_path):
+    a = add("a note", tags=["memora/issues"])
+    with storage.connect() as conn:
+        storage.update_memory(conn, a, metadata={"project": "clmux"}, embed=False)
+    before = list(mem(a).tags)
+    plan = seal([rt("s1", a, ["extra"])])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    if res["applied"]:       # the store keeps the tag as is: add-only holds
+        assert set(before) <= set(mem(a).tags)
+    else:
+        assert "rewrite existing tag" in reasons(res)["s1"] and mem(a).tags == before
