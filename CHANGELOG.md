@@ -12,6 +12,15 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.10 — 2026-11-08
+
+`memora-tidy`: the tidy pass, dry run only (Item 252, design in `docs/tidy-design.md`).
+
+- Clusters the live memories of one project (stored embeddings recomputed as cosine, shared references, typed edges, shared tags; `related_to` is never evidence) and has a judge propose merge, retire, link, retag, keep or a flagged contradiction per cluster, plus one `kind: digest` memory per project. Haiku groups and tags, Sonnet writes merged text and the digest, both through Claude Code (`claude -p`); the models are config values.
+- A merge is a proposal checked statement by statement: every source statement must be kept word for word, be an exact duplicate of a kept one, or be held for explicit approval; containment is never a duplicate. Item records, decisions, procedures and digests are never merged or retired. Contradictions are flagged and freeze their members.
+- Writes a sealed report (`tidy-1`, digest like dream's plan) with sealed bodies, symbolic ids (`@c1`), per-step write charges (merge 1+2N) and caps. **No store write and no `--apply`**: it reads a store copy only. Shares dream's run lock. Apply-time guards (`revalidate_step`, `check_edge_phase`, `substitute_symbols`, `load_tidy_plan`) exist and are tested for the later apply phase.
+- Weekly systemd user unit and timer in `scripts/tidy/` (never `--apply`). See `docs/tidy.md`.
+
 ## 0.5.7.9 — 2026-11-08
 
 `memora-dream` can run its judge through Claude Code (Item 250), because gpt-4o-mini returned malformed answers for 15% of memories on the full run.

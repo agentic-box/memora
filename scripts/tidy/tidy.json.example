@@ -1,0 +1,17 @@
+{
+  "project": "alpha",
+  "models": {"group": "haiku", "write": "sonnet"},
+  "limits": {
+    "max_clusters": 12,
+    "max_llm_calls": 24,
+    "max_merges": 10,
+    "max_retires": 10,
+    "max_links": 20,
+    "max_retags": 20,
+    "max_writes": 40,
+    "max_seconds": 1500,
+    "nice": 10
+  },
+  "read_ledger": "/path/to/read-ledger.jsonl",
+  "state_dir": "~/.local/state/memora-dream"
+}

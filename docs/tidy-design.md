@@ -1,7 +1,9 @@
 # The tidy pass (Item 251): design
 
-> **Status: design only.** Nothing here is implemented. Names marked *(new)* do not exist yet;
-> everything else (files, functions, line numbers at v0.5.7.9) is cited from the repo.
+> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10); the apply
+> step (`--apply`, `replace_digest` and friends as store writes) is not. Names marked *(new)* were new at
+> design time; line numbers are those of v0.5.7.9. Where the implementation differs from this design,
+> section 12 says how and why.
 >
 > **Scope, plainly.** `memora-dream` (docs/dream.md) checks that *references* exist. It does not make
 > the store better organised. `memora-tidy` is a separate, periodic pass that proposes **fewer
@@ -434,3 +436,32 @@ All taken in the dry-run report and again after the apply:
 | 7 | Does the digest need a staleness mark when cited memories later change? | Yes, cheaply: the next run regenerates it; between runs `covers` + `updated_at` lets a reader see drift. Not in phase 2. |
 | 8 | Where does the digest stay for projects with no `metadata.project`? | Skipped: tidy refuses a null project. |
 | 9 | Is a rejected merge retried next week? | Yes, but a cluster whose merge was rejected twice is listed under `review[]` and not re-sent to the judge. |
+
+## 12. Implementation notes (Item 252): where it differs, and why
+
+- **Models are config values** (`models.group`, `models.write` in `tidy.json`), not the
+  `MEMORA_TIDY_MODEL_*` variables of section 1. No default, no fallback; the judge is `ClaudeCodeJudge`
+  with the tidy system prompt (`TidyJudge`). `MEMORA_DREAM_JUDGE` is not read: tidy has no OpenAI path.
+- **Retire is mechanical, so only merges call Sonnet** (section 3 said a retire also goes to Sonnet).
+  `redundant` is proved by code (full-statement equality); `obsolete` carries the judge's statement
+  indices (`replaces`), is always `needs_approval`, and needs no second call. A cluster costs one Haiku
+  call plus one Sonnet call only when it has merge intents.
+- **`--db` (a store copy) and a project are required**; tidy never opens the live store and has no
+  `--apply`. The lock is dream's `run_lock` on `<state_dir>/dream.lock`, shared only while both use the
+  same `state_dir` (the default of both is `~/.local/state/memora-dream`).
+- **Statement identity includes its context.** A header or a parent bullet above a statement is part of
+  its `ctx`, and `kept`/`duplicate` compare `(ctx, text)`, so a condition or scope cannot be dropped
+  silently; merging flat notes from different sections therefore yields held rewordings. Unsupported
+  forms (code fences, tables, html, indented blocks, control characters, notes over the dream note cap)
+  make a memory context-only: kept, linked, retagged by adding, never merged or retired.
+- **Links and retags that touch a memory hidden by the same plan are dropped** with a reason instead of
+  rejecting the cluster.
+- **`max_writes` is 40** and is checked while the plan is built (the digest step's charge is reserved
+  first), so a sealed plan never exceeds it. Cluster work may use `max_llm_calls - 1` calls; the digest
+  call is the reserved one and is skipped only when the live digests call for a repair or a review.
+- **`repair_digest` winner** is the later `created_at` (id as tie-break) of two tidy-made digests.
+- **Apply-time hooks exist but nothing calls them yet:** `load_tidy_plan`, `revalidate_step` (every
+  `expect`, citations, dependencies, symbols), `check_edge_phase` (separate expected state for the
+  forward and the reverse edge) and `substitute_symbols` (token-aware: `@c3` never touches `@c30`).
+- **Not built in this phase:** the fixed retrieval query set and acceptance-rate file (section 9), the
+  `decisions.json` consumer, and the snapshot step before the unit (the operator makes the store copy).

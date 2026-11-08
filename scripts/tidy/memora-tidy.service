@@ -1,0 +1,17 @@
+# Template. Copy to ~/.config/systemd/user/, edit the paths, then `systemctl --user daemon-reload`.
+# Runs the DRY RUN only: memora-tidy has no apply mode, and this unit must never gain one.
+# --db is a READ-ONLY COPY of the store (a consistent copy, e.g. made with sqlite's online backup by
+# the operator's own step before this one); memora-tidy never opens the live store.
+[Unit]
+Description=memora tidy pass (dry run, writes a report)
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+# the config is git-ignored and holds the host-specific paths and model names (docs/tidy.md)
+Environment=MEMORA_TIDY_CONFIG=%h/.config/memora/tidy.json
+EnvironmentFile=-%h/.config/memora/tidy.env
+WorkingDirectory=%h/memora
+ExecStart=%h/memora/.venv/bin/python -m memora.tidy --db %h/.local/state/memora-tidy/store-copy.sqlite --out-dir %h/.local/state/memora-tidy/reports
+TimeoutStartSec=1800

@@ -176,4 +176,4 @@ not proof). `stopped_by` names the cap that ended the run, `judge.status` is
 
 ## See also
 
-`docs/tidy-design.md` designs the separate, periodic *tidy* pass (merge, retire, link, retag and a per-project digest). It reuses this module's judge, limits, plan digest and guarded apply. Design only; not implemented.
+`docs/tidy-design.md` designs the separate, periodic *tidy* pass (merge, retire, link, retag and a per-project digest); `docs/tidy.md` is its runbook. It reuses this module's judge, run lock, plan digest and report writer. Dry run only so far.

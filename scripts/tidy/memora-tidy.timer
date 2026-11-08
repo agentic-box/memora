@@ -1,0 +1,11 @@
+# Template: once a week, off-peak. Install with `systemctl --user enable --now memora-tidy.timer`.
+[Unit]
+Description=memora tidy pass, weekly
+
+[Timer]
+OnCalendar=Sun *-*-* 04:40:00
+RandomizedDelaySec=900
+Persistent=false
+
+[Install]
+WantedBy=timers.target
