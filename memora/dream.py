@@ -907,7 +907,12 @@ class ClaudeCodeJudge:
     retries, bounded by the run deadline, no fallback to another judge. The child gets no tools, no MCP
     servers, no hooks or settings, no session persistence, an empty private cwd and its own process group."""
 
-    _DROP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY")
+    # Anything that can pick a provider, a gateway or an API-key login is removed from the child, so the
+    # run can only use the ordinary Claude Code subscription login: every ANTHROPIC_* (keys, tokens, base
+    # URLs, Foundry), every CLAUDE_CODE_USE_* (Bedrock, Vertex, Foundry ...), the Bedrock bearer token and
+    # the OpenAI variables. The parent environment is not touched.
+    _DROP_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "OPENAI_")
+    _DROP_ENV = ("AWS_BEARER_TOKEN_BEDROCK",)
 
     def __init__(self, model: Optional[str] = None, timeout: float = 60.0):
         model = model or os.environ.get("MEMORA_DREAM_MODEL")
@@ -915,30 +920,29 @@ class ClaudeCodeJudge:
             raise JudgeError("MEMORA_DREAM_MODEL is not set (no default model, by design)")
         binary = os.environ.get("MEMORA_DREAM_CLAUDE_BIN") or "claude"
         found = shutil.which(binary)
+        found = os.path.abspath(found) if found else None
         if not found:
             raise JudgeError(f"claude binary not found: {binary!r} (set MEMORA_DREAM_CLAUDE_BIN)")
         self.model, self.timeout, self.binary = model, timeout, found
 
     def _argv(self) -> List[str]:
         return [self.binary, "-p", "--model", self.model, "--output-format", "json",
-                "--system-prompt", _SYSTEM, "--tools", "", "--strict-mcp-config",
-                "--setting-sources", "", "--settings", '{"disableAllHooks": true}',
-                "--disable-slash-commands", "--no-session-persistence"]
+                "--system-prompt", _SYSTEM, "--safe-mode", "--tools", "", "--strict-mcp-config",
+                "--settings", '{"disableAllHooks": true}', "--no-session-persistence"]
 
     def __call__(self, prompt: str, timeout: Optional[float] = None) -> str:
         t = self.timeout if timeout is None else max(min(self.timeout, timeout), 1.0)
-        env = {k: v for k, v in os.environ.items() if k not in self._DROP_ENV}
+        env = {k: v for k, v in os.environ.items() if k not in self._DROP_ENV and not k.startswith(self._DROP_PREFIXES)}
         env["DISABLE_AUTOUPDATER"] = "1"
         with tempfile.TemporaryDirectory(prefix="memora-dream-claude-") as cwd:
             try:
                 proc = subprocess.Popen(self._argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, cwd=cwd, env=env, text=True,
-                                        encoding="utf-8", start_new_session=True)
+                                        stderr=subprocess.PIPE, cwd=cwd, env=env, start_new_session=True)
             except OSError as e:
                 raise JudgeError(f"claude could not be started: {e.__class__.__name__}")
             try:
                 try:
-                    out, _err = proc.communicate(prompt, timeout=t)
+                    out, _err = proc.communicate(prompt.encode("utf-8"), timeout=t)
                 except subprocess.TimeoutExpired:
                     self._kill_group(proc)
                     try:
@@ -951,8 +955,8 @@ class ClaudeCodeJudge:
         if proc.returncode != 0:
             raise JudgeError(f"claude exited with status {proc.returncode}")
         try:
-            data = json.loads(out)
-        except ValueError:
+            data = json.loads(out.decode("utf-8"))
+        except ValueError:   # includes UnicodeDecodeError
             raise JudgeError("claude output is not JSON")
         if isinstance(data, list):  # some versions print the event array; take the final result event
             data = next((d for d in reversed(data) if isinstance(d, dict) and d.get("type") == "result"), None)
@@ -961,14 +965,14 @@ class ClaudeCodeJudge:
         if data.get("is_error"):
             raise JudgeError("claude reported an error (is_error)")
         if data.get("subtype") != "success":
-            raise JudgeError(f"claude result subtype is {data.get('subtype')!r}, not 'success'")
+            raise JudgeError("claude result subtype is not 'success'")
         res = data.get("result")
-        if not isinstance(res, str):
+        if not isinstance(res, str) or not res.strip():
             raise JudgeError("claude result has no text")
         return res
 
     @staticmethod
-    def _kill_group(proc: "subprocess.Popen[str]") -> None:
+    def _kill_group(proc: "subprocess.Popen[bytes]") -> None:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

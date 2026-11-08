@@ -79,10 +79,11 @@ refused, the run reports every claim `unverifiable` and exits 3. There is no fal
   `claude` binary (`MEMORA_DREAM_CLAUDE_BIN`, default `claude` on PATH; missing is an error). It never
   reads or reuses Claude Code's OAuth token and never goes through a proxy.
 - Each call is a fresh print-mode run: the prompt arrives on stdin, `_SYSTEM` replaces the default
-  system prompt, no tools, no MCP servers, no hooks or settings, no session saved, run in an empty
-  temp dir in its own process group (killed whole on timeout). `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN` and `OPENAI_API_KEY` are removed from its environment, so a run cannot
-  silently switch to pay-per-use billing; `DISABLE_AUTOUPDATER=1` is set.
+  system prompt, no tools, no MCP servers, no hooks or customizations, no session saved, run in an empty
+  temp dir in its own process group (killed whole on timeout). `--safe-mode` turns off CLAUDE.md, memory, plugins, skills, hooks and MCP while keeping the
+  normal login. Every `ANTHROPIC_*`, `CLAUDE_CODE_USE_*` (Bedrock, Vertex, Foundry) and `OPENAI_*`
+  variable and `AWS_BEARER_TOKEN_BEDROCK` is removed from its environment, so a run cannot silently
+  switch to pay-per-use billing, a provider or a gateway; `DISABLE_AUTOUPDATER=1` is set.
 - Every call counts against the subscription's usage limits (`max_llm_calls` bounds them per run).
 
 ## Dry run, then apply

@@ -1637,6 +1637,8 @@ def test_claude_judge_success(monkeypatch, tmp_path):
     ('sys.stdin.read(); print("{\\"type\\": \\"result\\"")', "not JSON"),
     ('sys.stdin.read(); print("hello")', "not JSON"),
     ('sys.stdin.read(); print("[1]")', "no result object"),
+    ('sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "  "}))', "no text"),
+    ('sys.stdin.read(); sys.stdout.buffer.write(b"\\xff\\xfe")', "not JSON"),
     ('sys.stdin.read(); sys.stderr.write("ANSWER"); sys.exit(3)', "status 3"),
     ('sys.stdin.read(); sys.stderr.write("ANSWER")', "not JSON"),
 ])
@@ -1676,7 +1678,7 @@ def test_claude_judge_prompt_on_stdin_not_argv_and_flags(monkeypatch, tmp_path):
     assert "-p" in a and a[a.index("--model") + 1] == "haiku" and a[a.index("--output-format") + 1] == "json"
     assert a[a.index("--system-prompt") + 1] == dream._SYSTEM
     assert a[a.index("--tools") + 1] == "" and "--strict-mcp-config" in a and "--no-session-persistence" in a
-    assert a[a.index("--setting-sources") + 1] == "" and "disableAllHooks" in a[a.index("--settings") + 1]
+    assert "--safe-mode" in a and "disableAllHooks" in a[a.index("--settings") + 1]
     assert "--bare" not in a
     assert seen["empty"] == [] and seen["pgid_own"] is True
     assert not os.path.exists(seen["cwd"])      # private cwd removed afterwards
@@ -1685,16 +1687,19 @@ def test_claude_judge_prompt_on_stdin_not_argv_and_flags(monkeypatch, tmp_path):
 
 def test_claude_judge_env_scrubbed(monkeypatch, tmp_path):
     out = tmp_path / "env.json"
-    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"):
+    leaks = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL",
+             "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_FOUNDRY_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+             "CLAUDE_CODE_USE_FOUNDRY", "AWS_BEARER_TOKEN_BEDROCK")
+    for k in leaks:
         monkeypatch.setenv(k, "leak")
     monkeypatch.delenv("DISABLE_AUTOUPDATER", raising=False)
     monkeypatch.setenv("KEEPME", "1")
     j = _cc(monkeypatch, tmp_path, f'open({str(out)!r}, "w").write(json.dumps(dict(os.environ)))\n' + _OK)
     j("p")
     env = json.loads(out.read_text())
-    assert not {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"} & set(env)
+    assert not set(leaks) & set(env)
     assert env["DISABLE_AUTOUPDATER"] == "1" and env["KEEPME"] == "1"
-    assert os.environ["OPENAI_API_KEY"] == "leak"       # the parent is untouched
+    assert all(os.environ[k] == "leak" for k in leaks)   # the parent is untouched
 
 
 def _alive(pid):
@@ -1779,3 +1784,21 @@ def test_judge_unknown_selector_fails_closed_in_main(monkeypatch, tmp_path):
     monkeypatch.setenv("MEMORA_DREAM_MODEL", "m")
     with pytest.raises(dream.JudgeError, match="bogus"):
         dream.make_judge()
+
+
+def test_claude_judge_event_array_and_relative_binary(monkeypatch, tmp_path):
+    ev = ('sys.stdin.read(); print(json.dumps([{"type": "system"}, {"type": "result", "subtype": "success", '
+          '"is_error": False, "result": "ARR"}]))\n')
+    assert _cc(monkeypatch, tmp_path, ev)("p") == "ARR"
+    script = _fake_claude(tmp_path, _OK)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", "./" + os.path.basename(script))
+    j = dream.ClaudeCodeJudge()
+    assert os.path.isabs(j.binary) and j("p") == "ANSWER"   # still found after the child's cwd changes
+
+
+def test_claude_judge_subtype_not_echoed(monkeypatch, tmp_path):
+    j = _cc(monkeypatch, tmp_path, 'sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "SECRETWORDS", "is_error": False, "result": "x"}))\n')
+    with pytest.raises(dream.JudgeError) as ei:
+        j("p")
+    assert "SECRETWORDS" not in str(ei.value)
