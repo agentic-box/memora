@@ -410,9 +410,9 @@ All taken in the dry-run report and again after the apply:
   `decisions.json` the leader writes when pruning the plan before `--apply`). Target to proceed to a
   second project: ≥ 80% on merges and retires, and **zero** merges rejected afterwards for a
   dropped or invented fact.
-- **Retrieval:** a fixed query set (about 20 real queries for the project, recorded once in
-  `scripts/tidy/queries.json`) is run before and after through the existing read-effectiveness
-  ledger (Item 118, off by default; the memora effectiveness pilot): top-5 hit contains an expected
+- **Retrieval:** a fixed query set (about 20 real queries for the project, recorded once in a private
+  file outside git, `~/.config/memora/tidy-queries.json`; Item 258) is run before and after with
+  `memora-tidy-eval` on store copies (docs/tidy.md "Measuring"): top-5 hit contains an expected
   memory (or its successor, via `follow="active"`), and the digest is the first hit for
   "what is current for <project>". A drop in recall blocks the next phase.
 
@@ -465,7 +465,7 @@ All taken in the dry-run report and again after the apply:
 - **Apply-time hooks exist but nothing calls them yet:** `load_tidy_plan`, `revalidate_step` (every
   `expect`, citations, dependencies, symbols), `check_edge_phase` (separate expected state for the
   forward and the reverse edge) and `substitute_symbols` (token-aware: `@c3` never touches `@c30`).
-- **Not built in this phase:** the fixed retrieval query set and acceptance-rate file (section 9), the
+- **Not built in this phase:** the acceptance-rate file (section 9; the retrieval check is `memora-tidy-eval`, Item 258), the
   `decisions.json` consumer, and the snapshot step before the unit (the operator makes the store copy).
 
 ## 13. Item 254: fixes from the first real run

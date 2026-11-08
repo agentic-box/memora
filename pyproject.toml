@@ -41,6 +41,7 @@ dev = [
 memora-server = "memora.server:main"
 memora-dream = "memora.dream:main"
 memora-tidy = "memora.tidy:main"
+memora-tidy-eval = "memora.tidy_eval:main"
 
 [tool.ruff]
 line-length = 120

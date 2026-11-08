@@ -162,6 +162,33 @@ Procedure (design 5.5; the leader runs it, the unit never does):
 
 The run scripts and the systemd unit never contain `--apply` (tested).
 
+## Measuring (Item 258)
+
+`memora-tidy-eval` answers "do real queries find the right memory?" with a number you can repeat before and
+after each apply. It never writes: it opens a store **copy** read-only, runs no model, and calls the search
+the MCP tools use (`hybrid_search_scored`, `follow="active"`, top 5) without the read ledger. Only the query
+embedding is computed, with the store's embedding environment; if that is unavailable it stops (exit 2)
+rather than report keyword-only results.
+
+```sh
+memora-tidy-eval --db before-copy.sqlite --out before.json     # take the copy, run, then apply the tidy
+memora-tidy-eval --db after-copy.sqlite  --out after.json
+memora-tidy-eval --compare before.json after.json
+```
+
+The queries file is private and stays out of git: `~/.config/memora/tidy-queries.json`, or `--queries PATH`.
+Format (see `scripts/tidy/queries.json.example`): `{"queries": [{"q": text, "project": name|null,
+"expect": [memory ids], "digest": true?}]}`.
+
+- Each query runs unscoped, and scoped by `project` when it has one (the project filter of the plain JSON
+  API; the MCP tool has no such argument).
+- An expected id that was superseded counts as hit by its live successor; a retired one with no successor
+  can only miss.
+- Report: per query hit or miss, the rank of the first expected memory and the returned ids; totals
+  recall@5 and MRR, unscoped and scoped. `digest: true` also checks that the project's live `kind: digest`
+  memory is rank 1 of the scoped search (`n/a` when there is no digest yet).
+- Same copy and queries give the same report (`created` aside). Ties keep the search's own order.
+
 ## Schedule
 
 `scripts/tidy/memora-tidy.service` and `.timer` run it weekly, dry run only; copy them to

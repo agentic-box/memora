@@ -1,0 +1,8 @@
+{
+  "queries": [
+    {"q": "how do we deploy the example service", "project": "alpha", "expect": [101, 102]},
+    {"q": "why was the retry limit lowered", "project": "alpha", "expect": [117]},
+    {"q": "what is current for alpha", "project": "alpha", "expect": [], "digest": true},
+    {"q": "cache invalidation rule", "project": null, "expect": [205]}
+  ]
+}
