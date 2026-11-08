@@ -775,15 +775,15 @@ def test_config_and_judges(tmp_path, monkeypatch):
     assert "--safe-mode" in argv and "--setting-sources" in argv and isinstance(g, dream.ClaudeCodeJudge)
 
 
-def test_there_is_no_apply_flag_and_no_write_path_in_the_module(tmp_path):
-    with pytest.raises(SystemExit) as e:
+def test_the_dry_run_module_has_no_write_path(tmp_path):
+    with pytest.raises(SystemExit) as e:           # --apply is dispatched to tidy_apply, which needs its own arguments
         tidy.main(["--apply"])
     assert e.value.code == 2
     src = (ROOT / "memora" / "tidy.py").read_text()
     code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
     for forbidden in (r"add_memory", r"update_memory", r"delete_memory", r"link_memories", r"\bsupersede\b",
                       r"\.commit\(", r"INSERT ", r"UPDATE ", r"DELETE ", r"sqlite3\.connect", r"connect_without_schema",
-                      r"storage\.connect\(", r"add_argument\(.--apply", r"apply_plan"):
+                      r"storage\.connect\(", r"add_argument\(.--apply", r"apply_plan", r"add_link"):
         assert not re.search(forbidden, code), forbidden
     assert "open_readonly_file" in src
 

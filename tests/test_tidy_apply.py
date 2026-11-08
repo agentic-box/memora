@@ -1,0 +1,373 @@
+"""Item 255: the tidy apply step (memora/tidy_apply.py): metadata-only, sealed, approved, guarded."""
+import hashlib
+import json
+import re
+from pathlib import Path
+
+import pytest
+
+import memora
+import memora.storage as storage
+from memora import dream, tidy, tidy_apply as ta
+from memora.backends import LocalSQLiteBackend
+from memora.tidy import TidyError, TidyLimits
+from tests.l3_fakes import URI
+from memora import schema
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture()
+def store(tmp_path, monkeypatch):
+    backend = LocalSQLiteBackend(tmp_path / "memories.db")
+    monkeypatch.setattr(storage, "STORAGE_BACKEND", backend)
+    monkeypatch.setattr(storage, "EMBEDDING_MODEL", "tfidf")
+    monkeypatch.setattr(memora, "TAG_WHITELIST", set())
+    conn = backend.connect()
+    schema.ensure_schema(conn)
+    schema.install_sync(conn, URI, 0)
+    conn.close()
+    return backend
+
+
+def add(content, tags=None, meta=None):
+    with storage.connect() as conn:
+        r = storage.add_memory(conn, content="memo: " + content, tags=list(tags or []), metadata=dict(meta or {}))
+        conn.commit()
+    return r["id"] if "id" in r else r["memory"]["id"]
+
+
+def mem(mid):
+    with storage.connect() as conn:
+        return dream._fresh(conn, mid)[0]
+
+
+def sha(mid):
+    return mem(mid).state_sha
+
+
+def outbox():
+    with storage.connect() as conn:
+        return [tuple(r) for r in conn.execute("SELECT tbl, op, pk FROM sync_outbox ORDER BY seq")]
+
+
+def embeddings():
+    with storage.connect() as conn:
+        return {r[0]: r[1] for r in conn.execute("SELECT memory_id, embedding FROM memories_embeddings")}
+
+
+def seal(steps, **kw):
+    plan = {"version": tidy.TIDY_PLAN_VERSION, "mode": "dry-run", "run": "r1", "created_ts": 1.0,
+            "candidates": ["clmux", "memora"], "steps": steps, **kw}
+    plan["digest"] = tidy.plan_digest(plan)
+    return plan
+
+
+def sp(sid, mid, proj="memora", conf="high", **kw):
+    return {"id": sid, "op": "set_project", "target": mid, "project": proj, "evidence": ["x"], "confidence": conf,
+            "needs_approval": False, "status": "eligible", "expect": {str(mid): sha(mid)}, "depends_on": [], **kw}
+
+
+def lk(sid, a, b, et="references", **kw):
+    return {"id": sid, "op": "link", "a": a, "b": b, "edge_type": et, "needs_approval": False, "status": "eligible",
+            "expect": {str(a): sha(a), str(b): sha(b)}, "depends_on": [], **kw}
+
+
+def rt(sid, mid, add_, remove=(), **kw):
+    return {"id": sid, "op": "retag", "target": mid, "add": list(add_), "remove": list(remove), "needs_approval": False,
+            "status": "eligible", "expect": {str(mid): sha(mid)}, "depends_on": [], **kw}
+
+
+def dec_for(plan, tmp_path, **kw):
+    p = tmp_path / "dec.json"
+    p.write_text(json.dumps({"report_digest": plan["digest"], **kw}))
+    return ta.load_decisions(str(p), plan)
+
+
+ALL = [{"op": "set_project"}, {"op": "link"}, {"op": "retag"}]
+LIM = TidyLimits()
+
+
+def run(plan, dec, lim=LIM):
+    return ta.apply_report(plan, dec, lim)
+
+
+def reasons(res):
+    return {r["id"]: r["reason"] for r in res["skipped"] + res["deferred"]}
+
+
+# ------------------------------------------------------------------ decisions
+
+def test_decisions_refuse_wrong_digest_unknown_id_and_malformed(tmp_path):
+    plan = seal([{"id": "s1", "op": "retag"}])
+    for body, msg in (({"report_digest": "zzz"}, "report_digest"),
+                      ({"report_digest": plan["digest"], "approve": ["nope"]}, "not in the report"),
+                      ({"report_digest": plan["digest"], "reject": ["nope"]}, "not in the report"),
+                      ({"report_digest": plan["digest"], "approve": "s1"}, "list of strings"),
+                      ({"report_digest": plan["digest"], "bogus": 1}, "unknown key"),
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "frob"}]}, "approve_ops"),
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "link", "min_confidence": "x"}]}, "min_confidence")):
+        p = tmp_path / "d.json"
+        p.write_text(json.dumps(body))
+        with pytest.raises(TidyError, match=msg):
+            ta.load_decisions(str(p), plan)
+    p.write_text("{not json")
+    with pytest.raises(TidyError):
+        ta.load_decisions(str(p), plan)
+    p.write_text("[]")
+    with pytest.raises(TidyError):
+        ta.load_decisions(str(p), plan)
+
+
+def test_approval_rules(tmp_path):
+    steps = [{"id": "a", "op": "set_project", "confidence": "high", "needs_approval": False},
+             {"id": "b", "op": "set_project", "confidence": "medium", "needs_approval": False},
+             {"id": "c", "op": "set_project", "confidence": "low", "needs_approval": False},
+             {"id": "d", "op": "link", "needs_approval": False},
+             {"id": "e", "op": "link", "needs_approval": True},
+             {"id": "f", "op": "link", "needs_approval": False}]
+    plan = seal(steps)
+    d = dec_for(plan, tmp_path, approve_ops=[{"op": "set_project", "min_confidence": "medium"}, {"op": "link"}],
+                approve=["c", "e"], reject=["f", "a"])
+    got = {s["id"]: ta.approved_by(s, d) for s in steps}
+    assert got["a"] is None                        # reject wins over approve_ops
+    assert got["b"] and got["c"] == "approve:id"    # medium by rule, low by id
+    assert got["d"] and got["e"] == "approve:id"    # needs_approval only by id ...
+    assert got["f"] is None
+    d2 = dec_for(plan, tmp_path, approve_ops=[{"op": "link"}])
+    assert ta.approved_by(steps[4], d2) is None     # ... never by approve_ops
+    d3 = dec_for(plan, tmp_path, approve_ops=[{"op": "link", "min_confidence": "high"}])
+    assert ta.approved_by(steps[3], d3) is None     # a step with no confidence never meets a confidence floor
+
+
+def test_nothing_approved_means_nothing_written(store, tmp_path):
+    a, b = add("alpha"), add("beta")
+    plan = seal([sp("b1", a), lk("s1", a, b), rt("s2", b, ["t"])])
+    res = run(plan, dec_for(plan, tmp_path))
+    assert res["counts"]["applied"] == 0 and {s["reason"] for s in res["skipped"]} == {"not approved"}
+    assert outbox() == [r for r in outbox() if True] and mem(a).metadata.get("project") is None
+
+
+def test_unsupported_ops_are_never_written_even_when_approved(store, tmp_path):
+    a = add("alpha")
+    steps = [{"id": f"x{i}", "op": op, "needs_approval": False, "expect": {str(a): sha(a)}, "status": "eligible"}
+             for i, op in enumerate(["merge", "retire", "bootstrap_digest", "replace_digest", "repair_digest", "frobnicate"])]
+    plan = seal(steps)
+    d = dec_for(plan, tmp_path, approve=[s["id"] for s in steps])
+    before = outbox()
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 0 and outbox() == before
+    assert all(s["reason"] == f"skipped: {ta.NOT_SUPPORTED}" for s in res["skipped"]) and len(res["skipped"]) == 6
+
+
+# ------------------------------------------------------------------ writes and guards
+
+def test_rehearsal_outbox_u_only_content_and_embeddings_unchanged_and_rerun_applies_nothing(store, tmp_path):
+    a, b, c = add("alpha note about things"), add("beta note about stuff"), add("gamma", meta={"kind": "item-record"})
+    plan = seal([sp("b1", a), rt("s2", b, ["newtag", "other"]), lk("s3", a, c, "extends"), rt("s4", c, ["more"])])
+    d = dec_for(plan, tmp_path, approve_ops=ALL)
+    before_emb, before_content = embeddings(), {i: mem(i).content for i in (a, b, c)}
+    n0 = len(outbox())
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 4 and not res["skipped"], res
+    rows = outbox()[n0:]
+    assert rows and {op for _t, op, _pk in rows} == {"U"} and all(op != "D" for _t, op, _pk in outbox())
+    assert embeddings() == before_emb                                    # no re-embed
+    assert {i: mem(i).content for i in (a, b, c)} == before_content      # text untouched
+    assert mem(a).metadata["project"] == "memora" and set(mem(b).tags) == {"newtag", "other"}
+    assert {(r["id"], r["edge_type"]) for r in mem(a).refs} >= {(c, "extends")} and (a, "extended_by") in {(r["id"], r["edge_type"]) for r in mem(c).refs}
+    assert "more" in mem(c).tags                                         # a protected memory still gets an added tag
+    n1 = len(outbox())
+    again = run(plan, d)                                                 # same plan, same decisions
+    assert again["counts"]["applied"] == 0 and again["counts"]["already_done"] == 4 and len(outbox()) == n1
+    assert all(s["reason"].startswith("already done") for s in again["skipped"])
+
+
+def test_metadata_update_does_not_call_the_embedding_provider_or_llm(store, tmp_path, monkeypatch):
+    a = add("alpha")
+    plan = seal([sp("b1", a), rt("s2", a, ["t"])])
+    def boom(*a, **k):
+        raise AssertionError("embedding/LLM called")
+    monkeypatch.setattr(storage, "_compute_embedding", boom)
+    monkeypatch.setattr(storage, "_get_llm_client", boom)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert res["counts"]["applied"] == 2
+
+
+def test_set_project_never_overwrites_and_skips_protected_and_changed(store, tmp_path):
+    a, b, c, d_ = add("a"), add("b"), add("c", tags=["item-record"]), add("d")
+    steps = [sp("b1", a), sp("b2", b), sp("b3", c), sp("b4", d_)]
+    plan = seal(steps)
+    with storage.connect() as conn:                       # b gains a project, d changes, after the plan
+        storage.update_memory(conn, b, metadata={"project": "clmux"}, embed=False)
+        storage.update_memory(conn, d_, metadata={"note": "x"}, embed=False)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    r = reasons(res)
+    assert [x["id"] for x in res["applied"]] == ["b1"]
+    assert "never overwritten" in r["b2"] and mem(b).metadata["project"] == "clmux"
+    assert r["b3"].startswith("protected") and mem(c).metadata.get("project") is None
+    assert "state sha" in r["b4"] and mem(d_).metadata.get("project") is None
+
+
+def test_set_project_bad_project_name_is_a_skip_not_a_crash(store, tmp_path):
+    a, b = add("a"), add("b")
+    plan = seal([sp("b1", a, proj="Bad Name!"), sp("b2", b)])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert [x["id"] for x in res["applied"]] == ["b2"] and "write failed" in reasons(res)["b1"]
+
+
+def test_retag_adds_only_and_ignores_removals(store, tmp_path):
+    a = add("a", tags=["keep", "old"])
+    plan = seal([rt("s1", a, ["new"], remove=["old"])])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert set(mem(a).tags) == {"keep", "old", "new"} and res["applied"][0]["remove_ignored"] == ["old"]
+
+
+def test_link_is_idempotent_and_never_overwrites_another_edge(store, tmp_path):
+    a, b, c, d_ = add("a"), add("b"), add("c"), add("d")
+    with storage.connect() as conn:
+        storage.add_link(conn, a, b, edge_type="references")
+        storage.add_link(conn, a, c, edge_type="supersedes", bidirectional=False)     # a hides... c by a forward edge
+    plan = seal([lk("s1", a, b, "references"), lk("s2", a, c, "extends"), lk("s3", b, d_, "contradicts")])
+    n0 = len(outbox())
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    r = reasons(res)
+    assert r["s1"].startswith("already done") and "different edge" in r["s2"]
+    assert [x["id"] for x in res["applied"]] == ["s3"]
+    assert {x["edge_type"] for x in mem(a).refs if x["id"] == c} == {"supersedes"}     # the hiding edge is intact
+    assert len(outbox()) > n0
+
+
+def test_link_skips_when_an_endpoint_changed_or_is_retired(store, tmp_path):
+    a, b, c = add("a"), add("b"), add("c")
+    plan = seal([lk("s1", a, b), lk("s2", a, c)])
+    with storage.connect() as conn:
+        storage.update_memory(conn, b, tags=["z"], embed=False)
+        storage.add_link(conn, add("new"), c, edge_type="supersedes", bidirectional=False)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert not res["applied"] and "state sha" in reasons(res)["s1"] and "retired" in reasons(res)["s2"]
+
+
+def test_a_later_step_still_matches_after_this_runs_own_earlier_write(store, tmp_path):
+    a, b = add("a"), add("b")
+    plan = seal([sp("b1", a), rt("s2", a, ["t"]), lk("s3", a, b)])       # all judged against the same original state
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert [x["id"] for x in res["applied"]] == ["b1", "s2", "s3"], res["skipped"]
+
+
+def test_caps_are_charged_before_dispatch_and_the_rest_deferred(store, tmp_path):
+    ids = [add(f"m{i}") for i in range(5)]
+    plan = seal([sp(f"b{i}", m) for i, m in enumerate(ids)] + [lk("l1", ids[0], ids[1]), lk("l2", ids[2], ids[3]),
+                                                              rt("t1", ids[4], ["x"])])
+    lim = TidyLimits(max_backfill=2, max_writes=3)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL), lim)
+    assert [x["id"] for x in res["applied"]] == ["b0", "b1", "l1", "t1"]
+    assert {d["id"]: d["reason"] for d in res["deferred"]} == {"b2": "cap:max_backfill", "b3": "cap:max_backfill",
+                                                                "b4": "cap:max_backfill", "l2": "cap:max_writes"}
+    assert res["counts"]["writes_charged"] == 3 and res["counts"]["backfill_charged"] == 2
+    assert mem(ids[2]).metadata.get("project") is None
+
+
+def test_deadline_stops_dispatch_and_defers_the_rest(store, tmp_path):
+    ids = [add(f"m{i}") for i in range(3)]
+    plan = seal([sp(f"b{i}", m) for i, m in enumerate(ids)])
+    t = iter(range(0, 1000))
+    clock = lambda: next(t) * 1.0  # noqa: E731 - every reading advances one second
+    res = ta.apply_report(plan, dec_for(plan, tmp_path, approve_ops=ALL), TidyLimits(max_seconds=12), clock=clock)
+    assert res["aborted"] == "max_seconds"
+    assert len(res["applied"]) < 3 and len(res["applied"]) + len(res["deferred"]) + len(res["skipped"]) >= 3
+
+
+def test_dependency_not_applied_is_skipped(store, tmp_path):
+    a, b = add("a"), add("b")
+    plan = seal([sp("b1", a, conf="low"), dict(rt("s2", b, ["t"]), depends_on=["b1"])])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=[{"op": "retag"}, {"op": "set_project", "min_confidence": "high"}]))
+    assert not res["applied"] and "dependency" in reasons(res)["s2"]
+
+
+# ------------------------------------------------------------------ CLI
+
+def write_plan(tmp_path, plan):
+    p = tmp_path / "report.json"
+    p.write_text(json.dumps(plan))
+    return p
+
+
+def test_cli_refuses_edited_report_and_old_report(tmp_path):
+    plan = seal([{"id": "s1", "op": "retag"}], created_ts=__import__("time").time())
+    p = write_plan(tmp_path, plan)
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"report_digest": plan["digest"]}))
+    assert tidy.main(["--apply", "--plan", str(p), "--decisions", str(d), "--check"]) == 0
+    plan["steps"][0]["op"] = "merge"                                   # edited after sealing
+    p.write_text(json.dumps(plan))
+    assert tidy.main(["--apply", "--plan", str(p), "--decisions", str(d), "--check"]) == 2
+    old = seal([], created_ts=1.0)
+    p.write_text(json.dumps(old))
+    d.write_text(json.dumps({"report_digest": old["digest"]}))
+    assert tidy.main(["--apply", "--plan", str(p), "--decisions", str(d), "--check"]) == 2
+    with pytest.raises(SystemExit):
+        tidy.main(["--apply"])                                          # --plan and --decisions are required
+
+
+def test_cli_apply_writes_a_result_file_next_to_the_plan(store, tmp_path, monkeypatch, capsys):
+    a = add("a")
+    plan = seal([sp("b1", a)], created_ts=__import__("time").time())
+    p = write_plan(tmp_path, plan)
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"report_digest": plan["digest"], "approve_ops": ALL}))
+    cfg = tmp_path / "tidy.json"
+    cfg.write_text(json.dumps({"state_dir": str(tmp_path / "state")}))
+    assert tidy.main(["--apply", "--plan", str(p), "--decisions", str(d), "--config", str(cfg)]) == 0
+    out = json.loads(capsys.readouterr().out)
+    res = json.loads(Path(out["result"]).read_text())
+    assert Path(out["result"]).parent == tmp_path and res["counts"]["applied"] == 1 and mem(a).metadata["project"] == "memora"
+    assert not any(k for k in res if k == "content")
+
+
+def test_apply_holds_the_run_lock(store, tmp_path):
+    a = add("a")
+    plan = seal([sp("b1", a)], created_ts=__import__("time").time())
+    p = write_plan(tmp_path, plan)
+    d = tmp_path / "d.json"
+    d.write_text(json.dumps({"report_digest": plan["digest"], "approve_ops": ALL}))
+    cfg = tmp_path / "tidy.json"
+    cfg.write_text(json.dumps({"state_dir": str(tmp_path / "state")}))
+    with dream.run_lock(tmp_path / "state"):
+        assert tidy.main(["--apply", "--plan", str(p), "--decisions", str(d), "--config", str(cfg)]) == 2
+    assert mem(a).metadata.get("project") is None
+
+
+# ------------------------------------------------------------------ the module has no model, git or network path
+
+def test_apply_module_has_no_model_git_network_delete_or_content_edit():
+    code = "\n".join(l for l in (ROOT / "memora" / "tidy_apply.py").read_text().splitlines() if not l.lstrip().startswith("#"))
+    for forbidden in (r"subprocess", r"GitSource", r"urllib", r"requests", r"socket", r"\bjudge\b", r"claude", r"openai",
+                      r"delete_memory", r"remove_link", r"\bcontent=", r"supersede", r"add_memory",
+                      r"sqlite3\.connect"):
+        assert not re.search(forbidden, code, re.I), forbidden
+    assert "DELETE " not in code and "INSERT " not in code
+    assert code.count("update_memory(") == 2 and code.count("embed=False") == 2 and "add_link(" in code
+
+
+def test_nothing_in_the_unit_or_run_scripts_contains_apply():
+    files = [p for p in (ROOT / "scripts" / "tidy").rglob("*") if p.is_file()]
+    assert any(p.name == "memora-tidy.service" for p in files)
+    for p in files:
+        assert "--apply" not in p.read_text(), p
+
+
+# ------------------------------------------------------------------ storage: the embed=False path
+
+def test_update_memory_embed_false_keeps_the_vector_and_refreshes_fts_but_default_still_embeds(store, monkeypatch):
+    a = add("alpha note")
+    before = embeddings()[a]
+    with storage.connect() as conn:
+        storage.update_memory(conn, a, tags=["t1"], embed=False)
+    assert embeddings()[a] == before and "t1" in mem(a).tags
+    with storage.connect() as conn:
+        assert conn.execute("SELECT 1 FROM memories_fts WHERE memories_fts MATCH 't1'").fetchone() is not None
+        with pytest.raises(ValueError):
+            storage.update_memory(conn, a, content="changed text", embed=False)
+        storage.update_memory(conn, a, tags=["t1", "t2"])          # default path computes an embedding
+    assert embeddings()[a] != before

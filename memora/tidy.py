@@ -3,8 +3,9 @@
 `memora-tidy` clusters the live memories of ONE project, asks a judge (Haiku for grouping and tags, Sonnet
 for merged text and the project digest, both through Claude Code, `claude -p`) to propose per cluster:
 merge, retire, link, retag, keep, or flag a contradiction, and then proposes one `kind: digest` memory for
-the project. It writes a SEALED report (the plan) and nothing else. There is no apply path in this module:
-no `--apply` flag, no store write, no delete. The store is read through a read-only copy only.
+the project. It writes a SEALED report (the plan) and nothing else. There is no write path in this module:
+no store write, no delete; the store is read through a read-only copy only. `--apply` (Item 255) is dispatched
+to memora/tidy_apply.py, which writes only metadata-only steps (docs/tidy.md).
 
 What the model never decides (the code does, mechanically): which memories form a cluster, what a
 statement is, whether a merged statement is an exact copy of a source statement, whether a retire is
@@ -2069,7 +2070,7 @@ def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group
     return report
 
 
-# --------------------------------------------------------------------------- CLI (no --apply, by design)
+# --------------------------------------------------------------------------- CLI (the write path is memora/tidy_apply.py)
 
 
 def _summary(r: Dict[str, Any]) -> str:
@@ -2084,7 +2085,7 @@ def _summary(r: Dict[str, Any]) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    ap = argparse.ArgumentParser(prog="memora-tidy", description=SCOPE_NOTE + " Dry run only: there is no --apply.")
+    ap = argparse.ArgumentParser(prog="memora-tidy", description=SCOPE_NOTE + " Dry run here; `--apply` (metadata-only steps) is memora/tidy_apply.py, see docs/tidy.md.")
     ap.add_argument("--config", help=f"JSON config (default $MEMORA_TIDY_CONFIG or {DEFAULT_CONFIG})")
     ap.add_argument("--db", help="a READ-ONLY copy of a store (a sqlite file); required here or in the config")
     ap.add_argument("--project", help="the project to tidy (default: the config's `project`)")
@@ -2092,7 +2093,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="instead of a tidy pass, report set_project proposals for memories with no project")
     ap.add_argument("--out", help="write the report (the plan) here, 0600")
     ap.add_argument("--out-dir", help="write the report as tidy-<project>-<UTC time>.json in this directory")
-    args = ap.parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if "--apply" in raw_args:        # the write path lives in its own module; this one stays write-free
+        from . import tidy_apply  # noqa: PLC0415
+        return tidy_apply.main(raw_args)
+    args = ap.parse_args(raw_args)
     try:
         cfg = TidyConfig.load(args.config)
         project = args.project or cfg.project

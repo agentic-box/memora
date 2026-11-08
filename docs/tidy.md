@@ -3,8 +3,8 @@
 `memora-tidy` proposes a better-organised store for **one project**: fewer overlapping memories,
 outdated ones retired, consistent tags and links, and one current `kind: digest` summary. The design,
 the safety rules and the reasons are in [tidy-design.md](tidy-design.md). This page is how to run what
-exists: **the dry run**. There is no apply step yet and no `--apply` flag; the command reads a copy of
-the store and writes a report.
+exists: **the dry run**, and the **apply** of the metadata-only steps (see "Apply" below). The dry run reads
+a copy of the store and writes a report; only `--apply` writes the store.
 
 ```sh
 memora-tidy --db store-copy.sqlite --project clmux --out report.json
@@ -106,7 +106,49 @@ go to Haiku in batches; it may only pick a project that had a signal, must quote
 confidence is `medium` or `low`; "unknown" lands in `unresolved`, as do memories with no signal at all
 (no call is spent on them). A project is never overwritten. `lists` separates protected memories and item
 records from the rest (it is metadata only, but you may want to read them first); `by_project` counts the
-proposals. The apply is a later phase; `validate_set_project` and `revalidate_step` are its hooks.
+proposals. See "Apply" for how they reach the store.
+
+## Apply (metadata-only steps)
+
+`memora-tidy --apply --plan report.json --decisions decisions.json [--config ...]` writes the sealed report's
+**`set_project`, `link` and `retag`** steps (tags are only ever added). They never change a memory's text,
+never hide one, never delete, compute no embedding and call no model. **Not supported yet:** `merge`, `retire`,
+`bootstrap_digest`, `replace_digest`, `repair_digest` (and any unknown op): they are listed as
+`skipped: op not supported by this apply` and are never written, even when approved.
+
+Decisions file (`report_digest` must be the report's `digest`; the leader never edits the report):
+
+```json
+{"report_digest": "<digest of the report>",
+ "approve_ops": [{"op": "set_project", "min_confidence": "medium"}, {"op": "link"}, {"op": "retag"}],
+ "approve": ["b12"], "reject": ["b40", "s3"]}
+```
+
+`approve_ops` approves every step of the op at or above the confidence; `approve` adds steps by id; `reject`
+always wins; a step the report marks `needs_approval` is approved by id only; anything not approved is not
+applied. A file with another report's digest, an id that is not in the report, or a malformed shape is refused.
+`memora-tidy --apply --plan ... --decisions ... --check` prints what would be attempted, by op and reason, and
+touches no store (no lock, no config).
+
+Each step is checked against the store when it runs (state sha, still no project, protection read now, not
+retired, an existing edge is "done", a different edge is never replaced). Protected memories (item records,
+decisions, procedures, digests) receive links and added tags, not a project label. Caps (config `limits`):
+`max_backfill` for `set_project` (set it to the size of the report, the default is 200; a rerun continues where
+it stopped), `max_writes` for links (2 each) and tags (1 each). The result is written next to the plan as
+`<plan>.apply-<UTC time>.json` with `applied`, `skipped`, `deferred`, `ambiguous` (ids and reasons) and counts.
+Rerunning the same plan and decisions applies nothing new.
+
+Procedure (design 5.5; the leader runs it, the unit never does):
+
+1. Rehearse on a **new, writable, consistent copy** of the store (an online backup, or a copy made with the
+   container stopped; never reuse an old copy's `-wal`/`-shm`). Point the store environment at the copy
+   (embedding settings in a 0600 file, never printed), run `--apply`, and diff `sync_outbox` before and after:
+   only `U` rows, **no `D` rows**; the memories' text unchanged; a second run applies nothing.
+2. Live: stop the watchdog, then the memora container; run `--apply` in a one-off container (same image, the
+   data volume, the plan directory read-only for the plan, `MEMORA_LLM_ENABLED=false`); start the container, then
+   the watchdog; check that D1's `last_acked_seq` equals `max(sync_outbox.seq)` with no halt and no error.
+
+The run scripts and the systemd unit never contain `--apply` (tested).
 
 ## Schedule
 

@@ -8830,6 +8830,7 @@ def update_memory(
     expected_row: Optional[Mapping[str, Any]] = None,
     force_reindex: bool = False,
     commit: bool = True,
+    embed: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Update an existing memory. Only provided fields are updated.
 
@@ -8849,7 +8850,13 @@ def update_memory(
     when nothing changed (repairing a write that stopped part-way).
     commit=False (internal): leave the transaction open (local SQLite), so a
     caller can verify the result and roll it back; no effect on D1.
+    embed=False (internal, the tidy apply, Item 255): a metadata/tag-only
+    update that computes NO embedding (no provider call) and leaves the stored
+    vector untouched; the FTS row is still refreshed. Never combine with a
+    content change.
     """
+    if not embed and content is not None:
+        raise ValueError("embed=False is only for metadata/tag updates")
     # First check if memory exists
     existing = get_memory(conn, memory_id)
     if not existing:
@@ -8905,7 +8912,7 @@ def update_memory(
     metadata_json = json.dumps(new_metadata, ensure_ascii=False) if new_metadata else None
     tags_json = json.dumps(new_tags, ensure_ascii=False)
     vector: Optional[Dict[str, float]] = None
-    if index_changed:
+    if index_changed and embed:
         # D1 makes the content UPDATE durable immediately. Validate the new
         # embedding before that statement so an empty vector cannot leave a
         # migrated store permanently unrebuildable.
@@ -8950,7 +8957,8 @@ def update_memory(
         _fts_upsert(conn, memory_id, new_content, metadata_json, tags_json)
 
         # Update embeddings (calls OpenAI API - ~1-2 sec)
-        _upsert_embedding(conn, memory_id, vector)
+        if embed:
+            _upsert_embedding(conn, memory_id, vector)
 
         # Skip cross-references update - too expensive for D1 HTTP API (~15 sec)
         # Cross-refs remain valid enough until manual rebuild via memory_rebuild_crossrefs

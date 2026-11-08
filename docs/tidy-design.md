@@ -1,7 +1,9 @@
 # The tidy pass (Item 251): design
 
-> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in sections 13 and 14, v0.5.7.11 and v0.5.7.12); the apply
-> step (`--apply`, `replace_digest` and friends as store writes) is not. Names marked *(new)* were new at
+> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in sections 13 and 14, v0.5.7.11 and v0.5.7.12).
+> **Phase 4 is partly implemented** (Item 255, v0.5.7.12, `memora/tidy_apply.py`, section 15): `--apply` writes only the
+> metadata-only steps `set_project`, `link` and add-only `retag`. Merges, retires and the digest steps
+> (`bootstrap_digest`, `replace_digest`, `repair_digest`) are still not applied. Names marked *(new)* were new at
 > design time; line numbers are those of v0.5.7.9. Where the implementation differs from this design,
 > section 12 says how and why.
 >
@@ -515,3 +517,34 @@ opposite of its quote. Two causes, two fixes.
   the lines stay and `digest_fidelity.status` reads `unchecked:<why>`. The report is a dry run read by a
   leader; losing the whole digest to a flaky check would cost more than flagging it. Coverage is
   computed after the drop.
+
+## 15. Item 255: the apply step, metadata-only (sections 5.4 to 5.8 for these ops)
+
+- **Scope.** `memora-tidy --apply --plan REPORT --decisions DECISIONS` (code in `memora/tidy_apply.py`; `tidy.py`
+  stays write-free and only dispatches the flag). Supported: `set_project`, `link`, `retag` (add only). Any other op is
+  listed `skipped: op not supported by this apply` and never written, approved or not.
+- **Checks before any write.** `load_tidy_plan` (version, mode, age, digest); a decisions file whose
+  `report_digest` differs, that names an id not in the report, or that is malformed is refused. No model, git or
+  network in apply; it runs under dream's `run_lock` and writes the configured store (never `--db`).
+- **Approvals.** `approve` and `reject` by step id, plus `approve_ops` (leader addition): `{"op": "set_project",
+  "min_confidence": "medium"}` approves every step of that op at or above the confidence; `{"op": "link"}` all of them.
+  A reject always wins. A `needs_approval` step is approved by id only. Steps without a confidence (link, retag)
+  never meet a `min_confidence` floor. Anything not approved is not applied.
+- **Guards, against the store at apply time.** The step's `expect` state sha (a memory this run already changed
+  still matches, through the sha this run recorded after its own write); `set_project` only on a memory that still
+  has no project (one that already has the planned project is "already done"); protected memories (`tidy.is_protected`,
+  read now: item records, decisions, procedures, digests) get links and added tags only, so a `set_project` on one is
+  skipped; retired memories are skipped; a link never replaces an existing edge other than the automatic `related_to`
+  (a `supersedes`/`superseded_by` edge is left alone); a link whose edge already exists on both sides is "already done".
+- **Writes.** `update_memory(..., embed=False)` for set_project and retag: metadata/tags only, the FTS row is refreshed,
+  **no embedding is computed and the stored vector is not touched** (it still reflects the old metadata until the next
+  reindex), no content change, no model call. `add_link` for links. The D1 outbox therefore receives `U` rows only.
+  A typed system tag of a memory that gets a project is re-prefixed by the store's normal rule; it is reported as
+  `tags_retargeted`.
+- **Caps.** Charged before dispatch: `set_project` 1 against `max_backfill`; `link` 2 and `retag` 1 against
+  `max_writes`. The remainder is `deferred` and a rerun picks it up. Deadline (`max_seconds`) as in dream: an
+  in-flight call is `ambiguous`, nothing further is dispatched.
+- **Result.** `<plan>.apply-<UTC time>.json` next to the plan (0600): `applied`, `skipped`, `deferred`, `ambiguous`
+  with step ids and reasons, plus counts. Rerunning the same plan and decisions applies nothing: finished steps are
+  skipped as "already done".
+- **Not here.** Merge, retire, the digest steps, `approve_statements`, and the success measures of section 9.
