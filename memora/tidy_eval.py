@@ -11,10 +11,12 @@ wrapper, so the read ledger is not written. Hybrid search itself never bumps ``a
 ``last_accessed`` (only ``get_memory(track_access=True)`` does, and nothing here calls it). No LLM is called;
 the query embedding uses the store's embedding environment, exactly like a search.
 
-Determinism: the same copy and queries give the same output. Ranks are the search path's own order (fused
-score, rounded to 4 places; a tie keeps the order of the semantic leg, then the keyword leg, both of which
-scan by id). Nothing here re-sorts, shuffles or samples. The report carries no timestamp except ``created``,
-which ``--compare`` ignores.
+Determinism: the same copy and queries give the same output. Ranks are the search path's own order. Inside
+the search, the semantic leg orders by score, then ``created_at``, then id; the keyword leg orders by
+``created_at``; fusion stable-sorts the UNROUNDED fused scores (the printed score is rounded), so a tie keeps
+the order in which the legs listed the memory. All of that is a function of the stored rows. Nothing here
+re-sorts, shuffles or samples. The report carries no timestamp except ``created``, which ``--compare``
+ignores.
 """
 from __future__ import annotations
 
@@ -83,12 +85,36 @@ def load_queries(path: str) -> List[Dict[str, Any]]:
 # --------------------------------------------------------------------------- the checks
 
 
-def accepted_ids(conn: Any, expected: int) -> List[int]:
-    """The ids that count as a hit for an expected id: itself when live, else its live successors (the
-    ``superseded_by`` chain's leaves, section 9: a superseded expected memory is hit by its successor). A
-    retired memory with no successor accepts nothing."""
+def forward_successors(conn: Any) -> Dict[int, List[int]]:
+    """old id -> ids of memories holding a forward-only ``supersedes`` edge to it (no ``superseded_by`` on the
+    old one). Storage's follow="active" does not hide such an old memory, but the tidy helpers
+    (``tidy.retired_ids``) treat it as retired, so both it and its successor count as a hit."""
+    mems = dream.load_memories(conn)
+    live = {m.id for m in mems}
+    out: Dict[int, List[int]] = {}
+    for m in mems:
+        for ref in m.refs:
+            if ref.get("edge_type") == "supersedes" and ref.get("id") in live and ref.get("id") != m.id:
+                out.setdefault(ref["id"], []).append(m.id)
+    return out
+
+
+def accepted_ids(conn: Any, expected: int, fwd: Optional[Dict[int, List[int]]] = None) -> List[int]:
+    """The ids that count as a hit for an expected id: itself when live, else its live successors (the leaves
+    of its ``superseded_by`` chain, section 9), following forward-only ``supersedes`` edges too (see
+    ``forward_successors``). A retired memory with no successor accepts nothing."""
     from . import storage  # noqa: PLC0415
-    return sorted(set(storage._resolve_latest(conn, expected)))
+    fwd = forward_successors(conn) if fwd is None else fwd
+    seen: set = set()
+    stack = [expected]
+    while stack:
+        n = stack.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        stack.extend(storage._resolve_latest(conn, n))
+        stack.extend(fwd.get(n, []))
+    return sorted(n for n in seen if storage._resolve_latest(conn, n) == [n])
 
 
 def live_digest_ids(conn: Any, project: str) -> List[int]:
@@ -117,12 +143,12 @@ def _rank(ids: Sequence[int], accept: set) -> Optional[int]:
     return None
 
 
-def run_query(conn: Any, qd: Dict[str, Any]) -> Dict[str, Any]:
+def run_query(conn: Any, qd: Dict[str, Any], fwd: Optional[Dict[int, List[int]]] = None) -> Dict[str, Any]:
     accept = set()
     for e in qd["expect"]:
-        accept.update(accepted_ids(conn, e))
+        accept.update(accepted_ids(conn, e, fwd))
     res: Dict[str, Any] = {"q": qd["q"], "project": qd["project"], "expect": qd["expect"],
-                           "accepted": sorted(accept)}
+                           "digest_asked": qd["digest"], "accepted": sorted(accept)}
     legs = {"unscoped": None}
     if qd["project"]:
         legs["scoped"] = qd["project"]
@@ -154,7 +180,8 @@ def _agg(rows: Sequence[Dict[str, Any]], leg: str) -> Dict[str, Any]:
 
 
 def evaluate(conn: Any, queries: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    rows = [run_query(conn, q) for q in queries]
+    fwd = forward_successors(conn)
+    rows = [run_query(conn, q, fwd) for q in queries]
     dig = [r["digest"]["first"] for r in rows if r["digest"] is not None]
     return {
         "version": REPORT_VERSION,
@@ -213,6 +240,9 @@ def compare(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         if k not in ib:
             continue
         ra, rb = ia[k], ib[k]
+        if (ra["expect"], ra.get("digest_asked")) != (rb["expect"], rb.get("digest_asked")):
+            raise EvalError(f"the criteria changed between the reports for query {_short(ra['q'])!r} "
+                            f"(expect or digest differs); a before/after comparison needs the same queries file")
         d: Dict[str, Any] = {"q": ra["q"], "project": ra["project"]}
         for leg in ("unscoped", "scoped"):
             if leg in ra and leg in rb:
@@ -291,8 +321,26 @@ def _load_report(path: str) -> Dict[str, Any]:
         rep = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         raise EvalError(f"cannot read the report {path}: {e}")
-    if not isinstance(rep, dict) or rep.get("version") != REPORT_VERSION or "queries" not in rep or "totals" not in rep:
-        raise EvalError(f"{path} is not a memora-tidy-eval report")
+    bad = EvalError(f"{path} is not a memora-tidy-eval report")
+    if not isinstance(rep, dict) or rep.get("version") != REPORT_VERSION:
+        raise bad
+    if not isinstance(rep.get("queries"), list) or not isinstance(rep.get("totals"), dict):
+        raise bad
+    try:
+        for r in rep["queries"]:
+            if not (isinstance(r["q"], str) and isinstance(r["expect"], list) and "project" in r
+                    and isinstance(r.get("digest_asked"), bool)):
+                raise bad
+            for leg in ("unscoped", "scoped"):
+                if leg in r and not (isinstance(r[leg], dict) and {"hit", "rank"} <= set(r[leg])):
+                    raise bad
+            if not isinstance(r["unscoped"], dict) or (r.get("digest") is not None and not isinstance(r["digest"], dict)):
+                raise bad
+        for leg in ("unscoped", "scoped"):
+            if not {"recall_at_5", "mrr"} <= set(rep["totals"][leg]):
+                raise bad
+    except (KeyError, TypeError):
+        raise bad
     return rep
 
 
