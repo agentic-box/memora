@@ -86,13 +86,17 @@ def load_queries(path: str) -> List[Dict[str, Any]]:
 
 
 def forward_successors(conn: Any) -> Dict[int, List[int]]:
-    """old id -> ids of memories holding a forward-only ``supersedes`` edge to it (no ``superseded_by`` on the
-    old one). Storage's follow="active" does not hide such an old memory, but the tidy helpers
-    (``tidy.retired_ids``) treat it as retired, so both it and its successor count as a hit."""
+    """old id -> ids of LIVE memories holding a forward-only ``supersedes`` edge to it. Storage's
+    follow="active" does not hide such an old memory, but the tidy helpers (``tidy.retired_ids``) treat it as
+    retired. A holder that is itself tombstoned or superseded is not a live successor and is left out."""
+    from . import tidy  # noqa: PLC0415
     mems = dream.load_memories(conn)
     live = {m.id for m in mems}
+    gone = tidy.retired_ids(conn, mems)
     out: Dict[int, List[int]] = {}
     for m in mems:
+        if m.id in gone:
+            continue
         for ref in m.refs:
             if ref.get("edge_type") == "supersedes" and ref.get("id") in live and ref.get("id") != m.id:
                 out.setdefault(ref["id"], []).append(m.id)
@@ -100,9 +104,12 @@ def forward_successors(conn: Any) -> Dict[int, List[int]]:
 
 
 def accepted_ids(conn: Any, expected: int, fwd: Optional[Dict[int, List[int]]] = None) -> List[int]:
-    """The ids that count as a hit for an expected id: itself when live, else its live successors (the leaves
-    of its ``superseded_by`` chain, section 9), following forward-only ``supersedes`` edges too (see
-    ``forward_successors``). A retired memory with no successor accepts nothing."""
+    """The ids that count as a hit for an expected id: itself when it is live, else its live successors,
+    never a retired predecessor. Live means: not tombstoned, no ``superseded_by`` leaf beyond it
+    (``_resolve_latest``), and no live forward-only ``supersedes`` holder (``forward_successors``). So with
+    B --supersedes--> A (either edge representation) only B is accepted, even when the search still lists A
+    (the search is not changed: a top five holding only A is then a miss). A memory with no live successor
+    chain accepts nothing."""
     from . import storage  # noqa: PLC0415
     fwd = forward_successors(conn) if fwd is None else fwd
     seen: set = set()
@@ -114,7 +121,7 @@ def accepted_ids(conn: Any, expected: int, fwd: Optional[Dict[int, List[int]]] =
         seen.add(n)
         stack.extend(storage._resolve_latest(conn, n))
         stack.extend(fwd.get(n, []))
-    return sorted(n for n in seen if storage._resolve_latest(conn, n) == [n])
+    return sorted(n for n in seen if storage._resolve_latest(conn, n) == [n] and not fwd.get(n))
 
 
 def live_digest_ids(conn: Any, project: str) -> List[int]:
@@ -316,6 +323,10 @@ def _write_json(path: Optional[str], obj: Dict[str, Any]) -> None:
     os.chmod(path, 0o600)
 
 
+def _num(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
 def _load_report(path: str) -> Dict[str, Any]:
     try:
         rep = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -332,12 +343,17 @@ def _load_report(path: str) -> Dict[str, Any]:
                     and isinstance(r.get("digest_asked"), bool)):
                 raise bad
             for leg in ("unscoped", "scoped"):
-                if leg in r and not (isinstance(r[leg], dict) and {"hit", "rank"} <= set(r[leg])):
+                if leg in r and not (isinstance(r[leg], dict) and {"hit", "rank"} <= set(r[leg])
+                                     and (r[leg]["hit"] is None or isinstance(r[leg]["hit"], bool))
+                                     and (r[leg]["rank"] is None or _num(r[leg]["rank"]))):
                     raise bad
-            if not isinstance(r["unscoped"], dict) or (r.get("digest") is not None and not isinstance(r["digest"], dict)):
+            if not isinstance(r["unscoped"], dict) or (r.get("digest") is not None and not (
+                    isinstance(r["digest"], dict) and (r["digest"].get("first") is None
+                                                       or isinstance(r["digest"]["first"], bool)))):
                 raise bad
         for leg in ("unscoped", "scoped"):
-            if not {"recall_at_5", "mrr"} <= set(rep["totals"][leg]):
+            t = rep["totals"][leg]
+            if not ({"recall_at_5", "mrr"} <= set(t) and all(t[m] is None or _num(t[m]) for m in ("recall_at_5", "mrr"))):
                 raise bad
     except (KeyError, TypeError):
         raise bad

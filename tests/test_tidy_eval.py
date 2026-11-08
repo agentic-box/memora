@@ -203,13 +203,46 @@ def test_missing_db_and_queries_exit_2(tmp_path, capsys):
     assert te.main(["--db", str(tmp_path / "nope.db"), "--queries", str(tmp_path / "missing.json")]) == 2
 
 
-def test_forward_only_supersedes_accepts_old_and_successor(store, tmp_path, corpus):
-    new = add("kiwi orchard irrigation schedule newer")
+def fwd_link(new, old):
     with storage.connect() as conn:
-        storage.add_link(conn, new, corpus["kiwi"], edge_type="supersedes", bidirectional=False)
+        storage.add_link(conn, new, old, edge_type="supersedes", bidirectional=False)
         conn.commit()
+
+
+def accepted(store, mid):
     with te.dream.open_readonly_file(str(store.db_path)) as conn:
-        assert te.accepted_ids(conn, corpus["kiwi"]) == sorted([corpus["kiwi"], new])
+        return te.accepted_ids(conn, mid)
+
+
+def test_forward_only_supersedes_accepts_only_the_successor(store, tmp_path, corpus):
+    assert accepted(store, corpus["kiwi"]) == [corpus["kiwi"]]          # before: A is live
+    new = add("kiwi orchard irrigation schedule newer")
+    fwd_link(new, corpus["kiwi"])
+    assert accepted(store, corpus["kiwi"]) == [new]
+    rep = run(store, tmp_path, [{"q": "kiwi orchard irrigation schedule", "project": None, "expect": [corpus["kiwi"]]}])
+    ids = rep["queries"][0]["unscoped"]["ids"]
+    assert corpus["kiwi"] in ids and new in ids                         # the search still lists A
+    assert rep["queries"][0]["unscoped"]["rank"] == ids.index(new) + 1   # rank is B's, not A's
+
+
+def test_only_the_retired_predecessor_in_the_top_five_is_a_miss(store, tmp_path, corpus):
+    new = add("zzz qqq unrelated wording entirely")
+    fwd_link(new, corpus["kiwi"])
+    for i in range(6):
+        add(f"kiwi orchard irrigation schedule filler {i}")
+    rep = run(store, tmp_path, [{"q": "kiwi orchard irrigation schedule", "project": None, "expect": [corpus["kiwi"]]}])
+    u = rep["queries"][0]["unscoped"]
+    assert corpus["kiwi"] in u["ids"] and new not in u["ids"]
+    assert u["hit"] is False and rep["queries"][0]["accepted"] == [new]
+
+
+def test_tombstoned_forward_holder_is_not_a_live_successor(store, tmp_path, corpus):
+    new = add("kiwi orchard irrigation schedule newer")
+    fwd_link(new, corpus["kiwi"])
+    with storage.connect() as conn:
+        storage.delete_memory(conn, new)
+        conn.commit()
+    assert accepted(store, corpus["kiwi"]) == [corpus["kiwi"]]
 
 
 def test_fork_and_chain_accept_leaves(store, tmp_path, corpus):
@@ -236,6 +269,8 @@ def test_compare_refuses_changed_criteria(store, tmp_path, corpus, capsys):
     {"version": 1, "queries": [{"q": "x", "project": None, "expect": [], "digest_asked": False, "unscoped": 3}], "totals": {}},
     {"version": 1, "queries": [], "totals": {"unscoped": {}}},
     {"version": 1, "queries": "x", "totals": {}},
+    {"version": 1, "queries": [], "totals": {"unscoped": {"recall_at_5": "x", "mrr": 1}, "scoped": {"recall_at_5": 1, "mrr": 1}}},
+    {"version": 1, "queries": [{"q": "x", "project": None, "expect": [], "digest_asked": False, "unscoped": {"hit": "yes", "rank": 1}}], "totals": {}},
     [],
 ])
 def test_malformed_reports_are_refused_not_crashed(tmp_path, bad, capsys):
