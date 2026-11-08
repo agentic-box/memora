@@ -29,6 +29,7 @@ written, with no proposals), 4 wall-time watchdog.
 | `state_dir` | where the run lock lives. Default `~/.local/state/memora-dream`, the same as dream, so the two never run at once. Give them different directories and they do. |
 | `read_ledger` | optional read-count ledger, used to rank the digest input. |
 | `projects` | backfill candidates, in addition to every project the store already uses (`--backfill`). |
+| `mirrors` | backfill: dream's `{"git_dir": ..., "repos": {name: {"dir", "ref", "projects"}}}`; the file lists of those bare mirrors are a path signal (read-only, no fetch). |
 | `repo_paths` | backfill: `{"clmux": ["Sources/"]}`, path prefixes that identify a project's tree. |
 | `limits.digest_recent_share` | share (0 to 1, default 0.33) of the digest input reserved for the newest memories. Also `newer_per_note` 3, `newer_note_chars` 600, `newer_min_words` 2. |
 | `limits.max_backfill` | `set_project` steps per backfill run (200); `backfill_batch` 8 ambiguous memories per Haiku call. |
@@ -74,7 +75,7 @@ records, decisions, procedures and digests are never merged or retired.
 
 `digest_flags[]` lists every digest candidate that had newer memories beside it and where the writer put
 it (`decisions`, `followups`, `constraints`, `overtaken`, or `left_out`): read the ones that stayed
-current. `review[]` gets a `kind: overtaken` row (older ids, newer ids) for each `Overtaken` line. It is a
+current. A candidate left out gets a `kind: potential_overtaken` row. `review[]` gets a `kind: overtaken` row (older ids, newer ids) for each `Overtaken` line. It is a
 **retire or contradiction candidate for you to decide**; tidy never retires it.
 
 ## Project backfill
@@ -82,8 +83,8 @@ current. `review[]` gets a `kind: overtaken` row (older ids, newer ids) for each
 `memora-tidy --config ... --db <store copy> --backfill --out-dir ...` (no `--project`). For each live
 memory with no project it proposes a `set_project` step: `{target, project, evidence[], confidence,
 source}`. `source: signals` means the evidence was decisive without a model (a project-prefixed tag 3, an
-item record's `metadata.repo` 5, a path that only one project mentions or a `repo_paths` tree covers 2
-each; the top score is at least 3 and double the runner-up) and `confidence` is `high`. Ambiguous cases
+item record's `metadata.repo` 5, a path that exists in exactly one project's mirror tree, that only one
+project mentions, or that a `repo_paths` prefix covers 2 each; the top score is at least 3 and double the runner-up) and `confidence` is `high`. Ambiguous cases
 go to Haiku in batches; it may only pick a project that had a signal, must quote the note, and its
 confidence is `medium` or `low`; "unknown" lands in `unresolved`, as do memories with no signal at all
 (no call is spent on them). A project is never overwritten. `lists` separates protected memories and item

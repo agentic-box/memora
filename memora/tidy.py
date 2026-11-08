@@ -23,6 +23,7 @@ import math
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 import uuid
@@ -111,6 +112,7 @@ class TidyConfig:
     models: Dict[str, str] = dataclasses.field(default_factory=dict)     # {"group": "haiku", "write": "sonnet"}
     projects: List[str] = dataclasses.field(default_factory=list)        # backfill candidates (plus the store's own)
     repo_paths: Dict[str, List[str]] = dataclasses.field(default_factory=dict)   # backfill: project -> path prefixes
+    mirrors: Optional[Dict[str, Any]] = None       # backfill: dream-style {"git_dir": ..., "repos": {name: {...}}}
     read_ledger: Optional[Path] = None
     # Shared with dream BY DEFAULT: run_lock() takes `<state_dir>/dream.lock`, so tidy and dream exclude
     # each other only while they use the same state_dir (docs/tidy.md).
@@ -138,8 +140,13 @@ class TidyConfig:
         if not isinstance(rp, dict) or not all(isinstance(k, str) and isinstance(v, list)
                                                 and all(isinstance(x, str) and x for x in v) for k, v in rp.items()):
             raise TidyError("config 'repo_paths' must map a project to a list of path prefixes")
+        mir = raw.get("mirrors")
+        if mir is not None and not (isinstance(mir, dict) and isinstance(mir.get("git_dir"), str) and mir["git_dir"]
+                                    and isinstance(mir.get("repos"), dict)
+                                    and all(isinstance(v, dict) for v in mir["repos"].values())):
+            raise TidyError("config 'mirrors' must be {\"git_dir\": str, \"repos\": {name: object}} like dream's")
         ex = lambda v: Path(os.path.expanduser(v)) if v else None  # noqa: E731
-        return cls(limits=TidyLimits.from_dict(raw.get("limits")),
+        return cls(mirrors=mir, limits=TidyLimits.from_dict(raw.get("limits")),
                    project=raw.get("project") if isinstance(raw.get("project"), str) else None,
                    db=raw.get("db") if isinstance(raw.get("db"), str) else None,
                    models=dict(models), projects=list(projects), repo_paths={k: list(v) for k, v in rp.items()},
@@ -1529,6 +1536,12 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
                 flags = digest_flags(rows, newer_map, content["sections"])
                 if flags:
                     digest_flagged.extend(flags)
+                for f in flags:
+                    if f["placed"] == ["left_out"]:
+                        review.append({"kind": "potential_overtaken", "older": f["id"], "newer": f["newer"],
+                                       "action": "left out of the digest although newer memories exist on its "
+                                                 "topic: a retire or contradiction candidate if one of them "
+                                                 "supersedes it (not proven); leader decides"})
                 for ln in content["sections"].get("overtaken", []):
                     ids = [c for c in ln["cites"] if _is_int(c)]
                     olds = [o for o in ids if any(n in newer_map.get(o, ()) for n in ids)]
@@ -1630,8 +1643,49 @@ def _path_index(labelled: Sequence[Mem], cands: set) -> Dict[str, set]:
     return idx
 
 
-def project_signals(m: Mem, cands: set, path_index: Dict[str, set], repo_paths: Dict[str, Sequence[str]]
-                    ) -> Dict[str, List[Tuple[int, str]]]:
+def load_mirror_trees(mirrors: Optional[Dict[str, Any]], cands: Sequence[str],
+                      runner: Callable[..., Any] = subprocess.run, timeout: float = 60.0
+                      ) -> Tuple[Dict[str, frozenset], Dict[str, str]]:
+    """Read-only file lists of dream's bare mirror clones, by project: ({project: paths}, {mirror: status}).
+    Never fetches (no network, `fetch` is off), reuses GitSource's boundary (bare repo inside git_dir, no
+    symlink, read-only plumbing, bounded tree). A mirror that is absent, refused, failed, or maps to no or
+    several candidate projects contributes nothing and says why in the status."""
+    if not mirrors:
+        return {}, {}
+    status: Dict[str, str] = {}
+    try:
+        lim = dream.Limits()
+        lim.git_timeout = timeout
+        cfg = dream.Config(limits=lim, git_dir=Path(os.path.expanduser(mirrors["git_dir"])),
+                           repos=mirrors["repos"], fetch=False)
+        src = dream.GitSource(cfg, runner=runner)
+    except Exception as e:  # noqa: BLE001  a signal source, never a reason to fail the run
+        return {}, {"*": f"mirrors unusable: {type(e).__name__}"}
+    acc: Dict[str, set] = {}
+    for name, spec in mirrors["repos"].items():
+        listed = spec.get("projects") if isinstance(spec.get("projects"), list) else [name]
+        projs = [p for p in listed if p in cands]
+        if len(projs) != 1:
+            status[name] = "maps to no candidate project" if not projs else "ambiguous: maps to several projects"
+            continue
+        try:
+            if src._dir(name) is None:
+                status[name] = src.status.get(name, "no clone")
+                continue
+            files, complete = src._tree(name)
+        except Exception as e:  # noqa: BLE001
+            status[name] = f"tree unavailable: {type(e).__name__}"
+            continue
+        if files is None:
+            status[name] = "tree unavailable (git failed)"
+            continue
+        acc.setdefault(projs[0], set()).update(files)
+        status[name] = "ok" if complete else "ok (tree truncated: positive matches only)"
+    return {k: frozenset(v) for k, v in acc.items()}, status
+
+
+def project_signals(m: Mem, cands: set, path_index: Dict[str, set], repo_paths: Dict[str, Sequence[str]],
+                    trees: Optional[Dict[str, frozenset]] = None) -> Dict[str, List[Tuple[int, str]]]:
     """Deterministic signals per candidate project: a project-prefixed tag (3), an item record's
     metadata.repo (5), a path that only one project's labelled memories mention or that a configured repo
     tree covers (2 each, at most 2 paths count). A signal is evidence, not a decision."""
@@ -1652,12 +1706,17 @@ def project_signals(m: Mem, cands: set, path_index: Dict[str, set], repo_paths: 
             continue
         owners = path_index.get(c.value, set())
         hit = None
-        if len(owners) == 1:
+        in_trees = sorted(pr for pr, ps in (trees or {}).items() if c.value in ps) if c.ctx == "" and "/" in c.value else []
+        if len(in_trees) == 1:
+            hit = (in_trees[0], f"path:{c.value} (exists in the {in_trees[0]} mirror tree)")
+        elif len(in_trees) > 1:
+            continue                                        # the path exists in several projects' trees: ambiguous
+        elif len(owners) == 1:
             hit = (next(iter(owners)), f"path:{c.value} (only in labelled {next(iter(owners))} memories)")
         else:
-            trees = [pr for pr, prefixes in repo_paths.items() if pr in cands and any(c.value.startswith(x) for x in prefixes)]
-            if len(trees) == 1:
-                hit = (trees[0], f"path:{c.value} (configured {trees[0]} tree)")
+            pref = [pr for pr, prefixes in repo_paths.items() if pr in cands and any(c.value.startswith(x) for x in prefixes)]
+            if len(pref) == 1:
+                hit = (pref[0], f"path:{c.value} (configured {pref[0]} tree)")
         if hit:
             sig.setdefault(hit[0], []).append((2, hit[1]))
             paths += 1
@@ -1723,11 +1782,13 @@ def validate_backfill_answer(ans: Dict[str, Any], batch: Sequence[Mem], sigs: Di
                 or r["id"] in ok or r["id"] in bad:
             continue
         mid, proj = r["id"], r["project"]
-        if proj == "unknown":
+        if not isinstance(proj, str):
+            bad[mid] = "project is not a string"
+        elif proj == "unknown":
             bad[mid] = "judge: unknown"
         elif proj not in sigs[mid]:
             bad[mid] = "project is not one of the offered options"
-        elif r["confidence"] not in ("medium", "low"):
+        elif not isinstance(r["confidence"], str) or r["confidence"] not in ("medium", "low"):
             bad[mid] = "bad confidence"
         elif not isinstance(r["quote"], str) or not r["quote"].strip() or r["quote"] not in by_id[mid].content:
             bad[mid] = "quote is not word for word in the note"
@@ -1740,6 +1801,7 @@ def validate_backfill_answer(ans: Dict[str, Any], batch: Sequence[Mem], sigs: Di
 
 
 def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group: Optional[Callable[..., str]], *,
+                 trees: Optional[Dict[str, frozenset]] = None, mirror_status: Optional[Dict[str, str]] = None,
                  now: Optional[float] = None, clock: Callable[[], float] = time.monotonic, judge_note: str = "ok",
                  models: Optional[Dict[str, str]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Item 254: propose `set_project` for live memories with NO project. Report only: it never overwrites an
@@ -1766,7 +1828,7 @@ def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group
                 "expect": {str(m.id): m.state_sha}, "depends_on": []}
 
     for m in todo:
-        sg = project_signals(m, cset, pidx, cfg.repo_paths)
+        sg = project_signals(m, cset, pidx, cfg.repo_paths, trees)
         proj, ev = decide_project(sg)
         if proj:
             steps.append(step_for(m, proj, ev, "high", "signals"))
@@ -1777,6 +1839,10 @@ def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group
             unresolved.append({"id": m.id, "reason": "no signal"})
     calls = 0
     stopped = None
+    room = lim.max_backfill - len(steps)                  # the cap is applied BEFORE any model call is spent
+    if room < len(ambiguous):
+        deferred.extend({"id": m.id, "reason": "cap:max_backfill (not asked)"} for m in ambiguous[max(room, 0):])
+        ambiguous = ambiguous[: max(room, 0)]
     for i in range(0, len(ambiguous), max(lim.backfill_batch, 1)):
         batch = ambiguous[i:i + max(lim.backfill_batch, 1)]
         if judge_group is None:
@@ -1813,14 +1879,14 @@ def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group
             steps.remove(st)
             unresolved.append({"id": st["target"], "reason": problem})
     if len(steps) > lim.max_backfill:
-        deferred = [{"id": st["target"], "project": st["project"], "reason": "cap:max_backfill"}
-                    for st in steps[lim.max_backfill:]]
+        deferred += [{"id": st["target"], "project": st["project"], "reason": "cap:max_backfill"}
+                     for st in steps[lim.max_backfill:]]
         steps = steps[: lim.max_backfill]
     for i, st in enumerate(steps, 1):
         st["id"] = f"b{i}"
     report = {
         "version": TIDY_PLAN_VERSION, "mode": "dry-run", "plan": "backfill", "scope": SCOPE_NOTE, "run": run_id,
-        "at": dream._iso(now), "created_ts": now, "project": None, "candidates": cands,
+        "at": dream._iso(now), "created_ts": now, "project": None, "candidates": cands, "mirrors": mirror_status or {},
         "judge": {"status": judge_note, "models": models or {}, "calls": {"group": calls, "write": 0, "total": calls}},
         "limits": dataclasses.asdict(lim), "stopped_by": stopped or ("max_backfill" if deferred else None),
         "counts": {"live": len(live), "without_project": len(todo), "steps": len(steps),
@@ -1889,7 +1955,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 with contextlib.closing(conn):
                     if args.backfill:
                         bm = dream.load_memories(conn)
-                        report = run_backfill(bm, retired_ids(conn, bm), cfg, jg, judge_note=note,
+                        trees, mstat = load_mirror_trees(cfg.mirrors, backfill_candidates(bm, cfg.projects),
+                                                         timeout=cfg.limits.judge_timeout)
+                        report = run_backfill(bm, retired_ids(conn, bm), cfg, jg, trees=trees, mirror_status=mstat,
+                                              judge_note=note,
                                               models=dict(cfg.models), extra={"priority": prio})
                     else:
                         report = run_from_conn(conn, cfg, project, jg, jw, judge_note=note,

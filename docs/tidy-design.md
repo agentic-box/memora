@@ -481,5 +481,11 @@ All taken in the dry-run report and again after the apply:
   the second answer is validated the same way and the cluster is rejected if it fails.
 - **Project backfill** (`--backfill`): see `docs/tidy.md`. Deterministic signals first, Haiku only for
   ambiguous ones. Report only; `set_project` is validated (`validate_set_project`) and revalidated at
-  apply time (`has_project`). The mirror-tree lookup of dream is not used: paths are matched against
-  the labelled memories and an optional `repo_paths` config.
+  apply time (`has_project`). Path signals, strongest first: the path exists in exactly one project's
+  **dream mirror tree** (`mirrors` in `tidy.json`, dream's `git_dir`/`repos` shape; read-only `ls-tree`
+  through `GitSource`, never a fetch; an absent, refused, failed or multi-project mirror contributes
+  nothing and is named in the report's `mirrors`), then a path only one project's labelled memories
+  mention, then an optional `repo_paths` prefix. A path in several trees or a bare file name is no signal.
+- **Caps.** Backfill has its own cap (`max_backfill`, one write each, apart from `max_writes` 40, which
+  bounds a tidy plan); it is applied before any model call. A digest candidate that was left out
+  although newer memories exist becomes a `potential_overtaken` review row (not proven).

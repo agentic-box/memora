@@ -1185,3 +1185,96 @@ def test_backfill_cli_end_to_end_reads_a_store_copy_and_writes_only_the_report(s
     # no group model: still a report from signals, not an error
     cp.write_text(json.dumps({"models": {}, "state_dir": str(tmp_path / "state")}))
     assert tidy.main(["--config", str(cp), "--db", str(store), "--backfill", "--out", str(tmp_path / "r.json")]) == 0
+
+
+# ----------------------------------------------------------------------------- Item 254 round 2
+
+
+class _Proc:
+    def __init__(self, out="", rc=0):
+        self.stdout, self.returncode, self.stderr = out, rc, ""
+
+
+def _mirror_dir(tmp_path, name):
+    d = tmp_path / "git" / name
+    (d / "objects").mkdir(parents=True)
+    (d / "HEAD").write_text("ref: refs/heads/main\n")
+    return d
+
+
+def _runner(trees, calls=None, fail=()):
+    def run(cmd, **kw):
+        if calls is not None:
+            calls.append(cmd)
+        name = Path(cmd[cmd.index("-C") + 1]).name
+        sub = cmd[cmd.index("-C") + 2:]
+        if name in fail:
+            raise OSError("boom")
+        if sub[0] == "ls-tree":
+            return _Proc("\n".join(trees[name]) + "\n")
+        return _Proc("true\n")
+    return run
+
+
+def test_backfill_uses_mirror_trees_where_available(tmp_path):
+    for n in ("clmux", "memora", "dead", "multi"):
+        _mirror_dir(tmp_path, n)
+    mir = {"git_dir": str(tmp_path / "git"), "repos": {
+        "clmux": {}, "memora": {}, "missing": {"projects": ["acebar"]}, "dead": {"projects": ["acebar"]},
+        "multi": {"projects": ["clmux", "memora"]}}}
+    calls = []
+    trees, status = tidy.load_mirror_trees(mir, ["acebar", "clmux", "memora"], runner=_runner({
+        "clmux": ["Sources/Term/pane.zig", "shared/util.py", "README.md"],
+        "memora": ["memora/tidy.py", "shared/util.py"], "dead": [], "multi": []}, calls, fail=("dead",)))
+    assert set(trees) == {"clmux", "memora"} and "Sources/Term/pane.zig" in trees["clmux"]
+    assert status["clmux"] == "ok" and status["missing"].startswith("no clone")
+    assert status["dead"] == "tree unavailable (git failed)"
+    assert status["multi"].startswith("ambiguous")
+    assert all("fetch" not in c for c in calls) and all(c[0] == "git" for c in calls)         # read-only plumbing only
+    # the genuine unlabelled corpus: two real repo paths, no tag, no repo metadata, no labelled mention
+    cfg = TidyConfig(limits=TidyLimits(), projects=["clmux", "memora"])
+    note = NP(5, "Fix Sources/Term/pane.zig and Sources/Term/split.zig crash.")
+    assert not tidy.run_backfill([note], set(), cfg, None, now=1.0)["steps"]                  # without mirrors: no signal
+    trees2 = {"clmux": frozenset({"Sources/Term/pane.zig", "Sources/Term/split.zig"}), "memora": frozenset({"memora/tidy.py"})}
+    rep = tidy.run_backfill([note], set(), cfg, None, trees=trees2, mirror_status={"clmux": "ok"}, now=1.0)
+    st = rep["steps"][0]
+    assert (st["target"], st["project"], st["confidence"], st["source"]) == (5, "clmux", "high", "signals")
+    assert "mirror tree" in st["evidence"][0] and rep["mirrors"] == {"clmux": "ok"}
+    # a path present in two trees, a bare file name, and an absent path give no signal
+    both = {"clmux": frozenset({"shared/util.py", "README.md"}), "memora": frozenset({"shared/util.py"})}
+    assert not tidy.run_backfill([NP(6, "See shared/util.py and shared/util.py again")], set(), cfg, None, trees=both, now=1.0)["steps"]
+    assert not tidy.run_backfill([NP(7, "Read README.md and docs/none.md")], set(), cfg, None, trees=both, now=1.0)["steps"]
+    # no mirrors configured: nothing, quietly
+    assert tidy.load_mirror_trees(None, ["a"]) == ({}, {})
+    assert tidy.load_mirror_trees({"git_dir": "x", "repos": {"a": {}}}, ["a"])[1]["a"]
+    cp = tmp_path / "c.json"
+    cp.write_text(json.dumps({"models": {"group": "h", "write": "s"}, "mirrors": {"git_dir": "x"}}))
+    with pytest.raises(TidyError, match="mirrors"):
+        TidyConfig.load(str(cp))
+    cp.write_text(json.dumps({"models": {"group": "h", "write": "s"}, "mirrors": mir}))
+    assert TidyConfig.load(str(cp)).mirrors == mir
+
+
+def test_malformed_backfill_values_fail_closed_per_row():
+    mem = NP(20, "Exact words here.", tags=["clmux/a", "memora/b"])
+    labelled = [M(1, "x", project="clmux"), M(2, "y", project="memora")]
+    for bad_project in ([], {}, 5, None):
+        rep = bf(labelled + [mem], lambda p, timeout=None, v=bad_project: json.dumps({"answers": [
+            {"id": 20, "project": v, "quote": "Exact words", "confidence": "low"}]}))
+        assert rep["unresolved"] == [{"id": 20, "reason": "project is not a string"}] and not rep["steps"]
+    rep = bf(labelled + [mem], lambda p, timeout=None: json.dumps({"answers": [
+        {"id": 20, "project": "clmux", "quote": "Exact words", "confidence": []}]}))
+    assert rep["unresolved"] == [{"id": 20, "reason": "bad confidence"}]
+
+
+def test_left_out_overtaken_candidates_become_review_rows_and_backfill_honours_its_cap_first():
+    rep, _ = run_zig("left-out")
+    row_ = [r for r in rep["review"] if r["kind"] == "potential_overtaken"]
+    assert {r["older"] for r in row_} >= {1294} and all(r["newer"] for r in row_)
+    # backfill: deterministic steps fill the cap, so no model call is spent on the ambiguous ones
+    labelled = [M(1, "x", project="clmux"), M(2, "y", project="memora")]
+    mems = labelled + [NP(100 + i, "n", tags=["clmux/x"]) for i in range(3)] + [NP(50, "w", tags=["clmux/a", "memora/b"])]
+    seen = []
+    rep = bf(mems, lambda p, timeout=None: seen.append(p) or "{}", max_backfill=3)
+    assert seen == [] and rep["judge"]["calls"]["total"] == 0 and len(rep["steps"]) == 3
+    assert {"id": 50, "reason": "cap:max_backfill (not asked)"} in rep["deferred"]
