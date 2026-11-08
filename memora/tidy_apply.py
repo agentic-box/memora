@@ -25,10 +25,12 @@ from . import dream, tidy
 from .dream import DreamError
 from .tidy import TidyError
 
-SUPPORTED_OPS = ("set_project", "link", "retag")
-KNOWN_OPS = SUPPORTED_OPS + ("merge", "retire", "bootstrap_digest", "replace_digest", "repair_digest")
+DIGEST_OPS = ("bootstrap_digest", "replace_digest", "repair_digest")
+SUPPORTED_OPS = ("set_project", "link", "retag") + DIGEST_OPS
+KNOWN_OPS = SUPPORTED_OPS + ("merge", "retire")
 CONF_RANK = {"low": 1, "medium": 2, "high": 3}
-CHARGE = {"set_project": 1, "link": 2, "retag": 1}      # store writes per step (the design's charges)
+CHARGE = {"set_project": 1, "link": 2, "retag": 1,      # store writes per step (the design's charges, 5.3)
+          "bootstrap_digest": 1, "replace_digest": 3, "repair_digest": 2}
 NOT_SUPPORTED = "op not supported by this apply"
 
 
@@ -67,6 +69,8 @@ def load_decisions(path: str, plan: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(r, dict) or set(r) - {"op", "min_confidence"} or not isinstance(r.get("op"), str) \
                 or r["op"] not in KNOWN_OPS:
             raise TidyError("each approve_ops entry must be {\"op\": <known op>[, \"min_confidence\": high|medium|low]}")
+        if r["op"] in DIGEST_OPS:
+            raise TidyError(f"approve_ops cannot name {r['op']}: a digest step is approved by its id only")
         if "min_confidence" in r and not (isinstance(r["min_confidence"], str) and r["min_confidence"] in CONF_RANK):
             raise TidyError("approve_ops min_confidence must be high, medium or low")
         out["approve_ops"].append(dict(r))
@@ -80,6 +84,8 @@ def approved_by(step: Dict[str, Any], dec: Dict[str, Any]) -> Optional[str]:
         return None
     if sid in dec["approve"]:
         return "approve:id"
+    if step.get("op") in DIGEST_OPS:    # whatever the report says, a digest (a new memory) is approved by id only
+        return None
     if step.get("needs_approval") is not False:          # true, or anything that is not exactly false: by id only
         return None
     for r in dec["approve_ops"]:
@@ -94,9 +100,45 @@ def approved_by(step: Dict[str, Any], dec: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def shape_problem(step: Dict[str, Any]) -> Optional[str]:
+def _digest_shape(step: Dict[str, Any], project: Any) -> Optional[str]:
+    op = step.get("op")
+    isint = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
+    exp = step.get("expect")
+    if not isinstance(exp, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in exp.items()):
+        return "malformed step: expect"
+    if not isinstance(step.get("depends_on", []), list):
+        return "malformed step: depends_on"
+    if not (isinstance(project, str) and project):
+        return "malformed report: no project"
+    if op == "repair_digest":
+        w, lo, both = step.get("winner"), step.get("supersedes"), step.get("both")
+        if not (isint(w) and isint(lo)) or w == lo or not isinstance(both, list) or not all(isint(x) for x in both) \
+                or sorted(both) != sorted([w, lo]) or set(exp) != {str(w), str(lo)}:
+            return "malformed repair_digest step"
+        return None
+    body, tags, md, cites = step.get("body"), step.get("tags"), step.get("metadata"), step.get("cites")
+    if not (isinstance(body, str) and body.strip()) or not isinstance(tags, list) or not tags \
+            or not all(isinstance(t, str) and t.strip() for t in tags) or f"{project}/digest" not in tags:
+        return f"malformed {op} step: body or tags"
+    if not isinstance(md, dict) or md.get("kind") != "digest" or md.get("project") != project \
+            or md.get("digest_of") != "tidy" or not isinstance(md.get("run"), str) \
+            or not isinstance(md.get("covers"), list) or not all(isint(c) for c in md["covers"]):
+        return f"malformed {op} step: metadata"
+    if not isinstance(cites, list) or not cites or not all(isint(c) or isinstance(c, str) for c in cites):
+        return f"malformed {op} step: cites"
+    if op == "bootstrap_digest":
+        return None if not exp and "supersedes" not in step else "malformed bootstrap_digest step: expect"
+    old = step.get("supersedes")
+    if not isint(old) or set(exp) != {str(old)}:
+        return "malformed replace_digest step"
+    return None
+
+
+def shape_problem(step: Dict[str, Any], project: Any = None) -> Optional[str]:
     """Structure of a supported step, before anything is read from the store."""
     op = step.get("op")
+    if op in DIGEST_OPS:
+        return _digest_shape(step, project)
     isint = lambda v: isinstance(v, int) and not isinstance(v, bool)  # noqa: E731
     exp = step.get("expect")
     if not isinstance(exp, dict) or not exp or not all(isinstance(k, str) and isinstance(v, str) for k, v in exp.items()):
@@ -144,7 +186,7 @@ def select(plan: Dict[str, Any], dec: Dict[str, Any]) -> Dict[str, List[Dict[str
                                                                 if st.get("needs_approval") is not False else "")})
         elif st.get("status", "eligible") != "eligible":
             skipped.append({**row, "reason": f"step status is {st.get('status')!r}, not eligible"})
-        elif (bad := shape_problem(st)) is not None:
+        elif (bad := shape_problem(st, plan.get("project"))) is not None:
             skipped.append({**row, "reason": bad})
         else:
             run.append(dict(st, _approved=why))
@@ -183,11 +225,13 @@ class _Ctx:
         self.alias: Dict[Tuple[int, str], set] = {}
         self.journal: Optional[Path] = None
         self.digest: Optional[str] = None
+        self.project: Optional[str] = None
+        self.created: Dict[str, int] = {}       # digest step id -> the memory it created (kept in the journal)
 
     def save_journal(self) -> None:
         if self.journal is None:
             return
-        body = {"report_digest": self.digest,
+        body = {"report_digest": self.digest, "created": dict(self.created),
                 "post": {f"{m}:{w}": sorted(v) for (m, w), v in sorted(self.alias.items())}}
         tmp = self.journal.with_name(self.journal.name + ".tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -196,6 +240,14 @@ class _Ctx:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, self.journal)
+        try:        # make the rename itself durable (the file was fsynced above)
+            dfd = os.open(str(self.journal.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
 
     def intend(self, mid: int, want: Optional[str], post_sha: str) -> Optional[str]:
         """WRITE-AHEAD: record the state sha the sealed mutation WILL produce, durably, BEFORE it is dispatched. A
@@ -215,6 +267,9 @@ class _Ctx:
             raw = json.loads(self.journal.read_text())
             if raw.get("report_digest") != self.digest:
                 return
+            c = raw.get("created")
+            if isinstance(c, dict):
+                self.created = {k: v for k, v in c.items() if isinstance(k, str) and isinstance(v, int)}
             for k, v in raw["post"].items():
                 m, w = k.split(":", 1)
                 if isinstance(v, list) and all(isinstance(x, str) for x in v):
@@ -252,6 +307,16 @@ def _predict_sha(m: Any, metadata: Dict[str, Any], tags: Sequence[str]) -> str:
     return dream.Mem(m.id, m.content, dict(metadata), list(tags), m.updated_at, m.created_at, list(m.refs)).state_sha
 
 
+def _canon(cx: "_Ctx", meta: Dict[str, Any]) -> Dict[str, Any]:
+    """The metadata as the store itself writes it back. Every update runs it through the store's canonical form
+    (`section`/`subsection` become `hierarchy.path`, `tasks`/`done` are reshaped): a project set on a row that has
+    a section gives it a derived `hierarchy`. The expected post-write state must be computed the same way."""
+    try:
+        return dict(cx.st._build_metadata_dict(dict(meta)))
+    except (ValueError, AttributeError, TypeError):
+        return dict(meta)
+
+
 def _norm(tags: Sequence[str]) -> List[str]:
     return [t.strip() for t in tags]
 
@@ -277,10 +342,11 @@ def _do_set_project(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
         return {"defer": why}
     new_meta = {**m.metadata, "project": proj}
     resolved = cx.st._resolve_project(None, m.tags, new_meta, strict=False)
-    post = _predict_sha(m, new_meta, cx.st._retarget_typed_tags(list(m.tags), resolved, new_meta))
-    bad = cx.intend(mid, step["expect"].get(str(mid)), post)
-    if bad:
-        return {"skip": bad}
+    tags_after = cx.st._retarget_typed_tags(list(m.tags), resolved, new_meta)
+    for md in (_canon(cx, new_meta), new_meta):          # the store's canonical form, or the metadata as given
+        bad = cx.intend(mid, step["expect"].get(str(mid)), _predict_sha(m, md, tags_after))
+        if bad:
+            return {"skip": bad}
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
         cx.conn, mid, metadata={"project": proj}, expected_row=raw, embed=False))
     return _after(cx, step, mid, m, res, {"project": proj}, {"project": proj})
@@ -311,9 +377,10 @@ def _do_retag(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     why = cx.reserve("retag")
     if why:
         return {"defer": why}
-    bad = cx.intend(mid, step["expect"].get(str(mid)), _predict_sha(m, m.metadata, result))
-    if bad:
-        return {"skip": bad}
+    for md in (m.metadata, _canon(cx, m.metadata)):
+        bad = cx.intend(mid, step["expect"].get(str(mid)), _predict_sha(m, md, result))
+        if bad:
+            return {"skip": bad}
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
         cx.conn, mid, tags=want, expected_row=raw, embed=False))
     extra: Dict[str, Any] = {"added": missing}
@@ -331,10 +398,10 @@ def _after(cx: _Ctx, step: Dict[str, Any], mid: int, m: Any, res: Any, meta_patc
     got = cx.read(mid)
     f = got[0] if got is not None else None
     own = set(dream._OWN_KEYS)
-    exp_meta = {k: v for k, v in {**m.metadata, **meta_patch}.items() if k not in own}
+    exp_meta = {k: v for k, v in _canon(cx, {**m.metadata, **meta_patch}).items() if k not in own}
     exact = (f is not None and isinstance(res, dict) and f.content == m.content == res.get("content")
              and sorted(f.tags) == sorted(res.get("tags") or []) and f.updated_at == res.get("updated_at")
-             and {k: v for k, v in f.metadata.items() if k not in own} == exp_meta
+             and {k: v for k, v in _canon(cx, f.metadata).items() if k not in own} == exp_meta
              and (step["op"] == "set_project" or set(m.tags) <= set(f.tags)))
     if exact:
         cx.alias.setdefault((mid, step["expect"].get(str(mid))), set()).add(f.state_sha)
@@ -413,8 +480,366 @@ def _do_link(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     return {"applied": {"edge": et, "directions": int(need_fwd) + int(need_rev)}}
 
 
+# --------------------------------------------------------------------------- the project digest (design 6.4)
+#
+# Every mutation below is ONE statement that carries the operation's expected state (the rows involved, still exactly
+# as read; the live digests of the project; for the reverse edge the distinct state after our own forward edge), so a
+# change between a check and the write makes it write nothing. The checks before it only choose what to try.
+
+
+def _live_digests(cx: _Ctx) -> List[int]:
+    """The live digests of the project NOW: kind digest, this project, not retired by any source the store honours."""
+    rows = cx.W.run("read", lambda: cx.conn.execute(
+        "SELECT id FROM memories WHERE json_extract(metadata, '$.kind') = 'digest' "
+        "AND json_extract(metadata, '$.project') = ? ORDER BY id", (cx.project,)).fetchall())
+    return [int(r[0]) for r in rows if not cx.retired(int(r[0]))]
+
+
+def _retired_sql(cx: _Ctx, col: str) -> str:
+    """SQL: the memory whose id is the expression `col` is retired by any source `dream._retired` honours: a tombstone,
+    a `supersedes` edge held by another memory, or a `superseded_by` entry naming a memory that exists. ONE definition,
+    used by every statement below, so the checks and the writes cannot disagree."""
+    return ("(EXISTS (SELECT 1 FROM tombstones t WHERE t.memory_id = " + col + ") "
+            "OR EXISTS (SELECT 1 FROM tombstone_components t2 WHERE t2.memory_id = " + col + ") "
+            "OR EXISTS (" + cx.st._SUPERSEDES_EDGE_TO_SQL.replace("?", col) + ") "
+            "OR EXISTS (SELECT 1 FROM memories_crossrefs rc, json_each(CASE WHEN json_valid(rc.related) "
+            "THEN rc.related ELSE '[]' END) rj WHERE rc.memory_id = " + col + " "
+            "AND (CASE WHEN rj.type = 'object' THEN json_extract(rj.value, '$.edge_type') END) = 'superseded_by' "
+            "AND EXISTS (SELECT 1 FROM memories rx WHERE rx.id = "
+            "(CASE WHEN rj.type = 'object' THEN CAST(json_extract(rj.value, '$.id') AS INTEGER) END))))")
+
+
+def _live_only(cx: _Ctx, allowed: Sequence[int]) -> Tuple[str, tuple]:
+    """SQL predicate: the project has no live digest outside `allowed`."""
+    ph = ",".join("?" for _ in allowed) or "-1"
+    sql = ("NOT EXISTS (SELECT 1 FROM memories d WHERE json_extract(d.metadata, '$.kind') = 'digest' "
+           "AND json_extract(d.metadata, '$.project') = ? AND d.id NOT IN (" + ph + ") AND NOT "
+           + _retired_sql(cx, "d.id") + ")")
+    return sql, (cx.project, *allowed)
+
+
+def _cites_live(cx: _Ctx, cites: Sequence[Any]) -> Tuple[str, tuple]:
+    """SQL predicate: every cited memory is still a live memory of the project, checked IN the statement that creates
+    the digest (a citation retired or moved while the embedding was computed makes the insert write nothing)."""
+    ids = sorted({int(c) for c in cites})
+    ph = ",".join("?" for _ in ids)
+    return ("(SELECT count(*) FROM memories m WHERE m.id IN (" + ph + ") AND json_extract(m.metadata, '$.project') = ? "
+            "AND NOT " + _retired_sql(cx, "m.id") + ") = ?", (*ids, cx.project, len(ids)))
+
+
+def _only_superseder(cx: _Ctx, win: int, lose: int) -> Tuple[str, tuple]:
+    """SQL predicate: `win` holds a `supersedes` edge to `lose` and nobody else does (the reverse-phase state)."""
+    src = cx.st._SUPERSEDES_EDGE_TO_SQL.replace("SELECT 1 FROM", "SELECT c.memory_id AS src FROM", 1)
+    return (f"EXISTS (SELECT 1 FROM ({src}) s WHERE s.src = ?) AND NOT EXISTS (SELECT 1 FROM ({src}) s2 "
+            "WHERE s2.src != ?)", (lose, win, lose, win))
+
+
+def _digest_edge(cx: _Ctx, holder: int, peer: int, et: str, guards: Sequence[Tuple[str, tuple]]) -> bool:
+    """Write `holder --et--> peer` onto holder's crossrefs row in ONE statement that also requires every guard
+    predicate. False = a guard refused, nothing written."""
+    conn = cx.conn
+    exists = conn.execute("SELECT related FROM memories_crossrefs WHERE memory_id = ?", (holder,)).fetchone()
+    raw = exists[0] if exists else None
+    cur = [r for r in dream._json(raw, []) if isinstance(r, dict) and r.get("id") != peer]
+    cur.append({"id": peer, "score": 1.0, "edge_type": et})
+    blob = json.dumps(cur, ensure_ascii=False)
+    g_sql = " AND ".join(g[0] for g in guards)
+    g_params = tuple(p for g in guards for p in g[1])
+    if exists is not None:
+        res = conn.execute("UPDATE memories_crossrefs SET related = ? WHERE memory_id = ? AND related IS ? AND " + g_sql,
+                           (blob, holder, raw, *g_params))
+    else:
+        res = conn.execute("INSERT INTO memories_crossrefs(memory_id, related) SELECT ?, ? WHERE " + g_sql,
+                           (holder, blob, *g_params))
+    conn.commit()
+    return getattr(res, "rowcount", 0) == 1
+
+
+def _is_digest(cx: _Ctx, m: Any) -> bool:
+    return m.metadata.get("kind") == "digest" and m.metadata.get("project") == cx.project
+
+
+def _is_ours(cx: _Ctx, m: Any, step: Dict[str, Any]) -> bool:
+    """This very step's digest: the sealed metadata, tags and body (and our own create marker), nothing materially edited."""
+    return (_is_digest(cx, m) and all(m.metadata.get(k) == v for k, v in step["metadata"].items())
+            and m.metadata.get("indexing") == {"skip_crossrefs": True}
+            and set(step["tags"]) <= set(m.tags) and m.content.strip() == step["body"].strip())
+
+
+def _complete(cx: _Ctx, mid: int) -> bool:
+    """The create finished: the vector and (when the store has one) the FTS row exist. `add_memory` inserts the row
+    first, so a failure after it leaves a row without them."""
+    def chk() -> bool:
+        if cx.conn.execute("SELECT 1 FROM memories_embeddings WHERE memory_id = ?", (mid,)).fetchone() is None:
+            return False
+        if cx.st._fts_enabled(cx.conn):
+            return cx.conn.execute("SELECT 1 FROM memories_fts WHERE rowid = ?", (mid,)).fetchone() is not None
+        return True
+    return bool(cx.W.run("read", chk))
+
+
+def _complete_it(cx: _Ctx, step: Dict[str, Any], mid: int, guards: Sequence[Tuple[str, tuple]] = ()) -> Optional[str]:
+    """Finish a partial create of OUR digest through the store's own reindex (vector and FTS; no text change). The row
+    is read now, must be this step's sealed digest, and the reindex is guarded by that exact row (expected_row) AND by
+    the operation's `guards` (citations, live digests, the expected old digest), carried in the write itself: the
+    reindex computes its embedding BEFORE that statement, so a check before the call would not cover it. None = complete; else the reason."""
+    if _complete(cx, mid):
+        return None
+    got = cx.read(mid)
+    if got is None or not _is_ours(cx, got[0], step):
+        return f"digest {mid} is no longer this step's sealed digest; not completed"
+    try:
+        guard = (" AND ".join(g[0] for g in guards), tuple(p for g in guards for p in g[1])) if guards else None
+        cx.W.run("update_memory", lambda: cx.st.update_memory(
+            cx.conn, mid, force_reindex=True, expected_row=got[1], update_guard=guard))
+    except cx.st.ConcurrentUpdateError:
+        return f"digest {mid} (or a citation, or the live digests) changed during the completion; refused"
+    return None if _complete(cx, mid) else f"digest {mid} could not be completed"
+
+
+def _cite_problem(cx: _Ctx, step: Dict[str, Any]) -> Optional[str]:
+    """Citations must be real, live memories of the project NOW. A symbolic id (@c3) names a merge result, and merges
+    are not applied here, so it can never be resolved. The body is never rewritten: the step is refused."""
+    syms = sorted({c for c in step["cites"] if isinstance(c, str)}
+                  | {x for x in tidy.symbols_in(step["body"]) if x != step.get("create")})
+    if syms:
+        return f"refused: cites a planned create ({', '.join(syms)}); merges are not applied, so it cannot be resolved"
+    for c in sorted(set(step["cites"])):
+        got = cx.read(c)
+        if got is None:
+            return f"refused: cited memory {c} is gone"
+        if cx.retired(c):
+            return f"refused: cited memory {c} is retired"
+        if got[0].metadata.get("project") != cx.project:
+            return f"refused: cited memory {c} is not in project {cx.project!r}"
+    return None
+
+
+def _edge_flags(cx: _Ctx, win: int, lose: int) -> Optional[Tuple[bool, bool]]:
+    """(forward edge exists, reverse edge exists); None when a digest is gone."""
+    gw, gl = cx.read(win), cx.read(lose)
+    if gw is None or gl is None:
+        return None
+    return (any(r.get("id") == lose and r.get("edge_type") == "supersedes" for r in gw[0].refs),
+            any(r.get("id") == win and r.get("edge_type") == "superseded_by" for r in gl[0].refs))
+
+
+def _snapshots(cx: _Ctx, step: Dict[str, Any], win: int, lose: int, check: Callable[[Any, Any], Optional[str]]):
+    """ONE read of both digests, validated against their authority (`check`: the sealed expectation for a repair, this
+    step's own sealed create for a replacement; the loser always against its judged sha). The raw rows returned are
+    the very rows that were validated, so the statement guards authorise nothing else. str = the reason to stop."""
+    gw, gl = cx.read(win), cx.read(lose)
+    if gw is None or gl is None:
+        return "a digest is gone; no edge written"
+    if not (_is_digest(cx, gw[0]) and _is_digest(cx, gl[0])):
+        return "an endpoint is not a digest of this project; no edge written"
+    if not cx.sha_ok(lose, gl[0], step):
+        return f"digest {lose} changed since it was judged; no edge written"
+    bad = check(gw[0], gl[0])
+    if bad:
+        return bad
+    if not _complete(cx, win):
+        return f"digest {win} is not completely written (no vector or index); no edge written"
+    return gw, gl
+
+
+def _edges(cx: _Ctx, step: Dict[str, Any], win: int, lose: int, check: Callable[[Any, Any], Optional[str]],
+           extra: Sequence[Tuple[str, tuple]] = ()) -> Dict[str, Any]:
+    """`win` supersedes `lose`: the forward edge held by the winner, then the reverse edge on the loser. Both rows are
+    validated (`_snapshots`) and the SAME snapshot feeds the statement guards; the validation is repeated for the
+    reverse phase on a fresh snapshot. Forward = both rows as validated, no superseder, no live digest outside the pair;
+    reverse = the winner is the loser's only superseder, winner unchanged and unhidden, only the winner live. Edges that
+    already exist are not rewritten."""
+    snap = _snapshots(cx, step, win, lose, check)
+    if isinstance(snap, str):
+        return {"partial": snap}
+    (mw, raw_w), (ml, raw_l) = snap
+    fwd = any(r.get("id") == lose and r.get("edge_type") == "supersedes" for r in mw.refs)
+    rev = any(r.get("id") == win and r.get("edge_type") == "superseded_by" for r in ml.refs)
+    out: Dict[str, Any] = {}
+    if not fwd:
+        if cx.retired(lose):
+            return {"partial": f"digest {lose} is already hidden by another memory; no edge written"}
+        guards = [dream._state_guard(cx.st, lose, raw_l, True), dream._state_guard(cx.st, win, raw_w, True),
+                  _live_only(cx, [win, lose]), *extra]
+        if not cx.W.run("guarded_edge", lambda: _digest_edge(cx, win, lose, "supersedes", guards)):
+            return {"partial": "the forward edge was refused (the state changed at the write); both digests stay "
+                               "live and the next dry run seals a repair_digest"}
+        out["forward"] = True
+        snap = _snapshots(cx, step, win, lose, check)
+        if isinstance(snap, str) or not _same_row(snap[1][1], raw_l, ("content", "metadata", "tags", "updated_at", "related")):
+            out["partial"] = "a digest changed after the forward edge; the reverse edge was not written"
+            return out
+        (mw, raw_w), (ml, raw_l) = snap
+    if not rev:
+        guards = [dream._state_guard(cx.st, lose, raw_l, False), dream._state_guard(cx.st, win, raw_w, True),
+                  _only_superseder(cx, win, lose), _live_only(cx, [win])]
+        if not cx.W.run("guarded_edge", lambda: _digest_edge(cx, lose, win, "superseded_by", guards)):
+            out["partial"] = "the reverse edge was refused (the state changed); the forward edge alone hides the old digest"
+            return out
+        out["reverse"] = True
+    if out:
+        cx.W.run("log", lambda: cx.st._log_action(cx.conn, win, "link", f"Digest #{win} supersedes #{lose} by tidy"))
+        cx.W.run("commit", cx.conn.commit)
+    return out
+
+
+def _replace_check(cx: _Ctx, step: Dict[str, Any], win: int) -> Callable[[Any, Any], Optional[str]]:
+    return lambda mw, ml: None if _is_ours(cx, mw, step) else \
+        f"digest {win} is no longer this step's sealed digest; no edge written"
+
+
+def _created(cx: _Ctx, step: Dict[str, Any], guards: Sequence[Tuple[str, tuple]]) -> Dict[str, Any]:
+    """Create the digest through the store's own create path: its embedding is computed like any create (the one
+    place this apply needs the embedding environment). No absorb, no dedup, no suggestion, no model: `add_memory`
+    is the storage function, the similarity crossrefs are switched off for this row (`indexing.skip_crossrefs`), and
+    the row insert itself carries the expected live-digest state (`insert_guard`), so a digest that appeared while the
+    embedding was computed makes it write nothing. {"id"}, {"refused"} or {"partial": id}."""
+    md = {**step["metadata"], "indexing": {"skip_crossrefs": True}}
+    sql = " AND ".join(g[0] for g in guards)
+    params = tuple(p for g in guards for p in g[1])
+    try:
+        new = cx.W.run("add_memory", lambda: cx.st.add_memory(
+            cx.conn, content=step["body"], metadata=md, tags=list(step["tags"]), project=cx.project,
+            insert_guard=(sql, params)))
+    except cx.st.CreateGuardRefused:
+        return {"refused": "stale: the live digests or a citation changed before the insert; nothing was written"}
+    except cx.st.MemoryWriteError as e:
+        cx.created[step["id"]] = int(e.memory_id)
+        return {"partial": int(e.memory_id)}
+    nid = int(new["id"] if "id" in new else new["memory"]["id"])
+    cx.created[step["id"]] = nid
+    try:
+        cx.save_journal()           # informational: the rerun finds the digest in the store, not here
+    except OSError:
+        pass
+    return {"id": nid}
+
+
+def _create_result(cx: _Ctx, got: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if "refused" in got:
+        return {"skip": got["refused"]}
+    if "partial" in got:
+        return {"skip": f"partial create: digest {got['partial']} was inserted but not completed (counted as written); "
+                        "a rerun completes it and nothing is hidden until then"}
+    return None
+
+
+def _do_digest(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
+    op, ids = step["op"], _live_digests(cx)
+    if op == "repair_digest":
+        return _do_repair(cx, step, ids)
+    mine = [i for i in ids if (g := cx.read(i)) is not None and _is_ours(cx, g[0], step)]
+    if len(mine) > 1:
+        return {"skip": f"ambiguous: several live digests match this step ({mine}); a leader decides"}
+    old = step.get("supersedes")
+    if op == "bootstrap_digest":
+        if mine:
+            if ids != mine:
+                return {"skip": f"stale: the project has other live digest(s) {ids}"}
+            if _complete(cx, mine[0]):
+                return {"skip": f"already done: digest {mine[0]} of this run is the live digest"}
+            bad = _cite_problem(cx, step)             # completing makes it searchable: the citations must hold now
+            if bad:
+                return {"skip": bad + "; the incomplete digest is not completed"}
+            why = cx.reserve(op)
+            if why:
+                return {"defer": why}
+            bad = _complete_it(cx, step, mine[0], [_live_only(cx, [mine[0]]), _cites_live(cx, step["cites"])])
+            return {"skip": bad} if bad else {"applied": {"completed": mine[0]}}
+        if ids:
+            return {"skip": f"stale: the project already has live digest(s) {ids}; a bootstrap needs none"}
+        bad = _cite_problem(cx, step)
+        if bad:
+            return {"skip": bad}
+        why = cx.reserve(op)
+        if why:
+            return {"defer": why}
+        got = _created(cx, step, [_live_only(cx, []), _cites_live(cx, step["cites"])])
+        return _create_result(cx, got) or {"applied": {"created": got["id"]}}
+    # replace_digest
+    if mine:
+        d = mine[0]
+        if ids not in ([d], sorted([d, old])):
+            return {"skip": f"stale: the live digests are {ids}, the step was sealed against [{old}] and its own digest"}
+        flags = _edge_flags(cx, d, old)
+        if flags is None:
+            return {"skip": f"digest {old} is gone"}
+        if all(flags) and _complete(cx, d):
+            return {"skip": f"already done: digest {d} of this run is live and supersedes {old}"}
+        bad = _cite_problem(cx, step)             # a resume revalidates every citation before it hides anything
+        if bad:
+            return {"skip": bad}
+        extra = 0 if _complete(cx, d) else 1
+        why = cx.reserve(op, extra + int(not flags[0]) + int(not flags[1]))
+        if why:
+            return {"defer": why}
+        if extra:
+            got_old = cx.read(old)
+            if got_old is None:
+                return {"skip": f"digest {old} is gone; nothing hidden"}
+            bad = _complete_it(cx, step, d, [dream._state_guard(cx.st, old, got_old[1], True), _live_only(cx, [d, old]),
+                                             _cites_live(cx, step["cites"])])
+            if bad:
+                return {"skip": bad + "; nothing hidden"}
+        return {"applied": {"created": None, "resumed": d, "superseded": old,
+                            **_edges(cx, step, d, old, _replace_check(cx, step, d),
+                                     [_cites_live(cx, step["cites"])])}}
+    if ids != [old]:
+        return {"skip": f"stale: the live digests are {ids}, the step was sealed against [{old}]"}
+    got_old = cx.read(old)
+    if got_old is None or not _is_digest(cx, got_old[0]):
+        return {"skip": f"digest {old} is not a digest of this project"}
+    if not cx.sha_ok(old, got_old[0], step):
+        return {"skip": f"digest {old} changed since it was judged (state sha mismatch)"}
+    bad = _cite_problem(cx, step)
+    if bad:
+        return {"skip": bad}
+    why = cx.reserve(op)
+    if why:
+        return {"defer": why}
+    got = _created(cx, step, [dream._state_guard(cx.st, old, got_old[1], True), _live_only(cx, [old]),
+                              _cites_live(cx, step["cites"])])
+    res = _create_result(cx, got)
+    if res:
+        return res
+    nid = got["id"]
+    return {"applied": {"created": nid, "superseded": old, **_edges(cx, step, nid, old, _replace_check(cx, step, nid),
+                                                                  [_cites_live(cx, step["cites"])])}}
+
+
+def _do_repair(cx: _Ctx, step: Dict[str, Any], ids: List[int]) -> Dict[str, Any]:
+    """Both digests are re-read and every expectation is checked again, also when only the winner is live (a resume):
+    both judged rows, both tidy-made, the winner later. Creates nothing; writes the missing edges only."""
+    win, lose = step["winner"], step["supersedes"]
+    if ids not in ([win], sorted([win, lose])):
+        return {"skip": f"stale: the live digests are {ids}, the step was sealed against {sorted([win, lose])}"}
+    flags = _edge_flags(cx, win, lose)
+    if flags is None:
+        return {"skip": "a digest is gone"}
+    if all(flags):
+        return {"skip": f"already done: digest {win} supersedes {lose} on both sides"}
+    def check(mw: Any, ml: Any) -> Optional[str]:        # the sealed expectation, applied to the snapshot that is written against
+        if not (mw.metadata.get("digest_of") == "tidy" == ml.metadata.get("digest_of")):
+            return "a digest was not made by tidy: not repaired automatically"
+        if (mw.created_at or "", win) <= (ml.created_at or "", lose):
+            return f"digest {win} is not the later one; not repaired"
+        if not cx.sha_ok(win, mw, step):
+            return f"digest {win} changed since it was judged (state sha mismatch)"
+        return None
+
+    why = cx.reserve("repair_digest", int(not flags[0]) + int(not flags[1]))
+    if why:
+        return {"defer": why}
+    out = _edges(cx, step, win, lose, check)
+    if "forward" not in out and "reverse" not in out:
+        return {"skip": out.get("partial", "nothing written")}
+    return {"applied": {"superseded": lose, **out}}
+
+
 _DO: Dict[str, Callable[[_Ctx, Dict[str, Any]], Dict[str, Any]]] = {
-    "set_project": _do_set_project, "link": _do_link, "retag": _do_retag}
+    "set_project": _do_set_project, "link": _do_link, "retag": _do_retag,
+    "bootstrap_digest": _do_digest, "replace_digest": _do_digest, "repair_digest": _do_digest}
 
 
 def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mod: Any = None,
@@ -438,6 +863,7 @@ def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mo
         conn = W.run("open", lambda: storage_mod.connect(check_same_thread=False))
         cx = _Ctx(W, storage_mod, conn, lim)
         cx.journal, cx.digest = journal, plan.get("digest")
+        cx.project = plan.get("project")
         cx.load_journal()
         if journal is not None:
             try:
@@ -448,6 +874,9 @@ def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mo
             cur = st
             row = {"id": st["id"], "op": st["op"]}
             dep = [d for d in st.get("depends_on", []) if d not in done_ids]
+            if dep and st["op"] in DIGEST_OPS:      # never rewritten, never run on a result that did not commit (6.3)
+                deferred.append({**row, "reason": f"deferred: dependency {', '.join(map(str, dep))}"})
+                continue
             if dep:
                 skipped.append({**row, "reason": f"dependency not applied: {', '.join(map(str, dep))}"})
                 continue

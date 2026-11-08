@@ -15,6 +15,7 @@ version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 ## 0.5.7.13 — 2026-11-08
 
 - **`memora-tidy-eval` (Item 258): the tidy retrieval check.** Runs a private, git-ignored query set against a read-only store copy through the real hybrid search (`follow="active"`, top 5), unscoped and scoped by project, and reports recall@5, MRR and a digest-first check; `--compare before.json after.json` prints per-query and total deltas. An expected memory that was superseded counts as hit by its live successor, resolved at the leaves of the supersession graph (both `superseded_by` chains and forward-only `supersedes` edges); a retired predecessor never counts. It writes nothing (no ledger, no access counts), calls no model, and stops rather than report keyword-only results when the query embedding is unavailable. `scripts/tidy/queries.json.example` shows the format; see `docs/tidy.md` "Measuring".
+- **`memora-tidy --apply` writes the project digest (Item 259).** `bootstrap_digest`, `replace_digest` and `repair_digest` create the sealed digest as a new memory (embedding computed like any create, no model call, no automatic links) and supersede the old one with guarded edges, never deleting it. Digest steps are approved by id only, deferred when a dependency did not commit, refused when a citation is symbolic or no longer a live memory of the project, and a rerun creates nothing. `set_project`/`retag` no longer report the store's own derived `hierarchy` as an anomaly.
 
 ## 0.5.7.12 — 2026-11-08
 

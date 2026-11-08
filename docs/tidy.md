@@ -111,10 +111,11 @@ proposals. See "Apply" for how they reach the store.
 ## Apply (metadata-only steps)
 
 `memora-tidy --apply --plan report.json --decisions decisions.json [--config ...]` writes the sealed report's
-**`set_project`, `link` and `retag`** steps (tags are only ever added). They never change a memory's text,
-never hide one, never delete, compute no embedding and call no model. **Not supported yet:** `merge`, `retire`,
-`bootstrap_digest`, `replace_digest`, `repair_digest` (and any unknown op): they are listed as
-`skipped: op not supported by this apply` and are never written, even when approved.
+**`set_project`, `link` and `retag`** steps (tags are only ever added) and the three **digest steps**
+(`bootstrap_digest`, `replace_digest`, `repair_digest`, see "The project digest" below). The metadata steps never change
+a memory's text, never hide one, never delete, compute no embedding and call no model. **Not supported yet:** `merge`,
+`retire` (and any unknown op): they are listed as `skipped: op not supported by this apply` and are never written,
+even when approved.
 
 Decisions file (`report_digest` must be the report's `digest`; the leader never edits the report):
 
@@ -126,7 +127,9 @@ Decisions file (`report_digest` must be the report's `digest`; the leader never 
 
 `approve_ops` approves every step of the op at or above the confidence; `approve` adds steps by id; `reject`
 always wins; a step the report marks `needs_approval` is approved by id only; anything not approved is not
-applied. A file with another report's digest, an id that is not in the report, or a malformed shape is refused.
+applied. **Digest steps are always approved by id** (`"approve": ["s23"]`), whatever the report says: the dry run
+marks them `needs_approval: false`, but the apply ignores that for a step that creates a memory, and a decisions
+file whose `approve_ops` names a digest op is refused. A file with another report's digest, an id that is not in the report, or a malformed shape is refused.
 `memora-tidy --apply --plan ... --decisions ... --check` prints what would be attempted, by op and reason, and
 touches no store (no lock, no config).
 
@@ -137,6 +140,43 @@ decisions, procedures, digests) receive links and added tags, not a project labe
 it stopped), `max_writes` for links (2 each) and tags (1 each). The result is written next to the plan as
 `<plan>.apply-<UTC time>.json` with `applied`, `skipped`, `deferred`, `ambiguous` (ids and reasons) and counts.
 Rerunning the same plan and decisions applies nothing new.
+
+**The project digest (Item 259).** A digest step is the only step that creates a memory: a new `kind: digest`
+memory (`project`, `digest_of: tidy`, `run`, `covers`, tag `<project>/digest`) holding the sealed body, written by the
+store's own `add_memory` (it also gets `indexing.skip_crossrefs`, so it receives no automatic `related_to` edges).
+**Its embedding is computed like any create, so this is the one apply that needs the embedding environment**
+(`MEMORA_EMBEDDING_*` or `OPENAI_*`, as for any write; keep it in a 0600 file); `MEMORA_LLM_ENABLED=false` still holds and
+no absorb, dedup, suggestion, consolidation or model call runs. The outbox gets `I`/`U` rows, never `D`.
+
+- `bootstrap_digest` runs only when the project has **no live digest** (kind digest, this project, not hidden).
+- `replace_digest` runs only when the live digests are exactly `{P}` and `P` is still the judged row (state sha); it
+  creates `D`, then writes `D supersedes P` and the reverse `P superseded_by D`, each one statement that also requires
+  `P` to be unchanged and unhidden. `P` is kept as it was and stays reachable.
+- `repair_digest` creates nothing: when exactly two tidy-made digests are live, both still the judged rows, and the
+  winner is the later one, it writes the two edges only.
+- Every other live-digest state is "stale" and writes nothing. Each write is ONE statement that carries the
+  operation's expected state: the create is `add_memory(insert_guard=...)` (an atomic `INSERT ... SELECT ... WHERE`
+  requiring the sealed live-digest set, so a digest that appears while the embedding is computed makes it write
+  nothing); the forward edge requires both rows as read, no superseder, and no live digest outside the pair; the reverse
+  edge requires the state after our own forward edge (the winner is the loser's only superseder, the winner unchanged
+  and unhidden, only the winner live).
+- The edges are written against the very snapshot that was validated (a repair: the sealed expectation of both rows;
+  a replacement: this step's own sealed digest, and the loser's judged sha), never against a fresh re-read that was
+  not validated; the reverse phase validates a new snapshot. The create statement also requires every citation to be a
+  live memory of the project (one retirement definition shared by all statements), and the completion of a partial
+  create is guarded by the exact row it validated (`expected_row`) and requires the citations to hold now.
+- A create that fails after the row was inserted (vector or index) is not a digest yet: nothing is hidden, and a rerun
+  completes it through the store's reindex before anything else. A digest is recognised as this step's only when its
+  sealed metadata, tags and body match. Several matching live digests are "ambiguous", not done.
+- A resume (after a crash, a forward-only write) repeats every check: the citations, the loser's judged state, for
+  a repair both judged rows, both tidy-made and the winner later.
+- A digest step whose `depends_on` names a step that did not commit (including an unsupported `merge`) is **deferred**
+  as `deferred: dependency sN`. A digest citing a symbolic id (`@c3`, only a merge can make one) is refused. Every
+  numbered citation must be a live memory of the project right now; otherwise the step is refused. The body is never rewritten.
+- Charges (against `max_writes`, before dispatch): bootstrap 1, replace 3, repair 2.
+- **Reruns create nothing.** The digest of the run is recognised in the store (same run and body, live), so a rerun is
+  "already done"; after a crash between the create and the edges, the rerun writes the missing edges only. `created`
+  step ids are also kept in the replay journal.
 
 **The replay journal.** Next to the plan the apply keeps `<plan>.applied.json` (0600, bound to the report's
 digest; another report's journal is ignored). A step that rewrites a memory changes the state sha that later steps

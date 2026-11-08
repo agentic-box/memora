@@ -155,13 +155,13 @@ def test_nothing_approved_means_nothing_written(store, tmp_path):
 def test_unsupported_ops_are_never_written_even_when_approved(store, tmp_path):
     a = add("alpha")
     steps = [{"id": f"x{i}", "op": op, "needs_approval": False, "expect": {str(a): sha(a)}, "status": "eligible"}
-             for i, op in enumerate(["merge", "retire", "bootstrap_digest", "replace_digest", "repair_digest", "frobnicate"])]
+             for i, op in enumerate(["merge", "retire", "frobnicate"])]
     plan = seal(steps)
     d = dec_for(plan, tmp_path, approve=[s["id"] for s in steps])
     before = outbox()
     res = run(plan, d)
     assert res["counts"]["applied"] == 0 and outbox() == before
-    assert all(s["reason"] == f"skipped: {ta.NOT_SUPPORTED}" for s in res["skipped"]) and len(res["skipped"]) == 6
+    assert all(s["reason"] == f"skipped: {ta.NOT_SUPPORTED}" for s in res["skipped"]) and len(res["skipped"]) == 3
 
 
 # ------------------------------------------------------------------ writes and guards
@@ -347,13 +347,15 @@ def test_apply_holds_the_run_lock(store, tmp_path):
 def test_apply_module_has_no_model_git_network_delete_or_content_edit():
     code = "\n".join(l for l in (ROOT / "memora" / "tidy_apply.py").read_text().splitlines() if not l.lstrip().startswith("#"))
     for forbidden in (r"subprocess", r"GitSource", r"urllib", r"requests", r"socket", r"\bjudge\b", r"claude", r"openai",
-                      r"delete_memory", r"remove_link", r"\bcontent=", r"supersede", r"add_memory",
-                      r"sqlite3\.connect"):
+                      r"delete_memory", r"remove_link", r"sqlite3\.connect"):
         assert not re.search(forbidden, code, re.I), forbidden
     assert "DELETE " not in code                                  # the only raw SQL writes are the guarded edge statement
-    assert code.count("INSERT INTO memories_crossrefs") == 1 and code.count("UPDATE memories_crossrefs") == 1
-    assert len(re.findall(r"\b(INSERT|UPDATE)\b ", code)) == 2
-    assert code.count("update_memory(") == 2 and code.count("embed=False") == 2 and "_guarded_edge(" in code
+    assert code.count("INSERT INTO memories_crossrefs") == 2 and code.count("UPDATE memories_crossrefs") == 2
+    assert len(re.findall(r"\b(INSERT|UPDATE)\b ", code)) == 4          # the link edge and the digest edge, two shapes each
+    assert code.count("update_memory(") == 3 and code.count("embed=False") == 2 and "_guarded_edge(" in code
+    assert code.count("force_reindex=True") == 1             # the third: completing OUR half-created digest, no text change
+    # Item 259: the ONE create is the digest's, through the store's own add_memory; nothing else is added
+    assert code.count("add_memory(") == 1 and code.count("content=") == 1 and "skip_crossrefs" in code
 
 
 def test_nothing_in_the_unit_or_run_scripts_contains_apply():
@@ -621,3 +623,798 @@ def test_retag_refuses_to_retarget_a_legacy_typed_tag(store, tmp_path):
         assert set(before) <= set(mem(a).tags)
     else:
         assert "rewrite existing tag" in reasons(res)["s1"] and mem(a).tags == before
+
+
+# ------------------------------------------------------------------ Item 259: the project digest
+
+DIG_OPS = ("bootstrap_digest", "replace_digest", "repair_digest")
+
+
+def old_digest(run="old", project="memora", digest_of="tidy", text="digest: older text"):
+    with storage.connect() as conn:
+        r = storage.add_memory(conn, content=text, tags=[f"{project}/digest"], project=project,
+                               metadata={"kind": "digest", "project": project, "digest_of": digest_of, "run": run})
+        conn.commit()
+    return r["id"]
+
+
+def pm(text, **kw):                                   # a memory of project memora, citable by a digest
+    return add(text, meta={"project": "memora"}, **kw)
+
+
+def dg(sid, op, cites, supersedes=None, project="memora", run="r9", body=None, **kw):
+    st = {"id": sid, "op": op, "create": "@d1", "sections": {}, "tags": [f"{project}/digest"],
+          "body": body or "## Current decisions\n- the first decision [" + ", ".join(f"m{c}" for c in cites) + "]\n",
+          "metadata": {"kind": "digest", "project": project, "digest_of": "tidy", "run": run, "covers": list(cites)},
+          "cites": list(cites), "depends_on": [], "needs_approval": False, "status": "eligible",
+          "charge": {"bootstrap_digest": 1, "replace_digest": 3}[op], "expect": {}}
+    if supersedes is not None:
+        st["supersedes"] = supersedes
+        st["expect"] = {str(supersedes): sha(supersedes)}
+    st.update(kw)
+    return st
+
+
+def rp(sid, winner, loser, **kw):
+    return {"id": sid, "op": "repair_digest", "winner": winner, "supersedes": loser, "both": sorted([winner, loser]),
+            "charge": 2, "needs_approval": False, "status": "eligible", "depends_on": [], "cites": [],
+            "expect": {str(winner): sha(winner), str(loser): sha(loser)}, **kw}
+
+
+def dseal(steps):
+    return seal(steps, project="memora")
+
+
+def live_digest_ids():
+    with storage.connect() as conn:
+        ids = [r[0] for r in conn.execute(
+            "SELECT id FROM memories WHERE json_extract(metadata, '$.kind') = 'digest' ORDER BY id")]
+        return [i for i in ids if not dream._retired(conn, i, storage)]
+
+
+def n_memories():
+    with storage.connect() as conn:
+        return conn.execute("SELECT count(*) FROM memories").fetchone()[0]
+
+
+def edge_types(a, b):
+    return {r["edge_type"] for r in mem(a).refs if r.get("id") == b}
+
+
+def d_dec(plan, tmp_path, ids):
+    return dec_for(plan, tmp_path, approve=list(ids))
+
+
+def test_digest_steps_are_approved_by_id_only_whatever_the_report_says(store, tmp_path):
+    c = pm("cited")
+    plan = dseal([dg("s1", "bootstrap_digest", [c]), dg("s2", "replace_digest", [c], supersedes=old_digest())])
+    for op in DIG_OPS:                                  # approve_ops can not name a digest op at all
+        p = tmp_path / "d.json"
+        p.write_text(json.dumps({"report_digest": plan["digest"], "approve_ops": [{"op": op}]}))
+        with pytest.raises(TidyError, match="by its id only"):
+            ta.load_decisions(str(p), plan)
+    forged = {"approve": [], "reject": [], "approve_ops": [{"op": "bootstrap_digest"}]}   # even a hand-built one
+    assert ta.approved_by(plan["steps"][0], forged) is None                  # the report says needs_approval: false
+    assert ta.approved_by(plan["steps"][0], dict(forged, approve=["s1"])) == "approve:id"
+    assert ta.approved_by(plan["steps"][0], dict(forged, approve=["s1"], reject=["s1"])) is None
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert res["counts"]["applied"] == 0 and live_digest_ids() == [plan["steps"][1]["supersedes"]]
+
+
+def test_bootstrap_creates_one_digest_with_embedding_u_i_outbox_no_auto_links_and_a_rerun_creates_nothing(store, tmp_path):
+    c1, c2 = pm("first cited note about alpha"), pm("second cited note about beta")
+    other = pm("unrelated note about alpha beta")
+    plan = dseal([dg("s1", "bootstrap_digest", [c1, c2])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    before_emb, before_content, n0, o0 = embeddings(), {i: mem(i).content for i in (c1, c2, other)}, n_memories(), len(outbox())
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 1 and res["counts"]["writes_charged"] == 1, res
+    (nid,) = live_digest_ids()
+    m = mem(nid)
+    assert m.content.strip() == plan["steps"][0]["body"].strip() and n_memories() == n0 + 1
+    assert m.metadata["kind"] == "digest" and m.metadata["project"] == "memora" and m.metadata["digest_of"] == "tidy"
+    assert m.metadata["run"] == "r9" and m.metadata["covers"] == [c1, c2] and "memora/digest" in m.tags
+    assert nid in embeddings() and {i: v for i, v in embeddings().items() if i != nid} == before_emb
+    assert {i: mem(i).content for i in (c1, c2, other)} == before_content
+    assert m.refs == [] and all(r.get("id") != nid for i in (c1, c2, other) for r in mem(i).refs)   # no auto related_to
+    new_rows = outbox()[o0:]
+    assert new_rows and {op for _t, op, _pk in new_rows} <= {"I", "U"} and all(op != "D" for _t, op, _pk in outbox())
+    n1, o1 = n_memories(), len(outbox())
+    again = run(plan, d)                                          # the same plan again
+    assert again["counts"]["applied"] == 0 and again["counts"]["already_done"] == 1
+    assert n_memories() == n1 and len(outbox()) == o1 and live_digest_ids() == [nid]
+
+
+def test_creating_a_digest_calls_no_llm_no_subprocess_and_no_suggestion_logic(store, tmp_path, monkeypatch):
+    import subprocess
+    c = pm("cited note")
+    def boom(*a, **k):
+        raise AssertionError("an LLM, a subprocess or a suggestion path was called")
+    monkeypatch.setattr(storage, "_get_llm_client", boom, raising=False)
+    monkeypatch.setattr(subprocess, "run", boom)
+    monkeypatch.setattr(subprocess, "Popen", boom)
+    for name in ("suggest_similar", "_suggest_tags", "find_similar_paths"):
+        monkeypatch.setattr(storage, name, boom, raising=False)
+    monkeypatch.setattr(storage, "_update_crossrefs_for_memory", boom)            # the auto-link pass must not run
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 1 and len(live_digest_ids()) == 1
+
+
+def test_bootstrap_refuses_when_the_project_already_has_a_live_digest(store, tmp_path):
+    c, p = pm("cited"), old_digest()
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "stale" in reasons(res)["s1"] and n_memories() == n0 and live_digest_ids() == [p]
+
+
+def test_replace_creates_then_supersedes_both_ways_never_deletes_and_a_rerun_creates_nothing(store, tmp_path):
+    c = pm("cited note")
+    p = old_digest()
+    p_content, p_embed = mem(p).content, embeddings()[p]
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    o0 = len(outbox())
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 1 and res["counts"]["writes_charged"] == 3, res
+    (nid,) = live_digest_ids()
+    assert nid != p and "supersedes" in edge_types(nid, p) and "superseded_by" in edge_types(p, nid)
+    assert mem(p).content == p_content and embeddings()[p] == p_embed             # the old digest is kept as it was
+    new_rows = outbox()[o0:]
+    assert {op for _t, op, _pk in new_rows} <= {"I", "U"} and all(op != "D" for _t, op, _pk in outbox())
+    n1, o1 = n_memories(), len(outbox())
+    again = run(plan, d)
+    assert again["counts"]["applied"] == 0 and n_memories() == n1 and len(outbox()) == o1
+    assert reasons(again)["s1"].startswith("already done") and live_digest_ids() == [nid]
+
+
+@pytest.mark.parametrize("how", ["changed", "two_live", "none_live", "foreign_kind"])
+def test_replace_guards_refuse_and_write_nothing(store, tmp_path, how):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    if how == "changed":
+        with storage.connect() as conn:
+            storage.update_memory(conn, p, tags=["memora/digest", "extra"], embed=False)
+    elif how == "two_live":
+        old_digest(run="other")
+    elif how == "none_live":
+        newer = old_digest(run="newer")
+        with storage.connect() as conn:
+            dream._guarded_edge(conn, storage, newer, p, "supersedes", p, dream._fresh(conn, p)[1], True)
+    elif how == "foreign_kind":
+        with storage.connect() as conn:                       # the "digest" is not one any more: another project's
+            storage.update_memory(conn, p, metadata={"project": "clmux"}, embed=False)
+    n0, o0 = n_memories(), len(outbox())
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and n_memories() == n0 and len(outbox()) == o0, reasons(res)
+
+
+def test_a_crash_after_the_create_before_the_edges_resumes_without_a_second_digest(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = ta._edges
+    def crash(*a, **k):
+        raise RuntimeError("process died")
+    monkeypatch.setattr(ta, "_edges", crash)
+    res = run(plan, d)
+    assert "write failed" in reasons(res)["s1"] and len(live_digest_ids()) == 2     # D exists, nothing hidden yet
+    n1 = n_memories()
+    monkeypatch.setattr(ta, "_edges", real)
+    again = run(plan, d)
+    assert again["counts"]["applied"] == 1 and n_memories() == n1                   # edges only: no second create
+    (nid,) = live_digest_ids()
+    assert "supersedes" in edge_types(nid, p) and "superseded_by" in edge_types(p, nid)
+    assert run(plan, d)["counts"]["applied"] == 0
+
+
+def test_a_forward_only_state_gets_its_reverse_edge_from_a_rerun(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = ta._digest_edge
+    def forward_only(cx, holder, peer, et, guards):
+        return False if et == "superseded_by" else real(cx, holder, peer, et, guards)
+    monkeypatch.setattr(ta, "_digest_edge", forward_only)
+    res = run(plan, d)
+    assert "partial" in res["applied"][0] and "superseded_by" not in edge_types(p, live_digest_ids()[0])
+    monkeypatch.setattr(ta, "_digest_edge", real)
+    n1 = n_memories()
+    again = run(plan, d)
+    assert again["counts"]["applied"] == 1 and n_memories() == n1 and "superseded_by" in edge_types(p, live_digest_ids()[0])
+
+
+def test_repair_writes_the_edges_only_for_two_tidy_digests_and_never_creates(store, tmp_path):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    n0 = n_memories()
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 1 and res["counts"]["writes_charged"] == 2 and n_memories() == n0, res
+    assert live_digest_ids() == [newer] and "supersedes" in edge_types(newer, older) and "superseded_by" in edge_types(older, newer)
+    assert all(op != "D" for _t, op, _pk in outbox())
+    assert run(plan, d)["counts"]["applied"] == 0 and reasons(run(plan, d))["s1"].startswith("already done")
+
+
+@pytest.mark.parametrize("how", ["not_tidy", "winner_older", "three_live", "changed"])
+def test_repair_guards_refuse_and_write_nothing(store, tmp_path, how):
+    older = old_digest(run="a", digest_of="someone-else" if how == "not_tidy" else "tidy")
+    newer = old_digest(run="b")
+    win, lose = (older, newer) if how == "winner_older" else (newer, older)
+    plan = dseal([rp("s1", win, lose)])
+    if how == "three_live":
+        old_digest(run="c")
+    if how == "changed":
+        with storage.connect() as conn:
+            storage.update_memory(conn, older, tags=["memora/digest", "x"], embed=False)
+    o0 = len(outbox())
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and len(outbox()) == o0 and len(live_digest_ids()) >= 2, reasons(res)
+
+
+def test_a_digest_step_whose_dependency_did_not_commit_is_deferred_not_rewritten(store, tmp_path):
+    c, a, b = pm("cited"), pm("a note"), pm("b note")
+    merge = {"id": "s1", "op": "merge", "needs_approval": False, "status": "eligible", "expect": {str(a): sha(a)}}
+    link = lk("s2", a, b)
+    with storage.connect() as conn:
+        storage.update_memory(conn, b, tags=["touched"], embed=False)                 # the link's judged state is stale
+    plan = dseal([merge, link, dg("s3", "bootstrap_digest", [c], depends_on=["s1"]),
+                  dg("s4", "bootstrap_digest", [c], depends_on=["s2"])])
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1", "s2", "s3", "s4"]))
+    r = reasons(res)
+    assert r["s3"] == "deferred: dependency s1" and r["s4"] == "deferred: dependency s2"
+    assert n_memories() == n0 and live_digest_ids() == []
+    assert {x["id"] for x in res["deferred"]} == {"s3", "s4"}
+
+
+def test_a_dependency_that_committed_lets_the_digest_run(store, tmp_path):
+    c, a, b = pm("cited"), pm("a note"), pm("b note")
+    plan = dseal([lk("s1", a, b), dg("s2", "bootstrap_digest", [c], depends_on=["s1"])])
+    res = run(plan, d_dec(plan, tmp_path, ["s1", "s2"]))
+    assert res["counts"]["applied"] == 2 and len(live_digest_ids()) == 1
+
+
+def test_a_digest_citing_a_symbolic_merge_result_is_refused_and_the_body_is_never_rewritten(store, tmp_path):
+    c = pm("cited")
+    n0 = n_memories()
+    for kw in ({"cites": [c, "@c3"]}, {"body": "## Current decisions\n- merged [@c3]\n"}):
+        st = dg("s1", "bootstrap_digest", [c])
+        st.update(kw)
+        plan = dseal([st])
+        res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+        assert "@c3" in reasons(res)["s1"] and "refused" in reasons(res)["s1"]
+        assert n_memories() == n0
+
+
+@pytest.mark.parametrize("how", ["gone", "retired", "other_project", "no_project"])
+def test_every_citation_must_be_a_live_memory_of_the_project_at_apply_time(store, tmp_path, how):
+    good, bad = pm("good"), pm("bad")
+    plan = dseal([dg("s1", "bootstrap_digest", [good, bad])])
+    with storage.connect() as conn:
+        if how == "gone":
+            conn.execute("DELETE FROM memories WHERE id = ?", (bad,))
+            conn.commit()
+        elif how == "retired":
+            newer = pm("newer")
+            dream._guarded_edge(conn, storage, newer, bad, "supersedes", bad, dream._fresh(conn, bad)[1], True)
+        elif how == "other_project":
+            storage.update_memory(conn, bad, metadata={"project": "clmux"}, embed=False)
+        else:
+            conn.execute("UPDATE memories SET metadata = NULL WHERE id = ?", (bad,))
+            conn.commit()
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "refused: cited memory" in reasons(res)["s1"] and n_memories() == n0 and live_digest_ids() == []
+
+
+def test_digest_charges_are_reserved_before_dispatch(store, tmp_path):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]), TidyLimits(max_writes=2))         # a replace is 3
+    assert reasons(res)["s1"] == "cap:max_writes" and n_memories() == n0 and live_digest_ids() == [p]
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]), TidyLimits(max_writes=3))
+    assert res["counts"]["applied"] == 1 and res["counts"]["writes_charged"] == 3
+
+
+@pytest.mark.parametrize("bad", ["no_run", "wrong_project", "no_tag", "empty_body", "bootstrap_with_expect"])
+def test_malformed_digest_steps_are_skipped_before_the_store_is_read(store, tmp_path, bad):
+    c = pm("cited")
+    st = dg("s1", "bootstrap_digest", [c])
+    if bad == "no_run":
+        del st["metadata"]["run"]
+    elif bad == "wrong_project":
+        st["metadata"]["project"] = "clmux"
+    elif bad == "no_tag":
+        st["tags"] = ["other"]
+    elif bad == "empty_body":
+        st["body"] = "  "
+    else:
+        st["expect"] = {str(c): sha(c)}
+    plan = dseal([st])
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "malformed" in reasons(res)["s1"] and live_digest_ids() == []
+
+
+def test_digest_step_counts_in_check_mode(tmp_path, capsys):
+    plan = dseal([dg("s1", "bootstrap_digest", [1])])
+    p, d = tmp_path / "p.json", tmp_path / "d.json"
+    p.write_text(json.dumps(plan))
+    d.write_text(json.dumps({"report_digest": plan["digest"], "approve": ["s1"]}))
+    assert ta.main(["--apply", "--plan", str(p), "--decisions", str(d), "--check", "--max-age-hours", "1e9"]) == 0
+    assert json.loads(capsys.readouterr().out)["would_attempt_by_op"] == {"bootstrap_digest": 1}
+
+
+# ------------------------------------------------------------------ Item 259: the store's derived metadata is not an anomaly
+
+@pytest.mark.parametrize("meta", [{"hierarchy": {"path": ["memora", "issues"]}},
+                                  {"section": "memora", "subsection": "issues"},
+                                  {"hierarchy": {"section": "memora", "subsection": "issues"}, "tasks": [], "done": False}])
+def test_set_project_on_a_row_with_a_hierarchy_or_section_is_not_an_anomaly_and_later_steps_still_run(store, tmp_path, meta):
+    a = add("a note with a hierarchy")
+    with storage.connect() as conn:                      # a legacy row as the live store has: metadata not yet canonical
+        conn.execute("UPDATE memories SET metadata = ? WHERE id = ?", (json.dumps(meta), a))
+        conn.commit()
+    plan = seal([sp("s1", a), rt("s2", a, ["more"])])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert res["counts"]["applied"] == 2 and res["counts"]["anomalies"] == 0, res
+    assert not any("anomaly" in x for x in res["applied"]) and "more" in mem(a).tags
+    assert mem(a).metadata["project"] == "memora"
+    assert run(plan, dec_for(plan, tmp_path, approve_ops=ALL))["counts"]["applied"] == 0
+
+
+def test_a_real_foreign_edit_after_set_project_is_still_an_anomaly(store, tmp_path, monkeypatch):
+    a = add("a note")
+    plan = seal([sp("s1", a), rt("s2", a, ["more"])])
+    real = storage.update_memory
+    def racing(conn, mid, **kw):
+        r = real(conn, mid, **kw)
+        conn.execute("UPDATE memories SET metadata = json_set(metadata, '$.sneaky', 1) WHERE id = ?", (mid,))
+        conn.commit()
+        return r
+    monkeypatch.setattr(storage, "update_memory", racing)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert res["counts"]["anomalies"] == 1 and "state sha" in reasons(res)["s2"]
+
+
+def test_the_journal_write_is_fsynced_with_its_directory(store, tmp_path, monkeypatch):
+    import os
+    a = add("a note")
+    plan = seal([sp("s1", a)])
+    synced = []
+    real = os.fsync
+    monkeypatch.setattr(os, "fsync", lambda fd: (synced.append(os.fstat(fd).st_mode), real(fd))[1])
+    ta.apply_report(plan, dec_for(plan, tmp_path, approve_ops=ALL), LIM, journal=tmp_path / "j.applied.json")
+    import stat
+    assert any(stat.S_ISDIR(m) for m in synced) and any(stat.S_ISREG(m) for m in synced)
+
+
+# ------------------------------------------------------------------ Item 259 round 1: the write carries the state
+
+def _mutate(how, win, lose, third_run="third"):
+    """Change the world the way a concurrent writer could, with the store's own functions."""
+    with storage.connect() as conn:
+        if how == "winner_edit":
+            storage.update_memory(conn, win, tags=["memora/digest", "edited"], embed=False)
+        elif how == "winner_project":
+            storage.update_memory(conn, win, metadata={"project": "clmux"}, embed=False)
+        elif how == "winner_retired":
+            other = old_digest(run="zzz", project="clmux")
+            dream._guarded_edge(conn, storage, other, win, "supersedes", win, dream._fresh(conn, win)[1], True)
+        elif how == "third_live":
+            old_digest(run=third_run)
+        elif how == "loser_edit":
+            storage.update_memory(conn, lose, tags=["memora/digest", "edited"], embed=False)
+        conn.commit()
+
+
+@pytest.mark.parametrize("how", ["winner_edit", "winner_project", "winner_retired", "third_live", "loser_edit"])
+def test_forward_edge_statement_refuses_a_change_between_the_check_and_the_write(store, tmp_path, monkeypatch, how):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    real = ta._digest_edge
+    def racing(cx, holder, peer, et, guards):
+        if et == "supersedes":
+            _mutate(how, newer, older)
+        return real(cx, holder, peer, et, guards)
+    monkeypatch.setattr(ta, "_digest_edge", racing)
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "supersedes" not in edge_types(newer, older) and older in live_digest_ids(), res
+    assert res["counts"]["applied"] == 0 or "partial" in res["applied"][0]
+
+
+@pytest.mark.parametrize("how", ["winner_edit", "winner_project", "winner_retired", "third_live", "loser_edit"])
+def test_reverse_edge_statement_refuses_a_change_after_our_forward_edge(store, tmp_path, monkeypatch, how):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    real = ta._digest_edge
+    def racing(cx, holder, peer, et, guards):
+        if et == "superseded_by":
+            _mutate(how, newer, older)
+        return real(cx, holder, peer, et, guards)
+    monkeypatch.setattr(ta, "_digest_edge", racing)
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "superseded_by" not in edge_types(older, newer) and "partial" in res["applied"][0], res
+    assert "supersedes" in edge_types(newer, older)           # our own forward edge is the only thing written
+
+
+@pytest.mark.parametrize("op", ["bootstrap_digest", "replace_digest"])
+def test_a_digest_that_appears_while_the_embedding_is_computed_makes_the_insert_write_nothing(store, tmp_path, monkeypatch, op):
+    c = pm("cited")
+    p = old_digest() if op == "replace_digest" else None
+    st = dg("s1", op, [c], supersedes=p) if p else dg("s1", op, [c])
+    plan = dseal([st])
+    real, fired = storage._compute_embedding, []
+    def slow(*a, **k):
+        if not fired:
+            fired.append(1)
+            with storage.connect() as conn:       # a competitor creates its own digest during our embedding
+                storage.add_memory(conn, content="competitor digest", project="memora", tags=["memora/digest"],
+                                   metadata={"kind": "digest", "project": "memora", "digest_of": "tidy", "run": "rival"})
+                conn.commit()
+        return real(*a, **k)
+    n0 = n_memories()
+    monkeypatch.setattr(storage, "_compute_embedding", slow)
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and "stale" in reasons(res)["s1"], res
+    assert n_memories() == n0 + 1                              # only the competitor; ours was never inserted
+    assert all(op_ != "D" for _t, op_, _pk in outbox())
+    assert len(live_digest_ids()) == (2 if p else 1)           # no duplicate live digest from us
+
+
+@pytest.mark.parametrize("how", ["cite_retired", "cite_other_project"])
+def test_a_resume_revalidates_citations_before_it_hides_anything(store, tmp_path, monkeypatch, how):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = ta._edges
+    monkeypatch.setattr(ta, "_edges", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("died")))
+    run(plan, d)
+    monkeypatch.setattr(ta, "_edges", real)
+    with storage.connect() as conn:
+        if how == "cite_retired":
+            newer = pm("newer")
+            dream._guarded_edge(conn, storage, newer, c, "supersedes", c, dream._fresh(conn, c)[1], True)
+        else:
+            storage.update_memory(conn, c, metadata={"project": "clmux"}, embed=False)
+    n1 = n_memories()
+    res = run(plan, d)
+    assert "refused: cited memory" in reasons(res)["s1"] and n_memories() == n1
+    assert p in live_digest_ids() and len(live_digest_ids()) == 2     # P is still live
+
+
+def _forward_only(monkeypatch):
+    real = ta._digest_edge
+    monkeypatch.setattr(ta, "_digest_edge", lambda cx, h, p_, et, g: False if et == "superseded_by" else real(cx, h, p_, et, g))
+    return real
+
+
+def test_a_resume_after_a_forward_only_write_refuses_when_the_loser_was_edited(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = _forward_only(monkeypatch)
+    run(plan, d)
+    monkeypatch.setattr(ta, "_digest_edge", real)
+    with storage.connect() as conn:
+        storage.update_memory(conn, p, tags=["memora/digest", "edited"], embed=False)   # kind and project kept
+    (nid,) = live_digest_ids()
+    res = run(plan, d)
+    assert "superseded_by" not in edge_types(p, nid) and "changed since it was judged" in str(res["applied"][0]), res
+
+
+def test_unchanged_resume_completes_exactly_the_one_missing_edge(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = _forward_only(monkeypatch)
+    run(plan, d)
+    monkeypatch.setattr(ta, "_digest_edge", real)
+    n1 = n_memories()
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 1 and res["counts"]["writes_charged"] == 1 and n_memories() == n1
+    assert res["applied"][0].get("reverse") is True and "forward" not in res["applied"][0]
+
+
+@pytest.mark.parametrize("how", ["loser_edit", "winner_edit", "winner_not_tidy"])
+def test_repair_resume_with_one_live_digest_revalidates_everything(store, tmp_path, monkeypatch, how):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = _forward_only(monkeypatch)
+    run(plan, d)
+    monkeypatch.setattr(ta, "_digest_edge", real)
+    with storage.connect() as conn:
+        if how == "loser_edit":
+            storage.update_memory(conn, older, tags=["memora/digest", "edited"], embed=False)
+        elif how == "winner_edit":
+            storage.update_memory(conn, newer, tags=["memora/digest", "edited"], embed=False)
+        else:
+            storage.update_memory(conn, newer, metadata={"digest_of": "someone"}, embed=False)
+    res = run(plan, d)
+    assert "superseded_by" not in edge_types(older, newer) and res["counts"]["applied"] == 0, res
+
+
+def test_repair_resume_unchanged_completes_the_missing_edge(store, tmp_path, monkeypatch):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = _forward_only(monkeypatch)
+    run(plan, d)
+    monkeypatch.setattr(ta, "_digest_edge", real)
+    res = run(plan, d)
+    assert res["counts"]["applied"] == 1 and "superseded_by" in edge_types(older, newer) and res["counts"]["writes_charged"] == 1
+
+
+# ------------------------------------------------------------------ Item 259 round 1: a partial create is not a committed digest
+
+def _partial_embedding_once(monkeypatch):
+    real, fired = storage._upsert_embedding, []
+    def failing(conn, mid, vec, **kw):
+        if not fired:
+            fired.append(1)
+            conn.commit()                               # an auto-committing backend: the row and its FTS are durable
+            raise RuntimeError("vector store down")
+        return real(conn, mid, vec, **kw)
+    monkeypatch.setattr(storage, "_upsert_embedding", failing)
+
+
+def test_a_partial_bootstrap_create_is_completed_by_the_rerun_not_taken_for_done(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    res = run(plan, d)
+    assert "partial create" in reasons(res)["s1"]
+    (nid,) = live_digest_ids()
+    assert nid not in embeddings()                                   # inserted, but no vector yet
+    n1 = n_memories()
+    again = run(plan, d)
+    assert again["counts"]["applied"] == 1 and again["applied"][0].get("completed") == nid
+    assert nid in embeddings() and n_memories() == n1 and live_digest_ids() == [nid]
+    assert run(plan, d)["counts"]["already_done"] == 1
+    assert all(op != "D" for _t, op, _pk in outbox())
+
+
+def test_a_partial_replace_create_hides_nothing_until_it_is_complete(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    res = run(plan, d)
+    assert "partial create" in reasons(res)["s1"]
+    new = [i for i in live_digest_ids() if i != p]
+    assert len(new) == 1 and p in live_digest_ids() and "supersedes" not in edge_types(new[0], p)
+    n1 = n_memories()
+    again = run(plan, d)
+    assert again["counts"]["applied"] == 1 and n_memories() == n1
+    assert live_digest_ids() == new and new[0] in embeddings() and "superseded_by" in edge_types(p, new[0])
+    assert all(op != "D" for _t, op, _pk in outbox())
+
+
+def test_a_materially_edited_digest_of_the_run_is_not_taken_for_ours(store, tmp_path):
+    c = pm("cited")
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    run(plan, d)
+    (nid,) = live_digest_ids()
+    with storage.connect() as conn:
+        storage.update_memory(conn, nid, metadata={"covers": [999]}, embed=False)
+    n1 = n_memories()
+    res = run(plan, d)
+    assert "stale" in reasons(res)["s1"] and n_memories() == n1
+
+
+def test_several_matching_live_digests_are_an_ambiguous_state_not_done(store, tmp_path):
+    c = pm("cited")
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    for _ in range(2):
+        with storage.connect() as conn:
+            body = plan["steps"][0]["body"]
+            storage.add_memory(conn, content=body, project="memora", tags=["memora/digest"],
+                               metadata={**plan["steps"][0]["metadata"], "indexing": {"skip_crossrefs": True}})
+            conn.commit()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert reasons(res)["s1"].startswith("ambiguous")
+
+
+def test_a_malformed_repair_both_list_is_a_shape_refusal(store, tmp_path):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    st = rp("s1", newer, older)
+    st["both"] = [newer, "x"]
+    plan = dseal([st])
+    assert "malformed" in reasons(run(plan, d_dec(plan, tmp_path, ["s1"])))["s1"]
+
+
+# ------------------------------------------------------------------ Item 259 round 2: validated snapshot, citations at create/completion
+
+def _sql_edit(mid, how="content"):
+    """A foreign writer that bypasses the store API (what a concurrent client's raw statement could do)."""
+    with storage.connect() as conn:
+        if how == "content":
+            conn.execute("UPDATE memories SET content = content || ' (edited)', updated_at = '2099-01-01 00:00:00' WHERE id = ?", (mid,))
+        else:
+            conn.execute("UPDATE memories SET tags = '[\"memora/digest\", \"foreign\"]', updated_at = '2099-01-01 00:00:00' WHERE id = ?", (mid,))
+        conn.commit()
+
+
+def test_repair_winner_edited_right_after_the_caller_verified_it_hides_nothing(store, tmp_path, monkeypatch):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    plan = dseal([rp("s1", newer, older)])
+    real = ta._edges
+    def racing(cx, step, win, lose, check, *extra):
+        _sql_edit(win)
+        return real(cx, step, win, lose, check, *extra)
+    monkeypatch.setattr(ta, "_edges", racing)
+    o0 = len(outbox())
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and "state sha" in reasons(res)["s1"]
+    assert sorted(live_digest_ids()) == sorted([older, newer]) and not ({"supersedes", "superseded_by"} & (edge_types(newer, older) | edge_types(older, newer)))
+
+
+@pytest.mark.parametrize("phase", ["after_create", "on_resume"])
+def test_replace_winner_edited_after_create_or_identification_hides_nothing(store, tmp_path, monkeypatch, phase):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    d = d_dec(plan, tmp_path, ["s1"])
+    real = ta._edges
+    def racing(cx, step, win, lose, check, *extra):
+        _sql_edit(win)
+        return real(cx, step, win, lose, check, *extra)
+    if phase == "on_resume":
+        monkeypatch.setattr(ta, "_edges", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("died")))
+        run(plan, d)
+    monkeypatch.setattr(ta, "_edges", racing)
+    res = run(plan, d)
+    new = [i for i in live_digest_ids() if i != p]
+    if phase == "after_create":
+        assert "no longer this step's sealed digest" in str(res["applied"][0])
+        assert len(new) == 1 and "supersedes" not in edge_types(new[0], p)
+    else:
+        assert "no longer this step's sealed digest" in str(res["applied"][0])
+    assert p in live_digest_ids() and "superseded_by" not in edge_types(p, new[0])
+
+
+@pytest.mark.parametrize("how", ["cite_retired", "cite_moved"])
+def test_a_partial_bootstrap_is_not_completed_after_a_citation_stopped_being_valid(store, tmp_path, monkeypatch, how):
+    c, newer = pm("cited"), pm("newer")
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    run(plan, d)
+    (nid,) = live_digest_ids()
+    with storage.connect() as conn:
+        if how == "cite_retired":
+            dream._guarded_edge(conn, storage, newer, c, "supersedes", c, dream._fresh(conn, c)[1], True)
+        else:
+            storage.update_memory(conn, c, metadata={"project": "clmux"}, embed=False)
+    res = run(plan, d)
+    assert "refused: cited memory" in reasons(res)["s1"] and res["counts"]["applied"] == 0 and nid not in embeddings()
+
+
+@pytest.mark.parametrize("op", ["bootstrap_digest", "replace_digest"])
+@pytest.mark.parametrize("how", ["cite_retired", "cite_moved"])
+def test_a_citation_that_stops_being_valid_during_the_embedding_makes_the_insert_write_nothing(store, tmp_path, monkeypatch, op, how):
+    c = pm("cited")
+    p = old_digest() if op == "replace_digest" else None
+    plan = dseal([dg("s1", op, [c], supersedes=p) if p else dg("s1", op, [c])])
+    real, fired = storage._compute_embedding, []
+    def slow(*a, **k):
+        if not fired:
+            fired.append(1)
+            with storage.connect() as conn:
+                if how == "cite_retired":
+                    dream._guarded_edge(conn, storage, pm("newer"), c, "supersedes", c, dream._fresh(conn, c)[1], True)
+                else:
+                    storage.update_memory(conn, c, metadata={"project": "clmux"}, embed=False)
+        return real(*a, **k)
+    monkeypatch.setattr(storage, "_compute_embedding", slow)
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and "stale" in reasons(res)["s1"]
+    assert len(live_digest_ids()) == (1 if p else 0) and (p is None or live_digest_ids() == [p])
+
+
+def test_the_reindex_of_a_partial_create_is_refused_when_the_row_was_edited_meanwhile(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    plan = dseal([dg("s1", "bootstrap_digest", [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    run(plan, d)
+    (nid,) = live_digest_ids()
+    real = storage.update_memory
+    def racing(conn, mid, **kw):
+        _sql_edit(mid, "tags")                              # a foreign edit between our read and the guarded reindex
+        return real(conn, mid, **kw)
+    monkeypatch.setattr(storage, "update_memory", racing)
+    res = run(plan, d)
+    assert "changed during the completion" in reasons(res)["s1"] and nid not in embeddings()
+    assert "foreign" in mem(nid).tags and res["counts"]["applied"] == 0
+
+
+def test_the_store_checks_the_retirement_the_same_way_in_sql_as_in_python(store):
+    a, b = pm("a"), pm("b")
+    cx = type("C", (), {})()
+    cx.st = storage
+    with storage.connect() as conn:
+        sql = ta._retired_sql(cx, "m.id")
+        def sql_retired(mid):
+            return bool(conn.execute("SELECT " + sql + " FROM memories m WHERE m.id = ?", (mid,)).fetchone()[0])
+        assert not sql_retired(a) and not dream._retired(conn, a, storage)
+        dream._guarded_edge(conn, storage, b, a, "supersedes", a, dream._fresh(conn, a)[1], True)
+        assert sql_retired(a) and dream._retired(conn, a, storage)
+        x, y = pm("x"), pm("y")
+        raw = dream._fresh(conn, y)[1]                       # reverse-only: y says it is superseded_by x, no forward edge
+        dream._guarded_edge(conn, storage, y, x, "superseded_by", y, raw, False)
+        assert sql_retired(y) and dream._retired(conn, y, storage)
+
+
+# ------------------------------------------------------------------ Item 259 round 3: the completion write carries the state
+
+def _during_next_embedding(monkeypatch, how, c, newer):
+    real, fired = storage._compute_embedding, []
+    def hooked(*a, **k):
+        if not fired:
+            fired.append(1)
+            with storage.connect() as conn:
+                if how == "cite_retired":
+                    dream._guarded_edge(conn, storage, newer, c, "supersedes", c, dream._fresh(conn, c)[1], True)
+                elif how == "cite_moved":
+                    storage.update_memory(conn, c, metadata={"project": "clmux"}, embed=False)
+                else:
+                    storage.add_memory(conn, content="competitor digest", project="memora", tags=["memora/digest"],
+                                       metadata={"kind": "digest", "project": "memora", "digest_of": "tidy", "run": "rival"})
+                conn.commit()
+        return real(*a, **k)
+    monkeypatch.setattr(storage, "_compute_embedding", hooked)
+    return real
+
+
+@pytest.mark.parametrize("op", ["bootstrap_digest", "replace_digest"])
+@pytest.mark.parametrize("how", ["cite_retired", "cite_moved", "competing"])
+def test_completion_embedding_race_on_a_citation_or_the_live_set_refuses_completion_and_hiding(store, tmp_path, monkeypatch, op, how):
+    c, newer = pm("cited"), pm("newer")
+    p = old_digest() if op == "replace_digest" else None
+    plan = dseal([dg("s1", op, [c], supersedes=p) if p else dg("s1", op, [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    run(plan, d)
+    nid = [i for i in live_digest_ids() if i != p][0]
+    real = _during_next_embedding(monkeypatch, how, c, newer)
+    res = run(plan, d)                                              # the replay: its completion embedding is the race
+    assert res["counts"]["applied"] == 0 and "during the completion" in reasons(res)["s1"], res
+    if how != "competing":          # the competitor's own create back-fills missing vectors of its neighbours itself
+        assert nid not in embeddings(), "an invalid partial digest was promoted"
+    if p:
+        assert p in live_digest_ids() and "superseded_by" not in edge_types(p, nid) and "supersedes" not in edge_types(nid, p)
+    assert all(op_ != "D" for _t, op_, _pk in outbox())
+    monkeypatch.setattr(storage, "_compute_embedding", real)
+
+
+@pytest.mark.parametrize("op", ["bootstrap_digest", "replace_digest"])
+def test_completion_unchanged_completes_the_same_id_and_a_third_replay_adds_nothing(store, tmp_path, monkeypatch, op):
+    c = pm("cited")
+    p = old_digest() if op == "replace_digest" else None
+    plan = dseal([dg("s1", op, [c], supersedes=p) if p else dg("s1", op, [c])])
+    d = d_dec(plan, tmp_path, ["s1"])
+    _partial_embedding_once(monkeypatch)
+    run(plan, d)
+    nid = [i for i in live_digest_ids() if i != p][0]
+    n1 = n_memories()
+    assert run(plan, d)["counts"]["applied"] == 1
+    assert nid in embeddings() and n_memories() == n1 and live_digest_ids() == [nid]
+    n2, o2 = n_memories(), len(outbox())
+    third = run(plan, d)
+    assert third["counts"]["applied"] == 0 and n_memories() == n2 and len(outbox()) == o2
+    assert all(op_ != "D" for _t, op_, _pk in outbox())

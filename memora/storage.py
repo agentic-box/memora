@@ -541,6 +541,10 @@ class ConcurrentUpdateError(RuntimeError):
     was retired) after the caller checked it. Nothing was written."""
 
 
+class CreateGuardRefused(ValueError):
+    """add_memory(insert_guard=...): the guard predicate was false at the INSERT, so nothing was written."""
+
+
 class MemoryWriteError(Exception):
     """Raised when add_memory fails after allocating a row id (partial insert)."""
 
@@ -5814,8 +5818,13 @@ def add_memory(
     corpus: Optional[_CorpusSnapshot] = None,
     project: Optional[str] = None,
     system_tags: Optional[List[str]] = None,
+    insert_guard: Optional[Tuple[str, Sequence[Any]]] = None,
 ) -> Dict[str, Any]:
     """Create a memory.
+
+    insert_guard: (SQL predicate, params). The INSERT then is `INSERT ... SELECT ... WHERE <predicate>`, ONE
+    statement, so the predicate and the insert are atomic; when it is false nothing is written and
+    CreateGuardRefused is raised (before any index or vector write). Not for image memories. Default: unchanged.
 
     system_tags: typed tags a memora tool adds itself ("issues",
     "<project>/documents", ...; _system_typed_tags) -- exempt from the tag
@@ -5857,6 +5866,8 @@ def add_memory(
         meta_for_embed["absorb_nonce"] = absorb_nonce
     if absorb_operation_key:
         meta_for_embed["absorb_operation_key"] = absorb_operation_key
+    if insert_guard is not None and has_images:
+        raise ValueError("insert_guard is not supported for memories with images")
     prepared_for_embed = _prepare_metadata(
         {k: v for k, v in meta_for_embed.items() if k != "images"} if has_images else meta_for_embed
     )
@@ -5920,10 +5931,19 @@ def add_memory(
                 prepared_metadata["absorb_operation_key"] = absorb_operation_key
             metadata_json = json.dumps(prepared_metadata, ensure_ascii=False) if prepared_metadata else None
             now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-            cur = conn.execute(
-                "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
-                (content, metadata_json, tags_json, now),
-            )
+            if insert_guard is not None:
+                cur = conn.execute(
+                    "INSERT INTO memories (content, metadata, tags, created_at) SELECT ?, ?, ?, ? WHERE "
+                    + insert_guard[0],
+                    (content, metadata_json, tags_json, now, *insert_guard[1]),
+                )
+                if getattr(cur, "rowcount", 1) == 0:
+                    raise CreateGuardRefused("the insert guard was false; nothing was written")
+            else:
+                cur = conn.execute(
+                    "INSERT INTO memories (content, metadata, tags, created_at) VALUES (?, ?, ?, ?)",
+                    (content, metadata_json, tags_json, now),
+                )
             memory_id = cur.lastrowid
             if owned_ids is not None and memory_id is not None:
                 owned_ids.append(int(memory_id))
@@ -8829,6 +8849,7 @@ def update_memory(
     replace_metadata: bool = False,
     expected_row: Optional[Mapping[str, Any]] = None,
     force_reindex: bool = False,
+    update_guard: Optional[Tuple[str, Sequence[Any]]] = None,
     commit: bool = True,
     embed: bool = True,
 ) -> Optional[Dict[str, Any]]:
@@ -8931,11 +8952,12 @@ def update_memory(
             "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ? "
             # A forward-only supersedes edge (add_link bidirectional=False)
             # lives only in the SUPERSEDING memory's crossrefs row.
-            "AND NOT EXISTS (" + _SUPERSEDES_EDGE_TO_SQL + ")",
+            "AND NOT EXISTS (" + _SUPERSEDES_EDGE_TO_SQL + ")"
+            + (" AND " + update_guard[0] if update_guard is not None else ""),
             (new_content, metadata_json, tags_json, now, memory_id,
              expected_row["content"], expected_row["metadata"], expected_row["tags"],
              expected_row["updated_at"], memory_id, memory_id, memory_id, expected_row["related"],
-             memory_id),
+             memory_id, *(update_guard[1] if update_guard is not None else ())),
         )
         if getattr(cur, "rowcount", None) == 0:
             raise ConcurrentUpdateError(

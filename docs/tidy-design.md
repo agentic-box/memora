@@ -1,9 +1,9 @@
 # The tidy pass (Item 251): design
 
 > **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in sections 13 and 14, v0.5.7.11 and v0.5.7.12).
-> **Phase 4 is partly implemented** (Item 255, v0.5.7.12, `memora/tidy_apply.py`, section 15): `--apply` writes only the
-> metadata-only steps `set_project`, `link` and add-only `retag`. Merges, retires and the digest steps
-> (`bootstrap_digest`, `replace_digest`, `repair_digest`) are still not applied. Names marked *(new)* were new at
+> **Phase 4 is partly implemented** (`memora/tidy_apply.py`): `--apply` writes the metadata-only steps `set_project`,
+> `link` and add-only `retag` (Item 255, section 15) and the three digest steps `bootstrap_digest`, `replace_digest`,
+> `repair_digest` (Item 259, section 16). Merges and retires are still not applied. Names marked *(new)* were new at
 > design time; line numbers are those of v0.5.7.9. Where the implementation differs from this design,
 > section 12 says how and why.
 >
@@ -550,3 +550,41 @@ opposite of its quote. Two causes, two fixes.
   with step ids and reasons, plus counts. Rerunning the same plan and decisions applies nothing: finished steps are
   skipped as "already done".
 - **Not here.** Merge, retire, the digest steps, `approve_statements`, and the success measures of section 9.
+
+## 16. Item 259: the apply step, the project digest (sections 6.2 to 6.4)
+
+- **Ops.** `bootstrap_digest`, `replace_digest`, `repair_digest`, each with the state guard of 6.4 re-read over the
+  project's live digests at apply time (live = kind digest, this project, not retired by any source the store honours).
+  Bootstrap: none live. Replace: exactly `{P}`, `P` still its judged row. Repair: exactly the two sealed ids, both still
+  judged, both tidy-made, the winner later. Any other state writes nothing and is "stale". Charges 1, 3, 2.
+- **First create in apply.** The digest goes through `storage.add_memory` (embedding computed like any create; this is
+  the one apply that needs the embedding environment). No absorb, dedup, suggestion or model call; the similarity
+  crossref pass is switched off for the row (`indexing.skip_crossrefs`), so no automatic `related_to` edge appears. The
+  outbox gets `I`/`U` rows, never `D`. Supersession is the two guarded edges of 6.4, `dream._guarded_edge` for both; the old
+  digest is never deleted or edited.
+- **Approval.** The dry run marks digest steps `needs_approval: false` (section 6.4's repair had said so too). The
+  apply approves a digest step **by id only**, regardless of the flag, and refuses a decisions file whose `approve_ops`
+  names a digest op.
+- **Dependencies and citations (6.2, 6.3).** `depends_on` not committed (a `merge` is unsupported, so never) gives
+  `deferred: dependency sN`. A symbolic `@c` citation, in `cites` or the body, is refused (only merges make them).
+  Numbered citations must be live memories of the project at apply time, else the step is refused; the body is never rewritten.
+- **Idempotence.** The live digest of the same run and body is recognised in the store: bootstrap and replace reruns are
+  "already done"; a rerun after a crash between the create and the edges writes the missing edges and creates nothing
+  (6.4 table rows 3 and 5 are resumed directly instead of waiting for a `repair_digest`). The created id is also kept in the replay journal.
+- **Round 1 (review).** Every digest write is one statement carrying the exact expected state of its phase (create:
+  `add_memory(insert_guard=)`, an atomic conditional insert; forward edge: both rows, no superseder, live set within
+  the pair; reverse edge: the loser's only superseder is the winner, winner unchanged and unhidden). A partial create (row
+  inserted, vector or index missing) is completed by the rerun before anything is hidden, and "ours" requires the sealed
+  metadata, tags and body. Resumes revalidate citations and all judged rows.
+- **Round 2 (review).** The snapshot that is validated is the snapshot the statement guards authorise (no refresh
+  between check and guard); citations are part of the conditional insert; completing a partial create requires valid
+  citations and is guarded by `expected_row`; one SQL retirement predicate (tombstone, `supersedes` edge, `superseded_by`
+  naming a live memory) serves every statement.
+- **Round 3 (review).** The completion of a partial create carries the same operation state as the insert: the reindex
+  computes its embedding before its UPDATE, so `storage.update_memory(update_guard=)` appends citations, the live-digest
+  set (and for a replacement the expected old digest) to the exact-row UPDATE; the forward edge of a replacement also
+  requires the citations.
+- **Derived metadata.** The store canonicalises metadata on every update (`section`/`subsection` become
+  `hierarchy.path`). `set_project` and `retag` now compute the expected post-write row with the store's own
+  canonicaliser, so a correct write is no longer reported as an `anomaly` (the live Item 255 run reported 17). The
+  journal's parent directory is fsynced after the rename.
