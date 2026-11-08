@@ -85,17 +85,27 @@ def load_queries(path: str) -> List[Dict[str, Any]]:
 # --------------------------------------------------------------------------- the checks
 
 
+def _tombstoned(conn: Any) -> set:
+    gone: set = set()
+    for t in ("tombstones", "tombstone_components"):
+        try:
+            gone.update(r[0] for r in conn.execute(f"SELECT memory_id FROM {t}"))
+        except Exception:  # noqa: BLE001 - an unmigrated copy has no such table
+            pass
+    return gone
+
+
 def forward_successors(conn: Any) -> Dict[int, List[int]]:
-    """old id -> ids of LIVE memories holding a forward-only ``supersedes`` edge to it. Storage's
-    follow="active" does not hide such an old memory, but the tidy helpers (``tidy.retired_ids``) treat it as
-    retired. A holder that is itself tombstoned or superseded is not a live successor and is left out."""
-    from . import tidy  # noqa: PLC0415
+    """old id -> ids of memories holding a forward-only ``supersedes`` edge to it. Storage's follow="active"
+    does not hide such an old memory, but the tidy helpers treat it as retired. Only a TOMBSTONED holder is
+    left out: a holder that is itself superseded stays, because the route to the current version may run
+    through it (A <- B <- C, all forward-only). Liveness is decided at the leaves (``accepted_ids``)."""
     mems = dream.load_memories(conn)
     live = {m.id for m in mems}
-    gone = tidy.retired_ids(conn, mems)
+    dead = _tombstoned(conn)
     out: Dict[int, List[int]] = {}
     for m in mems:
-        if m.id in gone:
+        if m.id in dead:
             continue
         for ref in m.refs:
             if ref.get("edge_type") == "supersedes" and ref.get("id") in live and ref.get("id") != m.id:
@@ -104,24 +114,28 @@ def forward_successors(conn: Any) -> Dict[int, List[int]]:
 
 
 def accepted_ids(conn: Any, expected: int, fwd: Optional[Dict[int, List[int]]] = None) -> List[int]:
-    """The ids that count as a hit for an expected id: itself when it is live, else its live successors,
-    never a retired predecessor. Live means: not tombstoned, no ``superseded_by`` leaf beyond it
-    (``_resolve_latest``), and no live forward-only ``supersedes`` holder (``forward_successors``). So with
-    B --supersedes--> A (either edge representation) only B is accepted, even when the search still lists A
-    (the search is not changed: a top five holding only A is then a miss). A memory with no live successor
-    chain accepts nothing."""
+    """The ids that count as a hit for an expected id: the LIVE LEAVES of its supersession graph, never a
+    retired predecessor. The graph unions both edge forms: ``superseded_by`` chains (``_resolve_latest``) and
+    forward-only ``supersedes`` holders (``forward_successors``), followed through any number of hops and
+    mixed. A leaf is a memory that exists, is not tombstoned, has no ``superseded_by`` leaf beyond it and no
+    forward-only holder. Branches yield several leaves. A memory with no leaf (retired with no successor, or a
+    forward-only cycle, where every node has a successor) accepts nothing, so the query can only miss."""
     from . import storage  # noqa: PLC0415
     fwd = forward_successors(conn) if fwd is None else fwd
     seen: set = set()
     stack = [expected]
+    leaves = set()
     while stack:
         n = stack.pop()
         if n in seen:
             continue
         seen.add(n)
-        stack.extend(storage._resolve_latest(conn, n))
-        stack.extend(fwd.get(n, []))
-    return sorted(n for n in seen if storage._resolve_latest(conn, n) == [n] and not fwd.get(n))
+        nxt = [x for x in storage._resolve_latest(conn, n) if x != n] + list(fwd.get(n, []))
+        if nxt:
+            stack.extend(nxt)
+        elif storage._resolve_latest(conn, n) == [n]:
+            leaves.add(n)
+    return sorted(leaves)
 
 
 def live_digest_ids(conn: Any, project: str) -> List[int]:

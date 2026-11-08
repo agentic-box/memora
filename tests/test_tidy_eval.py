@@ -333,3 +333,55 @@ def test_wal_copy_with_sidecars_is_read_or_refused_never_changed(store, tmp_path
         assert (p.parent / "m.db-wal").read_bytes() == wal_before
     finally:
         w.close()
+
+
+def _graph(store):
+    """A, B, C, ids in a fresh corpus-free store."""
+    return [add(f"kiwi orchard irrigation schedule v{i}") for i in (1, 2, 3)]
+
+
+def test_all_forward_chain_reaches_the_current_leaf(store):
+    a, b, c = _graph(store)
+    fwd_link(b, a)
+    fwd_link(c, b)
+    assert accepted(store, a) == [c] and accepted(store, b) == [c]
+
+
+def test_forward_first_hop_then_bidirectional(store):
+    a, b, c = _graph(store)
+    fwd_link(b, a)
+    supersede(b, c)
+    assert accepted(store, a) == [c]
+
+
+def test_bidirectional_first_hop_then_forward(store):
+    a, b, c = _graph(store)
+    supersede(a, b)
+    fwd_link(c, b)
+    assert accepted(store, a) == [c]
+
+
+def test_branching_forward_chain_yields_both_leaves(store):
+    a, b, c = _graph(store)
+    d = add("kiwi orchard irrigation schedule v4")
+    fwd_link(b, a)
+    fwd_link(c, b)
+    fwd_link(d, b)
+    assert accepted(store, a) == sorted([c, d])
+
+
+def test_superseded_holder_with_live_successor(store):
+    a, b, c = _graph(store)
+    fwd_link(b, a)
+    fwd_link(c, b)
+    with storage.connect() as conn:         # C goes away alone: B is the newest live version again
+        conn.execute("INSERT INTO tombstone_components (memory_id, content_hash, reason) VALUES (?, 'h', 'test')", (c,))
+        conn.commit()
+    assert accepted(store, a) == [b]
+
+
+def test_forward_cycle_accepts_nothing(store):
+    a, b, _ = _graph(store)
+    fwd_link(b, a)
+    fwd_link(a, b)
+    assert accepted(store, a) == [] and accepted(store, b) == []
