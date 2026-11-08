@@ -25,7 +25,6 @@ import re
 import sqlite3
 import sys
 import time
-import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -177,7 +176,8 @@ _SENT_END = re.compile(r"([.!?])\s+(?=[A-Z0-9`\"'(\[])")
 
 
 def fold(s: str) -> str:
-    return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", s)).strip()
+    """Whitespace folding ONLY: no Unicode normalisation (cm² and cm2 are different statements)."""
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def _sentences(text: str) -> List[str]:
@@ -211,6 +211,7 @@ def split_statements(content: str) -> List[Stmt]:
     parents: List[Tuple[int, str]] = []
     para: List[Tuple[str, int, int]] = []        # (stripped line, start, end)
     bullet: Optional[Dict[str, Any]] = None
+    loose = False                                 # a blank line since the last bullet
 
     def ctx() -> Tuple[str, ...]:
         return tuple(h for _l, h in headers) + tuple(p for _i, p in parents)
@@ -226,11 +227,16 @@ def split_statements(content: str) -> List[Stmt]:
                 span = (at, at + len(s)) if (len(sents) > 1 and at >= 0 and at + len(s) <= end) else (start, end)
                 out.append(Stmt(len(out), s, ctx(), span))
             para = []
+            if out and out[-1].text.endswith(":"):
+                parents.clear()
+                parents.append((-1, out[-1].text))      # a paragraph ending in ':' scopes the list below it
 
     def flush_bullet() -> None:
         nonlocal bullet
         if bullet is not None:
             text = fold(" ".join(bullet["lines"]))
+            if text and bullet["marker"][:1].isdigit():
+                text = f"{bullet['marker']} {text}"      # a numbered item keeps its number: order is meaning
             if text:
                 while parents and parents[-1][0] >= bullet["indent"]:
                     parents.pop()
@@ -246,7 +252,7 @@ def split_statements(content: str) -> List[Stmt]:
         if not stripped:
             flush_para()
             flush_bullet()
-            parents.clear()
+            loose = True
             continue
         if stripped.startswith("|"):
             raise Unsupported("table")
@@ -258,6 +264,7 @@ def split_statements(content: str) -> List[Stmt]:
             flush_para()
             flush_bullet()
             parents.clear()
+            loose = False
             lvl = len(hm.group(1))
             while headers and headers[-1][0] >= lvl:
                 headers.pop()
@@ -267,7 +274,11 @@ def split_statements(content: str) -> List[Stmt]:
             flush_para()
             flush_bullet()
             indent = len(bm.group(1).expandtabs(4))
-            bullet = {"indent": indent, "lines": [bm.group(3)], "start": start + len(bm.group(1)), "end": end}
+            if loose and any(pi >= 0 and pi < indent for pi, _t in parents):
+                raise Unsupported("loose nested list")    # flattening it would drop the scope of the child
+            loose = False
+            bullet = {"indent": indent, "lines": [bm.group(3)], "marker": bm.group(2),
+                      "start": start + len(bm.group(1)), "end": end}
             continue
         if bullet is not None and (len(raw) - len(raw.lstrip())) > bullet["indent"]:
             bullet["lines"].append(stripped)
@@ -275,6 +286,7 @@ def split_statements(content: str) -> List[Stmt]:
             continue
         flush_bullet()
         parents.clear()
+        loose = False
         para.append((stripped, start + (len(raw) - len(raw.lstrip())), end))
     flush_para()
     flush_bullet()
@@ -691,8 +703,8 @@ def validate_retag(r: Dict[str, Any], ctx: ClusterCtx) -> Optional[str]:
     for t in r["remove"]:
         if t not in m.tags:
             return f"tag {t!r} is not on memory {m.id}"
-    if r["remove"] and r["id"] in ctx.protected:
-        return "a protected memory is retagged by adding only"
+    if r["remove"] and (r["id"] in ctx.protected or ctx.stmts.get(r["id"]) is None):
+        return "a protected or context-only memory is retagged by adding only"
     if not r["add"] and not r["remove"]:
         return "empty retag"
     return None
@@ -1051,15 +1063,15 @@ def revalidate_step(step: Dict[str, Any], lookup: Callable[[int], Optional[Tuple
         if dep not in set(done_steps):
             problems.append(f"dependency_not_applied:{dep}")
     for c in step.get("cites", []):
-        if isinstance(c, str):
-            if c not in resolved:
-                problems.append(f"symbol_not_committed:{c}")
-        else:
-            got = lookup(int(c))
-            if got is None or got[1]:
-                problems.append(f"cited_missing_or_retired:{c}")
-            elif got[0].metadata.get("project") != project:
-                problems.append(f"cited_other_project:{c}")
+        if isinstance(c, str) and c not in resolved:
+            problems.append(f"symbol_not_committed:{c}")
+            continue
+        real = resolved[c] if isinstance(c, str) else c     # a resolved symbol is not evidence: look it up too
+        got = lookup(int(real))
+        if got is None or got[1]:
+            problems.append(f"cited_missing_or_retired:{c}")
+        elif got[0].metadata.get("project") != project:
+            problems.append(f"cited_other_project:{c}")
     for sym in symbols_in(step.get("body", "")):
         if sym not in resolved and sym != step.get("create"):
             problems.append(f"symbol_not_committed:{sym}")
@@ -1137,7 +1149,11 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
     proj_all = [m for m in mems if m.metadata.get("project") == project and m.id not in retired]
     digests = live_digests(proj_all, project)
     d_op, d_info = digest_state(digests)
-    calls = _Calls(lim.max_llm_calls, reserve_digest=d_op in ("bootstrap_digest", "replace_digest"))
+    digest_charge = {"bootstrap_digest": 1, "replace_digest": 3, "repair_digest": 2}.get(d_op, 0)
+    d_deferred = digest_charge > lim.max_writes            # the sealed plan must never exceed max_writes
+    if d_deferred:
+        digest_charge = 0
+    calls = _Calls(lim.max_llm_calls, reserve_digest=d_op in ("bootstrap_digest", "replace_digest") and not d_deferred)
     clusterable = [m for m in proj_all if m.metadata.get("kind") != "digest"]
     vocab = project_vocab(proj_all, project)
     gone = set(retired)
@@ -1154,7 +1170,6 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
     counts_op = {"merge": 0, "retire": 0, "link": 0, "retag": 0}
     caps = {"merge": lim.max_merges, "retire": lim.max_retires, "link": lim.max_links, "retag": lim.max_retags}
     writes = 0
-    digest_charge = {"bootstrap_digest": 1, "replace_digest": 3, "repair_digest": 2}.get(d_op, 0)
     write_budget = lim.max_writes - digest_charge
     sym_n = 0
     sources_out: Dict[str, Any] = {}
@@ -1294,7 +1309,9 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
     digest_input: Dict[str, Any] = {"considered": 0, "included": 0, "excluded": 0, "chars": 0}
     digest_step = None
     review: List[Dict[str, Any]] = []
-    if d_op == "review":
+    if d_deferred:
+        deferred.append({"cluster": None, "op": d_op, "reason": "cap:max_writes"})
+    elif d_op == "review":
         review.append({"kind": "digests", "ids": [m.id for m in digests],
                        "reason": "not zero, one, or two tidy-made live digests: leader decision"})
     elif d_op == "repair_digest":

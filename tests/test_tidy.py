@@ -72,6 +72,46 @@ def test_splitter_sentences_bullets_headers_and_context():
     assert a.text == b.text and a.key() != b.key()
 
 
+def test_identity_is_whitespace_folding_only_cm2_is_not_cm_squared():
+    a, b = M(1, "Measure in cm\u00b2."), M(2, "Measure in cm2.")
+    assert split_statements(a.content)[0].key() != split_statements(b.content)[0].key()
+    e = merge_entry([1, 2], "Measure in cm2.", [row((1, 0), "duplicate", of=(2, 0)), row((2, 0), "kept", 0)])
+    assert "not word for word equal" in vmerge(e, a, b)[1]
+    e = merge_entry([1, 2], "Measure in cm\u00b2.", [row((1, 0), "kept", 0), row((2, 0), "duplicate", of=(1, 0))])
+    assert "not word for word equal" in vmerge(e, a, b)[1]
+    assert split_statements("a   b\n c")[0].text == "a b c"       # whitespace still folds
+
+
+def test_scope_survives_lists_or_the_form_is_unsupported():
+    scoped = "- Only in staging:\n\n  - Disable authentication."          # loose nested list
+    with pytest.raises(Unsupported, match="loose nested"):
+        split_statements(scoped)
+    tight = split_statements("- Only in staging:\n  - Disable authentication.")
+    assert tight[1].ctx == ("Only in staging:",)
+    flat = split_statements("- Only in staging:\n- Disable authentication.")
+    assert tight[1].key() != flat[1].key()
+    lead = split_statements("Only in staging:\n\n- Disable authentication.\n- Skip tls.")
+    assert [s.ctx for s in lead[1:]] == [("Only in staging:",)] * 2
+    assert lead[1].key() != split_statements("- Disable authentication.")[0].key()
+    assert split_statements("Rules:\n- a\n\n# New\n- b")[-1].ctx == ("New",)
+    assert [s.text for s in split_statements("1. a\n2. b")] == ["1. a", "2. b"]
+    # negative controls through the validators, with the inventories
+    a = M(1, scoped.replace("\n\n", "\n"))
+    b = M(2, "- Only in staging:\n- Disable authentication.", created="2026-02-01 00:00:00")
+    inv = [(s.text, s.ctx) for s in split_statements(a.content)], [(s.text, s.ctx) for s in split_statements(b.content)]
+    assert inv[0][1] == ("Disable authentication.", ("Only in staging:",))
+    assert inv[1][1] == ("Disable authentication.", ())
+    e = merge_entry([1, 2], b.content, [row((1, 0), "kept", 0), row((1, 1), "kept", 1),
+                                        row((2, 0), "duplicate", of=(1, 0)), row((2, 1), "duplicate", of=(1, 1))])
+    assert "word for word" in vmerge(e, a, b)[1]                                   # merge: not eligible
+    red = {"id": 1, "by": 2, "why": "redundant", "replaces": []}
+    _, p = tidy.validate_cluster_answer(ans(retire=[red], keep=keep(2)), ctx_of(a, b))
+    assert "not redundant" in p                                                     # retire: not redundant
+    loose_src = M(3, scoped)                                                        # the loose form itself
+    _, p = tidy.validate_cluster_answer(ans(retire=[{**red, "id": 3}], keep=keep(2)), ctx_of(loose_src, b))
+    assert "unsupported form" in p
+
+
 @pytest.mark.parametrize("bad", ["```\ncode\n```", "| a | b |\n|---|---|", "<b>x</b>", "\tcode", "    indented code",
                                  "a\x00b", "x" * (tidy.NOTE_CAP + 1), "   ", "line\r\nline"])
 def test_splitter_fails_closed_on_unsupported_forms(bad):
@@ -270,6 +310,9 @@ def test_retag_stays_in_vocabulary_and_protected_is_add_only():
     p = M(1, "Use X.", tags=["misc"], meta={"kind": "decision"})
     assert "adding only" in tidy.validate_retag(ok, ctx_of(p, M(2, "y"), vocab={"clmux/x", "misc"}))
     assert tidy.validate_retag({**ok, "remove": []}, ctx_of(p, M(2, "y"), vocab={"clmux/x", "misc"})) is None
+    u = M(1, "```\nx\n```", tags=["misc"])                                        # context-only: add only
+    assert "adding only" in tidy.validate_retag(ok, ctx_of(u, M(2, "y"), vocab={"clmux/x", "misc"}))
+    assert tidy.validate_retag({**ok, "remove": []}, ctx_of(u, M(2, "y"), vocab={"clmux/x", "misc"})) is None
 
 
 # ----------------------------------------------------------------------------- grouping (2)
@@ -429,6 +472,22 @@ def test_caps_defer_steps_and_the_write_charge_is_pruned_before_sealing():
     assert rep["deferred_clusters"] == ["c1"] and rep["stopped_by"] == "max_clusters"
 
 
+def test_the_digest_charge_never_exceeds_max_writes():
+    for cap, charge in ((0, 1), (1, 3)):
+        mems = world() + ([] if charge == 1 else [M(801, "d", meta={"kind": "digest", "digest_of": "tidy"})])
+        rep = run(Fake(), mems, max_writes=cap)
+        assert rep["counts"]["charge"] <= cap and all(s["op"] not in ("bootstrap_digest", "replace_digest")
+                                                      for s in rep["steps"])
+        assert {"cluster": None, "op": "bootstrap_digest" if charge == 1 else "replace_digest",
+                "reason": "cap:max_writes"} in rep["deferred"]
+    dg = [M(801, "d", meta={"kind": "digest", "digest_of": "tidy"}),
+          M(905, "d", meta={"kind": "digest", "digest_of": "tidy"}, created="2026-02-01 00:00:00")]
+    rep = run(Fake(), world() + dg, max_writes=1)                     # repair costs 2
+    assert all(s["op"] != "repair_digest" for s in rep["steps"]) and rep["counts"]["charge"] <= 1
+    rep = run(Fake(), world() + dg, max_writes=2)
+    assert rep["steps"][-1]["op"] == "repair_digest" and rep["counts"]["charge"] <= 2
+
+
 def test_judge_unavailable_makes_a_report_with_no_proposals():
     cfg = TidyConfig(limits=TidyLimits())
     rep = tidy.run_tidy(world(), EMB, set(), cfg, "clmux", None, None, now=1.0, judge_note="unavailable: x")
@@ -532,7 +591,7 @@ def look(mems, retired=()):
 
 
 def test_revalidate_step_checks_every_expectation_citation_and_dependency():
-    mems = [M(1, "a"), M(2, "b", meta={"kind": "decision"}), M(3, "c", project="other")]
+    mems = [M(1, "a"), M(2, "b", meta={"kind": "decision"}), M(3, "c", project="other"), M(7, "seven")]
     step = {"op": "merge", "expect": {"1": mems[0].state_sha}, "depends_on": ["s1"], "cites": [1, "@c1"],
             "body": "x @c1 @c2", "create": "@c9"}
     assert tidy.revalidate_step(step, look(mems), {"@c1": 7}, ["s1"], "clmux") == ["symbol_not_committed:@c2"]
@@ -544,6 +603,12 @@ def test_revalidate_step_checks_every_expectation_citation_and_dependency():
     cites = dict(step, cites=[1, 3, 9])
     got = tidy.revalidate_step(cites, look(mems, retired={1}), {"@c1": 7, "@c2": 8}, ["s1"], "clmux")
     assert {"cited_missing_or_retired:1", "cited_other_project:3", "cited_missing_or_retired:9"} <= set(got)
+    # a RESOLVED symbolic citation is looked up like a numeric one: committed is not the same as live
+    sym = dict(step, cites=["@c1"], body="", depends_on=[], expect={})
+    assert tidy.revalidate_step(sym, look(mems), {"@c1": 7}, [], "clmux") == []                       # valid control
+    assert tidy.revalidate_step(sym, look(mems), {"@c1": 99}, [], "clmux") == ["cited_missing_or_retired:@c1"]
+    assert tidy.revalidate_step(sym, look(mems, retired={7}), {"@c1": 7}, [], "clmux") == ["cited_missing_or_retired:@c1"]
+    assert tidy.revalidate_step(sym, look(mems), {"@c1": 3}, [], "clmux") == ["cited_other_project:@c1"]
     dg = {"op": "replace_digest", "expect": {"2": mems[1].state_sha}, "depends_on": [], "cites": [], "body": ""}
     assert tidy.revalidate_step(dg, look(mems), {}, [], "clmux") == ["not_a_project_digest:2"]
 
