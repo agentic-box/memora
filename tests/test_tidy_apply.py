@@ -106,7 +106,10 @@ def test_decisions_refuse_wrong_digest_unknown_id_and_malformed(tmp_path):
                       ({"report_digest": plan["digest"], "approve": "s1"}, "list of strings"),
                       ({"report_digest": plan["digest"], "bogus": 1}, "unknown key"),
                       ({"report_digest": plan["digest"], "approve_ops": [{"op": "frob"}]}, "approve_ops"),
-                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "link", "min_confidence": "x"}]}, "min_confidence")):
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "link", "min_confidence": "x"}]}, "min_confidence"),
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "link", "min_confidence": []}]}, "min_confidence"),
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": "link", "min_confidence": {}}]}, "min_confidence"),
+                      ({"report_digest": plan["digest"], "approve_ops": [{"op": ["link"]}]}, "approve_ops")):
         p = tmp_path / "d.json"
         p.write_text(json.dumps(body))
         with pytest.raises(TidyError, match=msg):
@@ -143,9 +146,10 @@ def test_approval_rules(tmp_path):
 def test_nothing_approved_means_nothing_written(store, tmp_path):
     a, b = add("alpha"), add("beta")
     plan = seal([sp("b1", a), lk("s1", a, b), rt("s2", b, ["t"])])
+    before_box, before_emb = outbox(), embeddings()
     res = run(plan, dec_for(plan, tmp_path))
     assert res["counts"]["applied"] == 0 and {s["reason"] for s in res["skipped"]} == {"not approved"}
-    assert outbox() == [r for r in outbox() if True] and mem(a).metadata.get("project") is None
+    assert outbox() == before_box and mem(a).metadata.get("project") is None and embeddings() == before_emb
 
 
 def test_unsupported_ops_are_never_written_even_when_approved(store, tmp_path):
@@ -346,8 +350,10 @@ def test_apply_module_has_no_model_git_network_delete_or_content_edit():
                       r"delete_memory", r"remove_link", r"\bcontent=", r"supersede", r"add_memory",
                       r"sqlite3\.connect"):
         assert not re.search(forbidden, code, re.I), forbidden
-    assert "DELETE " not in code and "INSERT " not in code
-    assert code.count("update_memory(") == 2 and code.count("embed=False") == 2 and "add_link(" in code
+    assert "DELETE " not in code                                  # the only raw SQL writes are the guarded edge statement
+    assert code.count("INSERT INTO memories_crossrefs") == 1 and code.count("UPDATE memories_crossrefs") == 1
+    assert len(re.findall(r"\b(INSERT|UPDATE)\b ", code)) == 2
+    assert code.count("update_memory(") == 2 and code.count("embed=False") == 2 and "_guarded_edge(" in code
 
 
 def test_nothing_in_the_unit_or_run_scripts_contains_apply():
@@ -371,3 +377,141 @@ def test_update_memory_embed_false_keeps_the_vector_and_refreshes_fts_but_defaul
             storage.update_memory(conn, a, content="changed text", embed=False)
         storage.update_memory(conn, a, tags=["t1", "t2"])          # default path computes an embedding
     assert embeddings()[a] != before
+
+
+# ------------------------------------------------------------------ round 1: statement-level link guards, exact aliases,
+# add-only tags, durable replay
+
+def _interfere_on_call(monkeypatch, n, action):
+    """Run `action()` just before the n-th guarded edge statement (1 = forward, 2 = reverse)."""
+    real, calls = ta._guarded_edge, {"n": 0}
+    def wrapper(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == n:
+            action()
+        return real(*a, **k)
+    monkeypatch.setattr(ta, "_guarded_edge", wrapper)
+    return calls
+
+
+def _edge_types(mid, peer):
+    return {r["edge_type"] for r in mem(mid).refs if r["id"] == peer}
+
+
+@pytest.mark.parametrize("phase", [1, 2])
+@pytest.mark.parametrize("kind", ["endpoint_edit", "retirement", "typed_edge"])
+def test_link_interleaving_never_overwrites_or_writes_across_a_concurrent_change(store, tmp_path, monkeypatch, phase, kind):
+    a, b, other = add("a note"), add("b note"), add("other note")
+    plan = seal([lk("s1", a, b, "references")])
+    def action():
+        with storage.connect() as conn:
+            if kind == "endpoint_edit":
+                storage.update_memory(conn, b if phase == 1 else a, tags=["foreign"], embed=False)
+            elif kind == "retirement":
+                storage.add_link(conn, other, b if phase == 1 else a, edge_type="supersedes", bidirectional=False)
+            else:       # a hiding edge between the pair, added by someone else, on the holder of THIS write
+                storage.add_link(conn, a if phase == 1 else b, b if phase == 1 else a, edge_type="supersedes",
+                                 bidirectional=False)
+    _interfere_on_call(monkeypatch, phase, action)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert not res["applied"]
+    if kind == "typed_edge":
+        holder, peer = (a, b) if phase == 1 else (b, a)
+        assert "supersedes" in _edge_types(holder, peer)         # the foreign edge is intact, not replaced
+        assert "references" not in _edge_types(holder, peer) and "extends" not in _edge_types(holder, peer)
+    if phase == 1:
+        assert "references" not in _edge_types(a, b)             # nothing written at all
+    else:
+        assert "references" in _edge_types(a, b) and "referenced_by" not in _edge_types(b, a)   # only the forward half
+
+
+def test_exact_aliases_a_concurrent_edit_between_commit_and_read_blocks_later_steps(store, tmp_path, monkeypatch):
+    a, b = add("a note"), add("b note")
+    plan = seal([rt("s1", a, ["t1"]), rt("s2", a, ["t2"]), lk("s3", a, b)])
+    real = storage.update_memory
+    def racing(conn, mid, **kw):
+        out = real(conn, mid, **kw)
+        if kw.get("tags") and "t1" in kw["tags"]:
+            real(conn, mid, metadata={"foreign": "x"}, embed=False)       # unrelated metadata edit after OUR commit
+        return out
+    monkeypatch.setattr(storage, "update_memory", racing)
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert [x["id"] for x in res["applied"]] == ["s1"] and "anomaly" in res["applied"][0]
+    r = reasons(res)
+    assert "state sha" in r["s2"] and "state sha" in r["s3"]
+    assert "t2" not in mem(a).tags and "references" not in _edge_types(a, b)
+
+
+def test_retag_never_rewrites_an_existing_tag(store, tmp_path):
+    a = add("a note", tags=["architecture"])                      # generic, bare, projectless
+    p = add("p note", tags=["architecture"], meta={"kind": "item-record"})
+    with storage.connect() as conn:                               # the project is set elsewhere, the bare tag stays
+        storage.update_memory(conn, p, metadata={"project": "memora"}, embed=False)
+    assert "architecture" in mem(p).tags
+    plan = seal([sp("b1", a), rt("s1", a, ["extra"]), rt("s2", p, ["extra"])])
+    res = run(plan, dec_for(plan, tmp_path, approve_ops=ALL))
+    assert "architecture" in mem(a).tags and "extra" not in mem(a).tags and "architecture" in mem(p).tags
+    assert "rewrite existing tag" in reasons(res)["s1"] and "rewrite existing tag" in reasons(res)["s2"]
+
+
+def test_replay_after_a_cap_limited_run_completes_the_rest_and_foreign_edits_still_refuse(store, tmp_path):
+    a, b, c, d_ = add("a note"), add("b note"), add("c note"), add("d note")
+    plan = seal([rt("s1", a, ["t"]), lk("s2", a, b), rt("s3", c, ["u"]), lk("s4", c, d_)])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    j = tmp_path / "plan.applied.json"
+    r1 = ta.apply_report(plan, dec, TidyLimits(max_writes=3), journal=j)
+    assert [x["id"] for x in r1["applied"]] == ["s1", "s2"] and {d["id"] for d in r1["deferred"]} == {"s3", "s4"}
+    with storage.connect() as conn:                                # a foreign edit of c after the first run
+        storage.update_memory(conn, c, metadata={"foreign": 1}, embed=False)
+    n = len(outbox())
+    r2 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert {x["id"] for x in r2["skipped"] if x["reason"].startswith("already done")} == {"s1", "s2"}
+    assert "state sha" in reasons(r2)["s3"] and "state sha" in reasons(r2)["s4"]       # foreign edit refuses
+    assert len(outbox()) == n
+
+
+def test_replay_completes_unfinished_approved_work_and_finished_work_adds_no_outbox_rows(store, tmp_path):
+    a, b, c = add("a note"), add("b note"), add("c note")
+    plan = seal([rt("s1", a, ["t"]), lk("s2", a, b), lk("s3", b, c)])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    j = tmp_path / "plan.applied.json"
+    r1 = ta.apply_report(plan, dec, TidyLimits(max_writes=2), journal=j)     # retag 1, link needs 2: deferred
+    assert [x["id"] for x in r1["applied"]] == ["s1"] and {d["id"] for d in r1["deferred"]} == {"s2", "s3"}
+    n = len(outbox())
+    r2 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert [x["id"] for x in r2["applied"]] == ["s2", "s3"] and reasons(r2)["s1"].startswith("already done")
+    n2 = len(outbox())
+    assert n2 > n and not [r for r in outbox()[n:] if r[0] == "memories" and r[2] == f"[{a}]"]    # s1 wrote nothing again
+    r3 = ta.apply_report(plan, dec, TidyLimits(), journal=j)
+    assert not r3["applied"] and len(outbox()) == n2
+
+
+def test_half_written_link_is_completed_by_a_rerun_with_one_direction(store, tmp_path, monkeypatch):
+    a, b = add("a note"), add("b note")
+    plan = seal([lk("s1", a, b)])
+    dec = dec_for(plan, tmp_path, approve_ops=ALL)
+    real, calls = ta._guarded_edge, {"n": 0}
+    def flaky(*x, **k):
+        calls["n"] += 1
+        return False if calls["n"] == 2 else real(*x, **k)         # the reverse write is refused once
+    monkeypatch.setattr(ta, "_guarded_edge", flaky)
+    r1 = run(plan, dec)
+    assert not r1["applied"] and "partial" in reasons(r1)["s1"] and "references" in _edge_types(a, b)
+    monkeypatch.setattr(ta, "_guarded_edge", real)
+    r2 = run(plan, dec)
+    assert [x["directions"] for x in r2["applied"]] == [1] and "referenced_by" in _edge_types(b, a)
+    assert r2["counts"]["writes_charged"] == 1
+
+
+def test_a_deadline_inside_a_write_is_ambiguous_with_its_step_id_and_not_deferred(store, tmp_path, monkeypatch):
+    import time as _t
+    a, b = add("a note"), add("b note")
+    plan = seal([sp("b1", a), sp("b2", b)])
+    real = storage.update_memory
+    def slow(*x, **k):
+        _t.sleep(0.6)
+        return real(*x, **k)
+    monkeypatch.setattr(storage, "update_memory", slow)
+    res = ta.apply_report(plan, dec_for(plan, tmp_path, approve_ops=ALL), TidyLimits(max_seconds=0.2))
+    assert res["aborted"] == "max_seconds" and [x["id"] for x in res["ambiguous"]] == ["b1"]
+    assert {d["id"] for d in res["deferred"]} == {"b2"}

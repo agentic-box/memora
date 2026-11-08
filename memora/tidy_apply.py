@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -63,9 +64,10 @@ def load_decisions(path: str, plan: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(rules, list):
         raise TidyError("decisions 'approve_ops' must be a list")
     for r in rules:
-        if not isinstance(r, dict) or set(r) - {"op", "min_confidence"} or r.get("op") not in KNOWN_OPS:
+        if not isinstance(r, dict) or set(r) - {"op", "min_confidence"} or not isinstance(r.get("op"), str) \
+                or r["op"] not in KNOWN_OPS:
             raise TidyError("each approve_ops entry must be {\"op\": <known op>[, \"min_confidence\": high|medium|low]}")
-        if "min_confidence" in r and r["min_confidence"] not in CONF_RANK:
+        if "min_confidence" in r and not (isinstance(r["min_confidence"], str) and r["min_confidence"] in CONF_RANK):
             raise TidyError("approve_ops min_confidence must be high, medium or low")
         out["approve_ops"].append(dict(r))
     return out
@@ -176,12 +178,40 @@ class _Ctx:
         self.W, self.st, self.conn, self.lim = W, storage_mod, conn, lim
         self.writes = 0
         self.backfill = 0
-        self.alias: Dict[Tuple[int, str], str] = {}     # (id, sha judged in the plan) -> sha after OUR write
+        # (id, sha judged in the plan) -> sha after OUR exact write; persisted in the journal so a rerun can tell
+        # our earlier effects from a foreign edit
+        self.alias: Dict[Tuple[int, str], str] = {}
+        self.journal: Optional[Path] = None
+        self.digest: Optional[str] = None
 
-    def reserve(self, op: str) -> Optional[str]:
+    def save_journal(self) -> None:
+        if self.journal is None:
+            return
+        body = {"report_digest": self.digest, "post": {f"{m}:{w}": v for (m, w), v in sorted(self.alias.items())}}
+        tmp = self.journal.with_name(self.journal.name + ".tmp")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(body, indent=1))
+        os.replace(tmp, self.journal)
+
+    def load_journal(self) -> None:
+        if self.journal is None or not self.journal.is_file():
+            return
+        try:
+            raw = json.loads(self.journal.read_text())
+            if raw.get("report_digest") != self.digest:
+                return
+            for k, v in raw["post"].items():
+                m, w = k.split(":", 1)
+                if isinstance(v, str):
+                    self.alias[(int(m), w)] = v
+        except (OSError, ValueError, KeyError, AttributeError):
+            self.alias.clear()      # an unreadable journal only means later steps are checked against the original state
+
+    def reserve(self, op: str, n: Optional[int] = None) -> Optional[str]:
         if self.W.stuck or self.W.remaining() <= 0:
             return "max_seconds"
-        n = CHARGE[op]
+        n = CHARGE[op] if n is None else n
         if op == "set_project":
             if self.backfill + n > self.lim.max_backfill:
                 return "cap:max_backfill"
@@ -226,10 +256,9 @@ def _do_set_project(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     why = cx.reserve("set_project")
     if why:
         return {"defer": why}
-    before_tags = list(m.tags)
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
         cx.conn, mid, metadata={"project": proj}, expected_row=raw, embed=False))
-    return _after(cx, step, mid, m, before_tags, res, {"project": proj})
+    return _after(cx, step, mid, m, res, {"project": proj}, {"project": proj})
 
 
 def _do_retag(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
@@ -246,34 +275,72 @@ def _do_retag(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
         return {"skip": "the memory changed since it was judged (state sha mismatch)"}
     if cx.retired(mid):
         return {"skip": "the memory is retired"}
+    want = list(m.tags) + missing
+    # update_memory normalises and retargets the WHOLE tag list; add-only means every old tag must survive that
+    # unchanged, so it is previewed BEFORE the write (same helpers, same order) and refused when it would rewrite one
+    project = cx.st._resolve_project(None, want, m.metadata, strict=False)
+    result = cx.st._retarget_typed_tags(list(cx.st._normalize_tags(list(want), project)), project, m.metadata)
+    lost = [t for t in m.tags if t not in result]
+    if lost:
+        return {"skip": f"adding tags would rewrite existing tag(s) {lost}: not an add-only change"}
     why = cx.reserve("retag")
     if why:
         return {"defer": why}
-    before_tags = list(m.tags)
     res = cx.W.run("update_memory", lambda: cx.st.update_memory(
-        cx.conn, mid, tags=before_tags + missing, expected_row=raw, embed=False))
-    extra = {"added": missing}
+        cx.conn, mid, tags=want, expected_row=raw, embed=False))
+    extra: Dict[str, Any] = {"added": missing}
     if step.get("remove"):
         extra["remove_ignored"] = list(step["remove"])
-    return _after(cx, step, mid, m, before_tags, res, extra)
+    return _after(cx, step, mid, m, res, {}, extra)
 
 
-def _after(cx: _Ctx, step: Dict[str, Any], mid: int, m: Any, before_tags: List[str], res: Any,
+def _after(cx: _Ctx, step: Dict[str, Any], mid: int, m: Any, res: Any, meta_patch: Dict[str, Any],
            extra: Dict[str, Any]) -> Dict[str, Any]:
-    """Record the memory's new state sha as 'ours' so later steps of the same plan still match, and check that the
-    write kept the text and every old tag."""
-    got = cx.read(mid)
+    """Authorize later steps of this plan on the memory ONLY when the row now is exactly what our write produced
+    (the returned content, tags and timestamp, and the old metadata plus our patch). Anything else, such as a
+    concurrent edit between our commit and this read, is reported and gives no alias: later steps then refuse."""
     out: Dict[str, Any] = dict(extra)
-    if got is not None:
-        want = step["expect"].get(str(mid))
-        cx.alias[(mid, want)] = got[0].state_sha
-        if got[0].content != m.content:
-            out["anomaly"] = "content changed"
-        elif not set(before_tags) <= set(got[0].tags):
-            out["anomaly"] = "a tag was lost"
-        elif step["op"] == "set_project" and sorted(got[0].tags) != sorted(before_tags):
-            out["tags_retargeted"] = sorted(set(got[0].tags) ^ set(before_tags))
+    got = cx.read(mid)
+    f = got[0] if got is not None else None
+    own = set(dream._OWN_KEYS)
+    exp_meta = {k: v for k, v in {**m.metadata, **meta_patch}.items() if k not in own}
+    exact = (f is not None and isinstance(res, dict) and f.content == m.content == res.get("content")
+             and sorted(f.tags) == sorted(res.get("tags") or []) and f.updated_at == res.get("updated_at")
+             and {k: v for k, v in f.metadata.items() if k not in own} == exp_meta
+             and (step["op"] == "set_project" or set(m.tags) <= set(f.tags)))
+    if exact:
+        cx.alias[(mid, step["expect"].get(str(mid)))] = f.state_sha
+        cx.save_journal()
+        if step["op"] == "set_project" and sorted(f.tags) != sorted(m.tags):
+            out["tags_retargeted"] = sorted(set(f.tags) ^ set(m.tags))
+    else:
+        out["anomaly"] = "the row after the write is not exactly what the write produced; later steps on it will refuse"
     return {"applied": out}
+
+
+def _guarded_edge(conn: Any, st: Any, holder: int, peer: int, et: str, raw_h: Dict[str, Any],
+                  raw_p: Dict[str, Any]) -> bool:
+    """Write `holder --et--> peer` in ONE statement that also requires BOTH endpoints to still be exactly the rows
+    read (content, metadata, tags, updated_at, crossrefs blob), neither tombstoned, neither already hidden by a newer memory.
+    A concurrent edit, a retirement or a typed edge added since the read makes it write nothing (False)."""
+    exists = conn.execute("SELECT related FROM memories_crossrefs WHERE memory_id = ?", (holder,)).fetchone()
+    cur = [r for r in dream._json(raw_h["related"], []) if isinstance(r, dict) and r.get("id") != peer]
+    cur.append({"id": peer, "score": 1.0, "edge_type": et})
+    blob = json.dumps(cur, ensure_ascii=False)
+    g_h, p_h = dream._state_guard(st, holder, raw_h, True)
+    g_p, p_p = dream._state_guard(st, peer, raw_p, True)
+    if exists is not None:
+        res = conn.execute("UPDATE memories_crossrefs SET related = ? WHERE memory_id = ? AND related IS ? AND "
+                           + g_h + " AND " + g_p, (blob, holder, raw_h["related"], *p_h, *p_p))
+    else:
+        res = conn.execute("INSERT INTO memories_crossrefs(memory_id, related) SELECT ?, ? WHERE " + g_h + " AND " + g_p,
+                           (holder, blob, *p_h, *p_p))
+    conn.commit()
+    return getattr(res, "rowcount", 0) == 1
+
+
+def _same_row(x: Dict[str, Any], y: Dict[str, Any], keys: Sequence[str]) -> bool:
+    return all(x.get(k) == y.get(k) for k in keys)
 
 
 def _do_link(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
@@ -281,7 +348,7 @@ def _do_link(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
     ga, gb = cx.read(a), cx.read(b)
     if ga is None or gb is None:
         return {"skip": "an endpoint is gone"}
-    (ma, _), (mb, _) = ga, gb
+    (ma, raw_a), (mb, raw_b) = ga, gb
     rev = cx.st._get_reverse_edge_type(et)
     fa = [r for r in ma.refs if r.get("id") == b]
     fb = [r for r in mb.refs if r.get("id") == a]
@@ -289,17 +356,33 @@ def _do_link(cx: _Ctx, step: Dict[str, Any]) -> Dict[str, Any]:
         for r in ref:
             if r.get("edge_type") not in (want, "related_to"):     # the automatic similarity edge is replaced, as memory_link does
                 return {"skip": f"a different edge already links {a} and {b} ({r.get('edge_type')!r}); not overwritten"}
-    if all(r.get("edge_type") == want for ref, want in ((fa, et), (fb, rev)) for r in ref) and fa and fb:
+    need_fwd = not any(r.get("edge_type") == et for r in fa)
+    need_rev = not any(r.get("edge_type") == rev for r in fb)
+    if not (need_fwd or need_rev):
         return {"skip": f"already done: the {et} edge exists on both sides"}
     if not (cx.sha_ok(a, ma, step) and cx.sha_ok(b, mb, step)):
         return {"skip": "an endpoint changed since it was judged (state sha mismatch)"}
     if cx.retired(a) or cx.retired(b):
         return {"skip": "an endpoint is retired"}
-    why = cx.reserve("link")
+    why = cx.reserve("link", int(need_fwd) + int(need_rev))
     if why:
         return {"defer": why}
-    cx.W.run("add_link", lambda: cx.st.add_link(cx.conn, a, b, edge_type=et))
-    return {"applied": {"edge": et}}
+    if need_fwd and not cx.W.run("guarded_edge", lambda: _guarded_edge(cx.conn, cx.st, a, b, et, raw_a, raw_b)):
+        return {"skip": "an endpoint changed at the write; nothing written"}
+    if need_rev:
+        ga2, gb2 = cx.read(a), cx.read(b)
+        keys = ("content", "metadata", "tags", "updated_at")
+        if ga2 is None or gb2 is None or not _same_row(ga2[1], raw_a, keys) or not _same_row(gb2[1], raw_b, keys) \
+                or gb2[1]["related"] != raw_b["related"] \
+                or not any(r.get("id") == b and r.get("edge_type") == et for r in ga2[0].refs):
+            return {"skip": "partial: an endpoint changed after the forward edge; the reverse edge was not written "
+                            "(a rerun completes it)"}
+        if not cx.W.run("guarded_edge", lambda: _guarded_edge(cx.conn, cx.st, b, a, rev, gb2[1], ga2[1])):
+            return {"skip": "partial: an endpoint changed at the reverse write; only the forward edge exists "
+                            "(a rerun completes it)"}
+    cx.W.run("log", lambda: cx.st._log_action(cx.conn, a, "link", f"Linked #{a} -> #{b} ({et}) by tidy"))
+    cx.W.run("commit", cx.conn.commit)
+    return {"applied": {"edge": et, "directions": int(need_fwd) + int(need_rev)}}
 
 
 _DO: Dict[str, Callable[[_Ctx, Dict[str, Any]], Dict[str, Any]]] = {
@@ -307,7 +390,7 @@ _DO: Dict[str, Callable[[_Ctx, Dict[str, Any]], Dict[str, Any]]] = {
 
 
 def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mod: Any = None,
-                 clock: Callable[[], float] = time.monotonic) -> Dict[str, Any]:
+                 clock: Callable[[], float] = time.monotonic, journal: Optional[Path] = None) -> Dict[str, Any]:
     """Apply the approved, supported steps of a verified report. Add-only metadata writes through the store's own
     functions: no content change, no embedding, no model, no delete, no hiding edge."""
     if storage_mod is None:
@@ -321,11 +404,15 @@ def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mo
     W = dream._Writer(clock, clock(), lim.max_seconds)
     cx: Optional[_Ctx] = None
     conn: Any = None
+    cur: Optional[Dict[str, Any]] = None
     done_ids: set = set()
     try:
         conn = W.run("open", lambda: storage_mod.connect(check_same_thread=False))
         cx = _Ctx(W, storage_mod, conn, lim)
+        cx.journal, cx.digest = journal, plan.get("digest")
+        cx.load_journal()
         for st in sel["run"]:
+            cur = st
             row = {"id": st["id"], "op": st["op"]}
             dep = [d for d in st.get("depends_on", []) if d not in done_ids]
             if dep:
@@ -350,9 +437,10 @@ def apply_report(plan: Dict[str, Any], dec: Dict[str, Any], lim: Any, storage_mo
     except dream._Deadline as d:
         aborted = "max_seconds"
         if d.started:
-            ambiguous.append({"op": d.op, "why": "in flight when the deadline passed; it may still commit"})
-        # the steps never reached are deferred, not lost
-        reached = {r["id"] for r in applied + skipped + deferred}
+            ambiguous.append({"id": cur["id"] if cur else None, "op": cur["op"] if cur else d.op, "call": d.op,
+                              "why": "in flight when the deadline passed; it may still commit"})
+        # the steps never reached are deferred, not lost; the ambiguous one is neither
+        reached = {r["id"] for r in applied + skipped + deferred + ambiguous}
         deferred.extend({"id": s["id"], "op": s["op"], "reason": "max_seconds"} for s in sel["run"]
                         if s["id"] not in reached)
     finally:
@@ -406,7 +494,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         cfg = tidy.TidyConfig.load(args.config)
         with dream.run_lock(cfg.state_dir):
             dream.lower_priority(cfg.limits.nice)
-            out = apply_report(plan, dec, cfg.limits)
+            out = apply_report(plan, dec, cfg.limits, journal=Path(str(args.plan) + ".applied.json"))
             path = result_path(args.plan)
             dream.write_report(str(path), out)
             print(json.dumps({"result": str(path), "aborted": out["aborted"], **out["counts"]}, indent=2))
