@@ -47,6 +47,8 @@ import json
 import math
 import os
 import re
+import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -898,6 +900,91 @@ class OpenAIJudge:
         return ch.message.content or ""
 
 
+class ClaudeCodeJudge:
+    """Judge run through the Claude Code CLI (`claude -p`), so the user's Claude subscription pays for it.
+    The CLI is the only sanctioned way to use that subscription: its credentials are never read or reused
+    here, and nothing is proxied. Same contract as OpenAIJudge: one counted call per logical call, no
+    retries, bounded by the run deadline, no fallback to another judge. The child gets no tools, no MCP
+    servers, no hooks or settings, no session persistence, an empty private cwd and its own process group."""
+
+    _DROP_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY")
+
+    def __init__(self, model: Optional[str] = None, timeout: float = 60.0):
+        model = model or os.environ.get("MEMORA_DREAM_MODEL")
+        if not model:
+            raise JudgeError("MEMORA_DREAM_MODEL is not set (no default model, by design)")
+        binary = os.environ.get("MEMORA_DREAM_CLAUDE_BIN") or "claude"
+        found = shutil.which(binary)
+        if not found:
+            raise JudgeError(f"claude binary not found: {binary!r} (set MEMORA_DREAM_CLAUDE_BIN)")
+        self.model, self.timeout, self.binary = model, timeout, found
+
+    def _argv(self) -> List[str]:
+        return [self.binary, "-p", "--model", self.model, "--output-format", "json",
+                "--system-prompt", _SYSTEM, "--tools", "", "--strict-mcp-config",
+                "--setting-sources", "", "--settings", '{"disableAllHooks": true}',
+                "--disable-slash-commands", "--no-session-persistence"]
+
+    def __call__(self, prompt: str, timeout: Optional[float] = None) -> str:
+        t = self.timeout if timeout is None else max(min(self.timeout, timeout), 1.0)
+        env = {k: v for k, v in os.environ.items() if k not in self._DROP_ENV}
+        env["DISABLE_AUTOUPDATER"] = "1"
+        with tempfile.TemporaryDirectory(prefix="memora-dream-claude-") as cwd:
+            try:
+                proc = subprocess.Popen(self._argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, cwd=cwd, env=env, text=True,
+                                        encoding="utf-8", start_new_session=True)
+            except OSError as e:
+                raise JudgeError(f"claude could not be started: {e.__class__.__name__}")
+            try:
+                try:
+                    out, _err = proc.communicate(prompt, timeout=t)
+                except subprocess.TimeoutExpired:
+                    self._kill_group(proc)
+                    try:
+                        proc.communicate(timeout=5)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    raise JudgeError(f"claude timed out after {t:.0f}s")
+            finally:
+                self._kill_group(proc)  # no orphan survives the call, however it ended
+        if proc.returncode != 0:
+            raise JudgeError(f"claude exited with status {proc.returncode}")
+        try:
+            data = json.loads(out)
+        except ValueError:
+            raise JudgeError("claude output is not JSON")
+        if isinstance(data, list):  # some versions print the event array; take the final result event
+            data = next((d for d in reversed(data) if isinstance(d, dict) and d.get("type") == "result"), None)
+        if not isinstance(data, dict):
+            raise JudgeError("claude output has no result object")
+        if data.get("is_error"):
+            raise JudgeError("claude reported an error (is_error)")
+        if data.get("subtype") != "success":
+            raise JudgeError(f"claude result subtype is {data.get('subtype')!r}, not 'success'")
+        res = data.get("result")
+        if not isinstance(res, str):
+            raise JudgeError("claude result has no text")
+        return res
+
+    @staticmethod
+    def _kill_group(proc: "subprocess.Popen[str]") -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def make_judge() -> Any:
+    """MEMORA_DREAM_JUDGE: unset or `openai` -> OpenAIJudge, `claude-code` -> ClaudeCodeJudge. No fallback."""
+    kind = os.environ.get("MEMORA_DREAM_JUDGE") or "openai"
+    if kind == "openai":
+        return OpenAIJudge()
+    if kind == "claude-code":
+        return ClaudeCodeJudge()
+    raise JudgeError(f"unknown MEMORA_DREAM_JUDGE {kind!r} (use 'openai' or 'claude-code')")
+
+
 # --------------------------------------------------------------------------- selection
 
 
@@ -1561,7 +1648,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raise DreamError("--plan is only for --apply")
             judge, note, model = None, "ok", ""
             try:
-                judge = OpenAIJudge()
+                judge = make_judge()
                 model = judge.model
             except JudgeError as e:
                 note = f"unavailable: {e}"  # fail closed: every claim becomes unverifiable

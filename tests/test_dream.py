@@ -1604,3 +1604,178 @@ def test_244_apply_refuses_a_supersede_backed_only_by_restricted_claims(tmp_path
     assert dream.main(["--config", _cfg_file(tmp_path, corrections=True), "--apply", "--plan", plan]) == 0
     out = json.loads(capsys.readouterr().out)
     assert _count() == before and any("no unrestricted" in x.get("why", "") for x in out["skipped"])
+
+
+# ----------------------------------------------------------------------------- Item 250: the Claude Code judge
+
+
+def _fake_claude(tmp_path, body):
+    """A fake `claude` script (never the real one). `body` is Python run with sys/os/json imported."""
+    p = tmp_path / "fakeclaude"
+    p.write_text("#!" + __import__("sys").executable + "\nimport sys, os, json\n" + body)
+    p.chmod(0o755)
+    return str(p)
+
+
+def _cc(monkeypatch, tmp_path, body, model="haiku"):
+    monkeypatch.setenv("MEMORA_DREAM_MODEL", model)
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", _fake_claude(tmp_path, body))
+    return dream.ClaudeCodeJudge()
+
+
+_OK = 'sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "ANSWER"}))\n'
+
+
+def test_claude_judge_success(monkeypatch, tmp_path):
+    assert _cc(monkeypatch, tmp_path, _OK)("p") == "ANSWER"
+
+
+@pytest.mark.parametrize("body,match", [
+    ('sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "success", "is_error": True, "result": "x"}))', "is_error"),
+    ('sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": False, "result": "x"}))', "subtype"),
+    ('sys.stdin.read(); print(json.dumps({"type": "result", "subtype": "success", "is_error": False}))', "no text"),
+    ('sys.stdin.read(); print("{\\"type\\": \\"result\\"")', "not JSON"),
+    ('sys.stdin.read(); print("hello")', "not JSON"),
+    ('sys.stdin.read(); print("[1]")', "no result object"),
+    ('sys.stdin.read(); sys.stderr.write("ANSWER"); sys.exit(3)', "status 3"),
+    ('sys.stdin.read(); sys.stderr.write("ANSWER")', "not JSON"),
+])
+def test_claude_judge_failures(monkeypatch, tmp_path, body, match):
+    j = _cc(monkeypatch, tmp_path, body + "\n")
+    with pytest.raises(dream.JudgeError, match=match) as ei:
+        j("p")
+    assert "ANSWER" not in str(ei.value)   # stderr is never the answer nor echoed
+
+
+def test_claude_judge_nonzero_exit_ignores_good_stdout(monkeypatch, tmp_path):
+    j = _cc(monkeypatch, tmp_path, _OK + "sys.exit(1)\n")
+    with pytest.raises(dream.JudgeError, match="status 1"):
+        j("p")
+
+
+def test_claude_judge_requires_model_and_binary(monkeypatch, tmp_path):
+    monkeypatch.delenv("MEMORA_DREAM_MODEL", raising=False)
+    with pytest.raises(dream.JudgeError, match="MEMORA_DREAM_MODEL"):
+        dream.ClaudeCodeJudge()
+    monkeypatch.setenv("MEMORA_DREAM_MODEL", "haiku")
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", str(tmp_path / "nope"))
+    with pytest.raises(dream.JudgeError, match="not found"):
+        dream.ClaudeCodeJudge()
+
+
+def test_claude_judge_prompt_on_stdin_not_argv_and_flags(monkeypatch, tmp_path):
+    out = tmp_path / "seen.json"
+    j = _cc(monkeypatch, tmp_path,
+            f'd = sys.stdin.read()\nopen({str(out)!r}, "w").write(json.dumps({{"argv": sys.argv[1:], "stdin": d, "cwd": os.getcwd(), '
+            f'"empty": os.listdir("."), "pgid_own": os.getpgrp() == os.getpid()}}))\n' + _OK.split("; ", 1)[1])
+    secret = "SECRET-PROMPT-" + "x" * 300000    # far over any argv limit
+    assert j(secret) == "ANSWER"
+    seen = json.loads(out.read_text())
+    assert seen["stdin"] == secret and not any("SECRET-PROMPT" in a for a in seen["argv"])
+    a = seen["argv"]
+    assert "-p" in a and a[a.index("--model") + 1] == "haiku" and a[a.index("--output-format") + 1] == "json"
+    assert a[a.index("--system-prompt") + 1] == dream._SYSTEM
+    assert a[a.index("--tools") + 1] == "" and "--strict-mcp-config" in a and "--no-session-persistence" in a
+    assert a[a.index("--setting-sources") + 1] == "" and "disableAllHooks" in a[a.index("--settings") + 1]
+    assert "--bare" not in a
+    assert seen["empty"] == [] and seen["pgid_own"] is True
+    assert not os.path.exists(seen["cwd"])      # private cwd removed afterwards
+    assert os.path.realpath(seen["cwd"]) != os.path.realpath(os.getcwd())
+
+
+def test_claude_judge_env_scrubbed(monkeypatch, tmp_path):
+    out = tmp_path / "env.json"
+    for k in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"):
+        monkeypatch.setenv(k, "leak")
+    monkeypatch.delenv("DISABLE_AUTOUPDATER", raising=False)
+    monkeypatch.setenv("KEEPME", "1")
+    j = _cc(monkeypatch, tmp_path, f'open({str(out)!r}, "w").write(json.dumps(dict(os.environ)))\n' + _OK)
+    j("p")
+    env = json.loads(out.read_text())
+    assert not {"ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY"} & set(env)
+    assert env["DISABLE_AUTOUPDATER"] == "1" and env["KEEPME"] == "1"
+    assert os.environ["OPENAI_API_KEY"] == "leak"       # the parent is untouched
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def test_claude_judge_timeout_kills_group(monkeypatch, tmp_path):
+    import time
+    pids = tmp_path / "pids"
+    body = (f'import subprocess\nc = subprocess.Popen(["sleep", "60"])\n'
+            f'open({str(pids)!r}, "w").write(f"{{os.getpid()}} {{c.pid}}")\ntime.sleep(60)\n').replace("import subprocess", "import subprocess, time")
+    j = _cc(monkeypatch, tmp_path, body)
+    t0 = time.time()
+    with pytest.raises(dream.JudgeError, match="timed out"):
+        j("p", timeout=1.0)
+    assert time.time() - t0 < 15
+    parent, child = map(int, pids.read_text().split())
+    for _ in range(50):
+        if not _alive(parent) and not _alive(child):
+            break
+        time.sleep(0.1)
+    assert not _alive(parent) and not _alive(child)    # no orphan, grandchild included
+
+
+def test_claude_judge_orphan_after_normal_exit_is_killed(monkeypatch, tmp_path):
+    import time
+    pidf = tmp_path / "bg"
+    body = (f'import subprocess\nc = subprocess.Popen(["sleep", "60"])\nopen({str(pidf)!r}, "w").write(str(c.pid))\n' + _OK)
+    assert _cc(monkeypatch, tmp_path, body)("p") == "ANSWER"
+    pid = int(pidf.read_text())
+    for _ in range(50):
+        if not _alive(pid):
+            break
+        time.sleep(0.1)
+    assert not _alive(pid)
+
+
+def test_judge_selector(monkeypatch, tmp_path):
+    import sys as _sys
+    import types
+    monkeypatch.setenv("MEMORA_DREAM_MODEL", "m")
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setitem(_sys.modules, "openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", _fake_claude(tmp_path, _OK))
+    monkeypatch.delenv("MEMORA_DREAM_JUDGE", raising=False)
+    assert type(dream.make_judge()) is dream.OpenAIJudge
+    monkeypatch.setenv("MEMORA_DREAM_JUDGE", "openai")
+    assert type(dream.make_judge()) is dream.OpenAIJudge
+    monkeypatch.setenv("MEMORA_DREAM_JUDGE", "claude-code")
+    assert type(dream.make_judge()) is dream.ClaudeCodeJudge
+    for bad in ("Claude-Code", "anthropic", "claude"):
+        monkeypatch.setenv("MEMORA_DREAM_JUDGE", bad)
+        with pytest.raises(dream.JudgeError, match="unknown MEMORA_DREAM_JUDGE"):
+            dream.make_judge()
+
+
+def test_judge_selector_no_fallback(monkeypatch, tmp_path):
+    import sys as _sys
+    import types
+    monkeypatch.setenv("MEMORA_DREAM_MODEL", "m")
+    # claude-code selected, binary missing, OpenAI fully configured: still an error, never OpenAI
+    monkeypatch.setitem(_sys.modules, "openai", types.SimpleNamespace(OpenAI=lambda **kw: object()))
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+    monkeypatch.setenv("MEMORA_DREAM_JUDGE", "claude-code")
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", str(tmp_path / "nope"))
+    with pytest.raises(dream.JudgeError, match="not found"):
+        dream.make_judge()
+    # openai selected, key missing, a working claude present: still an error, never claude
+    monkeypatch.setenv("MEMORA_DREAM_JUDGE", "openai")
+    monkeypatch.delenv("OPENAI_API_KEY")
+    monkeypatch.setenv("MEMORA_DREAM_CLAUDE_BIN", _fake_claude(tmp_path, _OK))
+    with pytest.raises(dream.JudgeError, match="OPENAI_API_KEY"):
+        dream.make_judge()
+
+
+def test_judge_unknown_selector_fails_closed_in_main(monkeypatch, tmp_path):
+    monkeypatch.setenv("MEMORA_DREAM_JUDGE", "bogus")
+    monkeypatch.setenv("MEMORA_DREAM_MODEL", "m")
+    with pytest.raises(dream.JudgeError, match="bogus"):
+        dream.make_judge()

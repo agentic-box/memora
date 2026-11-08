@@ -12,6 +12,13 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.9 — 2026-11-08
+
+`memora-dream` can run its judge through Claude Code (Item 250), because gpt-4o-mini returned malformed answers for 15% of memories on the full run.
+
+- `MEMORA_DREAM_JUDGE=claude-code` runs `claude -p` (model from `MEMORA_DREAM_MODEL`, e.g. `haiku`) on the user's Claude subscription. Unset or `openai` keeps the OpenAI judge exactly as before; unknown values are refused; no fallback either way.
+- The child has no tools, MCP servers, hooks, settings or saved session, runs in an empty temp dir in its own process group (killed whole on timeout), and has `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `OPENAI_API_KEY` removed. Claude Code's token is never read or reused. See `docs/dream.md`.
+
 ## 0.5.7.8 — 2026-11-07
 
 `memora-dream` is much stricter about calling a note wrong (Item 244, after the first live dry run of 0.5.7.7 flagged true notes). The rules are heuristics that fail closed; a leader still reviews every proposal.
