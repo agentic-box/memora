@@ -1,4 +1,5 @@
 """Item 258: memora-tidy-eval (memora/tidy_eval.py): the retrieval check, read-only, deterministic."""
+import contextlib
 import hashlib
 import json
 from pathlib import Path
@@ -210,7 +211,7 @@ def fwd_link(new, old):
 
 
 def accepted(store, mid):
-    with te.dream.open_readonly_file(str(store.db_path)) as conn:
+    with contextlib.closing(te.dream.open_readonly_file(str(store.db_path))) as conn:
         return te.accepted_ids(conn, mid)
 
 
@@ -228,7 +229,7 @@ def test_forward_only_supersedes_accepts_only_the_successor(store, tmp_path, cor
 def test_only_the_retired_predecessor_in_the_top_five_is_a_miss(store, tmp_path, corpus):
     new = add("zzz qqq unrelated wording entirely")
     fwd_link(new, corpus["kiwi"])
-    for i in range(6):
+    for i in range(3):
         add(f"kiwi orchard irrigation schedule filler {i}")
     rep = run(store, tmp_path, [{"q": "kiwi orchard irrigation schedule", "project": None, "expect": [corpus["kiwi"]]}])
     u = rep["queries"][0]["unscoped"]
@@ -251,8 +252,7 @@ def test_fork_and_chain_accept_leaves(store, tmp_path, corpus):
     supersede(corpus["kiwi"], b)
     supersede(corpus["kiwi"], c)
     supersede(b, d)
-    with te.dream.open_readonly_file(str(store.db_path)) as conn:
-        assert te.accepted_ids(conn, corpus["kiwi"]) == sorted([c, d])
+    assert accepted(store, corpus["kiwi"]) == sorted([c, d])
 
 
 def test_compare_refuses_changed_criteria(store, tmp_path, corpus, capsys):
@@ -299,7 +299,7 @@ def test_wal_format_copy_without_sidecars_is_read_and_unchanged(store, tmp_path,
     p = _wal_copy(store, tmp_path, "w1")
     assert sorted(x.name for x in p.parent.iterdir()) == ["m.db"]
     before = _tree(p.parent)
-    with te.dream.open_readonly_file(str(p)) as conn:
+    with contextlib.closing(te.dream.open_readonly_file(str(p))) as conn:
         rep = te.evaluate(conn, [{"q": "kiwi orchard", "project": None, "expect": [corpus["kiwi"]], "digest": False}])
     assert rep["queries"][0]["unscoped"]["hit"] is True
     assert _tree(p.parent) == before                        # no -wal/-shm created, main file untouched
@@ -315,7 +315,7 @@ def test_wal_copy_with_sidecars_is_read_or_refused_never_changed(store, tmp_path
         main_before = hashlib.sha256(p.read_bytes()).hexdigest()
         wal_before = (p.parent / "m.db-wal").read_bytes()
         try:
-            with te.dream.open_readonly_file(str(p)) as conn:
+            with contextlib.closing(te.dream.open_readonly_file(str(p))) as conn:
                 rep = te.evaluate(conn, [{"q": "kiwi orchard", "project": None, "expect": [corpus["kiwi"]], "digest": False}])
             assert rep["queries"][0]["unscoped"]["hit"] is True
         except te.dream.DreamError:
