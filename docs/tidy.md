@@ -153,10 +153,11 @@ Procedure (design 5.5; the leader runs it, the unit never does):
 
 1. Rehearse on a **new, writable, consistent copy** of the store (an online backup, or a copy made with the
    container stopped; never reuse an old copy's `-wal`/`-shm`). Point the store environment at the copy
-   (embedding settings in a 0600 file, never printed), run `--apply`, and diff `sync_outbox` before and after:
+   (embedding settings in a 0600 file, never printed), copy the plan and decisions into a work directory, run `--apply`, and diff `sync_outbox` before and after:
    only `U` rows, **no `D` rows**; the memories' text unchanged; a second run applies nothing.
 2. Live: stop the watchdog, then the memora container; run `--apply` in a one-off container (same image, the
-   data volume, the plan directory read-only for the plan, `MEMORA_LLM_ENABLED=false`); start the container, then
+   data volume, a writable work directory that holds the plan, the decisions file and, afterwards, the result and the
+   `.applied.json` journal (keep them together for reruns), `MEMORA_LLM_ENABLED=false`); start the container, then
    the watchdog; check that D1's `last_acked_seq` equals `max(sync_outbox.seq)` with no halt and no error.
 
 The run scripts and the systemd unit never contain `--apply` (tested).

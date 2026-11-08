@@ -251,7 +251,7 @@ Dream's metadata (`dream.py:1071`) is read, never trusted as truth:
       0600 file, never printed; diff `sync_outbox` before and after: only op `U` rows as m1383 saw, **no `D` rows**;
    2. stop the watchdog service first, then the memora container;
    3. run `memora-tidy --apply` in a one-off container (same image, the container's embedding/container env taken from `docker inspect` into a temp file
-      deleted afterwards, the data volume, the secrets dir read-only, plan dir read-only,
+      deleted afterwards, the data volume, the secrets dir read-only, a writable work dir holding the plan (result and journal are written there, Item 255),
       `MEMORA_LLM_ENABLED=false`);
    4. start the container, then the watchdog;
    5. check D1: `last_acked_seq == max(sync_outbox.seq)`, no halt, no error.
