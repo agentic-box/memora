@@ -240,10 +240,19 @@ def test_only_the_retired_predecessor_in_the_top_five_is_a_miss(store, tmp_path,
 def test_tombstoned_forward_holder_is_not_a_live_successor(store, tmp_path, corpus):
     new = add("kiwi orchard irrigation schedule newer")
     fwd_link(new, corpus["kiwi"])
+    with storage.connect() as conn:         # tombstone the holder alone (a lineage delete would take A with it)
+        conn.execute("INSERT INTO tombstone_components (memory_id, content_hash, reason) VALUES (?, 'h', 'test')", (new,))
+        conn.commit()
+    assert accepted(store, corpus["kiwi"]) == [corpus["kiwi"]]
+
+
+def test_lineage_delete_of_the_holder_retires_the_predecessor_too(store, tmp_path, corpus):
+    new = add("kiwi orchard irrigation schedule newer")
+    fwd_link(new, corpus["kiwi"])
     with storage.connect() as conn:
         storage.delete_memory(conn, new)
         conn.commit()
-    assert accepted(store, corpus["kiwi"]) == [corpus["kiwi"]]
+    assert accepted(store, corpus["kiwi"]) == []
 
 
 def test_fork_and_chain_accept_leaves(store, tmp_path, corpus):
