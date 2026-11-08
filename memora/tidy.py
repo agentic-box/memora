@@ -284,6 +284,11 @@ def split_statements(content: str) -> List[Stmt]:
             bullet["lines"].append(stripped)
             bullet["end"] = end
             continue
+        # Here: a line that is neither a header, a bullet, nor an indented continuation of the bullet above.
+        if bullet is not None:
+            raise Unsupported("lazy list continuation")        # '- a' then 'b' without indent: ambiguous scope
+        if loose and any(pi >= 0 for pi, _t in parents) and (len(raw) - len(raw.lstrip())) > 0:
+            raise Unsupported("list continuation paragraph")   # an indented paragraph inside a list item
         flush_bullet()
         parents.clear()
         loose = False
@@ -774,6 +779,8 @@ def validate_merge(entry: Any, intent: Dict[str, Any], ctx: ClusterCtx, run: str
     if not 2 <= len(srcs_ids) <= lim.max_merge_sources:
         return None, f"a merge needs 2..{lim.max_merge_sources} sources"
     srcs = [ctx.mems[i] for i in srcs_ids]
+    if any(ctx.stmts.get(i) is None for i in srcs_ids):
+        return None, "a source has an unsupported form and cannot be merged"
     try:
         mstm = split_statements(entry["text"])
     except Unsupported as e:

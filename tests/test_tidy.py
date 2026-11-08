@@ -112,6 +112,74 @@ def test_scope_survives_lists_or_the_form_is_unsupported():
     assert "unsupported form" in p
 
 
+SCOPE_CASES = {          # name -> (note, supported?)
+    "loose nested bullet": ("- Only in staging:\n\n  - Disable authentication.", False),
+    "continuation paragraph": ("- Only in staging:\n\n  Disable authentication.", False),
+    "numbered continuation (3 spaces)": ("1. Only in staging:\n\n   Disable authentication.", False),
+    "deep continuation (4 spaces)": ("- a\n  - Only in staging:\n\n    Disable authentication.", False),
+    "lazy continuation": ("- Only in staging:\nDisable authentication.", False),
+    "tight nested bullet": ("- Only in staging:\n  - Disable authentication.", True),
+    "flat control": ("- Only in staging:\n- Disable authentication.", True),
+    "unindented paragraph (new block)": ("- Only in staging:\n\nDisable authentication.", True),
+    "list lead": ("Only in staging:\n\n- Disable authentication.", True),
+}
+
+
+def inventory(note):
+    try:
+        return [(s.text, s.ctx) for s in split_statements(note)]
+    except Unsupported as e:
+        return f"UNSUPPORTED({e})"
+
+
+@pytest.mark.parametrize("name", sorted(SCOPE_CASES))
+def test_every_scope_form_is_supported_with_its_scope_or_unsupported(name):
+    note, supported = SCOPE_CASES[name]
+    inv = inventory(note)
+    print(f"\n{name!r}: {inv}")
+    assert isinstance(inv, list) == supported
+    flat = inventory("- Only in staging:\n- Disable authentication.")
+    if supported and inv[-1][1]:                       # a supported SCOPED form never collapses into the flat one
+        assert inv[-1] != flat[-1]
+    if supported and not inv[-1][1]:                   # the unscoped forms are unscoped in the flat note too
+        assert inv[-1] == flat[-1]
+
+
+@pytest.mark.parametrize("name", [n for n, (_t, ok) in sorted(SCOPE_CASES.items()) if not ok])
+def test_scope_changing_forms_can_never_be_eligible_merge_or_redundant_retire(name):
+    note, _ = SCOPE_CASES[name]
+    flat_text = "- Only in staging:\n- Disable authentication."
+    a, a2, flat = M(1, note), M(2, note, created="2026-01-02 00:00:00"), M(3, flat_text, created="2026-02-01 00:00:00")
+    # merge: two scoped copies -> the flattened output, with kept/duplicate rows claimed
+    e = merge_entry([1, 2], flat_text, [row((1, 0), "kept", 0), row((1, 1), "kept", 1),
+                                        row((2, 0), "duplicate", of=(1, 0)), row((2, 1), "duplicate", of=(1, 1))])
+    step, problem = vmerge(e, a, a2)
+    print(f"\nmerge[{name}]: step={step} problem={problem!r}")
+    assert step is None and "unsupported form" in problem
+    # redundant retire of the scoped source by a newer flattened note
+    red = {"id": 1, "by": 3, "why": "redundant", "replaces": []}
+    ok, problem = tidy.validate_cluster_answer(ans(retire=[red], keep=keep(2, 3)), ctx_of(a, a2, flat))
+    print(f"retire[{name}]: ok={ok} problem={problem!r}")
+    assert ok is None and "unsupported form" in problem
+
+
+def test_scoped_supported_forms_are_not_redundant_against_the_flat_note():
+    for name in ("tight nested bullet", "list lead"):
+        note = SCOPE_CASES[name][0]
+        a, flat = M(1, note), M(3, "- Only in staging:\n- Disable authentication.\nx", created="2026-02-01 00:00:00")
+        flat = M(3, "- Only in staging:\n- Disable authentication.", created="2026-02-01 00:00:00")
+        _, p = tidy.validate_cluster_answer(ans(retire=[{"id": 1, "by": 3, "why": "redundant", "replaces": []}],
+                                                keep=keep(3)), ctx_of(a, flat))
+        print(f"\nretire[{name}] vs flat: {p!r}")
+        assert "not redundant" in p
+    flat_a, flat_b = M(1, "- Only in staging:\n- Disable authentication."), M(2, "- Only in staging:\n- Disable authentication.")
+    e = merge_entry([1, 2], flat_a.content, [row((1, 0), "kept", 0), row((1, 1), "kept", 1),
+                                             row((2, 0), "duplicate", of=(1, 0)), row((2, 1), "duplicate", of=(1, 1))])
+    step, problem = vmerge(e, flat_a, flat_b)
+    print(f"merge[flat control]: status={step['status']} problem={problem!r}")
+    assert problem is None and step["status"] == "eligible"           # the control: a true flat duplicate is eligible
+
+
 @pytest.mark.parametrize("bad", ["```\ncode\n```", "| a | b |\n|---|---|", "<b>x</b>", "\tcode", "    indented code",
                                  "a\x00b", "x" * (tidy.NOTE_CAP + 1), "   ", "line\r\nline"])
 def test_splitter_fails_closed_on_unsupported_forms(bad):
