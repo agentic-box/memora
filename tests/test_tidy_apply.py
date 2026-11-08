@@ -1466,3 +1466,49 @@ def test_update_memory_update_guard_false_writes_nothing(store):
         with pytest.raises(storage.ConcurrentUpdateError):
             storage.update_memory(conn, mid, tags=["x"], expected_row=raw, embed=False, update_guard=("1 = 0", ()))
     assert "x" not in mem(mid).tags
+
+
+def test_replace_insert_is_refused_when_the_old_digest_changes_during_the_embedding(store, tmp_path, monkeypatch):
+    c = pm("cited")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    real, fired = storage._compute_embedding, []
+    def slow(*a, **k):
+        if not fired:
+            fired.append(1)
+            _sql_edit(p, "tags")                       # the judged old digest is edited while we embed
+        return real(*a, **k)
+    monkeypatch.setattr(storage, "_compute_embedding", slow)
+    n0 = n_memories()
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert res["counts"]["applied"] == 0 and "stale" in reasons(res)["s1"] and n_memories() == n0
+
+
+def test_reverse_edge_is_refused_when_another_memory_also_supersedes_the_loser(store, tmp_path, monkeypatch):
+    older, newer = old_digest(run="a"), old_digest(run="b")
+    other = pm("another memory")
+    plan = dseal([rp("s1", newer, older)])
+    real = ta._digest_edge
+    def racing(cx, holder, peer, et, guards):
+        if et == "superseded_by":
+            with storage.connect() as conn:                # a second superseder of the loser appears after our forward edge
+                dream._guarded_edge(conn, storage, other, older, "supersedes", older, dream._fresh(conn, older)[1], False)
+        return real(cx, holder, peer, et, guards)
+    monkeypatch.setattr(ta, "_digest_edge", racing)
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert "superseded_by" not in edge_types(older, newer) and "partial" in res["applied"][0], res
+
+
+def test_a_replacement_forward_edge_is_refused_when_a_citation_goes_stale_after_the_create(store, tmp_path, monkeypatch):
+    c, newer = pm("cited"), pm("newer")
+    p = old_digest()
+    plan = dseal([dg("s1", "replace_digest", [c], supersedes=p)])
+    real = ta._digest_edge
+    def racing(cx, holder, peer, et, guards):
+        if et == "supersedes":
+            with storage.connect() as conn:
+                dream._guarded_edge(conn, storage, newer, c, "supersedes", c, dream._fresh(conn, c)[1], True)
+        return real(cx, holder, peer, et, guards)
+    monkeypatch.setattr(ta, "_digest_edge", racing)
+    res = run(plan, d_dec(plan, tmp_path, ["s1"]))
+    assert p in live_digest_ids() and "partial" in res["applied"][0] and "superseded_by" not in edge_types(p, [i for i in live_digest_ids() if i != p][0])
