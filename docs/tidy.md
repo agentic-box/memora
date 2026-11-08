@@ -31,6 +31,7 @@ written, with no proposals), 4 wall-time watchdog.
 | `projects` | backfill candidates, in addition to every project the store already uses (`--backfill`). |
 | `mirrors` | backfill: dream's `{"git_dir": ..., "repos": {name: {"dir", "ref", "projects"}}}`; the file lists of those bare mirrors are a path signal (read-only, no fetch). |
 | `repo_paths` | backfill: `{"clmux": ["Sources/"]}`, path prefixes that identify a project's tree. |
+| `limits.digest_min_coverage` | share (0 to 1, default 0.5) of the decision-bearing candidates (item records, decisions) a digest must place, at most `digest_max_lines`; fewer makes the report flag it thin. |
 | `limits.digest_recent_share` | share (0 to 1, default 0.33) of the digest input reserved for the newest memories. Also `newer_per_note` 3, `newer_note_chars` 600, `newer_min_words` 2. |
 | `limits.max_backfill` | `set_project` steps per backfill run (200); `backfill_batch` 8 ambiguous memories per Haiku call. |
 
@@ -48,12 +49,19 @@ written, with no proposals), 4 wall-time watchdog.
    for explicit approval; one that cannot be justified is **rejected**.
    A cluster the validator rejects gets **one repair call** carrying the validator's error (it counts
    against `max_llm_calls`); a second failure still rejects the cluster.
-4. **Digest** (Sonnet, one call, reserved first): a short summary where every line cites memory ids
-   (`[m123]`, or `[@c1]` for a merged memory the plan would create) and quotes a cited note. The input
-   reserves `digest_recent_share` of its bounds for the **newest** memories, then fills by rank and read
-   count (`digest_input.recent_ids` lists what the reserve took). Beside each candidate the writer is
-   shown the **newer** memories on its topic and must not state the decision as current if one of them
-   contradicts or completes it: it leaves it out or writes an `Overtaken` line citing both ids.
+4. **Digest** (Sonnet, one call, then a Haiku line check; both reserved first): every decision,
+   follow-up and constraint that is still current, one line each (at most `digest_max_lines`, 40), not a
+   short summary. Every line cites memory ids (`[m123]`, or `[@c1]` for a merged memory the plan would
+   create) and quotes a cited note. An item record or decision must appear in a current line or an
+   `Overtaken` line. The input reserves `digest_recent_share` of its bounds for the **newest**
+   memories, then fills by rank and read count (`digest_input.recent_ids` lists what the reserve took).
+   Beside each candidate the writer is shown the **newer** memories on its topic and must not state the
+   decision as current if one of them contradicts or completes it: it writes an `Overtaken` line citing
+   both ids.
+   Then **one** extra Haiku call (`digest_check`) reads all lines against the notes they cite; a line
+   whose text the notes do not support (for example one that reverses its quote) is dropped and listed
+   in `rejected`. The check fails open: if it cannot run, the lines stay and `digest_fidelity.status`
+   says `unchecked:<why>`. Both calls count against `max_llm_calls` and are reserved before cluster work.
 5. **Seal**: the report carries a `digest` over everything else (`tidy.plan_digest`); editing it is
    detectable (`tidy.load_tidy_plan`).
 
@@ -70,6 +78,15 @@ digest did and did not look at).
 A step has `status: eligible` (every statement kept or an exact duplicate) or `held` (it contains a
 reworded or dropped statement, or a metadata conflict, and needs the leader's explicit approval). Item
 records, decisions, procedures and digests are never merged or retired.
+
+## Is the digest thin or misstated?
+
+- `digest_coverage`: `decision_notes` (item records and decisions that were in the digest input),
+  `cited`, `overtaken`, `left_out`, `expected_placed`, `thin`, `reason`, `left_out_ids`, and `notes[]`
+  (each id and where it went). A thin digest also gets a `kind: thin_digest` row in `review[]`: read
+  the left-out notes before trusting it, or rerun.
+- `digest_fidelity`: `status` (`ok`, or `unchecked:<why>`), `checked` lines and `dropped` lines. Dropped
+  lines are in `rejected[]` with `op: digest_line` and a reason starting `check:`.
 
 ## Overtaken decisions and the leader
 

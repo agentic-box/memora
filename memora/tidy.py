@@ -76,6 +76,7 @@ class TidyLimits:
     digest_max_lines: int = 40
     digest_note_chars: int = 2000
     digest_recent_share: float = 0.33     # share of the digest input reserved for the NEWEST memories (Item 254)
+    digest_min_coverage: float = 0.5      # a digest placing fewer of the decision-bearing notes than this is thin (Item 256)
     newer_per_note: int = 3               # newer memories shown beside a digest candidate they may overtake
     newer_note_chars: int = 600
     newer_min_words: int = 2              # shared rare words that count as "same topic" when no reference is shared
@@ -101,6 +102,8 @@ class TidyLimits:
             setattr(out, k, type(getattr(out, k))(v))
         if not 0.0 <= out.digest_recent_share <= 1.0:
             raise TidyError("limit digest_recent_share must be between 0 and 1")
+        if not 0.0 <= out.digest_min_coverage <= 1.0:
+            raise TidyError("limit digest_min_coverage must be between 0 and 1")
         return out
 
 
@@ -1059,16 +1062,23 @@ def digest_prompt(project: str, rows: Sequence[Dict[str, Any]], lim: TidyLimits,
             n["newer"] = newer_map[r["cite"]]
         notes.append(n)
     rules = (
-        "Write a short current summary of the project from the notes. Answer exactly "
+        "List EVERY decision, follow-up and constraint in the notes that is still current: one line each, "
+        "covering all the notes, not a short summary. Answer exactly "
         '{"decisions":[LINE],"followups":[LINE],"constraints":[LINE],"overtaken":[LINE]} where LINE = '
         '{"text":str,"cites":[cite,...],"quote":str}; `overtaken` may be omitted. Every line must cite at least one '
         "note by its `cite` value (an integer or a string like \"@c3\") and carry `quote`, a passage copied word "
-        f"for word from a cited note. At most {lim.digest_max_lines} lines in all. Use only facts, numbers, paths "
-        "and identifiers that occur in the cited notes. Omit what you cannot support. "
+        f"for word from a cited note. At most {lim.digest_max_lines} lines in all; if more are current, keep the "
+        "most important and the newest. A note of kind `item-record` or `decision` records a decision: it must "
+        "appear in a current line or in an `overtaken` line, never be skipped. "
+        "Use only facts, numbers, paths and identifiers that occur in the cited notes. The `text` must say what "
+        "the cited notes say and nothing else: do not reverse, weaken or blend them, and when a note records a "
+        "change (something removed, replaced, renamed, finished), state the change, not the old state. "
+        "Omit only what you cannot support. "
         "A note with `newer` ids has later notes on the same topic in `newer_notes`. Read them BEFORE you state "
         "that note's decision as current. If a newer note contradicts it or completes it (the plan changed, the "
-        "work is done), do not list the old decision as current: either leave it out, or write one `overtaken` "
-        "line saying what was overtaken and by what, citing BOTH the old note and the newer note.")
+        "work is done), do not list the old decision as current: write one `overtaken` "
+        "line saying what was overtaken and by what, citing BOTH the old note and the newer note. A decision "
+        "must not be dropped silently.")
     data: Dict[str, Any] = {"project": project, "notes": notes}
     if newer_notes:
         data["newer_notes"] = list(newer_notes)
@@ -1145,6 +1155,110 @@ def digest_flags(rows: Sequence[Dict[str, Any]], newer_map: Dict[int, List[int]]
         placed = sorted({k for k, ls in sections.items() for ln in ls if c in ln["cites"]})
         out.append({"id": c, "newer": newer_map[c], "placed": placed or ["left_out"]})
     return out
+
+
+_ALL_SECTIONS = SECTIONS + (OVERTAKEN,)
+
+
+def _decision_bearing(r: Dict[str, Any]) -> bool:
+    return r.get("kind") in ("item-record", "decision") or any(t in ("item-record", "decision") for t in r.get("tags") or ())
+
+
+def digest_coverage(rows: Sequence[Dict[str, Any]], sections: Dict[str, List[Dict[str, Any]]],
+                    lim: TidyLimits) -> Dict[str, Any]:
+    """Item 256. How the decision-bearing candidates (item records, decisions) were placed: `cited` (a current
+    line), `overtaken` or `left_out`. Thin when fewer are placed than `expected`: `digest_min_coverage` of
+    them, but never more than the line cap, because a digest cannot place more notes than it has lines for
+    (one line may cite several notes, so the bound is generous, not exact). A note can be left out for good
+    reasons (a duplicate, routine), so the threshold is a flag for the leader to read, never a gate."""
+    notes = []
+    for r in rows:
+        if not _decision_bearing(r):
+            continue
+        c = r["cite"]
+        where = sorted({k for k, ls in sections.items() for ln in ls if c in ln["cites"]})
+        placed = "cited" if any(k != OVERTAKEN[0] for k in where) else "overtaken" if where else "left_out"
+        notes.append({"id": c, "placed": placed})
+    n = len(notes)
+    left = sorted((x["id"] for x in notes if x["placed"] == "left_out"),
+                  key=lambda c: (isinstance(c, str), c if _is_int(c) else 0, c if isinstance(c, str) else ""))
+    done = n - len(left)
+    expected = min(math.ceil(lim.digest_min_coverage * n), lim.digest_max_lines)
+    thin = done < expected
+    return {"decision_notes": n, "cited": sum(x["placed"] == "cited" for x in notes),
+            "overtaken": sum(x["placed"] == "overtaken" for x in notes), "left_out": len(left),
+            "min_coverage": lim.digest_min_coverage, "expected_placed": expected, "thin": thin,
+            "reason": (f"only {done} of {n} decision-bearing notes are in the digest (at least {expected} expected: "
+                       f"{lim.digest_min_coverage:.0%} of them, at most {lim.digest_max_lines})") if thin else None,
+            "left_out_ids": left, "notes": notes}
+
+
+def fidelity_prompt(project: str, sections: Dict[str, List[Dict[str, Any]]], rows: Sequence[Dict[str, Any]],
+                    newer_notes: Optional[Sequence[Dict[str, Any]]], lim: TidyLimits) -> Tuple[str, int]:
+    """Item 256: one cheap check call over ALL digest lines. The deterministic checks prove a quote is verbatim
+    and no token is invented; they cannot see a `text` that reverses its quote (Item 246: 'keeps the grey
+    background' written over a note that removed it). A model reads each line against its cited notes."""
+    by = {r["cite"]: r["text"] for r in rows}
+    for n in newer_notes or ():
+        by.setdefault(n["cite"], n["text"])
+    lines, cited = [], []
+    for key, _t in _ALL_SECTIONS:
+        for ln in sections.get(key, ()):
+            lines.append({"i": len(lines), "section": key, "text": ln["text"], "quote": ln["quote"], "cites": ln["cites"]})
+            cited.extend(c for c in ln["cites"] if c not in cited)
+    notes = [{"cite": c, "text": by[c][: lim.digest_note_chars]} for c in cited]
+    rules = (
+        "Check each digest LINE against the `notes` it cites. A line is supported only if its `text` says what the "
+        "cited notes say: nothing the notes do not say, and not the opposite or a weaker or stronger version of "
+        "what they say. Treat as UNSUPPORTED: a line that states as current or still open something a cited note "
+        "says was removed, replaced or finished; a line that blends two different facts; a line whose claim is "
+        "not in the note even though its `quote` is. Different wording of the same meaning is supported. A line in "
+        "`overtaken` is supported if it says the older decision was replaced or completed by the newer note, and "
+        "that is what the notes say. Answer exactly "
+        '{"verdicts":[{"i":int,"supported":bool,"reason":str}]} with one verdict per line, in any order; `reason` '
+        "is one short sentence, required when `supported` is false.")
+    return _data_prompt("digest_check", rules, {"project": project, "lines": lines, "notes": notes}), len(lines)
+
+
+def parse_fidelity(obj: Optional[Dict[str, Any]], n: int) -> Tuple[Optional[Dict[int, str]], Optional[str]]:
+    """({line index: reason} for the unsupported lines, or None and why). Strict: every line gets exactly one
+    verdict, so a partial answer never passes as a check."""
+    if not isinstance(obj, dict) or set(obj) != {"verdicts"} or not isinstance(obj["verdicts"], list):
+        return None, "wrong shape"
+    seen: Dict[int, str] = {}
+    for v in obj["verdicts"]:
+        if not _exact(v, ("i", "supported", "reason")) and not _exact(v, ("i", "supported")):
+            return None, "wrong verdict shape"
+        i = v["i"]
+        if not _is_int(i) or isinstance(i, bool) or not 0 <= i < n or i in seen or not isinstance(v["supported"], bool):
+            return None, "bad verdict"
+        reason = v.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            return None, "bad verdict"
+        seen[i] = "" if v["supported"] else ((reason or "").strip() or "no reason given")
+    if len(seen) != n:
+        return None, "missing verdicts"
+    return {i: r for i, r in seen.items() if r}, None
+
+
+def drop_unsupported(sections: Dict[str, List[Dict[str, Any]]], bad: Dict[int, str]
+                     ) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    rejected: List[Dict[str, Any]] = []
+    i = 0
+    for key, _t in _ALL_SECTIONS:
+        if key not in sections:
+            continue
+        kept = []
+        for ln in sections[key]:
+            if i in bad:
+                rejected.append({"line": ln["text"][:120],
+                                 "reason": "check: text is not supported by its cited notes: " + bad[i][:160]})
+            else:
+                kept.append(ln)
+            i += 1
+        out[key] = kept
+    return out, rejected
 
 
 def render_digest(sections: Dict[str, List[Dict[str, Any]]]) -> str:
@@ -1295,10 +1409,11 @@ def project_vocab(mems: Sequence[Mem], project: str) -> set:
 
 
 class _Calls:
-    """LLM-call accounting. The digest call is RESERVED first: cluster work may use `cap - 1` calls."""
+    """LLM-call accounting. The digest call and its line check (Item 256) are RESERVED first: cluster work may
+    use `cap - 2` calls."""
 
     def __init__(self, cap: int, reserve_digest: bool):
-        self.cap, self.reserve = cap, 1 if reserve_digest else 0
+        self.cap, self.reserve = cap, 2 if reserve_digest else 0
         self.group = self.write = 0
 
     @property
@@ -1314,6 +1429,44 @@ class _Calls:
 
 def _ask(judge: Callable[..., str], prompt: str, budget: "dream.Budget", lim: TidyLimits) -> str:
     return judge(prompt, timeout=max(min(budget.remaining(), lim.judge_timeout), 1.0))
+
+
+def _check_fidelity(content: Dict[str, Any], rows: Sequence[Dict[str, Any]], newer_notes: Sequence[Dict[str, Any]],
+                    project: str, judge_check: Optional[Callable[..., str]], calls: "_Calls", budget: "dream.Budget",
+                    lim: TidyLimits, rejected: List[Dict[str, Any]]
+                    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Dict[str, Any]]:
+    """Item 256: drop the digest lines the check judges unsupported by their cited notes (recorded in
+    `rejected`). It fails OPEN and says so: with no judge, no call budget or time left, a failed call or an
+    unusable answer, the lines stay and `digest_fidelity.status` is `unchecked:<why>`; the report is a dry run
+    a leader reads, and losing the whole digest to a flaky check would be worse than flagging it."""
+    prompt, n = fidelity_prompt(project, content["sections"], rows, newer_notes, lim)
+    info: Dict[str, Any] = {"status": "ok", "checked": n, "dropped": 0}
+    if judge_check is None:
+        why = "no judge"
+    elif not calls.digest_ok():
+        why = "max_llm_calls"
+    elif budget.out_of_time():
+        why = "max_seconds"
+    else:
+        why = None
+    bad: Optional[Dict[int, str]] = None
+    if why is None:
+        calls.group += 1
+        try:
+            obj, problem = parse_json_object(_ask(judge_check, prompt, budget, lim))
+        except Exception as e:  # noqa: BLE001
+            obj, problem = None, f"judge failed: {type(e).__name__}"
+        bad, problem = parse_fidelity(obj, n) if obj is not None else (None, problem)
+        if bad is None:
+            why = problem or "unusable answer"
+    if bad is None:
+        return content, None, {**info, "status": f"unchecked:{why}", "checked": 0}
+    kept, rej = drop_unsupported(content["sections"], bad)
+    rejected.extend({"cluster": None, "op": "digest_line", **x} for x in rej)
+    info["dropped"] = len(rej)
+    if not any(kept.values()):
+        return None, "no valid line", info
+    return {"sections": kept}, None, info
 
 
 def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: set, cfg: TidyConfig, project: str,
@@ -1505,6 +1658,8 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
     digest_input: Dict[str, Any] = {"considered": 0, "included": 0, "excluded": 0, "chars": 0}
     digest_step = None
     digest_flagged: List[Dict[str, Any]] = []
+    digest_cov: Optional[Dict[str, Any]] = None
+    digest_fid: Dict[str, Any] = {"status": "not_run", "checked": 0, "dropped": 0}
     review: List[Dict[str, Any]] = []
     if d_deferred:
         deferred.append({"cluster": None, "op": d_op, "reason": "cap:max_writes"})
@@ -1530,9 +1685,18 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
             content, drej, dproblem2 = (validate_digest(obj, rows, lim, newer_map, newer_notes) if obj is not None
                                         else (None, [], dproblem))
             rejected.extend({"cluster": None, "op": "digest_line", **x} for x in drej)
+            if content is not None:
+                content, dproblem2, digest_fid = _check_fidelity(content, rows, newer_notes, project, judge_group,
+                                                                 calls, budget, lim, rejected)
             if content is None:
                 rejected.append({"cluster": None, "op": "digest", "reason": dproblem2 or dproblem})
             else:
+                digest_cov = digest_coverage(rows, content["sections"], lim)
+                if digest_cov["thin"]:
+                    review.append({"kind": "thin_digest", "reason": digest_cov["reason"],
+                                   "left_out": digest_cov["left_out_ids"],
+                                   "action": "the digest leaves out decision-bearing notes: rerun, or read the "
+                                             "left-out notes before trusting it; leader decides"})
                 flags = digest_flags(rows, newer_map, content["sections"])
                 if flags:
                     digest_flagged.extend(flags)
@@ -1588,7 +1752,8 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
                    "duplicate_pairs": (metrics or {}).get("duplicate_pairs"),
                    "contradictions": len(contradictions)},
         "sources": sources_out, "clusters": out_clusters, "steps": steps, "rejected": rejected,
-        "digest_input": digest_input, "digest_flags": digest_flagged, "digest_state": d_op, "review": review, "contradictions": contradictions,
+        "digest_input": digest_input, "digest_coverage": digest_cov, "digest_fidelity": digest_fid,
+        "digest_flags": digest_flagged, "digest_state": d_op, "review": review, "contradictions": contradictions,
     }
     report.update(extra or {})
     report["digest"] = plan_digest(report)

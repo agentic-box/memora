@@ -12,6 +12,13 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.12 — 2026-11-08
+
+`memora-tidy` digest fixes from the second look at the real clmux report (Item 256). Still dry run only.
+
+- **The digest covers the notes instead of summarising them.** The prompt asks for every current decision, follow-up and constraint, requires item records and decisions to appear in a current or `Overtaken` line, and forbids dropping a decision silently (the real run wrote 9 lines against a cap of 40). New `digest_coverage` in the report lists how each included item record and decision was placed; fewer placed than `digest_min_coverage` (default 0.5, at most the line cap) flags the digest thin and adds a `thin_digest` review row.
+- **Each line must say what its quote says.** One extra Haiku call (`digest_check`) reads all lines against their cited notes; unsupported lines are dropped and listed in `rejected`. It fails open and says so (`digest_fidelity.status: unchecked:<why>`). It is reserved with the digest call, so cluster work may use `max_llm_calls - 2`.
+
 ## 0.5.7.11 — 2026-11-08
 
 `memora-tidy` fixes from the first real clmux report (Item 254). Still dry run only.

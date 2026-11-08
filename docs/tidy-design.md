@@ -1,6 +1,6 @@
 # The tidy pass (Item 251): design
 
-> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in section 13, v0.5.7.11); the apply
+> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in sections 13 and 14, v0.5.7.11 and v0.5.7.12); the apply
 > step (`--apply`, `replace_digest` and friends as store writes) is not. Names marked *(new)* were new at
 > design time; line numbers are those of v0.5.7.9. Where the implementation differs from this design,
 > section 12 says how and why.
@@ -489,3 +489,29 @@ All taken in the dry-run report and again after the apply:
 - **Caps.** Backfill has its own cap (`max_backfill`, one write each, apart from `max_writes` 40, which
   bounds a tidy plan); it is applied before any model call. A digest candidate that was left out
   although newer memories exist becomes a `potential_overtaken` review row (not proven).
+
+## 14. Item 256: digest coverage and line fidelity
+
+The first real run wrote 9 lines against a cap of 40 from 57 notes, and one line (Item 246) said the
+opposite of its quote. Two causes, two fixes.
+
+- **Coverage.** The prompt no longer asks for a "short summary". It asks for every decision, follow-up
+  and constraint that is still current, requires an item record or decision to appear in a current line
+  or an `overtaken` line, and forbids dropping a decision silently. `digest_coverage` in the report lists
+  the included item records and decisions and where each went (`cited`, `overtaken`, `left_out`). The
+  digest is **thin** when fewer are placed than `min(ceil(digest_min_coverage * N), digest_max_lines)`,
+  default `digest_min_coverage` 0.5. Why 0.5: some left-out notes are legitimate (a duplicate, a
+  routine record, a decision a merge absorbed), so the bar is "about half"; why the line cap: a digest
+  cannot place more notes than it has lines. A thin digest still seals; it adds a `thin_digest` row to
+  `review[]` for the leader, because the right response (rerun, read the left-out notes) is a human call.
+- **Line fidelity.** The existing checks prove the quote is verbatim and that no number, path or
+  identifier is invented. They cannot see a `text` that contradicts the quote it carries. One extra
+  Haiku call (`digest_check`) reads every line against the notes it cites and returns a strict
+  per-line verdict; unsupported lines are dropped and recorded in `rejected` (`op: digest_line`, reason
+  `check: ...`). One call for all lines, not one per line, and it is reserved with the digest call
+  (cluster work may use `max_llm_calls - 2`). A deterministic check alone was rejected: wording that
+  reverses a quote shares all its tokens with it. The check **fails open**: with no judge, no call or
+  time budget left, a failed call or an unusable answer (wrong shape, missing or repeated verdicts),
+  the lines stay and `digest_fidelity.status` reads `unchecked:<why>`. The report is a dry run read by a
+  leader; losing the whole digest to a flaky check would cost more than flagging it. Coverage is
+  computed after the drop.

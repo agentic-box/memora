@@ -15,6 +15,7 @@
     "max_seconds": 1500,
     "nice": 10,
     "digest_recent_share": 0.33,
+    "digest_min_coverage": 0.5,
     "max_backfill": 200
   },
   "read_ledger": "/path/to/read-ledger.jsonl",

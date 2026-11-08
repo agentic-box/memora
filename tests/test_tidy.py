@@ -447,12 +447,23 @@ EMB = {1: {"a": 1.0}, 2: {"a": 1.0}, 3: {"a": 1.0}}
 MERGED = "Uploads require admin approval. Logs are kept 30 days. See Item 44."
 
 
+def all_supported(prompt, unsupported=()):
+    lines = data_of(prompt)["lines"]
+    return json.dumps({"verdicts": [{"i": ln["i"], "supported": ln["i"] not in unsupported,
+                                     "reason": "" if ln["i"] not in unsupported else "reverses its note"}
+                                    for ln in lines]})
+
+
 class Fake:
-    def __init__(self, merged=MERGED, digest=True, group=None):
+    def __init__(self, merged=MERGED, digest=True, group=None, check=None):
         self.calls = []
+        self.check = check
         self.merged, self.digest, self.group_ans = merged, digest, group
 
     def group(self, prompt, timeout=None):
+        if prompt.startswith("TASK: digest_check"):                   # Item 256: the line-fidelity check (Haiku)
+            self.calls.append("check")
+            return self.check(prompt) if self.check else all_supported(prompt)
         self.calls.append("group")
         if self.group_ans is not None:
             return self.group_ans(prompt) if callable(self.group_ans) else self.group_ans
@@ -484,8 +495,8 @@ def run(fake, mems=None, **lim):
 def test_full_run_plans_a_merge_a_digest_with_symbolic_ids_and_seals_it():
     fake = Fake()
     rep = run(fake)
-    assert fake.calls == ["group", "TASK: merge", "TASK: digest"]
-    assert rep["judge"]["calls"] == {"group": 1, "write": 2, "total": 3}
+    assert fake.calls == ["group", "TASK: merge", "TASK: digest", "check"]
+    assert rep["judge"]["calls"] == {"group": 2, "write": 2, "total": 4}
     merge, digest = rep["steps"]
     assert merge["op"] == "merge" and merge["create"] == "@c1" and merge["charge"] == 5 and merge["status"] == "eligible"
     assert digest["op"] == "bootstrap_digest" and digest["create"] == "@d1" and digest["depends_on"] == [merge["id"]]
@@ -522,16 +533,20 @@ def test_a_cluster_answer_that_deviates_rejects_the_whole_cluster():
 
 def test_call_budget_reserves_the_digest_call_first():
     fake = Fake()
-    rep = run(fake, max_llm_calls=2)
-    # the cluster may use cap-1 = 1 call: no merge call, but the digest still gets its reserved call
-    assert fake.calls == ["group", "TASK: digest"]
-    assert rep["judge"]["calls"]["total"] == 2 and rep["stopped_by"] == "max_llm_calls"
+    rep = run(fake, max_llm_calls=3)
+    # the cluster may use cap-2 = 1 call: no merge call, but the digest and its check keep their reserved calls
+    assert fake.calls == ["group", "TASK: digest", "check"]
+    assert rep["judge"]["calls"]["total"] == 3 and rep["stopped_by"] == "max_llm_calls"
     assert any(r["reason"] == "call budget" for r in rep["clusters"][0]["proposals_rejected"])
     assert rep["steps"][-1]["op"] == "bootstrap_digest"
     fake = Fake()
+    rep = run(fake, max_llm_calls=2)
+    # cap 2: no cluster call at all (cap - 2 = 0), the reserved calls go to the digest and its check
+    assert fake.calls == ["TASK: digest", "check"] and rep["deferred_clusters"] == ["c1"]
+    fake = Fake()
     rep = run(fake, max_llm_calls=1)
-    # cap 1: no cluster call at all (cap - 1 = 0), the one reserved call still goes to the digest
-    assert fake.calls == ["TASK: digest"] and rep["deferred_clusters"] == ["c1"]
+    # cap 1: the digest runs, the check has no call left: the lines stay and the report says unchecked
+    assert fake.calls == ["TASK: digest"] and rep["digest_fidelity"]["status"] == "unchecked:max_llm_calls"
 
 
 def test_caps_defer_steps_and_the_write_charge_is_pruned_before_sealing():
@@ -823,6 +838,9 @@ def test_cli_end_to_end_reads_a_store_copy_writes_only_the_report(store, tmp_pat
     seen = []
 
     def group(prompt, timeout=None):
+        if prompt.startswith("TASK: digest_check"):
+            seen.append("c")
+            return all_supported(prompt)
         seen.append("g")
         return json.dumps(ans(keep=keep(i1, i2)))
 
@@ -833,7 +851,7 @@ def test_cli_end_to_end_reads_a_store_copy_writes_only_the_report(store, tmp_pat
     monkeypatch.setattr(tidy, "make_judges", lambda models, timeout: (group, write))
     out = tmp_path / "out"
     assert tidy.main(["--config", str(cp), "--db", str(store), "--out-dir", str(out)]) == 0
-    assert seen == ["g", "w"]
+    assert seen == ["g", "w", "c"]
     (report_path,) = list(out.iterdir())
     rep = tidy.load_tidy_plan(str(report_path))
     assert rep["project"] == "clmux" and rep["counts"]["live"] == 2 and rep["steps"][-1]["op"] == "bootstrap_digest"
@@ -1025,7 +1043,7 @@ def test_a_rejected_cluster_gets_one_repair_call_with_the_validator_error():
         return json.dumps(ans(keep=keep(1, 2))) if len(seen) == 1 else json.dumps(ans(keep=keep(1, 2, 3)))
     fake = Fake(group=group)
     rep = run(fake)
-    assert fake.calls.count("group") == 2 and rep["judge"]["calls"]["group"] == 2
+    assert fake.calls.count("group") == 2 and rep["judge"]["calls"]["group"] == 3      # 2 cluster calls + the digest check
     assert "Your previous answer was rejected" in seen[1] and "primary disposition" in seen[1]
     cl = rep["clusters"][0]
     assert cl["status"] == "judged" and cl["repair"]["result"] == "ok" and "primary disposition" in cl["repair"]["first_problem"]
@@ -1036,10 +1054,10 @@ def test_a_rejected_cluster_gets_one_repair_call_with_the_validator_error():
     cl = rep["clusters"][0]
     assert cl["status"] == "rejected" and cl["repair"]["result"] == cl["problem"]
     assert not [s for s in rep["steps"] if s["op"] not in ("bootstrap_digest",)]
-    # the repair is counted against max_llm_calls (cap 2, digest reserve 1: one cluster call, no repair)
+    # the repair is counted against max_llm_calls (cap 3, digest and check reserve 2: one cluster call, no repair)
     fake = Fake(group=json.dumps(ans(keep=keep(1, 2))))
-    rep = run(fake, max_llm_calls=2)
-    assert fake.calls.count("group") == 1 and "repair" not in rep["clusters"][0] and rep["judge"]["calls"]["total"] <= 2
+    rep = run(fake, max_llm_calls=3)
+    assert fake.calls.count("group") == 1 and "repair" not in rep["clusters"][0] and rep["judge"]["calls"]["total"] <= 3
     # a judge that failed outright is not retried with an error text
     def boom(prompt, timeout=None):
         raise RuntimeError("down")
@@ -1282,3 +1300,137 @@ def test_left_out_overtaken_candidates_become_review_rows_and_backfill_honours_i
     rep = bf(mems, lambda p, timeout=None: seen.append(p) or "{}", max_backfill=3)
     assert seen == [] and rep["judge"]["calls"]["total"] == 0 and len(rep["steps"]) == 3
     assert {"id": 50, "reason": "cap:max_backfill (not asked)"} in rep["deferred"]
+
+
+# ----------------------------------------------------------------------------- Item 256: digest coverage and line fidelity
+
+
+def rec_world(n=6):
+    ms = [M(100 + i, f"Decision {i}: use mode{i} for the thing{i}. See Item {900 + i}.", meta={"kind": "item-record"},
+            tags=["item-record"], created=f"2026-03-0{i + 1} 00:00:00") for i in range(n)]
+    return ms + [M(200, "A routine note about nothing in particular.", created="2026-03-09 00:00:00")]
+
+
+def rec_group(prompt):
+    return json.dumps(ans(keep=keep(*[m["id"] for m in data_of(prompt)["members"]])))
+
+
+class RecWriter:
+    """Writes one current line per item record id in `ids` (a judge that drops the rest)."""
+    def __init__(self, ids):
+        self.ids, self.prompts = ids, []
+
+    def __call__(self, prompt, timeout=None):
+        self.prompts.append(prompt)
+        by = {n["cite"]: n["text"] for n in data_of(prompt)["notes"]}
+        return json.dumps({"decisions": [{"text": by[i], "cites": [i], "quote": by[i]} for i in self.ids],
+                           "followups": [], "constraints": []})
+
+
+def run_rec(ids, check=None, n=6, **lim):
+    w = RecWriter(ids)
+    calls = []
+
+    def group(prompt, timeout=None):
+        if prompt.startswith("TASK: digest_check"):
+            calls.append(prompt)
+            return check(prompt) if check else all_supported(prompt)
+        return rec_group(prompt)
+    mems = rec_world(n)
+    cfg = TidyConfig(limits=TidyLimits(**lim))
+    rep = tidy.run_tidy(mems, {m.id: {"a": 1.0} for m in mems}, set(), cfg, "clmux", group, w, now=1_800_000_000.0)
+    return rep, w, calls
+
+
+def test_the_prompt_asks_for_every_current_decision_not_a_short_summary():
+    _rep, w, _c = run_rec([100])
+    p = w.prompts[0]
+    assert "EVERY decision, follow-up and constraint" in p and "short current summary" not in p
+    assert "at most 40 lines" in p.lower() or "At most 40 lines" in p
+    assert "must not be dropped silently" in p and "`item-record` or `decision`" in p
+
+
+def test_a_digest_that_drops_current_decisions_is_flagged_thin():
+    rep, _w, _c = run_rec([100])                       # 1 of 6 decision-bearing notes placed; 3 expected
+    cov = rep["digest_coverage"]
+    assert cov["decision_notes"] == 6 and cov["cited"] == 1 and cov["left_out"] == 5 and cov["thin"] is True
+    assert cov["expected_placed"] == 3 and cov["left_out_ids"] == [101, 102, 103, 104, 105]
+    assert "only 1 of 6" in cov["reason"] and 200 not in cov["left_out_ids"]          # routine note is not counted
+    thin = [r for r in rep["review"] if r["kind"] == "thin_digest"]
+    assert len(thin) == 1 and thin[0]["left_out"] == cov["left_out_ids"]
+    assert rep["steps"][-1]["op"] == "bootstrap_digest" and rep["digest"] == tidy.plan_digest(rep)   # flagged, not blocked
+    rep, _w, _c = run_rec([100, 101, 102])             # exactly the expected number: not thin
+    assert rep["digest_coverage"]["thin"] is False and rep["digest_coverage"]["reason"] is None
+    assert not [r for r in rep["review"] if r["kind"] == "thin_digest"]
+
+
+def test_coverage_counts_overtaken_as_placed_and_caps_the_expectation_at_the_line_cap():
+    rows = [{"cite": i, "text": "t", "tags": [], "kind": "item-record"} for i in range(1, 101)] + \
+           [{"cite": 500, "text": "t", "tags": ["decision"], "kind": None}, {"cite": 501, "text": "t", "tags": [], "kind": "todo"}]
+    secs = {"decisions": [{"text": "a", "cites": [1], "quote": "t"}], "followups": [], "constraints": [],
+            "overtaken": [{"text": "b", "cites": [2, 3], "quote": "t"}]}
+    cov = tidy.digest_coverage(rows, secs, TidyLimits())
+    assert (cov["decision_notes"], cov["cited"], cov["overtaken"], cov["left_out"]) == (101, 1, 2, 98)
+    assert cov["expected_placed"] == 40 and cov["thin"] is True      # 50% of 101 = 51, capped at the 40-line cap
+    assert {"id": 500, "placed": "left_out"} in cov["notes"] and all(x["id"] != 501 for x in cov["notes"])
+    assert tidy.digest_coverage(rows[:4], {"decisions": [{"text": "a", "cites": [1, 2], "quote": "t"}]},
+                                TidyLimits())["thin"] is False
+    with pytest.raises(TidyError):
+        TidyLimits.from_dict({"digest_min_coverage": 1.5})
+
+
+def test_an_unsupported_line_is_dropped_and_recorded():
+    rep, _w, calls = run_rec([100, 101, 102], check=lambda p: all_supported(p, unsupported={1}))
+    body = rep["steps"][-1]["body"]
+    assert "[m100]" in body and "[m102]" in body and "[m101]" not in body
+    rej = [r for r in rep["rejected"] if r["op"] == "digest_line"]
+    assert len(rej) == 1 and rej[0]["reason"].startswith("check: text is not supported") and "reverses its note" in rej[0]["reason"]
+    assert rep["digest_fidelity"] == {"status": "ok", "checked": 3, "dropped": 1}
+    assert rep["digest_coverage"]["cited"] == 2 and 101 in rep["digest_coverage"]["left_out_ids"]   # coverage after the drop
+    assert rep["judge"]["calls"] == {"group": 1, "write": 1, "total": 2}   # the check (Haiku) and the digest (Sonnet)
+    d = data_of(calls[0])                                         # the check sees the lines and only the cited notes
+    assert [ln["i"] for ln in d["lines"]] == [0, 1, 2] and {n["cite"] for n in d["notes"]} == {100, 101, 102}
+    assert d["lines"][0]["section"] == "decisions" and "quote" in d["lines"][0]
+
+
+def test_the_check_is_one_call_and_all_lines_dropped_means_no_digest():
+    rep, _w, calls = run_rec([100, 101], check=lambda p: all_supported(p, unsupported={0, 1}))
+    assert len(calls) == 1 and rep["digest_fidelity"]["dropped"] == 2
+    assert all(s["op"] != "bootstrap_digest" for s in rep["steps"]) and rep["digest_coverage"] is None
+    assert {"cluster": None, "op": "digest", "reason": "no valid line"} in rep["rejected"]
+
+
+@pytest.mark.parametrize("answer", ["not json", "{}", json.dumps({"verdicts": []}),
+                                    json.dumps({"verdicts": [{"i": 0, "supported": True}, {"i": 0, "supported": True}]}),
+                                    json.dumps({"verdicts": [{"i": 7, "supported": True}]})])
+def test_an_unusable_check_answer_keeps_the_lines_and_says_unchecked(answer):
+    rep, _w, _c = run_rec([100], check=lambda p: answer)
+    assert "[m100]" in rep["steps"][-1]["body"]
+    assert rep["digest_fidelity"]["status"].startswith("unchecked:") and rep["digest_fidelity"]["dropped"] == 0
+    assert not [r for r in rep["rejected"] if r["op"] == "digest_line"]
+
+
+def test_a_failing_or_missing_check_judge_fails_open_and_is_reported():
+    def boom(p):
+        raise RuntimeError("down")
+    rep, _w, _c = run_rec([100], check=boom)
+    assert rep["digest_fidelity"]["status"] == "unchecked:judge failed: RuntimeError" and "[m100]" in rep["steps"][-1]["body"]
+    mems = rec_world()
+    w = RecWriter([100])
+    rep = tidy.run_tidy(mems, {m.id: {"a": 1.0} for m in mems}, set(), TidyConfig(limits=TidyLimits(max_clusters=0)), "clmux",
+                        None, w, now=1_800_000_000.0)
+    assert rep["digest_fidelity"]["status"] == "unchecked:no judge"
+
+
+def test_parse_fidelity_is_strict_and_drop_unsupported_follows_render_order():
+    assert tidy.parse_fidelity({"verdicts": [{"i": 1, "supported": False, "reason": "r"}, {"i": 0, "supported": True}]}, 2) \
+        == ({1: "r"}, None)
+    assert tidy.parse_fidelity({"verdicts": [{"i": 0, "supported": False}]}, 1) == ({0: "no reason given"}, None)
+    for bad in ({"verdicts": []}, {"verdicts": "x"}, {"verdicts": [{"i": True, "supported": True}]},
+                {"verdicts": [{"i": 0, "supported": "yes"}]}, {"verdicts": [{"i": 0, "supported": True}], "x": 1}):
+        assert tidy.parse_fidelity(bad, 1)[0] is None
+    secs = {"decisions": [{"text": "a", "cites": [1], "quote": "q"}], "followups": [{"text": "b", "cites": [1], "quote": "q"}],
+            "constraints": [], "overtaken": [{"text": "c", "cites": [1, 2], "quote": "q"}]}
+    kept, rej = tidy.drop_unsupported(secs, {1: "no", 2: "no"})
+    assert [ln["text"] for ln in kept["decisions"]] == ["a"] and kept["followups"] == [] and kept["overtaken"] == []
+    assert [r["line"] for r in rej] == ["b", "c"]
