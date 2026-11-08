@@ -235,6 +235,11 @@ def test_numeric_constraint_containment_is_not_a_duplicate():
     a, b = M(1, "Allow 30 days."), M(2, "Do not allow 30 days.")
     e = merge_entry([1, 2], "Do not allow 30 days.", [row((1, 0), "duplicate", of=(2, 0)), row((2, 0), "kept", 0)])
     assert "not word for word equal" in vmerge(e, a, b)[1]
+    # the same with matching case, where plain substring containment WOULD hold
+    a, b = M(1, "Allow 30 days."), M(2, "Never Allow 30 days.")
+    assert "Allow 30 days." in "Never Allow 30 days."
+    e = merge_entry([1, 2], "Never Allow 30 days.", [row((1, 0), "duplicate", of=(2, 0)), row((2, 0), "kept", 0)])
+    assert "not word for word equal" in vmerge(e, a, b)[1]
 
 
 def test_partial_quote_constraint_is_held_not_kept_and_never_eligible():
