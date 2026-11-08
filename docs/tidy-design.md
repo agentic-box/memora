@@ -1,6 +1,6 @@
 # The tidy pass (Item 251): design
 
-> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10); the apply
+> **Status: phase 2 (dry run) is implemented** in `memora/tidy.py` (Item 252, v0.5.7.10; fixes in section 13, v0.5.7.11); the apply
 > step (`--apply`, `replace_digest` and friends as store writes) is not. Names marked *(new)* were new at
 > design time; line numbers are those of v0.5.7.9. Where the implementation differs from this design,
 > section 12 says how and why.
@@ -465,3 +465,21 @@ All taken in the dry-run report and again after the apply:
   forward and the reverse edge) and `substitute_symbols` (token-aware: `@c3` never touches `@c30`).
 - **Not built in this phase:** the fixed retrieval query set and acceptance-rate file (section 9), the
   `decisions.json` consumer, and the snapshot step before the unit (the operator makes the store copy).
+
+## 13. Item 254: fixes from the first real run
+
+- **Digest input.** A reserved share of the char and count bounds goes to the newest memories (by
+  `updated_at`) before the rank fill (`digest_recent_share`, default 0.33, recorded in `digest_input`).
+  The first real run ranked by read count and missed Items 240 to 249.
+- **Overtaken decisions.** Each candidate is shown the newer live memories that share a non-generic
+  reference or at least two rare words with it. The digest answer gains an optional `overtaken` section;
+  a line there must cite an older note and a newer note offered for it. `digest_flags` records where
+  every candidate with newer memories ended up, and `review[]` gets a retire-or-contradiction candidate
+  per overtaken line. Nothing is retired by tidy. This is a prompt rule plus a flag, not a proof: a
+  decision the writer keeps as current is listed for the leader, not blocked.
+- **Repair call.** A rejected cluster gets one more Haiku call that carries the validator's error;
+  the second answer is validated the same way and the cluster is rejected if it fails.
+- **Project backfill** (`--backfill`): see `docs/tidy.md`. Deterministic signals first, Haiku only for
+  ambiguous ones. Report only; `set_project` is validated (`validate_set_project`) and revalidated at
+  apply time (`has_project`). The mirror-tree lookup of dream is not used: paths are matched against
+  the labelled memories and an optional `repo_paths` config.

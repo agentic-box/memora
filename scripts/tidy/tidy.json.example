@@ -1,6 +1,9 @@
 {
   "project": "alpha",
-  "models": {"group": "haiku", "write": "sonnet"},
+  "models": {
+    "group": "haiku",
+    "write": "sonnet"
+  },
   "limits": {
     "max_clusters": 12,
     "max_llm_calls": 24,
@@ -10,8 +13,19 @@
     "max_retags": 20,
     "max_writes": 40,
     "max_seconds": 1500,
-    "nice": 10
+    "nice": 10,
+    "digest_recent_share": 0.33,
+    "max_backfill": 200
   },
   "read_ledger": "/path/to/read-ledger.jsonl",
-  "state_dir": "~/.local/state/memora-dream"
+  "state_dir": "~/.local/state/memora-dream",
+  "projects": [
+    "alpha",
+    "beta"
+  ],
+  "repo_paths": {
+    "alpha": [
+      "src/"
+    ]
+  }
 }

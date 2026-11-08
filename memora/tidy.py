@@ -74,6 +74,13 @@ class TidyLimits:
     digest_max_chars: int = 60000
     digest_max_lines: int = 40
     digest_note_chars: int = 2000
+    digest_recent_share: float = 0.33     # share of the digest input reserved for the NEWEST memories (Item 254)
+    newer_per_note: int = 3               # newer memories shown beside a digest candidate they may overtake
+    newer_note_chars: int = 600
+    newer_min_words: int = 2              # shared rare words that count as "same topic" when no reference is shared
+    max_backfill: int = 200               # set_project steps per backfill run
+    backfill_batch: int = 8               # ambiguous memories per Haiku call
+    backfill_note_chars: int = 1500
     recent_days: float = 90.0
     judge_timeout: float = 120.0
     max_dup_compares: int = 200000
@@ -91,6 +98,8 @@ class TidyLimits:
             if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
                 raise TidyError(f"limit {k} must be a finite, non-negative number")
             setattr(out, k, type(getattr(out, k))(v))
+        if not 0.0 <= out.digest_recent_share <= 1.0:
+            raise TidyError("limit digest_recent_share must be between 0 and 1")
         return out
 
 
@@ -100,6 +109,8 @@ class TidyConfig:
     project: Optional[str] = None
     db: Optional[str] = None
     models: Dict[str, str] = dataclasses.field(default_factory=dict)     # {"group": "haiku", "write": "sonnet"}
+    projects: List[str] = dataclasses.field(default_factory=list)        # backfill candidates (plus the store's own)
+    repo_paths: Dict[str, List[str]] = dataclasses.field(default_factory=dict)   # backfill: project -> path prefixes
     read_ledger: Optional[Path] = None
     # Shared with dream BY DEFAULT: run_lock() takes `<state_dir>/dream.lock`, so tidy and dream exclude
     # each other only while they use the same state_dir (docs/tidy.md).
@@ -120,11 +131,19 @@ class TidyConfig:
         if not isinstance(models, dict) or not all(isinstance(v, str) and v for v in models.values()) \
                 or set(models) - {"group", "write"}:
             raise TidyError("config 'models' must map group / write to a model name")
+        projects = raw.get("projects") or []
+        if not isinstance(projects, list) or not all(isinstance(x, str) and x for x in projects):
+            raise TidyError("config 'projects' must be a list of project names")
+        rp = raw.get("repo_paths") or {}
+        if not isinstance(rp, dict) or not all(isinstance(k, str) and isinstance(v, list)
+                                                and all(isinstance(x, str) and x for x in v) for k, v in rp.items()):
+            raise TidyError("config 'repo_paths' must map a project to a list of path prefixes")
         ex = lambda v: Path(os.path.expanduser(v)) if v else None  # noqa: E731
         return cls(limits=TidyLimits.from_dict(raw.get("limits")),
                    project=raw.get("project") if isinstance(raw.get("project"), str) else None,
                    db=raw.get("db") if isinstance(raw.get("db"), str) else None,
-                   models=dict(models), read_ledger=ex(raw.get("read_ledger")),
+                   models=dict(models), projects=list(projects), repo_paths={k: list(v) for k, v in rp.items()},
+                   read_ledger=ex(raw.get("read_ledger")),
                    state_dir=ex(raw.get("state_dir")) or Path(os.path.expanduser("~/.local/state/memora-dream")))
 
 
@@ -886,67 +905,193 @@ def _is_open_task(m: Mem) -> bool:
             or any(re.search(r"(?:^|/)(?:todos?|issues?)$", t) for t in m.tags))
 
 
-def digest_candidates(mems: Sequence[Mem], steps: Sequence[Dict[str, Any]], reads: Dict[int, int], lim: TidyLimits,
-                      now: float) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """The post-plan set (memories hidden by a planned step are out, planned creates are in), ranked and bounded:
-    protected decisions and item records, open todos, recently updated, then most read."""
+def _ts(m: Mem) -> float:
+    return dream._parse_ts(m.updated_at) or dream._parse_ts(m.created_at) or 0.0
+
+
+def _hidden_by(steps: Sequence[Dict[str, Any]]) -> set:
     hidden: set = set()
     for st in steps:
         if st["op"] == "merge":
             hidden.update(st["sources"])
         elif st["op"] == "retire":
             hidden.add(st["id_hidden"])
-    pool: List[Tuple[Tuple[int, float, int], Dict[str, Any]]] = []
+    return hidden
+
+
+def digest_candidates(mems: Sequence[Mem], steps: Sequence[Dict[str, Any]], reads: Dict[int, int], lim: TidyLimits,
+                      now: float) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """The post-plan set (memories hidden by a planned step are out, planned creates are in), ranked and bounded.
+    Item 254: first a reserved share (`digest_recent_share`) of both bounds goes to the NEWEST memories (by
+    updated_at), so a read-count-led ranking cannot starve recent work; the rest is filled in rank order
+    (protected, open todos, recently updated, then most read; the first three newest first)."""
+    hidden = _hidden_by(steps)
+    pool: List[Tuple[Tuple, Optional[float], Dict[str, Any]]] = []
     for m in mems:
         if m.id in hidden or m.metadata.get("kind") == "digest":
             continue
-        ts = dream._parse_ts(m.updated_at) or dream._parse_ts(m.created_at) or 0.0
+        ts = _ts(m)
         recent = (now - ts) <= lim.recent_days * 86400
         rank = 0 if is_protected(m) else 1 if _is_open_task(m) else 2 if recent else 3
-        pool.append(((rank, -float(reads.get(m.id, 0)), m.id),
-                     {"cite": m.id, "text": m.content, "tags": m.tags, "kind": m.metadata.get("kind")}))
+        r = float(reads.get(m.id, 0))
+        key = (rank, -ts, -r, m.id) if rank < 3 else (rank, -r, -ts, m.id)
+        pool.append((key, ts, {"cite": m.id, "text": m.content, "tags": m.tags, "kind": m.metadata.get("kind")}))
     for s in steps:
         if s["op"] == "merge":
-            pool.append(((2, 0.0, 10 ** 9 + int(s["create"][2:])),
+            pool.append(((2, 0.0, 0.0, 10 ** 9 + int(s["create"][2:])), None,
                          {"cite": s["create"], "text": s["body"], "tags": s["tags"], "kind": s["metadata"].get("kind")}))
     pool.sort(key=lambda t: t[0])
-    chosen, chars = [], 0
-    for _k, row in pool:
+    chosen: List[Dict[str, Any]] = []
+    seen: set = set()
+    chars = 0
+
+    def take(row: Dict[str, Any], c: int) -> None:
+        nonlocal chars
+        chosen.append(row)
+        seen.add(row["cite"])
+        chars += c
+
+    cap_chars = int(lim.digest_max_chars * lim.digest_recent_share)
+    cap_n = math.ceil(lim.digest_max_memories * lim.digest_recent_share) if lim.digest_recent_share > 0 else 0
+    recent_ids: List[Any] = []
+    rchars = 0
+    for _k, ts, row in sorted((x for x in pool if x[1] is not None), key=lambda x: (-x[1], str(x[2]["cite"]))):
+        c = min(len(row["text"]), lim.digest_note_chars)
+        if len(recent_ids) >= cap_n:
+            break
+        if rchars + c > cap_chars or chars + c > lim.digest_max_chars:
+            continue
+        take(row, c)
+        recent_ids.append(row["cite"])
+        rchars += c
+    for _k, _ts_, row in pool:
+        if row["cite"] in seen:
+            continue
         c = min(len(row["text"]), lim.digest_note_chars)
         if len(chosen) >= lim.digest_max_memories or chars + c > lim.digest_max_chars:
             continue
-        chosen.append(row)
-        chars += c
+        take(row, c)
     return chosen, {"considered": len(pool), "included": len(chosen), "excluded": len(pool) - len(chosen),
-                    "chars": chars}
+                    "chars": chars, "recent_share": lim.digest_recent_share, "recent_reserved_chars": cap_chars,
+                    "recent_reserved_count": cap_n, "recent_included": len(recent_ids), "recent_ids": recent_ids}
 
 
-def digest_prompt(project: str, rows: Sequence[Dict[str, Any]], lim: TidyLimits) -> str:
-    notes = [{"cite": r["cite"], "tags": r["tags"], "kind": r["kind"], "text": r["text"][: lim.digest_note_chars]}
-             for r in rows]
+_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]{2,}")
+
+
+def _topic_words(text: str) -> set:
+    out = set()
+    for w in _WORD.findall(text):
+        w = w.lower().rstrip(".-+_")
+        if len(w) >= 3 and not w.isdigit():
+            out.add(w)
+    return out
+
+
+def newer_context(rows: Sequence[Dict[str, Any]], mems: Sequence[Mem], steps: Sequence[Dict[str, Any]],
+                  lim: TidyLimits) -> Tuple[Dict[int, List[int]], List[Dict[str, Any]]]:
+    """Item 254. For each digest candidate, the NEWER live memories on the same topic: a shared non-generic
+    reference (item, path, tag, sha) or `newer_min_words` shared rare words. Nothing is decided here; the
+    writer sees them and must not present a decision as current when one of them overtakes it. Returns
+    ({older cite: [newer ids]}, the newer notes, bounded in total size)."""
+    hidden = _hidden_by(steps)
+    live = [m for m in mems if m.id not in hidden and m.metadata.get("kind") != "digest"]
+    keys = {m.id: {c.key() for c in dream.extract_claims(m.content, m.metadata, 10 ** 6)} for m in live}
+    words = {m.id: _topic_words(m.content) for m in live}
+    holders: Dict[Any, int] = {}
+    df: Dict[str, int] = {}
+    for m in live:
+        for k in keys[m.id]:
+            holders[k] = holders.get(k, 0) + 1
+        for w in words[m.id]:
+            df[w] = df.get(w, 0) + 1
+    rare = {w for w, n in df.items() if 2 <= n <= GENERIC_REF_HOLDERS}
+    by_id = {m.id: m for m in live}
+    newer_map: Dict[int, List[int]] = {}
+    notes: Dict[int, Dict[str, Any]] = {}
+    budget = lim.digest_max_chars // 3
+    used = 0
+    for row in rows:
+        cite = row["cite"]
+        if not _is_int(cite) or cite not in by_id or lim.newer_per_note <= 0:
+            continue
+        o = by_id[cite]
+        ots = _ts(o)
+        scored = []
+        for n in live:
+            if n.id == o.id or _ts(n) <= ots:
+                continue
+            shared = {k for k in keys[o.id] & keys[n.id] if holders[k] <= GENERIC_REF_HOLDERS}
+            sw = words[o.id] & words[n.id] & rare
+            if shared or len(sw) >= lim.newer_min_words:
+                scored.append((-(3 * len(shared) + len(sw)), -_ts(n), n.id))
+        picked = []
+        for _sc, _t, nid in sorted(scored)[: lim.newer_per_note]:
+            if nid not in notes:
+                c = min(len(by_id[nid].content), lim.newer_note_chars)
+                if used + c > budget:
+                    continue
+                used += c
+                n = by_id[nid]
+                notes[nid] = {"cite": nid, "date": (n.updated_at or n.created_at or "")[:10],
+                              "text": n.content[: lim.newer_note_chars]}
+            picked.append(nid)
+        if picked:
+            newer_map[cite] = picked
+    return newer_map, [notes[k] for k in sorted(notes)]
+
+
+def digest_prompt(project: str, rows: Sequence[Dict[str, Any]], lim: TidyLimits,
+                  newer_map: Optional[Dict[int, List[int]]] = None,
+                  newer_notes: Optional[Sequence[Dict[str, Any]]] = None) -> str:
+    newer_map = newer_map or {}
+    notes = []
+    for r in rows:
+        n = {"cite": r["cite"], "tags": r["tags"], "kind": r["kind"], "text": r["text"][: lim.digest_note_chars]}
+        if r["cite"] in newer_map:
+            n["newer"] = newer_map[r["cite"]]
+        notes.append(n)
     rules = (
         "Write a short current summary of the project from the notes. Answer exactly "
-        '{"decisions":[LINE],"followups":[LINE],"constraints":[LINE]} where LINE = '
-        '{"text":str,"cites":[cite,...],"quote":str}. Every line must cite at least one note by its `cite` value '
-        "(an integer or a string like \"@c3\") and carry `quote`, a passage copied word for word from a cited "
-        f"note. At most {lim.digest_max_lines} lines in all. Use only facts, numbers, paths and identifiers that "
-        "occur in the cited notes. Omit what you cannot support.")
-    return _data_prompt("digest", rules, {"project": project, "notes": notes})
+        '{"decisions":[LINE],"followups":[LINE],"constraints":[LINE],"overtaken":[LINE]} where LINE = '
+        '{"text":str,"cites":[cite,...],"quote":str}; `overtaken` may be omitted. Every line must cite at least one '
+        "note by its `cite` value (an integer or a string like \"@c3\") and carry `quote`, a passage copied word "
+        f"for word from a cited note. At most {lim.digest_max_lines} lines in all. Use only facts, numbers, paths "
+        "and identifiers that occur in the cited notes. Omit what you cannot support. "
+        "A note with `newer` ids has later notes on the same topic in `newer_notes`. Read them BEFORE you state "
+        "that note's decision as current. If a newer note contradicts it or completes it (the plan changed, the "
+        "work is done), do not list the old decision as current: either leave it out, or write one `overtaken` "
+        "line saying what was overtaken and by what, citing BOTH the old note and the newer note.")
+    data: Dict[str, Any] = {"project": project, "notes": notes}
+    if newer_notes:
+        data["newer_notes"] = list(newer_notes)
+    return _data_prompt("digest", rules, data)
 
 
-def validate_digest(ans: Dict[str, Any], rows: Sequence[Dict[str, Any]], lim: TidyLimits
+OVERTAKEN = ("overtaken", "Overtaken (an older decision and the newer memory that replaced it)")
+
+
+def validate_digest(ans: Dict[str, Any], rows: Sequence[Dict[str, Any]], lim: TidyLimits,
+                    newer_map: Optional[Dict[int, List[int]]] = None,
+                    newer_notes: Optional[Sequence[Dict[str, Any]]] = None
                     ) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]], Optional[str]]:
     """(digest content or None, rejected lines, problem). A line that fails is dropped with its reason; the
-    answer's SHAPE is all-or-nothing."""
-    if set(ans) != {k for k, _ in SECTIONS} or not all(isinstance(ans[k], list) for k, _ in SECTIONS):
+    answer's SHAPE is all-or-nothing. `overtaken` is optional; its lines must cite an older note AND a newer
+    note that was offered for it."""
+    required = {k for k, _ in SECTIONS}
+    if not (set(ans) == required or set(ans) == required | {OVERTAKEN[0]}) \
+            or not all(isinstance(v, list) for v in ans.values()):
         return None, [], "wrong shape"
+    newer_map = newer_map or {}
     by_cite = {r["cite"]: r["text"] for r in rows}
+    for n in newer_notes or ():
+        by_cite.setdefault(n["cite"], n["text"])
     sections: Dict[str, List[Dict[str, Any]]] = {}
     rejected: List[Dict[str, Any]] = []
     total = 0
-    for key, _title in SECTIONS:
+    for key, _title in SECTIONS + (OVERTAKEN,):
         kept = []
-        for ln in ans[key]:
+        for ln in ans.get(key, []):
             if not _exact(ln, ("text", "cites", "quote")) or not isinstance(ln["text"], str) \
                     or not ln["text"].strip() or "\n" in ln["text"] or not isinstance(ln["quote"], str) \
                     or not isinstance(ln["cites"], list) or not ln["cites"]:
@@ -956,6 +1101,11 @@ def validate_digest(ans: Dict[str, Any], rows: Sequence[Dict[str, Any]], lim: Ti
             if not all((_is_int(c) or (isinstance(c, str) and _SYM.fullmatch(c))) and c in by_cite for c in cites) \
                     or len(set(map(str, cites))) != len(cites):
                 rejected.append({"line": ln["text"][:120], "reason": "cites a note that is not in the digest input"})
+                continue
+            if key == OVERTAKEN[0] and not any(n in newer_map.get(o, ()) for o in cites if _is_int(o)
+                                               for n in cites if _is_int(n)):
+                rejected.append({"line": ln["text"][:120],
+                                 "reason": "overtaken line must cite an older note and a newer note offered for it"})
                 continue
             cited = [by_cite[c] for c in cites]
             if not ln["quote"].strip() or not any(ln["quote"] in t for t in cited):
@@ -969,15 +1119,30 @@ def validate_digest(ans: Dict[str, Any], rows: Sequence[Dict[str, Any]], lim: Ti
                 continue
             total += 1
             kept.append({"text": fold(ln["text"]), "cites": cites, "quote": ln["quote"]})
-        sections[key] = kept
+        if key in ans or key != OVERTAKEN[0]:
+            sections[key] = kept
     if total == 0:
         return None, rejected, "no valid line"
     return {"sections": sections}, rejected, None
 
 
+def digest_flags(rows: Sequence[Dict[str, Any]], newer_map: Dict[int, List[int]],
+                 sections: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    """Item 254. Every candidate that had newer memories beside it, and what the writer did with it, for the
+    leader: kept as current (a section name), moved to `overtaken`, or left out."""
+    out = []
+    for r in rows:
+        c = r["cite"]
+        if c not in newer_map:
+            continue
+        placed = sorted({k for k, ls in sections.items() for ln in ls if c in ln["cites"]})
+        out.append({"id": c, "newer": newer_map[c], "placed": placed or ["left_out"]})
+    return out
+
+
 def render_digest(sections: Dict[str, List[Dict[str, Any]]]) -> str:
     out: List[str] = []
-    for key, title in SECTIONS:
+    for key, title in SECTIONS + (OVERTAKEN,):
         if sections.get(key):
             out.append(f"## {title}")
             for ln in sections[key]:
@@ -1063,6 +1228,8 @@ def revalidate_step(step: Dict[str, Any], lookup: Callable[[int], Optional[Tuple
             problems.append(f"retired:{sid}")
         if op in ("merge", "retire") and is_protected(m):
             problems.append(f"protected:{sid}")
+        if op == "set_project" and _has_project(m):
+            problems.append(f"has_project:{sid}")
         if op in ("replace_digest", "repair_digest") and (m.metadata.get("kind") != "digest"
                                                           or m.metadata.get("project") != project):
             problems.append(f"not_a_project_digest:{sid}")
@@ -1228,6 +1395,21 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
         parsed = None
         if ans is not None:
             parsed, problem = validate_cluster_answer(ans, ctx)
+        if parsed is None and not str(problem).startswith("judge failed") and calls.cluster_ok() \
+                and not budget.out_of_time():
+            # Item 254: ONE repair call per rejected cluster, with the validator's own error; it still fails closed.
+            first = problem
+            calls.group += 1
+            try:
+                raw = _ask(judge_group, cluster_prompt(ctx) + "\n\nYour previous answer was rejected: "
+                           + str(first)[:300] + "\nAnswer again with the same schema and fix exactly that.", budget, lim)
+                ans, problem = parse_json_object(raw)
+            except Exception as e:  # noqa: BLE001
+                ans, problem = None, f"judge failed: {type(e).__name__}"
+            parsed = None
+            if ans is not None:
+                parsed, problem = validate_cluster_answer(ans, ctx)
+            rec["repair"] = {"first_problem": first, "result": "ok" if parsed is not None else problem}
         if parsed is None:
             rec["status"] = "rejected"
             rec["problem"] = problem
@@ -1315,6 +1497,7 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
     # --- digest
     digest_input: Dict[str, Any] = {"considered": 0, "included": 0, "excluded": 0, "chars": 0}
     digest_step = None
+    digest_flagged: List[Dict[str, Any]] = []
     review: List[Dict[str, Any]] = []
     if d_deferred:
         deferred.append({"cluster": None, "op": d_op, "reason": "cap:max_writes"})
@@ -1328,17 +1511,30 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
                        "expect": {str(a.id): a.state_sha, str(b.id): b.state_sha}, "depends_on": [], "cites": []}
     elif judge_write is not None and not budget.out_of_time() and calls.digest_ok():
         rows, digest_input = digest_candidates(proj_all, steps, reads, lim, now)
+        newer_map, newer_notes = newer_context(rows, proj_all, steps, lim) if rows else ({}, [])
+        digest_input.update(newer_notes=len(newer_notes), candidates_with_newer=len(newer_map))
         if rows:
             calls.write += 1
             try:
-                obj, dproblem = parse_json_object(_ask(judge_write, digest_prompt(project, rows, lim), budget, lim))
+                obj, dproblem = parse_json_object(_ask(judge_write, digest_prompt(project, rows, lim, newer_map,
+                                                                                  newer_notes), budget, lim))
             except Exception as e:  # noqa: BLE001
                 obj, dproblem = None, f"judge failed: {type(e).__name__}"
-            content, drej, dproblem2 = (validate_digest(obj, rows, lim) if obj is not None else (None, [], dproblem))
+            content, drej, dproblem2 = (validate_digest(obj, rows, lim, newer_map, newer_notes) if obj is not None
+                                        else (None, [], dproblem))
             rejected.extend({"cluster": None, "op": "digest_line", **x} for x in drej)
             if content is None:
                 rejected.append({"cluster": None, "op": "digest", "reason": dproblem2 or dproblem})
             else:
+                flags = digest_flags(rows, newer_map, content["sections"])
+                if flags:
+                    digest_flagged.extend(flags)
+                for ln in content["sections"].get("overtaken", []):
+                    ids = [c for c in ln["cites"] if _is_int(c)]
+                    olds = [o for o in ids if any(n in newer_map.get(o, ()) for n in ids)]
+                    review.append({"kind": "overtaken", "older": olds, "newer": [i for i in ids if i not in olds],
+                                   "text": ln["text"],
+                                   "action": "retire or contradiction candidate: leader decides, never auto"})
                 cites = sorted({c for ls in content["sections"].values() for ln in ls for c in ln["cites"]},
                                key=lambda c: (isinstance(c, str), c if _is_int(c) else 0, c if isinstance(c, str) else ""))
                 deps = sorted({s["id"] for s in steps if s["op"] == "merge" and s["create"] in cites})
@@ -1379,7 +1575,7 @@ def run_tidy(mems: Sequence[Mem], embs: Dict[int, Dict[str, float]], retired: se
                    "duplicate_pairs": (metrics or {}).get("duplicate_pairs"),
                    "contradictions": len(contradictions)},
         "sources": sources_out, "clusters": out_clusters, "steps": steps, "rejected": rejected,
-        "digest_input": digest_input, "digest_state": d_op, "review": review, "contradictions": contradictions,
+        "digest_input": digest_input, "digest_flags": digest_flagged, "digest_state": d_op, "review": review, "contradictions": contradictions,
     }
     report.update(extra or {})
     report["digest"] = plan_digest(report)
@@ -1408,11 +1604,249 @@ def run_from_conn(conn: sqlite3.Connection, cfg: TidyConfig, project: str, judge
     return run_tidy(mems, embs, retired, cfg, project, judge_group, judge_write, reads=reads, metrics=metrics, **kw)
 
 
+# --------------------------------------------------------------------------- project backfill (Item 254)
+
+CONFIDENCES = ("high", "medium", "low")
+
+
+def _has_project(m: Mem) -> bool:
+    p = m.metadata.get("project")
+    return isinstance(p, str) and bool(p.strip())
+
+
+def backfill_candidates(mems: Sequence[Mem], configured: Sequence[str]) -> List[str]:
+    """Projects a memory may be assigned to: the configured ones plus every project the store already uses."""
+    return sorted(set(configured) | {m.metadata["project"] for m in mems if _has_project(m)})
+
+
+def _path_index(labelled: Sequence[Mem], cands: set) -> Dict[str, set]:
+    idx: Dict[str, set] = {}
+    for m in labelled:
+        if m.metadata["project"] not in cands:
+            continue
+        for c in dream.extract_claims(m.content, m.metadata, 10 ** 6):
+            if c.kind == "path":
+                idx.setdefault(c.value, set()).add(m.metadata["project"])
+    return idx
+
+
+def project_signals(m: Mem, cands: set, path_index: Dict[str, set], repo_paths: Dict[str, Sequence[str]]
+                    ) -> Dict[str, List[Tuple[int, str]]]:
+    """Deterministic signals per candidate project: a project-prefixed tag (3), an item record's
+    metadata.repo (5), a path that only one project's labelled memories mention or that a configured repo
+    tree covers (2 each, at most 2 paths count). A signal is evidence, not a decision."""
+    sig: Dict[str, List[Tuple[int, str]]] = {}
+    for t in m.tags:
+        head = t.split("/", 1)[0]
+        if head in cands:
+            sig.setdefault(head, []).append((3, f"tag:{t}"))
+    repo = m.metadata.get("repo")
+    if isinstance(repo, str) and repo.strip():
+        name = repo.strip().rstrip("/").rsplit("/", 1)[-1]
+        name = name[:-4] if name.endswith(".git") else name
+        if name in cands:
+            sig.setdefault(name, []).append((5, f"metadata.repo:{repo.strip()[:80]}"))
+    paths = 0
+    for c in dream.extract_claims(m.content, m.metadata, 10 ** 6):
+        if c.kind != "path" or paths >= 2:
+            continue
+        owners = path_index.get(c.value, set())
+        hit = None
+        if len(owners) == 1:
+            hit = (next(iter(owners)), f"path:{c.value} (only in labelled {next(iter(owners))} memories)")
+        else:
+            trees = [pr for pr, prefixes in repo_paths.items() if pr in cands and any(c.value.startswith(x) for x in prefixes)]
+            if len(trees) == 1:
+                hit = (trees[0], f"path:{c.value} (configured {trees[0]} tree)")
+        if hit:
+            sig.setdefault(hit[0], []).append((2, hit[1]))
+            paths += 1
+    return sig
+
+
+def decide_project(sig: Dict[str, List[Tuple[int, str]]]) -> Tuple[Optional[str], List[str]]:
+    """(project, evidence) when the signals are decisive, else (None, []): the top score is at least 3 and at
+    least double the runner-up."""
+    scores = sorted(((sum(w for w, _ in v), k) for k, v in sig.items()), key=lambda t: (-t[0], t[1]))
+    if not scores:
+        return None, []
+    top, second = scores[0][0], scores[1][0] if len(scores) > 1 else 0
+    if top >= 3 and top >= 2 * second:
+        return scores[0][1], [why for _w, why in sig[scores[0][1]]]
+    return None, []
+
+
+def validate_set_project(step: Dict[str, Any], m: Optional[Mem], cands: Sequence[str]) -> Optional[str]:
+    """The checks a set_project step must pass at report time AND again right before a (later) apply."""
+    if not isinstance(step, dict) or step.get("op") != "set_project":
+        return "not a set_project step"
+    if m is None or m.id != step.get("target"):
+        return "target memory missing"
+    if _has_project(m):
+        return "the memory already has a project: never overwritten"
+    if step.get("project") not in cands:
+        return "project is not a candidate"
+    ev = step.get("evidence")
+    if not isinstance(ev, list) or not ev or not all(isinstance(x, str) and x for x in ev):
+        return "no evidence"
+    if step.get("confidence") not in CONFIDENCES:
+        return "bad confidence"
+    if step.get("expect", {}).get(str(m.id)) != m.state_sha:
+        return "the memory changed since it was judged"
+    return None
+
+
+def backfill_prompt(batch: Sequence[Mem], sigs: Dict[int, Dict[str, List[Tuple[int, str]]]], lim: TidyLimits) -> str:
+    items = [{"id": m.id, "tags": m.tags, "options": sorted(sigs[m.id]),
+              "signals": {k: [w for _x, w in v] for k, v in sorted(sigs[m.id].items())},
+              "text": m.content[: lim.backfill_note_chars]} for m in batch]
+    rules = ('For each note choose which project it belongs to. Answer exactly {"answers":[{"id":int,'
+             '"project":str,"quote":str,"confidence":"medium"|"low"}]} with one row per note. `project` must be one '
+             'of that note\'s `options` or "unknown". `quote` is a passage copied word for word from the note that '
+             'supports the choice (empty for "unknown"). Answer "unknown" when the note does not clearly belong '
+             "to one option.")
+    return _data_prompt("project", rules, {"notes": items})
+
+
+def validate_backfill_answer(ans: Dict[str, Any], batch: Sequence[Mem], sigs: Dict[int, Dict[str, Any]]
+                             ) -> Tuple[Dict[int, Tuple[str, str, str]], Dict[int, str]]:
+    """({id: (project, quote, confidence)}, {id: reason it was refused}). A row that fails is dropped; an
+    answer of 'unknown' is a result, not a failure."""
+    ok: Dict[int, Tuple[str, str, str]] = {}
+    bad: Dict[int, str] = {}
+    rows = ans.get("answers") if set(ans) == {"answers"} else None
+    if not isinstance(rows, list):
+        return ok, {m.id: "wrong shape" for m in batch}
+    by_id = {m.id: m for m in batch}
+    for r in rows:
+        if not _exact(r, ("id", "project", "quote", "confidence")) or not _is_int(r["id"]) or r["id"] not in by_id \
+                or r["id"] in ok or r["id"] in bad:
+            continue
+        mid, proj = r["id"], r["project"]
+        if proj == "unknown":
+            bad[mid] = "judge: unknown"
+        elif proj not in sigs[mid]:
+            bad[mid] = "project is not one of the offered options"
+        elif r["confidence"] not in ("medium", "low"):
+            bad[mid] = "bad confidence"
+        elif not isinstance(r["quote"], str) or not r["quote"].strip() or r["quote"] not in by_id[mid].content:
+            bad[mid] = "quote is not word for word in the note"
+        else:
+            ok[mid] = (proj, r["quote"], r["confidence"])
+    for m in batch:
+        if m.id not in ok and m.id not in bad:
+            bad[m.id] = "no answer"
+    return ok, bad
+
+
+def run_backfill(mems: Sequence[Mem], retired: set, cfg: TidyConfig, judge_group: Optional[Callable[..., str]], *,
+                 now: Optional[float] = None, clock: Callable[[], float] = time.monotonic, judge_note: str = "ok",
+                 models: Optional[Dict[str, str]] = None, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Item 254: propose `set_project` for live memories with NO project. Report only: it never overwrites an
+    existing project, and protected / item-record memories are included (it is metadata only) but listed apart."""
+    now = time.time() if now is None else now
+    lim, run_id = cfg.limits, uuid.uuid4().hex[:12]
+    budget = dream.Budget(lim, clock)                        # type: ignore[arg-type]
+    cands = backfill_candidates(mems, cfg.projects)
+    cset = set(cands)
+    live = [m for m in mems if m.id not in retired]
+    labelled = [m for m in live if _has_project(m)]
+    todo = sorted((m for m in live if not _has_project(m) and m.metadata.get("kind") != "digest"), key=lambda m: m.id)
+    pidx = _path_index(labelled, cset)
+    steps: List[Dict[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    unresolved: List[Dict[str, Any]] = []
+    ambiguous: List[Mem] = []
+    sigs: Dict[int, Dict[str, List[Tuple[int, str]]]] = {}
+
+    def step_for(m: Mem, proj: str, evidence: List[str], conf: str, source: str) -> Dict[str, Any]:
+        return {"op": "set_project", "target": m.id, "project": proj, "evidence": evidence, "confidence": conf,
+                "source": source, "protected": is_protected(m), "item_record": m.metadata.get("kind") == "item-record"
+                or "item-record" in m.tags, "charge": 1, "needs_approval": False, "status": "eligible",
+                "expect": {str(m.id): m.state_sha}, "depends_on": []}
+
+    for m in todo:
+        sg = project_signals(m, cset, pidx, cfg.repo_paths)
+        proj, ev = decide_project(sg)
+        if proj:
+            steps.append(step_for(m, proj, ev, "high", "signals"))
+        elif sg:
+            sigs[m.id] = {k: v for k, v in sg.items()}
+            ambiguous.append(m)
+        else:
+            unresolved.append({"id": m.id, "reason": "no signal"})
+    calls = 0
+    stopped = None
+    for i in range(0, len(ambiguous), max(lim.backfill_batch, 1)):
+        batch = ambiguous[i:i + max(lim.backfill_batch, 1)]
+        if judge_group is None:
+            unresolved.extend({"id": m.id, "reason": "judge unavailable"} for m in batch)
+            continue
+        if calls >= lim.max_llm_calls:
+            stopped = stopped or "max_llm_calls"
+            unresolved.extend({"id": m.id, "reason": "call budget"} for m in batch)
+            continue
+        if budget.out_of_time():
+            stopped = stopped or "max_seconds"
+            unresolved.extend({"id": m.id, "reason": "time budget"} for m in batch)
+            continue
+        calls += 1
+        try:
+            obj, problem = parse_json_object(_ask(judge_group, backfill_prompt(batch, sigs, lim), budget, lim))
+        except Exception as e:  # noqa: BLE001
+            obj, problem = None, f"judge failed: {type(e).__name__}"
+        if obj is None:
+            unresolved.extend({"id": m.id, "reason": problem} for m in batch)
+            continue
+        ok, bad = validate_backfill_answer(obj, batch, sigs)
+        for m in batch:
+            if m.id in ok:
+                proj, quote, conf = ok[m.id]
+                steps.append(step_for(m, proj, [w for _x, w in sigs[m.id][proj]] + [f"quote:{quote[:120]}"], conf, "judge"))
+            else:
+                unresolved.append({"id": m.id, "reason": bad[m.id]})
+    steps.sort(key=lambda st: (st["source"] != "signals", st["target"]))
+    by_id = {m.id: m for m in todo}
+    for st in list(steps):
+        problem = validate_set_project(dict(st, expect=st["expect"]), by_id[st["target"]], cands)
+        if problem:                                           # cannot happen by construction; fail closed
+            steps.remove(st)
+            unresolved.append({"id": st["target"], "reason": problem})
+    if len(steps) > lim.max_backfill:
+        deferred = [{"id": st["target"], "project": st["project"], "reason": "cap:max_backfill"}
+                    for st in steps[lim.max_backfill:]]
+        steps = steps[: lim.max_backfill]
+    for i, st in enumerate(steps, 1):
+        st["id"] = f"b{i}"
+    report = {
+        "version": TIDY_PLAN_VERSION, "mode": "dry-run", "plan": "backfill", "scope": SCOPE_NOTE, "run": run_id,
+        "at": dream._iso(now), "created_ts": now, "project": None, "candidates": cands,
+        "judge": {"status": judge_note, "models": models or {}, "calls": {"group": calls, "write": 0, "total": calls}},
+        "limits": dataclasses.asdict(lim), "stopped_by": stopped or ("max_backfill" if deferred else None),
+        "counts": {"live": len(live), "without_project": len(todo), "steps": len(steps),
+                   "by_signals": sum(1 for st in steps if st["source"] == "signals"),
+                   "by_judge": sum(1 for st in steps if st["source"] == "judge"), "unresolved": len(unresolved),
+                   "deferred": len(deferred), "charge": sum(st["charge"] for st in steps)},
+        "steps": steps, "deferred": deferred, "unresolved": unresolved,
+        "lists": {"protected": [st["target"] for st in steps if st["protected"] and not st["item_record"]],
+                  "item_records": [st["target"] for st in steps if st["item_record"]],
+                  "other": [st["target"] for st in steps if not st["protected"] and not st["item_record"]]},
+        "by_project": {p: sum(1 for st in steps if st["project"] == p) for p in sorted({st["project"] for st in steps})},
+    }
+    report.update(extra or {})
+    report["digest"] = plan_digest(report)
+    return report
+
+
 # --------------------------------------------------------------------------- CLI (no --apply, by design)
 
 
 def _summary(r: Dict[str, Any]) -> str:
     c = r["counts"]
+    if r.get("plan") == "backfill":
+        return (f"tidy backfill dry run {r['run']}: {c['without_project']} without a project; steps {c['steps']} "
+                f"(signals {c['by_signals']}, judge {c['by_judge']}); unresolved {c['unresolved']}; "
+                f"deferred {c['deferred']}; llm_calls {r['judge']['calls']['total']}; judge={r['judge']['status']}")
     return (f"tidy dry run {r['run']} ({r['project']}): live {c['live']}; clusters {c['clusters_judged']}/{c['clusters']}; "
             f"steps {c['steps']} (charge {c['charge']}); contradictions {c['contradictions']}; "
             f"llm_calls {r['judge']['calls']['total']}; stopped_by={r['stopped_by']}; judge={r['judge']['status']}")
@@ -1423,13 +1857,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--config", help=f"JSON config (default $MEMORA_TIDY_CONFIG or {DEFAULT_CONFIG})")
     ap.add_argument("--db", help="a READ-ONLY copy of a store (a sqlite file); required here or in the config")
     ap.add_argument("--project", help="the project to tidy (default: the config's `project`)")
+    ap.add_argument("--backfill", action="store_true",
+                    help="instead of a tidy pass, report set_project proposals for memories with no project")
     ap.add_argument("--out", help="write the report (the plan) here, 0600")
     ap.add_argument("--out-dir", help="write the report as tidy-<project>-<UTC time>.json in this directory")
     args = ap.parse_args(argv)
     try:
         cfg = TidyConfig.load(args.config)
         project = args.project or cfg.project
-        if not project:
+        if not project and not args.backfill:
             raise TidyError("no project: pass --project or set `project` in the config")
         db = args.db or cfg.db
         if not db:
@@ -1439,26 +1875,36 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             jg = jw = None
             note = "ok"
             try:
-                jg, jw = make_judges(cfg.models, cfg.limits.judge_timeout)
+                if args.backfill:                       # backfill needs only the grouping model
+                    if not cfg.models.get("group"):
+                        raise JudgeError("config 'models.group' is not set (no default model, by design)")
+                    jg = TidyJudge(model=cfg.models["group"], timeout=cfg.limits.judge_timeout)
+                else:
+                    jg, jw = make_judges(cfg.models, cfg.limits.judge_timeout)
             except JudgeError as e:
                 note = f"unavailable: {e}"
             dog = dream.start_watchdog(cfg.limits.max_seconds)
             try:
                 conn = dream.open_readonly_file(db)
                 with contextlib.closing(conn):
-                    report = run_from_conn(conn, cfg, project, jg, jw, judge_note=note, models=dict(cfg.models),
-                                           extra={"priority": prio})
+                    if args.backfill:
+                        bm = dream.load_memories(conn)
+                        report = run_backfill(bm, retired_ids(conn, bm), cfg, jg, judge_note=note,
+                                              models=dict(cfg.models), extra={"priority": prio})
+                    else:
+                        report = run_from_conn(conn, cfg, project, jg, jw, judge_note=note,
+                                               models=dict(cfg.models), extra={"priority": prio})
             finally:
                 dog.cancel()
             out_path = args.out
             if args.out_dir and not out_path:
                 Path(args.out_dir).mkdir(parents=True, exist_ok=True)
                 stamp = _dt.datetime.fromtimestamp(report["created_ts"], _dt.timezone.utc)
-                out_path = str(Path(args.out_dir) / f"tidy-{project}-{stamp:%Y%m%dT%H%M%SZ}.json")
+                out_path = str(Path(args.out_dir) / f"tidy-{project or 'backfill'}-{stamp:%Y%m%dT%H%M%SZ}.json")
             if out_path:
                 dream.write_report(out_path, report)
             print(_summary(report), file=sys.stderr)
-            return 3 if jg is None else 0
+            return 3 if jg is None and not args.backfill else 0
     except DreamError as e:
         print(f"memora-tidy: {e}", file=sys.stderr)
         return 2

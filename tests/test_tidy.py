@@ -615,9 +615,11 @@ def test_digest_input_is_bounded_ranked_and_reports_its_coverage():
             M(5, "recent note", created=tidy.dream._iso(now - 86400).replace("T", " ").replace("Z", "")),
             M(6, "gone", created=old), M(7, "prior digest", meta={"kind": "digest"})]
     steps = [{"op": "retire", "id_hidden": 6}]
-    rows, cov = tidy.digest_candidates(mems, steps, {4: 9}, TidyLimits(digest_max_memories=4), now)
+    rows, cov = tidy.digest_candidates(mems, steps, {4: 9}, TidyLimits(digest_max_memories=4,
+                                                                       digest_recent_share=0.0), now)
     assert [r["cite"] for r in rows] == [2, 3, 5, 4]       # protected, open task, recent, then most read
-    assert cov == {"considered": 5, "included": 4, "excluded": 1, "chars": sum(len(r["text"]) for r in rows)}
+    assert cov["considered"] == 5 and cov["included"] == 4 and cov["excluded"] == 1
+    assert cov["chars"] == sum(len(r["text"]) for r in rows) and cov["recent_included"] == 0
     rows, cov = tidy.digest_candidates(mems, steps, {}, TidyLimits(digest_max_chars=20), now)
     assert cov["chars"] <= 20 and cov["excluded"] == cov["considered"] - cov["included"]
 
@@ -869,3 +871,317 @@ def test_retired_ids_follow_storage_retirement_rules(store):
     with contextlib.closing(storage.connect_without_schema()) as conn:
         assert tidy.retired_ids(conn, mems) == {b}
     assert tidy.cosine({"a": 1.0}, {"a": 2.0}) == pytest.approx(1.0) and tidy.cosine({}, {"a": 1}) == 0.0
+
+
+# ----------------------------------------------------------------------------- Item 254: digest input recency share
+
+
+def _aged(i, days):
+    return M(i, f"Note number {i} about topic{i}.", created=tidy.dream._iso(1_800_000_000.0 - days * 86400)
+             .replace("T", " ").replace("Z", ""))
+
+
+def test_the_newest_memories_get_a_reserved_share_of_the_digest_input():
+    now = 1_800_000_000.0
+    old = [_aged(i, 400 + i) for i in range(1, 21)]                       # 20 old, heavily read
+    new = [_aged(100 + i, i) for i in range(1, 4)]                        # 3 new, never read
+    reads = {m.id: 50 for m in old}
+    lim = TidyLimits(digest_max_memories=6, digest_recent_share=0.5, recent_days=0.0)   # read-count-led ranking
+    rows, cov = tidy.digest_candidates(old + new, [], reads, lim, now)
+    ids = [r["cite"] for r in rows]
+    assert set(ids) >= {101, 102, 103} and len(ids) == 6                 # the newest three are in, then the read-most
+    assert cov["recent_included"] == 3 and cov["recent_ids"] == [101, 102, 103]
+    assert cov["recent_share"] == 0.5 and cov["recent_reserved_count"] == 3 and cov["recent_reserved_chars"] == 30000
+    # negative control: no share reproduces the old read-count-led input, which misses the new memories
+    rows0, cov0 = tidy.digest_candidates(old + new, [], reads, TidyLimits(digest_max_memories=6,
+                                                                          digest_recent_share=0.0, recent_days=0.0), now)
+    assert not ({101, 102, 103} & {r["cite"] for r in rows0}) and cov0["recent_included"] == 0
+    # the share is a share of BOTH bounds: a tiny char bound reserves a tiny amount
+    rows2, cov2 = tidy.digest_candidates(old + new, [], reads, TidyLimits(digest_max_chars=60, digest_recent_share=0.5), now)
+    assert cov2["chars"] <= 60 and cov2["recent_reserved_chars"] == 30
+    with pytest.raises(TidyError, match="between 0 and 1"):
+        TidyLimits.from_dict({"digest_recent_share": 1.5})
+
+
+def test_recent_share_is_recorded_in_the_sealed_report():
+    rep = run(Fake())
+    di = rep["digest_input"]
+    assert {"recent_share", "recent_included", "recent_ids", "newer_notes", "candidates_with_newer"} <= set(di)
+    assert rep["digest"] == tidy.plan_digest(rep)
+
+
+# ----------------------------------------------------------------------------- Item 254: overtaken decisions (Zig 0.17)
+
+
+def zig_world():
+    return [
+        M(1294, "Wait for Zig 0.17.1 before porting libghostty. See Item 230.", created="2026-09-01 00:00:00"),
+        M(1291, "The libghostty mirror is parked until Zig 0.16 or 0.17. See Item 230.", created="2026-09-02 00:00:00"),
+        M(1380, "The Zig 0.17 port of libghostty landed on 2026-10-28. See Item 230.", created="2026-10-28 00:00:00"),
+        M(1500, "Unrelated retries are capped at 3.", created="2026-10-30 00:00:00")]
+
+
+def zig_group(prompt):
+    return json.dumps(ans(keep=keep(*[m["id"] for m in data_of(prompt)["members"]])))
+
+
+class ZigWriter:
+    def __init__(self, mode):
+        self.mode, self.prompts = mode, []
+
+    def __call__(self, prompt, timeout=None):
+        assert prompt.startswith("TASK: digest")
+        d = data_of(prompt)
+        self.prompts.append(d)
+        old = {"text": "Wait for Zig 0.17.1 before porting libghostty.", "cites": [1294],
+               "quote": "Wait for Zig 0.17.1 before porting"}
+        if self.mode == "current":
+            return json.dumps({"decisions": [old], "followups": [], "constraints": []})
+        if self.mode == "overtaken":
+            return json.dumps({"decisions": [], "followups": [], "constraints": [], "overtaken": [{
+                "text": "Waiting for Zig 0.17.1 before porting was overtaken: the Zig 0.17 port landed on 2026-10-28.",
+                "cites": [1294, 1380], "quote": "Wait for Zig 0.17.1 before porting"}]})
+        if self.mode == "old-only":         # an overtaken line that does not cite a newer note is refused
+            return json.dumps({"decisions": [{"text": "Retries are capped at 3.", "cites": [1500],
+                                              "quote": "retries are capped at 3"}], "followups": [], "constraints": [],
+                               "overtaken": [{"text": "Wait for Zig 0.17.1.", "cites": [1294],
+                                              "quote": "Wait for Zig 0.17.1"}]})
+        return json.dumps({"decisions": [{"text": "Retries are capped at 3.", "cites": [1500],
+                                          "quote": "retries are capped at 3"}], "followups": [], "constraints": []})
+
+
+def run_zig(mode):
+    w = ZigWriter(mode)
+    cfg = TidyConfig(limits=TidyLimits())
+    emb = {m.id: {"a": 1.0} for m in zig_world()}
+    rep = tidy.run_tidy(zig_world(), emb, set(), cfg, "clmux", zig_group, w, now=1_800_000_000.0)
+    return rep, w
+
+
+def test_digest_writer_sees_the_newer_memories_and_marks_the_overtaken_decision():
+    rep, w = run_zig("overtaken")
+    d = w.prompts[0]
+    notes = {n["cite"]: n for n in d["notes"]}
+    assert 1380 in notes[1294]["newer"] and 1380 in notes[1291]["newer"] and "newer" not in notes[1500]
+    assert {n["cite"] for n in d["newer_notes"]} >= {1380} and "landed on 2026-10-28" in str(d["newer_notes"])
+    dg = rep["steps"][-1]
+    assert dg["op"] == "bootstrap_digest" and "## Overtaken" in dg["body"] and "## Current decisions" not in dg["body"]
+    assert "[m1294, m1380]" in dg["body"] and 1380 in dg["cites"]
+    ot = [r for r in rep["review"] if r["kind"] == "overtaken"]
+    assert ot == [{"kind": "overtaken", "older": [1294], "newer": [1380], "text": ot[0]["text"],
+                   "action": "retire or contradiction candidate: leader decides, never auto"}]
+    assert {"id": 1294, "newer": notes[1294]["newer"], "placed": ["overtaken"]} in rep["digest_flags"]
+    assert all(s["op"] not in ("retire", "merge") for s in rep["steps"])         # never auto-retired
+    assert rep["digest_input"]["candidates_with_newer"] >= 2 and rep["digest"] == tidy.plan_digest(rep)
+
+
+def test_a_decision_kept_current_despite_a_newer_memory_is_flagged_for_the_leader():
+    rep, _ = run_zig("current")
+    flag = next(f for f in rep["digest_flags"] if f["id"] == 1294)
+    assert 1380 in flag["newer"] and flag["placed"] == ["decisions"]
+    assert not [r for r in rep["review"] if r["kind"] == "overtaken"]
+    rep, _ = run_zig("left-out")
+    flag = next(f for f in rep["digest_flags"] if f["id"] == 1294)
+    assert flag["placed"] == ["left_out"]
+
+
+def test_overtaken_line_must_cite_an_older_and_an_offered_newer_note():
+    rep, _ = run_zig("old-only")
+    assert any(r["op"] == "digest_line" and "newer note offered" in r["reason"] for r in rep["rejected"])
+    assert "## Overtaken" not in rep["steps"][-1]["body"]
+    rows = [{"cite": 1294, "text": "Wait for Zig 0.17.1 before porting."}]
+    newer = [{"cite": 1380, "date": "2026-10-28", "text": "The Zig 0.17 port landed."}]
+    line = {"text": "Zig 0.17 port landed.", "cites": [1294, 1380], "quote": "The Zig 0.17 port landed."}
+    ans_ = {"decisions": [], "followups": [], "constraints": [], "overtaken": [line]}
+    assert tidy.validate_digest(ans_, rows, LIM, {1294: [1380]}, newer)[0] is not None
+    # a newer note that was not offered for THIS older note is refused
+    assert tidy.validate_digest(ans_, rows, LIM, {1294: []}, newer)[2] == "no valid line"
+    assert tidy.validate_digest(ans_, rows, LIM, None, newer)[2] == "no valid line"
+    # the old 3-section shape still works
+    assert tidy.validate_digest({"decisions": [], "followups": [], "constraints": [
+        {"text": "Wait for Zig 0.17.1.", "cites": [1294], "quote": "Wait for Zig 0.17.1"}]}, rows, LIM)[2] is None
+
+
+def test_newer_context_needs_a_shared_reference_or_rare_words_and_is_newer():
+    rows = [{"cite": 1, "text": ""}, {"cite": 2, "text": ""}, {"cite": 3, "text": ""}]
+    mems = [M(1, "Port waits for the frobnicator release. See Item 7.", created="2026-01-01 00:00:00"),
+            M(2, "Frobnicator release is out, Item 7 closed.", created="2026-02-01 00:00:00"),
+            M(3, "Nothing alike here.", created="2026-03-01 00:00:00"),
+            M(4, "Older note on Item 7.", created="2025-12-01 00:00:00")]
+    nm, notes = tidy.newer_context(rows, mems, [], TidyLimits())
+    assert nm == {1: [2]} and [n["cite"] for n in notes] == [2]                 # 4 is older, 3 is unrelated
+    assert tidy.newer_context(rows, mems, [{"op": "retire", "id_hidden": 2}], TidyLimits())[0] == {}
+    assert tidy.newer_context(rows, mems, [], TidyLimits(newer_per_note=0))[0] == {}
+
+
+# ----------------------------------------------------------------------------- Item 254: one repair call per rejected cluster
+
+
+def test_a_rejected_cluster_gets_one_repair_call_with_the_validator_error():
+    seen = []
+
+    def group(prompt):
+        seen.append(prompt)
+        return json.dumps(ans(keep=keep(1, 2))) if len(seen) == 1 else json.dumps(ans(keep=keep(1, 2, 3)))
+    fake = Fake(group=group)
+    rep = run(fake)
+    assert fake.calls.count("group") == 2 and rep["judge"]["calls"]["group"] == 2
+    assert "Your previous answer was rejected" in seen[1] and "primary disposition" in seen[1]
+    cl = rep["clusters"][0]
+    assert cl["status"] == "judged" and cl["repair"]["result"] == "ok" and "primary disposition" in cl["repair"]["first_problem"]
+    # still failing closed after the one repair
+    fake = Fake(group=json.dumps(ans(keep=keep(1, 2))))
+    rep = run(fake)
+    assert fake.calls.count("group") == 2                                   # one repair, not a loop
+    cl = rep["clusters"][0]
+    assert cl["status"] == "rejected" and cl["repair"]["result"] == cl["problem"]
+    assert not [s for s in rep["steps"] if s["op"] not in ("bootstrap_digest",)]
+    # the repair is counted against max_llm_calls (cap 2, digest reserve 1: one cluster call, no repair)
+    fake = Fake(group=json.dumps(ans(keep=keep(1, 2))))
+    rep = run(fake, max_llm_calls=2)
+    assert fake.calls.count("group") == 1 and "repair" not in rep["clusters"][0] and rep["judge"]["calls"]["total"] <= 2
+    # a judge that failed outright is not retried with an error text
+    def boom(prompt, timeout=None):
+        raise RuntimeError("down")
+    rep = tidy.run_tidy(world(), EMB, set(), TidyConfig(limits=TidyLimits()), "clmux", boom, boom, now=1.0)
+    assert rep["judge"]["calls"]["group"] == 1 and "repair" not in rep["clusters"][0]
+
+
+# ----------------------------------------------------------------------------- Item 254: project backfill
+
+
+def NP(mid, content="x", **kw):
+    kw.setdefault("project", None)
+    return M(mid, content, **kw)
+
+
+def bf(mems, judge=None, retired=(), **lim):
+    cfg = TidyConfig(limits=TidyLimits(**lim), projects=["clmux", "memora", "acebar"])
+    return tidy.run_backfill(mems, set(retired), cfg, judge, now=1_800_000_000.0, models={"group": "haiku"})
+
+
+def test_backfill_deterministic_signals_never_overwrite_and_list_protected_apart():
+    mems = [M(1, "labelled clmux", project="clmux"), M(2, "labelled memora", project="memora"),
+            M(3, "labelled acebar", project="acebar"),
+            NP(10, "a note", tags=["clmux/x"]),
+            NP(11, "Item record body.", tags=["item-record"], meta={"kind": "item-record", "repo": "agentic-box/memora"}),
+            NP(12, "a decision", tags=["acebar/ui"], meta={"kind": "decision"}),
+            NP(13, "no signal at all"),
+            M(14, "already has one", tags=["clmux/x"], project="memora")]
+    rep = bf(mems)
+    st = {s["target"]: s for s in rep["steps"]}
+    assert set(st) == {10, 11, 12} and 14 not in st and 13 in [u["id"] for u in rep["unresolved"]]
+    assert st[10]["project"] == "clmux" and st[10]["confidence"] == "high" and st[10]["source"] == "signals"
+    assert st[10]["evidence"] == ["tag:clmux/x"] and st[11]["project"] == "memora" and "metadata.repo" in st[11]["evidence"][0]
+    assert rep["lists"] == {"protected": [12], "item_records": [11], "other": [10]}
+    assert rep["by_project"] == {"acebar": 1, "clmux": 1, "memora": 1} and rep["counts"]["without_project"] == 4
+    assert rep["judge"]["calls"]["total"] == 0 and rep["mode"] == "dry-run" and rep["plan"] == "backfill"
+    assert rep["candidates"] == ["acebar", "clmux", "memora"] and rep["digest"] == tidy.plan_digest(rep)
+    assert all(s["charge"] == 1 and s["expect"] == {str(s["target"]): next(m for m in mems if m.id == s["target"]).state_sha}
+               for s in rep["steps"])
+    # the validator refuses to overwrite and checks the rest
+    by = {m.id: m for m in mems}
+    cands = rep["candidates"]
+    assert tidy.validate_set_project(st[10], by[10], cands) is None
+    assert "never overwritten" in tidy.validate_set_project(dict(st[10], target=14), by[14], cands)
+    assert tidy.validate_set_project(dict(st[10], project="zzz"), by[10], cands) == "project is not a candidate"
+    assert tidy.validate_set_project(dict(st[10], evidence=[]), by[10], cands) == "no evidence"
+    assert tidy.validate_set_project(dict(st[10], confidence="sure"), by[10], cands) == "bad confidence"
+    assert "changed" in tidy.validate_set_project(dict(st[10], expect={"10": "zz"}), by[10], cands)
+    assert tidy.validate_set_project(dict(st[10], op="link"), by[10], cands) == "not a set_project step"
+    # apply-time revalidation refuses a memory that has gained a project since
+    look = lambda i: (by[i], False)   # noqa: E731
+    assert tidy.revalidate_step(st[10], look, {}, [], "clmux") == []
+    by[10] = M(10, "a note", tags=["clmux/x"], project="memora")
+    assert tidy.revalidate_step(st[10], look, {}, [], "clmux") == ["changed:10", "has_project:10"]
+
+
+def test_backfill_ambiguous_signals_go_to_haiku_which_may_say_unknown():
+    labelled = [M(1, "uses `shared/util.py`", project="clmux"), M(2, "uses shared/util.py", project="memora")]
+    ambiguous = NP(20, "Fix the shared tag handling. Exact words here.", tags=["clmux/a", "memora/b"])
+    weak = NP(21, "Edits docs/readme_only.md for clmux.", tags=["acebar/z"])         # one signal of 3: decisive
+    weak2 = NP(22, "Edits src/only_clmux.py and src/other.py.")
+    labelled.append(M(3, "touches src/only_clmux.py", project="clmux"))
+    seen = []
+
+    def judge(prompt, timeout=None):
+        d = data_of(prompt)
+        seen.append(d)
+        assert prompt.startswith("TASK: project") and [n["id"] for n in d["notes"]] == [20, 22]
+        assert d["notes"][0]["options"] == ["clmux", "memora"] and "signals" in d["notes"][0]
+        return json.dumps({"answers": [
+            {"id": 20, "project": "unknown", "quote": "", "confidence": "low"},
+            {"id": 22, "project": "clmux", "quote": "Edits src/only_clmux.py", "confidence": "medium"}]})
+    rep = bf(labelled + [ambiguous, weak, weak2], judge)
+    by = {s["target"]: s for s in rep["steps"]}
+    assert set(by) == {21, 22} and by[21]["source"] == "signals" and by[22]["source"] == "judge"
+    assert by[22]["confidence"] == "medium" and by[22]["evidence"][-1].startswith("quote:")
+    assert {"id": 20, "reason": "judge: unknown"} in rep["unresolved"] and rep["judge"]["calls"]["total"] == 1
+    # refused judge rows: not an offered option, quote not in the note, high confidence, missing row, bad shape
+    def bad(prompt, timeout=None):
+        return json.dumps({"answers": [
+            {"id": 20, "project": "acebar", "quote": "Exact words", "confidence": "low"},
+            {"id": 22, "project": "clmux", "quote": "words not in the note", "confidence": "medium"}]})
+    rep = bf(labelled + [ambiguous, weak2], bad)
+    assert not rep["steps"] and {u["reason"] for u in rep["unresolved"]} == {
+        "project is not one of the offered options", "quote is not word for word in the note"}
+    rep = bf(labelled + [ambiguous], lambda p, timeout=None: json.dumps({"answers": []}))
+    assert rep["unresolved"] == [{"id": 20, "reason": "no answer"}]
+    rep = bf(labelled + [ambiguous], lambda p, timeout=None: json.dumps({"answers": [
+        {"id": 20, "project": "clmux", "quote": "Exact words", "confidence": "high"}]}))
+    assert rep["unresolved"] == [{"id": 20, "reason": "bad confidence"}]
+    rep = bf(labelled + [ambiguous], lambda p, timeout=None: "nope")
+    assert rep["unresolved"] == [{"id": 20, "reason": "judge answer is not JSON"}]
+    rep = bf(labelled + [ambiguous], None)
+    assert rep["unresolved"] == [{"id": 20, "reason": "judge unavailable"}] and not rep["steps"]
+    rep = bf(labelled + [ambiguous, weak2], judge, max_llm_calls=0)
+    assert {"id": 20, "reason": "call budget"} in rep["unresolved"] and rep["stopped_by"] == "max_llm_calls"
+
+
+def test_backfill_cap_retired_and_config():
+    mems = [M(1, "x", project="clmux")] + [NP(100 + i, "n", tags=["clmux/x"]) for i in range(5)]
+    rep = bf(mems, max_backfill=3)
+    assert [s["target"] for s in rep["steps"]] == [100, 101, 102] and [s["id"] for s in rep["steps"]] == ["b1", "b2", "b3"]
+    assert [d["id"] for d in rep["deferred"]] == [103, 104] and rep["stopped_by"] == "max_backfill"
+    assert [s["target"] for s in bf(mems, retired=[100])["steps"]] == [101, 102, 103, 104]      # retired are skipped
+    assert TidyLimits().max_backfill == 200
+
+
+def test_backfill_config_and_candidates_come_from_config_and_the_store(tmp_path):
+    cp = tmp_path / "c.json"
+    cp.write_text(json.dumps({"models": {"group": "h", "write": "s"}, "projects": ["clmux", "agentic-box"],
+                              "repo_paths": {"clmux": ["src/"]}}))
+    cfg = TidyConfig.load(str(cp))
+    assert cfg.projects == ["clmux", "agentic-box"] and cfg.repo_paths == {"clmux": ["src/"]}
+    for bad in ({"projects": "clmux"}, {"projects": [1]}, {"repo_paths": {"a": "b"}}):
+        cp.write_text(json.dumps({"models": {"group": "h", "write": "s"}, **bad}))
+        with pytest.raises(TidyError):
+            TidyConfig.load(str(cp))
+    mems = [M(1, "a", project="memora"), NP(2, "b")]
+    assert tidy.backfill_candidates(mems, ["clmux"]) == ["clmux", "memora"]
+    # a configured repo tree and the labelled-memory path index give path signals
+    cfg = TidyConfig(limits=TidyLimits(), projects=["clmux", "memora"], repo_paths={"clmux": ["Sources/"]})
+    rep = tidy.run_backfill([NP(5, "Edit Sources/App/main.swift")], set(), cfg, None, now=1.0)
+    assert not rep["steps"]                                                  # one path = 2 < 3: not decisive alone
+    rep = tidy.run_backfill([NP(5, "Edit Sources/App/main.zig and Sources/Other/b.zig")], set(), cfg, None, now=1.0)
+    assert [(s["target"], s["project"]) for s in rep["steps"]] == [(5, "clmux")]
+
+
+def test_backfill_cli_end_to_end_reads_a_store_copy_and_writes_only_the_report(store, tmp_path, capsys):
+    with storage.connect() as conn:
+        storage.add_memory(conn, content="Labelled.", tags=["clmux"], metadata={"project": "clmux"})
+        storage.add_memory(conn, content="Unlabelled.", tags=["clmux/x"], metadata={})
+        conn.commit()
+    before = _state()
+    cp = tmp_path / "tidy.json"
+    cp.write_text(json.dumps({"models": {"group": "haiku"}, "state_dir": str(tmp_path / "state")}))
+    out = tmp_path / "out"
+    assert tidy.main(["--config", str(cp), "--db", str(store), "--backfill", "--out-dir", str(out)]) == 0
+    (rp,) = list(out.iterdir())
+    rep = tidy.load_tidy_plan(str(rp))
+    assert rep["plan"] == "backfill" and [(s["target"], s["project"]) for s in rep["steps"]] == [(2, "clmux")]
+    assert _state() == before and "backfill dry run" in capsys.readouterr().err
+    assert rp.name.startswith("tidy-backfill-")
+    # no group model: still a report from signals, not an error
+    cp.write_text(json.dumps({"models": {}, "state_dir": str(tmp_path / "state")}))
+    assert tidy.main(["--config", str(cp), "--db", str(store), "--backfill", "--out", str(tmp_path / "r.json")]) == 0

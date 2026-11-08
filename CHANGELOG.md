@@ -12,6 +12,15 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.11 — 2026-11-08
+
+`memora-tidy` fixes from the first real clmux report (Item 254). Still dry run only.
+
+- **Project backfill:** `memora-tidy --backfill` reports `set_project` proposals for live memories with no `metadata.project` (928 of 1,236 in the real store). Deterministic signals first (project-prefixed tags, an item record's `metadata.repo`, paths only one project's labelled memories mention or a configured `repo_paths` tree covers); Haiku decides only ambiguous cases and may answer "unknown". Never overwrites a project; protected and item-record memories are included but listed apart; capped by `max_backfill` (200). Report plus validator (`validate_set_project`, `revalidate_step`); no apply.
+- **Digest no longer presents overtaken decisions as current:** each digest candidate is given the newer memories on its topic (shared reference or rare words); the writer must drop a decision a newer memory completes or contradicts, or move it to an `Overtaken` section citing both ids. Every candidate with newer memories is listed in `digest_flags`; overtaken lines become `review[]` retire-or-contradiction candidates, never auto-retired.
+- **Digest input reserves a share for the newest memories** (`digest_recent_share`, default 0.33) before filling by rank and read count; recorded in `digest_input`.
+- A rejected cluster gets **one repair call** with the validator's error (counted against `max_llm_calls`); it still fails closed.
+
 ## 0.5.7.10 — 2026-11-08
 
 `memora-tidy`: the tidy pass, dry run only (Item 252, design in `docs/tidy-design.md`).

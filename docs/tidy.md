@@ -28,6 +28,10 @@ written, with no proposals), 4 wall-time watchdog.
 | `limits` | caps: `max_clusters` 12, `max_llm_calls` 24, `max_merges` 10, `max_retires` 10, `max_links` 20, `max_retags` 20, `max_writes` 40, `max_seconds` 1500, `nice` 10, and the grouping and digest bounds in `TidyLimits`. |
 | `state_dir` | where the run lock lives. Default `~/.local/state/memora-dream`, the same as dream, so the two never run at once. Give them different directories and they do. |
 | `read_ledger` | optional read-count ledger, used to rank the digest input. |
+| `projects` | backfill candidates, in addition to every project the store already uses (`--backfill`). |
+| `repo_paths` | backfill: `{"clmux": ["Sources/"]}`, path prefixes that identify a project's tree. |
+| `limits.digest_recent_share` | share (0 to 1, default 0.33) of the digest input reserved for the newest memories. Also `newer_per_note` 3, `newer_note_chars` 600, `newer_min_words` 2. |
+| `limits.max_backfill` | `set_project` steps per backfill run (200); `backfill_batch` 8 ambiguous memories per Haiku call. |
 
 ## What a run does
 
@@ -41,8 +45,14 @@ written, with no proposals), 4 wall-time watchdog.
 3. **Write merges** (Sonnet, one call per cluster that has merges). The code checks each merge statement
    by statement ([tidy-design.md](tidy-design.md) 3.1). A merge that is not word for word is **held**
    for explicit approval; one that cannot be justified is **rejected**.
+   A cluster the validator rejects gets **one repair call** carrying the validator's error (it counts
+   against `max_llm_calls`); a second failure still rejects the cluster.
 4. **Digest** (Sonnet, one call, reserved first): a short summary where every line cites memory ids
-   (`[m123]`, or `[@c1]` for a merged memory the plan would create) and quotes a cited note.
+   (`[m123]`, or `[@c1]` for a merged memory the plan would create) and quotes a cited note. The input
+   reserves `digest_recent_share` of its bounds for the **newest** memories, then fills by rank and read
+   count (`digest_input.recent_ids` lists what the reserve took). Beside each candidate the writer is
+   shown the **newer** memories on its topic and must not state the decision as current if one of them
+   contradicts or completes it: it leaves it out or writes an `Overtaken` line citing both ids.
 5. **Seal**: the report carries a `digest` over everything else (`tidy.plan_digest`); editing it is
    detectable (`tidy.load_tidy_plan`).
 
@@ -59,6 +69,26 @@ digest did and did not look at).
 A step has `status: eligible` (every statement kept or an exact duplicate) or `held` (it contains a
 reworded or dropped statement, or a metadata conflict, and needs the leader's explicit approval). Item
 records, decisions, procedures and digests are never merged or retired.
+
+## Overtaken decisions and the leader
+
+`digest_flags[]` lists every digest candidate that had newer memories beside it and where the writer put
+it (`decisions`, `followups`, `constraints`, `overtaken`, or `left_out`): read the ones that stayed
+current. `review[]` gets a `kind: overtaken` row (older ids, newer ids) for each `Overtaken` line. It is a
+**retire or contradiction candidate for you to decide**; tidy never retires it.
+
+## Project backfill
+
+`memora-tidy --config ... --db <store copy> --backfill --out-dir ...` (no `--project`). For each live
+memory with no project it proposes a `set_project` step: `{target, project, evidence[], confidence,
+source}`. `source: signals` means the evidence was decisive without a model (a project-prefixed tag 3, an
+item record's `metadata.repo` 5, a path that only one project mentions or a `repo_paths` tree covers 2
+each; the top score is at least 3 and double the runner-up) and `confidence` is `high`. Ambiguous cases
+go to Haiku in batches; it may only pick a project that had a signal, must quote the note, and its
+confidence is `medium` or `low`; "unknown" lands in `unresolved`, as do memories with no signal at all
+(no call is spent on them). A project is never overwritten. `lists` separates protected memories and item
+records from the rest (it is metadata only, but you may want to read them first); `by_project` counts the
+proposals. The apply is a later phase; `validate_set_project` and `revalidate_step` are its hooks.
 
 ## Schedule
 
