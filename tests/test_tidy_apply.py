@@ -1418,3 +1418,51 @@ def test_completion_unchanged_completes_the_same_id_and_a_third_replay_adds_noth
     third = run(plan, d)
     assert third["counts"]["applied"] == 0 and n_memories() == n2 and len(outbox()) == o2
     assert all(op_ != "D" for _t, op_, _pk in outbox())
+
+
+# ------------------------------------------------------------------ Item 259 (leader condition): the core write path is unchanged
+
+class _Spy:
+    def __init__(self, conn):
+        self._c, self.calls = conn, []
+
+    def execute(self, sql, params=()):
+        self.calls.append((sql, tuple(params)))
+        return self._c.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def _guarded_update_calls(guard_kwargs):
+    mid = add("a note for the pin")
+    with storage.connect() as conn:
+        raw = dream._fresh(conn, mid)[1]
+        spy = _Spy(conn)
+        storage.update_memory(spy, mid, tags=["pin"], expected_row=raw, embed=False, **guard_kwargs)
+        return mid, [c for c in spy.calls if c[0].startswith("UPDATE memories SET content")]
+
+
+def test_update_memory_without_an_update_guard_runs_exactly_the_statement_it_always_ran(store):
+    expected = (
+        "UPDATE memories SET content = ?, metadata = ?, tags = ?, updated_at = ? "
+        "WHERE id = ? AND content = ? AND metadata IS ? AND tags IS ? AND updated_at IS ? "
+        "AND NOT EXISTS (SELECT 1 FROM tombstones WHERE memory_id = ?) "
+        "AND NOT EXISTS (SELECT 1 FROM tombstone_components WHERE memory_id = ?) "
+        "AND (SELECT related FROM memories_crossrefs WHERE memory_id = ?) IS ? "
+        "AND NOT EXISTS (" + storage._SUPERSEDES_EDGE_TO_SQL + ")")
+    for kw in ({}, {"update_guard": None}):
+        mid, calls = _guarded_update_calls(kw)
+        assert len(calls) == 1 and calls[0][0] == expected, kw
+        assert len(calls[0][1]) == 14 and calls[0][1][-1] == mid          # no extra parameter either
+    mid2, with_guard = _guarded_update_calls({"update_guard": ("1 = 1", ())})
+    assert with_guard[0][0] == expected + " AND 1 = 1"                    # the guard is only ever appended
+
+
+def test_update_memory_update_guard_false_writes_nothing(store):
+    mid = add("a note for the guard")
+    with storage.connect() as conn:
+        raw = dream._fresh(conn, mid)[1]
+        with pytest.raises(storage.ConcurrentUpdateError):
+            storage.update_memory(conn, mid, tags=["x"], expected_row=raw, embed=False, update_guard=("1 = 0", ()))
+    assert "x" not in mem(mid).tags
