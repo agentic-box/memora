@@ -1726,7 +1726,7 @@ def test_claude_judge_timeout_kills_group(monkeypatch, tmp_path):
 def test_claude_judge_orphan_after_normal_exit_is_killed(monkeypatch, tmp_path):
     import time
     pidf = tmp_path / "bg"
-    body = (f'import subprocess\nc = subprocess.Popen(["sleep", "60"])\nopen({str(pidf)!r}, "w").write(str(c.pid))\n' + _OK)
+    body = (f'import subprocess\nc = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\nopen({str(pidf)!r}, "w").write(str(c.pid))\n' + _OK)
     assert _cc(monkeypatch, tmp_path, body)("p") == "ANSWER"
     pid = int(pidf.read_text())
     for _ in range(50):
