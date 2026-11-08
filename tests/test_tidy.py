@@ -1216,7 +1216,8 @@ def _runner(trees, calls=None, fail=()):
     return run
 
 
-def test_backfill_uses_mirror_trees_where_available(tmp_path):
+def test_backfill_uses_mirror_trees_where_available(tmp_path, monkeypatch):
+    monkeypatch.setattr(dream.GitSource, "prepare", lambda self: (_ for _ in ()).throw(AssertionError("mirrors are never fetched")))
     for n in ("clmux", "memora", "dead", "multi"):
         _mirror_dir(tmp_path, n)
     mir = {"git_dir": str(tmp_path / "git"), "repos": {
@@ -1241,9 +1242,12 @@ def test_backfill_uses_mirror_trees_where_available(tmp_path):
     assert (st["target"], st["project"], st["confidence"], st["source"]) == (5, "clmux", "high", "signals")
     assert "mirror tree" in st["evidence"][0] and rep["mirrors"] == {"clmux": "ok"}
     # a path present in two trees, a bare file name, and an absent path give no signal
-    both = {"clmux": frozenset({"shared/util.py", "README.md"}), "memora": frozenset({"shared/util.py"})}
-    assert not tidy.run_backfill([NP(6, "See shared/util.py and shared/util.py again")], set(), cfg, None, trees=both, now=1.0)["steps"]
-    assert not tidy.run_backfill([NP(7, "Read README.md and docs/none.md")], set(), cfg, None, trees=both, now=1.0)["steps"]
+    both = {"clmux": frozenset({"shared/util.py", "shared/b.py", "README.md", "LICENSE.md"}),
+            "memora": frozenset({"shared/util.py", "shared/b.py"})}
+    assert not tidy.run_backfill([NP(6, "See shared/util.py and shared/b.py")], set(), cfg, None, trees=both, now=1.0)["steps"]
+    assert not tidy.run_backfill([NP(7, "Read README.md, LICENSE.md and docs/none.md")], set(), cfg, None, trees=both, now=1.0)["steps"]
+    only = {"clmux": frozenset({"shared/util.py", "shared/b.py"}), "memora": frozenset()}                # negative control
+    assert tidy.run_backfill([NP(6, "See shared/util.py and shared/b.py")], set(), cfg, None, trees=only, now=1.0)["steps"]
     # no mirrors configured: nothing, quietly
     assert tidy.load_mirror_trees(None, ["a"]) == ({}, {})
     assert tidy.load_mirror_trees({"git_dir": "x", "repos": {"a": {}}}, ["a"])[1]["a"]
