@@ -87,8 +87,10 @@ proposed for it):
 ```json
 {"proposals": [
   {"op": "merge",  "sources": [12, 40, 41], "text": "...",
-   "facts": [{"fact": "...", "spans": [{"id": 12, "quote": "exact substring of memory 12"}]}],
-   "dropped": [{"id": 41, "quote": "exact substring", "why": "duplicate_of", "of": {"id": 12, "quote": "..."}}],
+   "statements": [{"src": [12, 0], "outcome": "kept", "out": 0},
+                  {"src": [41, 0], "outcome": "duplicate", "of": [12, 1]},
+                  {"src": [40, 2], "outcome": "reworded", "out": 3, "why": "..."},
+                  {"src": [41, 1], "outcome": "dropped", "why": "quoted_history"}],
    "reason": "..."},
   {"op": "retire", "id": 7, "by": 40, "why": "obsolete|redundant", "evidence": [{"id": 7, "quote": "..."}, {"id": 40, "quote": "..."}]},
   {"op": "link",   "a": 40, "b": 55, "edge_type": "extends", "reason": "..."},
@@ -120,48 +122,57 @@ fast and checkable:
 1. **Source-fact inventory (code, not model).** Each source is split into *statements* (sentences and
    list items, deterministic splitter, no truncation). The report lists every statement with its id
    and character span.
-2. **Coverage.** The model must map every statement of every source to exactly one of: a
-   `facts[].spans` entry (an exact substring quote of that statement that the merged text
-   expresses), or a `dropped` entry. The code checks that each quote is a verbatim substring at the
-   stated memory, and that the union of spans and drops covers **every statement**; an unmapped
-   statement rejects the merge. Each `facts[].fact` must be a verbatim substring of the merged
-   `text`, and each span quote must be a substring of its source; so every merged sentence has a
-   provenance span, and a merged sentence with no span (an invented claim) rejects the merge.
-3. **Drops are not self-justifying.** `dropped.why` is only `duplicate_of` or `quoted_history`.
-   `duplicate_of` requires an `of` span in another source whose normalised text (case, whitespace,
-   punctuation folded) **equals or contains** the dropped statement; otherwise it is not a
-   duplicate. `quoted_history` is accepted only when the statement carries a literal marker
-   ("was", "previously", "used to", "before", a dated past event) *and* the leader approves it. No
-   other reason exists; `superseded_value` is not allowed (replacing a value is a retire/contradiction
-   decision, not a merge detail).
-4. **Approval.** Every `dropped` entry with `quoted_history`, and every merge where a statement was
-   reworded rather than kept verbatim, is marked `needs_approval: true` in the report. The leader's
-   decision file (section 5.4) must approve each one; `--apply` skips an unapproved merge.
-   Verbatim-only merges (all statements kept as exact quotes or exact duplicates) need no per-fact
-   approval beyond the normal step approval.
-5. **Heuristic guards stay on** (numbers, 60% size, same project/section/hierarchy, no prompt
-   envelope) and reject, but a pass proves nothing; the audit trail is the span table above.
+2. **Coverage is by COMPLETE statements.** The model must assign every inventoried statement of
+   every source exactly one outcome:
+   - `kept`: the statement appears in the merged text **in full**, byte-identical after only
+     whitespace folding, as a whole statement of the merged text (the merged text is split by the same
+     splitter; the match is statement-to-statement). The step lists `{src: [id, i], out: j}`. A quote
+     of part of a statement certifies nothing: a statement is covered only by a full-statement match.
+   - `duplicate`: the statement is **exactly equal** (same folding as above, **full-statement
+     equality**, no containment, no prefix/suffix) to a statement of another source that is itself
+     `kept`. Negation and conditions are therefore preserved by construction: "Use X." and
+     "Do not use X." are different statements; "Allow 30 days" and "Do not allow 30 days" likewise.
+   - `reworded` (anything else: a statement changed, shortened, combined, or only partly present),
+     or `dropped` (not expressed at all, e.g. `quoted_history`). Both are **held for explicit
+     per-statement leader approval**, listed with the source statement and the merged statement
+     (or none) side by side.
+   An unassigned statement, or a merged statement that is `kept` against no source statement and is
+   not listed as `reworded`, **rejects the merge** (nothing is hidden; invented content has no source).
+3. **Rejected vs held, one rule.** The merge is **rejected** (mechanical, never offered for approval)
+   when: a statement is unassigned; a `kept`/`duplicate` claim is not a full-statement match; the
+   merged text has a statement with no source and not listed as `reworded`; sources disagree on
+   project/section/hierarchy; the cluster has a `contradiction`; any protected member. The merge is
+   **held for approval** when it is mechanically well-formed but contains any `reworded` or
+   `dropped` statement. It is **eligible without per-statement approval** only when every statement is
+   `kept` or `duplicate`. Even then it is a step the leader must approve (5.4).
+4. **Metadata policy.** `project`, `section`, `hierarchy` must be equal across sources (else reject).
+   `kind` and `type` must be equal or absent (else reject). `resolution`, `status` and `provenance`
+   style scalars that differ are not unioned: the merged memory takes none of them and records
+   `metadata.tidy.conflicts = {field: {id: value}}`, which makes the step `needs_approval`. Lists
+   (tags) are unioned; `references_checked` of the sources is not copied (the merged text is new).
+5. **Heuristic guards stay on** (numbers, SHAs, tags, 60% size guard, no prompt envelope) and reject,
+   but a pass proves nothing; the audit trail is the statement table.
 
-Fail-closed outcomes: any of the above failing drops the merge into `proposals_rejected` with the
-reason; the cluster keeps its `link`/`retag` proposals and nothing is hidden.
+Fail-closed outcomes: any failure above drops the merge into `proposals_rejected` with the reason;
+the cluster keeps its `link`/`retag` proposals and nothing is hidden.
 
-**Accepted / rejected examples.**
+**Worked validation table (a).** Source statements are written `A1`, `B1`, ...; merged statements `M1`...
 
-| sources | merged text | outcome |
-|---|---|---|
-| A: "Uploads require admin approval. Logs are kept 30 days." / B: "Logs are kept 30 days." | "Uploads require admin approval. Logs are kept 30 days." | accepted: B's statement is `duplicate_of` A's (equal after folding); both A statements have spans |
-| same | "Uploads require approval. Logs are kept 30 days." | rejected: "admin approval" has no verbatim quote in the merged text's fact span; the merged sentence `Uploads require approval.` is not a substring of any source, so it has no span |
-| A: "Port is 8080 (was 8000)." / B: "Port is 8080." | "Port is 8080." | held for approval: "(was 8000)" is dropped as `quoted_history` |
-| A: "Use X." / B: "Do not use X." | any single text | no merge: the cluster is a `contradiction` (see 3.3) |
-| A and B share only "Item 44", each states a different constraint | "..." | rejected: shared reference is never a duplicate proof; both statements must be kept |
+| case | sources | merged text | inventory outcome | result |
+|---|---|---|---|---|
+| exact duplicate | A: "Uploads require admin approval." (A1) "Logs are kept 30 days." (A2) / B: "Logs are kept 30 days." (B1) | "Uploads require admin approval. Logs are kept 30 days." | A1 kept=M1, A2 kept=M2, B1 duplicate of A2 (full equality) | well-formed, all kept/duplicate: eligible; leader approves step; applied: 1 create + 2 edges per source = 1+2*2 = 5 |
+| Use X / Do not use X | A: "Use X." / B: "Do not use X." | "Do not use X." | A1: not equal to any statement of another source (B1 is "Do not use X."), not kept in M; so A1 is `dropped` | the cluster is already a `contradiction` (Haiku, with quotes); a contradiction freezes every member: merge **rejected**, nothing hidden. Even if the contradiction call were missed, A1 `dropped` would only be held for approval, never auto-eligible; containment is not a duplicate |
+| partial-quote constraint | A: "Uploads require admin approval." / B: "Logs are kept 30 days." | "Uploads require approval. Logs are kept 30 days." | A1: no full-statement match ("Uploads require approval." differs) => A1 `reworded` into M1; B1 kept=M2 | **held** for approval, shown side by side ("admin" removed). It is not rejected because it is well-formed; it is never applied without the leader approving `s:A1->M1` |
+| approved rewording | same as above, leader approves A1->M1 | same | A1 reworded (approved), B1 kept | applied: 5 charges; the decision file lists `approve_statements: ["s3:A1"]` |
+| unmapped | A: two statements, model maps one | any | A2 unassigned | **rejected**: `unmapped_statement:A#2` |
+| invented | any | adds "Retries are capped at 3." with no source statement | M3 has no source, not listed `reworded` | **rejected**: `statement_without_source` |
 
 ### 3.2 Retire
 
 A retire hides `id` behind the newer, existing, live memory `by`. It requires **demonstrated
 redundancy or obsolescence**, never topical overlap or a shared reference:
 
-- `why: redundant`: every statement of `id` is `duplicate_of` a statement of `by` by the same
-  folded-equality rule as 3.1(3) (quotes required, verified by code); or
+- `why: redundant`: every statement of `id` is a `duplicate` (full-statement equality, 3.1(2)) of a statement of `by` (quotes required, verified by code); or
 - `why: obsolete`: `by` contains a statement the judge quotes as replacing a specific statement of
   `id`, **and the leader approves it** (`needs_approval: true` always). A retire of an `obsolete`
   kind is never applied without that approval.
@@ -190,7 +201,8 @@ Dream's metadata (`dream.py:1071`) is read, never trusted as truth:
   candidate**: it is listed under `review[]` in the report with the missing references, and is
   shown to the cluster judge as context ("a reference of this note was not found").
 - It is **never retired on that alone.** Absence is not an error (docs/dream.md, Item 244). A retire
-  still needs the section 3 rule: a newer live memory in the cluster sharing a reference or typed edge.
+  still needs section 3.2: every statement a `duplicate` of the newer memory (`redundant`), or a quoted
+  replacement plus the leader's approval (`obsolete`). A shared reference is never enough.
 - A memory with `all_found` is not "verified"; it only means references resolve.
 
 ## 5. Safety (the rules, enforced in code, each with a test)
@@ -202,25 +214,24 @@ Dream's metadata (`dream.py:1071`) is read, never trusted as truth:
    `kind: decision` or a `decision` tag (dream's set, `dream.py:1016`), `kind: procedure`. They may
    be **linked** and **retagged only by adding**; they may sit in a cluster as context. Protection is
    read **at apply time**, never from the plan (`dream.py:1527`); a protected memory in a merge/retire
-   step makes that step fail closed. **`kind: digest` has one narrow exception**, the *digest
-   replacement* operation of section 6.4: allowed only when the old memory has `kind: digest`, the
-   same `project`, is the one live digest of that project, and equals the judged row
-   (`state_sha`); it cannot hide anything else, and a digest is never merged or retired by a
-   cluster step.
+   step makes that step fail closed. **`kind: digest` has one narrow exception**: the three digest
+   steps of section 6.4 (`bootstrap_digest`, `replace_digest`, `repair_digest`), each with its own
+   state guard over the project's live digests; they cannot hide anything but a digest of the same
+   project, and a digest is never merged or retired by a cluster step.
 3. **Caps per run** (`limits`, tested): `max_clusters` 12, `max_llm_calls` 24, `max_merges` 10,
    `max_retires` 10, `max_links` 20, `max_retags` 20, `max_writes` 40, `max_seconds` 1500, `nice` 10.
    **Write charges, before dispatch** (like dream: charged, not refunded, remainder `deferred`):
    a merge of N sources costs **1 + 2N** (the new memory, then per source the forward `supersedes`
    edge held by the new memory and the reverse edge on the source, each a separately committed
    guarded call, as `_guarded_edge`, `dream.py:1374`, does); a retire 2; a link 2 (one per side);
-   a retag 1; a digest replacement 3 (create + forward + reverse); an *ambiguous* call (deadline hit
+   a retag 1; a digest bootstrap 1, replacement 3 (create + forward + reverse), repair 2 (both edges, no create); an *ambiguous* call (deadline hit
    mid-call) keeps its charge and is listed, never retried in the same run. A merge of more than 8
    sources is split. `max_writes` is therefore 40, not dream's 20, and the plan is pruned to fit
    before it is sealed, not at apply time.
 4. **The plan is sealed; approvals are separate.** `plan_digest` (`dream.py:1297`) binds the whole
    report, including every body. The leader never edits the report. Acceptance goes in a separate
    `decisions.json` *(new)*: `{"report_digest": "<digest>", "approve": ["s3","s7"], "reject": ["s5"],
-   "approve_dropped": ["s3:41"]}`. `--apply --plan report.json --decisions decisions.json` refuses a
+   "approve_statements": ["s3:A1"]}`. `--apply --plan report.json --decisions decisions.json` refuses a
    decisions file whose `report_digest` is not the report's digest, an id not in the report, or an
    approval of a step that is not `needs_approval`-eligible. It can only select among sealed steps;
    it cannot change a body, guard or order. A step not approved is not applied (default is
@@ -233,9 +244,10 @@ Dream's metadata (`dream.py:1071`) is read, never trusted as truth:
       delete `-wal`/`-shm` of a copy that has uncheckpointed committed rows. m1383's pitfall (a
       reused read-only copy keeps stale sidecars and fails with `wal_shm_unusable`) is avoided by
       making a **new** copy per run, not by deleting sidecars of a source; with the embedding env in a
-      0600 file, never printed; diff `sync_outbox` before and after: only `U`/`I`-style rows, **no `D`**;
+      0600 file, never printed; diff `sync_outbox` before and after: only op `U` rows as m1383 saw, **no `D` rows**;
    2. stop the watchdog service first, then the memora container;
-   3. run `memora-tidy --apply` in a one-off container (same image, data volume, plan dir read-only,
+   3. run `memora-tidy --apply` in a one-off container (same image, the container's embedding/container env taken from `docker inspect` into a temp file
+      deleted afterwards, the data volume, the secrets dir read-only, plan dir read-only,
       `MEMORA_LLM_ENABLED=false`);
    4. start the container, then the watchdog;
    5. check D1: `last_acked_seq == max(sync_outbox.seq)`, no halt, no error.
@@ -271,7 +283,7 @@ The digest is generated in the dry run, **after** the cluster step and from the 
 memories, but a merged memory has no database id until apply. So:
 
 - each planned create has a **symbolic id** `@c<k>` (for example `@c3`), sealed in the report with its
-  full body, tags, metadata and provenance spans;
+  full body, tags, metadata and statement table;
 - the digest's sealed text cites `@c3` where it cites that memory; the sealed step lists
   `depends_on: ["s3"]`;
 - at apply, steps run in dependency order (all cluster steps, then the digest step). When step s3 has
@@ -285,19 +297,46 @@ If s3 is skipped, deferred, ambiguous, rejected by the leader or protected-faile
 live. No step may cite a result that did not commit. Because apply never regenerates text, the next
 weekly dry run produces a digest from the then-current store.
 
-### 6.4 Digest replacement operation
+### 6.4 Digest operations: `replace_digest`, `repair_digest`, bootstrap
 
-A dedicated apply step `replace_digest` *(new)*, not a merge or retire: it creates the new
-digest memory, then the forward and reverse `supersedes` edges from the new digest to the **expected
-prior digest id** recorded in the sealed step. Guards, in one statement as in `_guarded_edge`: the
-old memory is still exactly the judged row (`state_sha`), has `kind: digest` and the same `project`,
-and has no existing superseder. Exactly-once: before creating, apply re-reads "live digests of this
-project"; if there is already one that is **not** the expected prior (a half-applied earlier retry, or
-a concurrent writer) the step stops as ambiguous and writes nothing. If the create succeeded but the
-edges did not (partial failure), the step records the new id; a retry (the same sealed plan, or a new
-one) finds two live digests and a `repair_digest` plan step is produced by the next dry run
-(supersede the older one, same guards). So the system converges to one live digest, and never has
-none: the old one is hidden only after the new one exists.
+Digests are the only protected kind with a write path, through three dedicated steps, never through
+merge or retire. All three run the same checks inside the edge statement (`_guarded_edge`,
+`dream.py:1374`): the memory being hidden is exactly its judged row (`state_sha`), `kind: digest`,
+same `project`, no existing superseder. Ordinary item/decision/procedure protection is unchanged.
+
+State is the set L of **live digests of the project** (digest-kind memories not retired).
+
+- **`bootstrap_digest`** (|L| = 0): create the digest; no edge. Guard: re-read L now; if |L| != 0
+  the step stops (nothing written). Charge 1.
+- **`replace_digest`** (|L| = 1, L = {P}, P is the sealed `expect`): create new digest D, then the
+  forward edge D supersedes P, then the reverse edge on P. Guard before create: re-read L; if L is
+  not exactly {P} with P's `state_sha` unchanged, stop as `ambiguous`/`stale` and write nothing.
+  Charge 3.
+- **`repair_digest`** (|L| = 2, L = {P, D}): produced by a dry run that sees two live digests, and
+  sealed with **both** ids and both `state_sha`. The winner is the one with the later `created_at`
+  whose metadata has `digest_of: "tidy"` and the same `project` (a digest from another source or
+  project is never a winner or a loser: the step is not produced and the case goes to `review[]`).
+  Guard: both ids are `kind: digest`, same project, still exactly their judged rows, L is exactly
+  {P, D} now. It **creates nothing** and writes only the forward edge (winner supersedes loser)
+  and the reverse edge on the loser. Charge 2. Its dependencies are none (it cites no planned
+  create); if the winner's own citations are stale it is still the right repair, and the next
+  `replace_digest` refreshes the text.
+- A state with |L| >= 3, or two live digests where one is not tidy-made, is not repaired
+  automatically: it is a `review[]` entry for the leader.
+
+**State-transition table (b).** IDs: P=801 (the previous digest), D=905 (the new one, symbolic
+`@d1` in the plan). Charges are the section 5.3 charges.
+
+| # | state before | step and call outcome | state after | next run / replay |
+|---|---|---|---|---|
+| 1 | L={} | `bootstrap_digest`: create 905 ok (charge 1) | L={905} | replay of the same plan: re-read L={905}, expect L={} fails: **no-op**, nothing written |
+| 2 | L={801} | `replace_digest`: create 905 ok, forward edge ok, reverse edge ok (charge 3) | L={905} (801 hidden) | replay: L={905} != expect {801}: stopped before any write, reported `already_applied` |
+| 3 | L={801} | create 905 ok, forward edge **fails** (guard refused or error) (charge 3 spent) | L={801, 905} | next dry run sees |L|=2, both tidy-made, 905 later: seals `repair_digest(801, 905)` |
+| 4 | L={801, 905} | `repair_digest`: forward 905 supersedes 801 ok, reverse ok (charge 2) | L={905} | replay: L={905} != {801, 905}: stopped, no write |
+| 5 | L={801} | create 905 ok, forward ok, **reverse fails** | 801 is retired by the forward edge (retirement is any forward `supersedes` edge held by a live memory, `dream.py:1338`) | L={905}; the missing reverse edge is reported `partial` and needs no step: retirement is forward-only, so 801 is hidden and exactly one digest is live |
+| 6 | L={801} | the deadline passes inside the create call | unknown: 905 may exist | the step is `ambiguous`, charge kept, nothing retried in this run; next dry run reads L: if {801, 905} -> row 3; if {801} -> new `replace_digest` |
+| 7 | L={801, 777, 905} (|L|=3) | no automatic step | unchanged | `review[]` entry for the leader |
+| 8 | L={801} but a cited cluster step s3 was skipped | `replace_digest` depends_on s3: **refused**, `deferred: dependency s3` | L={801} | nothing written; the next run regenerates |
 
 ### 6.5 How a session finds it
 
@@ -343,9 +382,9 @@ the seal is not weakened. Fields `run` and `at` are informational.
                "proposals_rejected": [{"op":"merge","reason":"unmapped_statement:41#2"}]}],
  "steps": [{"id": "s3", "op": "merge", "cluster": "c1", "create": "@c3",
             "body": "...", "tags": [], "metadata": {}, "sources": [12,40,41],
-            "spans": [], "dropped": [], "charge": 7, "needs_approval": true,
-            "expect": {"12": "<state_sha>", "40": "<state_sha>"}, "depends_on": []},
-           {"id": "s9", "op": "replace_digest", "body": "... [@c3] ...", "supersedes": 801,
+            "statements": [], "charge": 7, "needs_approval": true,
+            "expect": {"12": "<state_sha>", "40": "<state_sha>", "41": "<state_sha>"}, "depends_on": []},
+           {"id": "s9", "op": "replace_digest", "create": "@d1", "body": "... [@c3] ...", "supersedes": 801,
             "expect": {"801": "<state_sha>"}, "depends_on": ["s3"], "charge": 3}],
  "digest_input": {"considered": 0, "included": 0, "excluded": 0},
  "review": [{"id": 5, "references_checked": "missing", "missing": ["..."]}],
@@ -353,7 +392,7 @@ the seal is not weakened. Fields `run` and `at` are informational.
 ```
 
 `steps` is the only thing `--apply` reads and it contains every sealed payload (bodies, tags,
-metadata, spans, dependencies, charges, guards); nothing executable lives outside the sealed
+metadata, statement tables, dependencies, charges, guards); nothing executable lives outside the sealed
 digest. Approvals come from the separate `decisions.json` (section 5.4).
 
 ## 9. Success measures
@@ -390,7 +429,7 @@ All taken in the dry-run report and again after the apply:
 | 2 | Should retired memories also be tagged (`tidy/retired`)? | No: tag edits on retired memories add writes for nothing; the `supersedes` edge is the record. |
 | 3 | Do item-record memories ever get merged? | No, never (decided above). Only linked. A later opt-in needs its own item. |
 | 4 | Sonnet for digest only, or also for merges? | Both (decided); revisit if the first report shows Haiku merges pass the mechanical check equally often. |
-| 5 | One lock per project or one global? | One global (dream's `run_lock`); the weekly schedule never overlaps. |
+| 5 | One lock per project or one global? | One global, and the **same lock file path** as dream (`run_lock`, `dream.py:167`), so `state_dir` must be shared between the two jobs; otherwise cross-job exclusion does not exist. |
 | 6 | Cosine threshold 0.80 and cluster size 12: right? | Start there, make them config; tune from the first report's `evidence` data. |
 | 7 | Does the digest need a staleness mark when cited memories later change? | Yes, cheaply: the next run regenerates it; between runs `covers` + `updated_at` lets a reader see drift. Not in phase 2. |
 | 8 | Where does the digest stay for projects with no `metadata.project`? | Skipped: tidy refuses a null project. |
