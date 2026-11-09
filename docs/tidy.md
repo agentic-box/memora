@@ -206,7 +206,7 @@ The run scripts and the systemd unit never contain `--apply` (tested).
 
 `memora-tidy-eval` answers "do real queries find the right memory?" with a number you can repeat before and
 after each apply. It never writes: it opens a store **copy** read-only, runs no model, and calls the search
-the MCP tools use (`hybrid_search_scored`, `follow="active"`, top 5) without the read ledger. Only the query
+the MCP tools use (`retrieval.search_v2`, `follow="active"`, top 5) without the read ledger. Only the query
 embedding is computed, with the store's embedding environment; if that is unavailable it stops (exit 2)
 rather than report keyword-only results.
 

@@ -1,8 +1,8 @@
 """Retrieval v2 (Item 260): a ranked keyword leg, exact identifier lookup, and a
 weighted fusion of them with the dense leg.
 
-Opt-in only (``memory_hybrid_search(engine="v2")``); ``storage.hybrid_search``
-is unchanged. Everything here is read-only: SELECTs against ``memories`` and
+The default engine of ``memory_hybrid_search`` (Item 262; ``engine="v1"`` still
+selects the unchanged ``storage.hybrid_search``). Everything here is read-only: SELECTs against ``memories`` and
 ``memories_fts``. The FTS index is never written, rebuilt or given a helper
 table (no fts5vocab), so it stays byte-identical.
 

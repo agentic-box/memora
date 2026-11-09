@@ -1,5 +1,6 @@
 """Item 260: retrieval v2 (memora/retrieval.py) -- synthetic stores only."""
 import asyncio
+import json
 
 import pytest
 
@@ -234,28 +235,71 @@ def test_search_v2_is_read_only(conn):
 
 # --- wiring ----------------------------------------------------------------
 
-def test_v1_default_is_unchanged_and_never_touches_v2(local_db, monkeypatch):
-    token = "defaultprobe-zzxq"
+def _seed_default_probe(token):
     with storage.connect() as c:
         for i in range(4):
             _mk(c, f"{token} document {i} extra words")
-    calls = []
-    real = server._hybrid_search
 
-    async def spy(*a, **kw):
-        calls.append(kw)
-        return await real(*a, **kw)
 
-    monkeypatch.setattr(server, "_hybrid_search", spy)
-    monkeypatch.setattr(retrieval, "search_v2", lambda *a, **k: pytest.fail("v2 ran on the default"))
+def test_default_engine_is_v2_and_v1_stays_unchanged(local_db, monkeypatch):
+    token = "defaultprobe-zzxq"
+    _seed_default_probe(token)
+    v2_calls = []
+    real_v2 = retrieval.search_v2
+
+    def spy_v2(*a, **kw):
+        v2_calls.append(kw)
+        return real_v2(*a, **kw)
+
+    monkeypatch.setattr(retrieval, "search_v2", spy_v2)
     default = asyncio.run(server.memory_hybrid_search(token, limit=3, follow="active"))
-    explicit = asyncio.run(server.memory_hybrid_search(token, limit=3, follow="active", engine="v1"))
-    assert default["results"] == explicit["results"] and default["count"] == 3
-    assert all("engine" not in kw for kw in calls), "v1 call shape is exactly the old one"
+    assert len(v2_calls) == 1, "the default path runs v2"
+    with storage.connect() as c:
+        expect_v2 = real_v2(c, token, top_k=3, follow="active")
+    assert [r["memory"]["id"] for r in default["results"]] == [r["memory"]["id"] for r in expect_v2]
+    assert [r["score"] for r in default["results"]] == [r["score"] for r in expect_v2]
+    assert all("cosine" not in r and set(r) == {"score", "memory"} for r in default["results"])
+
+    monkeypatch.setattr(retrieval, "search_v2", lambda *a, **k: pytest.fail("v2 ran for engine=v1"))
+    v1 = asyncio.run(server.memory_hybrid_search(token, limit=3, follow="active", engine="v1"))
     with storage.connect() as c:
         direct = storage.hybrid_search(c, token, top_k=3, follow="active")
-    assert [r["memory"]["id"] for r in default["results"]] == [r["memory"]["id"] for r in direct]
-    assert [r["score"] for r in default["results"]] == [r["score"] for r in direct]
+    assert [r["memory"]["id"] for r in v1["results"]] == [r["memory"]["id"] for r in direct]
+    assert [r["score"] for r in v1["results"]] == [r["score"] for r in direct]
+
+
+def test_digest_and_cli_search_use_v2_negative_control(local_db, monkeypatch, capsys):
+    token = "callerprobe-qqxz"
+    _seed_default_probe(token)
+    seen = []
+    real_v2 = retrieval.search_v2
+
+    def spy_v2(*a, **kw):
+        seen.append(kw)
+        return real_v2(*a, **kw)
+
+    monkeypatch.setattr(retrieval, "search_v2", spy_v2)
+    asyncio.run(server.memory_digest(token, k=3))
+    assert len(seen) == 1 and seen[0]["follow"] == "active"
+    from memora import cli
+    cli.cmd_search(token, top_k=3)
+    assert len(seen) == 2
+    out = json.loads(capsys.readouterr().out)
+    assert len(out) == 3 and all(set(e) == {"score", "memory"} for e in out)
+    # negative control: the v1 engine does not reach search_v2
+    asyncio.run(server.memory_hybrid_search(token, limit=3, engine="v1"))
+    assert len(seen) == 2
+
+
+def test_write_paths_are_not_switched(local_db, monkeypatch):
+    """absorb dedup / supersede checks and crossref linking stay on their v1 path."""
+    monkeypatch.setattr(retrieval, "search_v2", lambda *a, **k: pytest.fail("a write path ran v2"))
+    token = "writepath-vvkj"
+    with storage.connect() as c:
+        a = _mk(c, f"{token} first note about caching")
+    out = asyncio.run(server.memory_absorb([f"{token} first note about caching"]))
+    assert out is not None
+    del a
 
 
 def test_engine_v2_through_the_tool_and_invalid_engine(local_db):

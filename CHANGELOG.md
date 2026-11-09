@@ -12,6 +12,10 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.14 — 2026-11-09
+
+- **Retrieval v2 is the default search (Items 260 and 262).** `memory_hybrid_search` now defaults to `engine="v2"`: a bm25-ranked OR keyword leg, exact lookup of identifiers in the query (Item N, ids, paths, snake_case/camelCase names, SHAs, versions) and the dense leg, fused by weighted RRF. On the hard query set R@10 rose from 0.49 to 0.76. `engine="v1"` stays available and unchanged. The result shape is the same (`{score, memory}`); `score` is now the v2 fused ranking value (about 0 to 0.2, only meaningful for ordering within a response), and `semantic_weight` is ignored by v2. `memory_digest`, the `memora search` CLI command and `memora-tidy-eval` read through v2 too. Write-path similarity (absorb dedup, supersede checks, crossref linking), `memory_semantic_search` and the `/v1/search` REST endpoint (its contract fixes `mode: "hybrid-v1"`) are unchanged.
+
 ## 0.5.7.13 — 2026-11-08
 
 - **`memora-tidy-eval` (Item 258): the tidy retrieval check.** Runs a private, git-ignored query set against a read-only store copy through the real hybrid search (`follow="active"`, top 5), unscoped and scoped by project, and reports recall@5, MRR and a digest-first check; `--compare before.json after.json` prints per-query and total deltas. An expected memory that was superseded counts as hit by its live successor, resolved at the leaves of the supersession graph (both `superseded_by` chains and forward-only `supersedes` edges); a retired predecessor never counts. It writes nothing (no ledger, no access counts), calls no model, and stops rather than report keyword-only results when the query embedding is unavailable. `scripts/tidy/queries.json.example` shows the format; see `docs/tidy.md` "Measuring".

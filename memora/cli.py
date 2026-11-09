@@ -46,16 +46,19 @@ def cmd_health() -> None:
 
 
 def cmd_search(query: str, top_k: int = 7, tags_any: list[str] | None = None) -> None:
-    from .storage import connect, hybrid_search
+    from .storage import connect
+    from .retrieval import search_v2
     from .embeddings import EmbeddingIntegrityFault, embedding_integrity_fault_payload
 
     conn = connect()
     try:
         try:
-            results = hybrid_search(
-                conn, query, semantic_weight=0.6, top_k=top_k,
-                min_score=0.0, tags_any=tags_any or None,
-            )
+            results = [
+                {k: v for k, v in item.items() if k != "cosine"}
+                for item in search_v2(
+                    conn, query, top_k=top_k, min_score=0.0, tags_any=tags_any or None,
+                )
+            ]
         except EmbeddingIntegrityFault as exc:
             json.dump(embedding_integrity_fault_payload(exc), sys.stdout)
             return

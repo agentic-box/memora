@@ -1,7 +1,7 @@
 """Item 258: the tidy retrieval check (docs/tidy-design.md section 9, docs/tidy.md "Measuring").
 
 ``memora-tidy-eval --db COPY [--queries FILE]`` runs a fixed query set through the search the MCP tools use
-(``storage.hybrid_search_scored``, ``follow="active"``, top 5), unscoped and, for a query with a project,
+(``retrieval.search_v2``, ``follow="active"``, top 5), unscoped and, for a query with a project,
 scoped by it, and reports recall@5 and MRR. Run it on a copy before and after a tidy apply, then
 ``memora-tidy-eval --compare before.json after.json``.
 
@@ -150,9 +150,10 @@ def _search(conn: Any, query: str, project: Optional[str]) -> List[int]:
     if not storage._query_embedding(query):
         raise EvalError("the query embedding is unavailable (check the store's embedding environment); "
                         "refusing to report keyword-only results as a retrieval measurement")
-    items = storage.hybrid_search_scored(
+    from . import retrieval  # noqa: PLC0415
+    items = retrieval.search_v2(
         conn, query, top_k=TOP_K, min_score=0.0, follow="active", project=project,
-        read_only=True, auto_rebuild=False,
+        read_only=True,
     )
     return [it["memory"]["id"] for it in items]
 
