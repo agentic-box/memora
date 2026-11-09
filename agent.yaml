@@ -66,6 +66,8 @@ skills:
     description: Search memories by vector similarity.
   - name: memory_hybrid_search
     description: Search memories with fused keyword and semantic ranking.
+  - name: memory_context
+    description: Return the project digest plus budgeted retrieval v2 hits in one call, for a brief or decision.
   - name: memory_digest
     description: Return a deterministic aggregation of memories, lineage, related ids, TODOs, and issues for a topic.
   - name: memory_rebuild_embeddings
