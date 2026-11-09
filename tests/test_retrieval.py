@@ -196,13 +196,13 @@ def test_decomposition_adds_paragraph_dense_lists(conn, monkeypatch):
     monkeypatch.setattr(storage, "semantic_search", spy)
     para = lambda w: (w + " ") * 30
     q = "\n\n".join([para("alpha"), para("beta"), "short"] + [para(f"p{i}") for i in range(8)])
-    retrieval.search_v2(conn, q, top_k=3)
+    retrieval.search_v2(conn, q, top_k=3, decompose=True)
     assert len(calls) == 1 + 6, "whole query + at most 6 paragraphs over 60 chars"
     calls.clear()
     retrieval.search_v2(conn, q, top_k=3, decompose=False)
     assert len(calls) == 1
     calls.clear()
-    retrieval.search_v2(conn, "one short paragraph only", top_k=3)
+    retrieval.search_v2(conn, "one short paragraph only", top_k=3, decompose=True)
     assert len(calls) == 1
 
 
@@ -307,3 +307,12 @@ def test_zero_weight_legs_are_skipped_and_knobs_validated(conn, monkeypatch):
     for bad in ({"dense_weight": float("nan")}, {"lexical_weight": -1}, {"rrf_k": 0}, {"dense_depth": 0}):
         with pytest.raises(ValueError):
             retrieval.search_v2(conn, "somethingelse", **bad)
+
+
+def test_leader_selected_defaults():
+    import inspect
+
+    d = {k: v.default for k, v in inspect.signature(retrieval.search_v2).parameters.items()}
+    assert (d["rrf_k"], d["lexical_weight"], d["identifier_weight"], d["dense_weight"]) == (20.0, 1.5, 1.0, 1.0)
+    assert d["decompose"] is False and d["bm25_weights"] == (1.0, 0.3, 0.6)
+    assert (d["dense_depth"], d["lexical_depth"], d["identifier_depth"], d["max_terms"]) == (100, 100, 50, 48)

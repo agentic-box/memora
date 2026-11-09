@@ -47,7 +47,7 @@ _STOPWORDS = frozenset(
 _TERM_RE = re.compile(r"[^\W_]+", re.UNICODE)
 
 DEFAULT_MAX_TERMS = 48
-DEFAULT_BM25_WEIGHTS = (1.0, 0.5, 0.5)  # content, metadata, tags
+DEFAULT_BM25_WEIGHTS = (1.0, 0.3, 0.6)  # content, metadata, tags
 _MAX_IDENTIFIERS = 40
 _PER_IDENTIFIER_ROWS = 200
 _IN_CHUNK = 500
@@ -409,7 +409,7 @@ def identifier_lookup(
     def credit(rowids: Iterable[int], exact: int) -> None:
         rowids = list(rowids)
         if len(rowids) >= cap:
-            logger.warning("identifier lookup scanned its raw candidate bound (%d); deeper matches omitted", cap)
+            logger.debug("identifier lookup scanned its raw candidate bound (%d); deeper matches omitted", cap)
         rowids = eligible(rowids)
         for rid in set(rowids):
             cur = hits.setdefault(rid, [0, 0])
@@ -504,11 +504,11 @@ def search_v2(
     dense_depth: int = 100,
     lexical_depth: int = 100,
     identifier_depth: int = 50,
-    rrf_k: float = 60.0,
+    rrf_k: float = 20.0,
     dense_weight: float = 1.0,
-    lexical_weight: float = 1.0,
+    lexical_weight: float = 1.5,
     identifier_weight: float = 1.0,
-    decompose: bool = True,
+    decompose: bool = False,
     decompose_min_chars: int = 60,
     decompose_max: int = 6,
     decompose_weight: float = 0.5,
