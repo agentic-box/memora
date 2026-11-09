@@ -285,7 +285,7 @@ def test_digest_and_cli_search_use_v2_negative_control(local_db, monkeypatch, ca
     cli.cmd_search(token, top_k=3)
     assert len(seen) == 2
     out = json.loads(capsys.readouterr().out)
-    assert len(out) == 3 and all(set(e) == {"score", "memory"} for e in out)
+    assert out["count"] == 3 and all(set(e) == {"score", "memory"} for e in out["results"])
     # negative control: the v1 engine does not reach search_v2
     asyncio.run(server.memory_hybrid_search(token, limit=3, engine="v1"))
     assert len(seen) == 2
