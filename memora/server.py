@@ -601,7 +601,30 @@ def _hybrid_search(
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
     follow: Optional[str] = None,
+    engine: str = "v1",
 ):
+    if engine == "v2":
+        # Item 260: opt-in retrieval v2 (ranked keyword leg + identifier
+        # lookup + dense, weighted RRF). semantic_weight does not apply: the
+        # per-leg weights are retrieval.search_v2 knobs.
+        from . import retrieval
+
+        return [
+            {k: v for k, v in item.items() if k != "cosine"}
+            for item in retrieval.search_v2(
+                conn,
+                query,
+                top_k=top_k,
+                min_score=min_score,
+                metadata_filters=metadata_filters,
+                date_from=date_from,
+                date_to=date_to,
+                tags_any=tags_any,
+                tags_all=tags_all,
+                tags_none=tags_none,
+                follow=follow,
+            )
+        ]
     return hybrid_search(
         conn,
         query,
@@ -2401,6 +2424,7 @@ async def memory_hybrid_search(
     preview_chars: int = 300,
     fields: Optional[List[str]] = None,
     follow: Optional[str] = None,
+    engine: str = "v1",
 ) -> Dict[str, Any]:
     """Perform a hybrid search combining keyword (FTS) and semantic (vector) search.
 
@@ -2431,10 +2455,16 @@ async def memory_hybrid_search(
                 ``latest`` / ``full_history`` as documented on memory_list;
                 ``all`` is the explicit unfiltered forensic escape hatch.
                 Omitting follow is NOT unfiltered — it means the safe default.
+        engine: "v1" (default, unchanged) or "v2" (opt-in): a bm25-ranked OR keyword
+                leg, exact lookup of identifiers in the query (Item N, ids, paths,
+                snake_case/camelCase names, SHAs, versions) and the dense leg, fused
+                by weighted RRF. semantic_weight is ignored by v2.
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
     """
+    if engine not in ("v1", "v2"):
+        return {"error": "invalid_engine", "message": "engine must be 'v1' or 'v2'"}
     try:
         effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
     except ValueError as exc:
@@ -2453,6 +2483,7 @@ async def memory_hybrid_search(
             tags_all,
             tags_none,
             follow=effective_follow,
+            **({"engine": engine} if engine != "v1" else {}),
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
