@@ -39,6 +39,7 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
   - Deleting any version retires the whole lineage (a deleted fact cannot reappear as an older version): `follow=latest`/`active` hide every version, `memory_get` on one answers `not_found` with `retired: true` naming the delete ("retired by deleting #N"), `follow=all` still reads it, and adding a `supersedes` edge to a retired id does not restore it.
   - `memory_absorb` never supersedes an item record (`metadata.kind = "item-record"` or tag `item-record`): the fact is written and linked `related_to` instead. Todos and issues are protected by the type boundary (a plain fact never supersedes a typed one).
 - 🗞️ **Topic Digest** - `memory_digest(topic)` bundles relevant memories, open TODOs/issues, related edges, and source IDs into one retrieval
+- 🎯 **Brief Context** - `memory_context(query, project=...)` is one call at the start of a brief or decision: the newest active project digest plus up to 25 compact hits in retrieval v2 order within a character budget; then `memory_get` for the full content of the few that matter
 
 **Search & Intelligence**
 - 🔍 **Semantic Search** - Vector embeddings (TF-IDF, sentence-transformers, OpenAI)
@@ -299,7 +300,7 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_PORT`          | Bind port for HTTP transports (default `8000`). Overridable with `--port`. |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
 | `MEMORA_TRANSPORT`     | `stdio` (default), `sse`, or `streamable-http`. An unknown **env** value falls back to `stdio`; `--transport` still rejects unknown values. Multi-database routing and the session guard run only on `streamable-http`. |
-| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 44), `leader` (19), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
+| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 45), `leader` (19), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
 | `MEMORA_MAX_SESSIONS`  | Hard ceiling on concurrent MCP sessions (default `128`). `0` disables. A creation rate plus an idle timeout is not a bound — a client that keeps session ids alive can grow without limit at the creation rate. Invalid values refuse to start. Streamable-HTTP only. |
 | `MEMORA_MAX_INIT_PER_MIN` | New sessions admitted per minute (default `120`). `0` disables. Invalid values refuse to start. Streamable-HTTP only. |
 | `MEMORA_MAX_INIT_BODY_BYTES` | Maximum initialize request body accepted/buffered (default `65536`, minimum `1024`). Larger requests receive `413`. Invalid values refuse to start. Streamable-HTTP only. |
@@ -341,21 +342,21 @@ Add to `~/.codex/config.toml`:
 <details id="tool-profiles">
 <summary><big><big><strong>Tool Profiles (MEMORA_TOOL_PROFILE)</strong></big></big></summary>
 
-All 44 MCP tools register unconditionally, so every agent session is injected with the full ~12,700-token tool schema even when most tools are never called. `MEMORA_TOOL_PROFILE` exposes a subset per deployment so a gated tool is **genuinely absent** — missing from `tools/list` AND undispatchable (`call_tool` returns `unknown-tool`, not a hidden execution). The profile is applied and attested at startup; the active profile and exposed tool count are logged to stderr.
+All 45 MCP tools register unconditionally, so every agent session is injected with the full ~12,700-token tool schema even when most tools are never called. `MEMORA_TOOL_PROFILE` exposes a subset per deployment so a gated tool is **genuinely absent** — missing from `tools/list` AND undispatchable (`call_tool` returns `unknown-tool`, not a hidden execution). The profile is applied and attested at startup; the active profile and exposed tool count are logged to stderr.
 
 | Value | Tools | Use |
 |-------|-------|-----|
-| `full` (default) | all 44 | Direct stdio use; every existing deployment is byte-for-byte unchanged |
+| `full` (default) | all 45 | Direct stdio use; every existing deployment is byte-for-byte unchanged |
 | `leader` | 19 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest`, `memory_list` |
 | `agent` | 12 | The read/create surface a worker agent needs: `memory_absorb`, `memory_semantic_search`, `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`, `memory_link`, `memory_stats`, `memory_create`, `memory_create_issue`, `memory_create_todo`, `memory_update` |
 
 - **Unset / empty = `full`.** No existing deployment changes behaviour.
 - **An unknown value aborts startup** with a message naming the valid values. It never silently falls back to `full` — a typo must not re-expose destructive maintenance tools (`memory_rebuild_embeddings`, `memory_delete_batch`) to every worker. Fail closed.
 - `memory_list` is in `leader` but not `agent`. It was excluded from both while it cost 163-174s on a D1 store against `memory_list_compact`'s 0.22s; #973 fixed that (now ~1.1s). It stays out of `agent` because a worker's read surface is deliberately narrow, not for speed.
-- The leader/agent boundary is **data** in `memora/tool_profile.py` (two frozensets). Editing it is one line, not a sweep of 44 decorators.
+- The leader/agent boundary is **data** in `memora/tool_profile.py` (two frozensets). Editing it is one line, not a sweep of 45 decorators.
 - The prune deletes from FastMCP's private `_tool_manager._tools` dict, so `memora` pins `mcp>=1.27,<1.28` (the audited minor) and runs a startup **attestation** through the low-level registered MCP request handlers (`_mcp_server.request_handlers[ListToolsRequest]` / `[CallToolRequest]` — the actual dispatch callable real client requests use, not the `FastMCP.list_tools` / `call_tool` Python helpers) that refuses to start if the installed SDK routes listing/dispatch elsewhere (private-implementation drift). The pin is the static guard; the attestation is the runtime backstop. Bumping the upper bound requires re-running `tests/test_tool_profile.py`.
 - Under [container deployment](#container-deployment) the profile is per *container* while roles are per *agent*. One container serving a workspace's leader and its workers needs the **leader** superset; `agent` would strip `create_section`/`store_document`/`delete`/`digest`/`tags` from the leader.
-- `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 44 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
+- `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 45 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
 
 ```bash
 # Leader deployment — exposes 19 tools
@@ -364,7 +365,7 @@ MEMORA_TOOL_PROFILE=leader memora-server
 # Agent worker — exposes 12 tools
 MEMORA_TOOL_PROFILE=agent memora-server
 
-# Full (default) — all 44 tools, existing behaviour
+# Full (default) — all 45 tools, existing behaviour
 memora-server
 
 # Typo refuses to start:

@@ -1,6 +1,6 @@
 """Tests for MEMORA_TOOL_PROFILE (memora issue #981).
 
-These tests use the REAL ``memora.server.mcp`` server, on which all 44
+These tests use the REAL ``memora.server.mcp`` server, on which all 45
 ``@mcp.tool()`` decorators have registered their tools at import time.
 Every "tool X is absent under profile agent/leader" assertion is paired
 with the SAME tool being present under ``full`` — so the assertion flips
@@ -29,7 +29,7 @@ from memora.tool_profile import (
 def _restore_tools():
     """apply_tool_profile MUTATES the global ``mcp._tool_manager._tools``
     dict (prunes gated tools). Snapshot before each test and restore after
-    so tests are independent and the global server is left with all 44."""
+    so tests are independent and the global server is left with all 45."""
     mgr = server.mcp._tool_manager
     snapshot = dict(mgr._tools)
     yield
@@ -66,8 +66,8 @@ AGENT_TOOL = "memory_absorb"
 class TestProfileCounts:
     def test_full_exposes_all_44(self, _clean_env):
         n = apply_tool_profile(server.mcp, "full")
-        assert n == 44, f"full must expose all 44 registered tools, got {n}"
-        assert _count() == 44
+        assert n == 45, f"full must expose all 45 registered tools, got {n}"
+        assert _count() == 45
 
     def test_leader_exposes_exactly_19(self, _clean_env):
         n = apply_tool_profile(server.mcp, "leader")
@@ -84,7 +84,7 @@ class TestProfileCounts:
         # direct-stdio deployments are byte-for-byte unchanged).
         assert resolve_tool_profile() == "full"
         n = apply_tool_profile(server.mcp)  # reads env (unset) -> full
-        assert n == 44, f"unset env must default to full (44), got {n}"
+        assert n == 45, f"unset env must default to full (45), got {n}"
 
 
 class TestGatedToolGenuinelyAbsent:
@@ -264,7 +264,7 @@ class TestAttestationUsesLowlevelHandlers:
 
     def test_listing_drift_fails_closed(self, _clean_env, monkeypatch):
         # Drift via the LOWLEVEL handler: the registered ListToolsRequest
-        # handler ignores the prune and returns all 44 names. The
+        # handler ignores the prune and returns all 45 names. The
         # attestation must catch the mismatch and raise.
         snap = dict(server.mcp._tool_manager._tools)
         all_names = frozenset(snap.keys())
@@ -290,7 +290,7 @@ class TestAttestationUsesLowlevelHandlers:
     def test_dispatch_drift_fails_closed(self, _clean_env, monkeypatch):
         # REAL drift shape: the lowlevel ListToolsRequest handler reflects
         # the prune (returns only allowed), but the lowlevel CallToolRequest
-        # handler is LEFT INTACT (all 44 dispatchable). This is the exact
+        # handler is LEFT INTACT (all 45 dispatchable). This is the exact
         # SDK-drift scenario — a future SDK that routes listing and dispatch
         # to different callables. Confirmed red at a45668a (helper-based
         # attestation did not catch this); GREEN after the lowlevel fix.
@@ -311,7 +311,7 @@ class TestAttestationUsesLowlevelHandlers:
 
         # Fake the LOWLEVEL list handler to reflect the prune; leave the
         # lowlevel call handler INTACT (dispatch through the real unpruned
-        # _tool_manager with all 44 tools).
+        # _tool_manager with all 45 tools).
         async def fake_list_handler(req):
             return ServerResult(ListToolsResult(
                 tools=[MCPTool(name=n, inputSchema={}) for n in allowed]
@@ -322,7 +322,7 @@ class TestAttestationUsesLowlevelHandlers:
             ListToolsRequest,
             fake_list_handler,
         )
-        # Do NOT prune _tools — leave all 44 dispatchable (drift).
+        # Do NOT prune _tools — leave all 45 dispatchable (drift).
         with pytest.raises(ToolProfileError, match="still dispatchable"):
             asyncio.run(_attest_tool_profile(server.mcp, "agent", allowed, gated_probe))
         server.mcp._tool_manager._tools.clear()
@@ -442,7 +442,7 @@ class TestAttestationUsesLowlevelHandlers:
         assert apply_tool_profile(server.mcp, "leader") == 19
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
-        assert apply_tool_profile(server.mcp, "full") == 44
+        assert apply_tool_profile(server.mcp, "full") == 45
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
 
@@ -484,7 +484,7 @@ class TestNoSafeProbeFailsClosed:
         # `full` is the only legitimate no-gated-probe case: no gated tools
         # exist, so no probe is needed. apply_tool_profile must NOT raise.
         snap = dict(server.mcp._tool_manager._tools)
-        assert apply_tool_profile(server.mcp, "full") == 44  # all kept, no gated
+        assert apply_tool_profile(server.mcp, "full") == 45  # all kept, no gated
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
 

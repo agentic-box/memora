@@ -12,6 +12,10 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## Unreleased
+
+- **`memory_context` (Item 263): one call for the context of a brief or decision.** Returns the newest active project digest (`metadata.kind="digest"`, full content or a prefix of at most half the budget; `null` when there is none) and up to `limit` (default 25) compact hits in retrieval v2 rank order, each `{id, score, preview, tags, created_at, item?}`, within `budget_chars` (default 12000; hits stop before the next would overflow and `truncated` is true). Digest memories are never in `hits`. Same filters as `memory_hybrid_search`. Call it once at the start of a brief or decision, then `memory_get` for the full content of the hits that matter. Read-ledgered. Registered under the `full` tool profile only; adding it to `leader`/`agent` is a separate change.
+
 ## 0.5.7.14 — 2026-11-09
 
 - **Retrieval v2 is the default search (Items 260 and 262).** `memory_hybrid_search` now defaults to `engine="v2"`: a bm25-ranked OR keyword leg, exact lookup of identifiers in the query (Item N, ids, paths, snake_case/camelCase names, SHAs, versions) and the dense leg, fused by weighted RRF. On the hard query set R@10 rose from 0.49 to 0.76. `engine="v1"` stays available and unchanged. The result shape is the same (`{score, memory}`); `score` is now the v2 fused ranking value (about 0 to 0.2, only meaningful for ordering within a response), and `semantic_weight` is ignored by v2. `memory_digest`, the `memora search` CLI command and `memora-tidy-eval` read through v2 too. Still on v1, by design: write-path similarity (absorb dedup, supersede checks, crossref linking); `memory_semantic_search`; the `/v1/search` REST endpoint (its byte-frozen contract fixes `mode: "hybrid-v1"` and cosine as the relevance signal, so v2 there needs a new contract version), which also serves any client reading through it; and the graph UI chat (`multi_query_hybrid_search`, which needs a multi-query v2 design).

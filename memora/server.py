@@ -470,6 +470,19 @@ def _list_memories(
     )
 
 
+@_with_connection(profile=True)
+def _newest_active_digest(conn, project: str):
+    """The newest active digest memory of a project (metadata.kind="digest",
+    metadata.project=project), or None."""
+    rows = list_memories(
+        conn, None, {"kind": "digest", "project": project}, 20, 0,
+        None, None, None, None, None, follow="active",
+    )
+    if not rows:
+        return None
+    return max(rows, key=lambda m: (m.get("created_at") or "", m.get("id") or 0))
+
+
 @_with_connection(writes=True)
 def _boost_memory(conn, memory_id: int, boost_amount: float):
     return boost_memory(conn, memory_id, boost_amount)
@@ -2510,6 +2523,134 @@ async def memory_hybrid_search(
     response["results"] = results
     response["profile"] = _last_call_profile()
     return response
+
+
+@mcp.tool()
+@_read_ledgered("memory_context")
+async def memory_context(
+    query: str,
+    project: Optional[str] = None,
+    limit: int = 25,
+    budget_chars: int = 12000,
+    preview_chars: int = 400,
+    include_digest: bool = True,
+    follow: Optional[str] = "active",
+    tags_any: Optional[List[str]] = None,
+    tags_all: Optional[List[str]] = None,
+    tags_none: Optional[List[str]] = None,
+    metadata_filters: Optional[Dict[str, Any]] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> Dict[str, Any]:
+    """One call that returns the context for a brief or a decision: the project
+    digest plus up to ``limit`` compact search hits, within a character budget.
+
+    Intended use: call once at the start of a brief or decision, then
+    ``memory_get`` for the full content of the few hits that matter. Hits come
+    in retrieval v2 rank order (the ``memory_hybrid_search`` default engine);
+    digest memories (metadata.kind="digest") are left out of ``hits`` because
+    the newest active digest of the project is returned separately.
+
+    Args:
+        query: What the context is for (the brief text or the decision question).
+        project: Project for the digest. Default: resolved from metadata_filters
+            or the tags, when exactly one configured project is named.
+        limit: Maximum hits, 1-100 (default 25).
+        budget_chars: Character budget for the digest plus all hit previews,
+            at least 1000 (default 12000). Hits stop when the next would
+            exceed it and ``truncated`` is true.
+        preview_chars: Characters per hit preview, at least 80 (default 400),
+            whitespace-collapsed.
+        include_digest: Return the project digest (default True). Its full
+            content, or a prefix of at most half the budget.
+        follow: Lineage mode, default ``active`` (as memory_hybrid_search).
+        tags_any, tags_all, tags_none, metadata_filters, date_from, date_to:
+            Filters, as memory_hybrid_search.
+
+    Returns:
+        ``{digest: {id, content, created_at} | null, hits: [{id, score, preview,
+        tags, created_at, item?}], truncated, budget_used, query}``. ``item`` is
+        metadata.item when present. ``budget_used`` counts the digest content
+        and the previews. No digest is ``null``, never an error.
+    """
+    query = (query or "").strip()
+    if not query:
+        return {"error": "invalid_input", "message": "query must not be empty"}
+    if limit < 1:
+        return {"error": "invalid_input", "message": "limit must be >= 1"}
+    if limit > 100:
+        return {"error": "invalid_input", "message": "limit must be <= 100"}
+    if budget_chars < 1000:
+        return {"error": "invalid_input", "message": "budget_chars must be >= 1000"}
+    if preview_chars < 80:
+        return {"error": "invalid_input", "message": "preview_chars must be >= 80"}
+    try:
+        effective_follow = resolve_follow(follow, default=DEFAULT_FOLLOW_LIST)
+    except ValueError as exc:
+        return {"error": "invalid_follow", "message": str(exc)}
+    try:
+        resolved_project = storage_resolve_project(
+            project, tags_all or tags_any or [], metadata_filters, strict=False
+        )
+    except Exception as exc:
+        return {"error": "invalid_input", "message": str(exc)}
+
+    try:
+        # Digests are filtered out below, so over-fetch by a small margin.
+        raw = await _hybrid_search(
+            query, 0.6, min(limit + 10, 110), 0.0, metadata_filters,
+            date_from, date_to, tags_any, tags_all, tags_none,
+            follow=effective_follow, engine="v2",
+        )
+        digest_row = None
+        if include_digest and resolved_project:
+            digest_row = await _newest_active_digest(resolved_project)
+    except ValueError as exc:
+        return {"error": "invalid_filters", "message": str(exc)}
+    except Exception as exc:
+        if fault := _integrity_fault_response(exc):
+            return fault
+        raise
+
+    used = 0
+    digest: Optional[Dict[str, Any]] = None
+    if digest_row is not None:
+        text = digest_row.get("content") or ""
+        cap = budget_chars // 2
+        if len(text) > cap:
+            text = text[:cap]
+        used += len(text)
+        digest = {"id": digest_row["id"], "content": text,
+                  "created_at": digest_row.get("created_at")}
+
+    hits: List[Dict[str, Any]] = []
+    noted: List[Dict[str, Any]] = []
+    truncated = False
+    for entry in raw:
+        memory = entry["memory"]
+        meta = memory.get("metadata")
+        if isinstance(meta, dict) and meta.get("kind") == "digest":
+            continue
+        if len(hits) >= limit:
+            break
+        preview = " ".join((memory.get("content") or "").split())[:preview_chars]
+        if used + len(preview) > budget_chars:
+            truncated = True
+            break
+        used += len(preview)
+        hit: Dict[str, Any] = {
+            "id": memory["id"], "score": entry["score"], "preview": preview,
+            "tags": memory.get("tags", []), "created_at": memory.get("created_at"),
+        }
+        if isinstance(meta, dict) and meta.get("item") is not None:
+            hit["item"] = meta["item"]
+        hits.append(hit)
+        noted.append(memory)
+    if digest_row is not None:
+        noted.append(digest_row)
+    _ledger_note(noted)
+    return {"digest": digest, "hits": hits, "truncated": truncated,
+            "budget_used": used, "query": query}
 
 
 @mcp.tool()

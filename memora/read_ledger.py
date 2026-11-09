@@ -46,6 +46,7 @@ READ_TOOLS = (
     "memory_list",
     "memory_get",
     "memory_related",
+    "memory_context",
 )
 
 log = logging.getLogger("memora.read_ledger")

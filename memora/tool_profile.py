@@ -1,12 +1,12 @@
-"""MEMORA_TOOL_PROFILE — expose a subset of the 44 MCP tools per deployment.
+"""MEMORA_TOOL_PROFILE — expose a subset of the 45 MCP tools per deployment.
 
-All 44 tools register unconditionally via ``@mcp.tool()`` in ``server.py``.
+All 45 tools register unconditionally via ``@mcp.tool()`` in ``server.py``.
 This module prunes the registered tools down to the active profile so a
 gated tool is GENUINELY ABSENT — missing from ``tools/list`` AND
 undispatchable.
 
 Profile membership is DATA here. Editing the leader/agent boundary is a
-one-line change to the frozensets below, not a sweep of 44 decorators and
+one-line change to the frozensets below, not a sweep of 45 decorators and
 not a scatter of conditionals across the tool definitions.
 
 Profiles (see memora issue #981):
@@ -47,7 +47,7 @@ SUPPORTED PROFILED PATH
 resolves the profile BEFORE any side effect, prunes, attests, then serves.
 A direct embedder that imports ``memora.server.mcp`` and calls ``mcp.run()``
 themselves BYPASSES profiling entirely (the global ``mcp`` still holds all
-44 tools). Embedders who want profiling must call ``apply_tool_profile``
+45 tools). Embedders who want profiling must call ``apply_tool_profile``
 themselves or use ``main()``. This is deliberately not a server factory:
 the attestation must run in the same process that serves, so a factory
 that returned a pre-built server would just move the obligation, not remove it.
