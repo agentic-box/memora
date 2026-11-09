@@ -267,3 +267,43 @@ def test_engine_v2_through_the_tool_and_invalid_engine(local_db):
     assert "cosine" not in out["results"][0]
     bad = asyncio.run(server.memory_hybrid_search("x", engine="v3"))
     assert bad["error"] == "invalid_engine"
+
+
+# --- F1: filters apply before the identifier candidate cap -------------------
+
+@pytest.mark.parametrize("fts", [True, False])
+def test_identifier_filters_apply_before_the_candidate_cap(conn, monkeypatch, fts):
+    monkeypatch.setattr(retrieval, "_PER_IDENTIFIER_ROWS", 3)
+    monkeypatch.setattr(retrieval, "_FTS_MAX_ROWS", 50)
+    eligible = _mk(conn, "old note about README.md", project="memora", tags=["keep"])
+    conn.execute("UPDATE memories SET created_at = '2020-01-01 00:00:00' WHERE id = ?", (eligible,))
+    for i in range(10):  # newer, more numerous, other project / tag
+        _mk(conn, f"clmux note {i} about README.md", project="clmux", tags=["other"])
+    conn.commit()
+    if not fts:
+        conn.execute("DROP TABLE memories_fts")
+        conn.commit()
+    ident = lambda **kw: _ids(retrieval.identifier_lookup(conn, "README.md", limit=5, **kw))
+    assert ident(project="memora") == [eligible], "project filter beyond the raw cap"
+    assert ident(tags_all=["keep"]) == [eligible], "tag filter beyond the raw cap"
+    assert ident(date_to="2021-01-01") == [eligible], "date filter beyond the raw cap"
+    assert ident(project="memora", tags_all=["keep"], date_to="2021-01-01") == [eligible]
+    assert len(ident()) == 3, "unfiltered still honours the per-identifier cap"
+
+
+def test_item_lookup_filters_apply_before_the_cap(conn, monkeypatch):
+    monkeypatch.setattr(retrieval, "_PER_IDENTIFIER_ROWS", 2)
+    monkeypatch.setattr(retrieval, "_FTS_MAX_ROWS", 50)
+    eligible = _mk(conn, "record", metadata={"kind": "item-record", "item": 7}, project="memora")
+    for i in range(6):
+        _mk(conn, f"other repo record {i}", metadata={"kind": "item-record", "item": 7}, project="clmux")
+    assert _ids(retrieval.identifier_lookup(conn, "Item 7", project="memora")) == [eligible]
+
+
+def test_zero_weight_legs_are_skipped_and_knobs_validated(conn, monkeypatch):
+    _mk(conn, "somethingelse")
+    monkeypatch.setattr(storage, "semantic_search", lambda *a, **k: pytest.fail("dense ran at weight 0"))
+    retrieval.search_v2(conn, "somethingelse", dense_weight=0)
+    for bad in ({"dense_weight": float("nan")}, {"lexical_weight": -1}, {"rrf_k": 0}, {"dense_depth": 0}):
+        with pytest.raises(ValueError):
+            retrieval.search_v2(conn, "somethingelse", **bad)

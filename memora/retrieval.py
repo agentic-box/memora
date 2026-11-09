@@ -12,11 +12,15 @@ query is an OR of normalised, IDF-capped terms ranked by bm25().
 """
 from __future__ import annotations
 
+import logging
+import math
 import re
 import sqlite3
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import storage
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
 # Query normalisation
@@ -295,39 +299,46 @@ def extract_identifiers(query: str) -> Dict[str, Any]:
     }
 
 
-def _item_rowids(conn: sqlite3.Connection, n: int) -> List[int]:
+def _item_rowids(
+    conn: sqlite3.Connection, n: int, date_clause: str, date_params: List[Any], cap: int
+) -> List[int]:
     # metadata.item only (item records); never metadata.item_number, which is
     # a document-fragment plan-step number. The item may be stored as an int
     # or a numeric string.
     rows = conn.execute(
         """
-        SELECT id FROM memories
-        WHERE CASE WHEN json_valid(metadata)
-                   THEN json_extract(metadata, '$.item') END IN (?, ?)
-        ORDER BY id DESC LIMIT ?
-        """,
-        (n, str(n), _PER_IDENTIFIER_ROWS),
+        SELECT m.id FROM memories m
+        WHERE CASE WHEN json_valid(m.metadata)
+                   THEN json_extract(m.metadata, '$.item') END IN (?, ?){date_clause}
+        ORDER BY m.id DESC LIMIT ?
+        """.replace("{date_clause}", date_clause),
+        (n, str(n), *date_params, cap),
     ).fetchall()
     return [int(r[0]) for r in rows]
 
 
-def _phrase_rowids(conn: sqlite3.Connection, phrase: str, prefix: bool) -> List[int]:
+def _phrase_rowids(
+    conn: sqlite3.Connection, phrase: str, prefix: bool,
+    date_clause: str, date_params: List[Any], cap: int,
+) -> List[int]:
     if _fts_ready(conn):
         q = f'"{phrase}"' + ("*" if prefix else "")
         try:
             rows = conn.execute(
-                "SELECT rowid FROM memories_fts WHERE memories_fts MATCH ? "
-                "ORDER BY rowid DESC LIMIT ?",
-                (q, _PER_IDENTIFIER_ROWS),
+                "SELECT memories_fts.rowid FROM memories_fts "
+                "JOIN memories m ON m.id = memories_fts.rowid "
+                f"WHERE memories_fts MATCH ?{date_clause} "
+                "ORDER BY memories_fts.rowid DESC LIMIT ?",
+                (q, *date_params, cap),
             ).fetchall()
             return [int(r[0]) for r in rows]
         except sqlite3.OperationalError:
             pass
     like = f"%{phrase}%" if prefix else f"%{phrase.replace(' ', '%')}%"
     rows = conn.execute(
-        "SELECT id FROM memories WHERE content LIKE ? OR tags LIKE ? OR metadata LIKE ? "
-        "ORDER BY id DESC LIMIT ?",
-        (like, like, like, _PER_IDENTIFIER_ROWS),
+        "SELECT m.id FROM memories m WHERE (m.content LIKE ? OR m.tags LIKE ? OR m.metadata LIKE ?)"
+        f"{date_clause} ORDER BY m.id DESC LIMIT ?",
+        (like, like, like, *date_params, cap),
     ).fetchall()
     return [int(r[0]) for r in rows]
 
@@ -356,9 +367,50 @@ def identifier_lookup(
     ids = extract_identifiers(query)
     if limit <= 0:
         return []
+    date_clause, date_params = _date_clause(date_from, date_to)
+    # Date and import-pending filters are applied in the candidate SQL, before
+    # the per-identifier cap. Metadata/tag/project filters need the parsed row,
+    # so with one of them set the raw cap is the wide safety bound and the
+    # candidates are filtered in rank order below (never cap-then-filter).
+    post = _has_post_filters(metadata_filters, tags_any, tags_all, tags_none, project)
+    cap = _FTS_MAX_ROWS if post else _PER_IDENTIFIER_ROWS
     hits: Dict[int, List[int]] = {}  # memory id -> [best exactness, n matched]
 
+    # id -> filtered record (None = filtered out), shared with the final pass.
+    recs_by_id: Dict[int, Optional[Dict[str, Any]]] = {}
+
+    def eligible(rowids: List[int]) -> List[int]:
+        """Rowids (newest first) that pass every filter, at most
+        _PER_IDENTIFIER_ROWS of them. Filtering happens BEFORE the cap, so an
+        eligible row deeper than the cap's worth of raw matches is still found."""
+        if not post:
+            return rowids
+        keep: List[int] = []
+        for i in range(0, len(rowids), _IN_CHUNK):
+            chunk = [r for r in rowids[i : i + _IN_CHUNK] if r not in recs_by_id]
+            if chunk:
+                marks = ",".join("?" for _ in chunk)
+                fetched = {
+                    int(row["id"]): row
+                    for row in conn.execute(
+                        f"SELECT {_COLS} FROM memories m WHERE m.id IN ({marks}){date_clause}",
+                        (*chunk, *date_params),
+                    ).fetchall()
+                }
+                for rid in chunk:
+                    row = fetched.get(rid)
+                    got = _post_filter([row], metadata_filters, tags_any, tags_all, tags_none, project) if row is not None else []
+                    recs_by_id[rid] = got[0] if got else None
+            keep.extend(r for r in rowids[i : i + _IN_CHUNK] if recs_by_id.get(r) is not None)
+            if len(keep) >= _PER_IDENTIFIER_ROWS:
+                return keep[:_PER_IDENTIFIER_ROWS]
+        return keep
+
     def credit(rowids: Iterable[int], exact: int) -> None:
+        rowids = list(rowids)
+        if len(rowids) >= cap:
+            logger.warning("identifier lookup scanned its raw candidate bound (%d); deeper matches omitted", cap)
+        rowids = eligible(rowids)
         for rid in set(rowids):
             cur = hits.setdefault(rid, [0, 0])
             cur[0] = max(cur[0], exact)
@@ -366,7 +418,7 @@ def identifier_lookup(
 
     budget = _MAX_IDENTIFIERS
     for n in ids["items"][:budget]:
-        credit(_item_rowids(conn, n), _EXACT_META)
+        credit(_item_rowids(conn, n, date_clause, date_params, cap), _EXACT_META)
     budget -= len(ids["items"][:budget])
     if budget > 0 and ids["memory_ids"]:
         wanted = ids["memory_ids"][:budget]
@@ -375,37 +427,38 @@ def identifier_lookup(
         credit((int(r[0]) for r in found), _EXACT_META)
         budget -= len(wanted)
     for phrase in ids["phrases"][: max(budget, 0)]:
-        credit(_phrase_rowids(conn, phrase, False), _EXACT_PHRASE)
+        credit(_phrase_rowids(conn, phrase, False, date_clause, date_params, cap), _EXACT_PHRASE)
     budget -= len(ids["phrases"][: max(budget, 0)])
     for sha in ids["shas"][: max(budget, 0)]:
-        credit(_phrase_rowids(conn, sha, True), _EXACT_PHRASE)
+        credit(_phrase_rowids(conn, sha, True, date_clause, date_params, cap), _EXACT_PHRASE)
     if not hits:
         return []
 
     ranked = sorted(hits.items(), key=lambda kv: (-kv[1][0], -kv[1][1], -kv[0]))
-    date_clause, date_params = _date_clause(date_from, date_to)
-    ordered_ids = [rid for rid, _ in ranked]
-    rows_by_id: Dict[int, Any] = {}
-    for i in range(0, len(ordered_ids), _IN_CHUNK):
-        chunk = ordered_ids[i : i + _IN_CHUNK]
-        marks = ",".join("?" for _ in chunk)
-        for row in conn.execute(
-            f"SELECT {_COLS} FROM memories m WHERE m.id IN ({marks}){date_clause}",
-            (*chunk, *date_params),
-        ).fetchall():
-            rows_by_id[int(row["id"])] = row
-
     out: List[Dict[str, Any]] = []
-    for rid, (exact, count) in ranked:
-        row = rows_by_id.get(rid)
-        if row is None:
-            continue
-        recs = _post_filter([row], metadata_filters, tags_any, tags_all, tags_none, project)
-        if not recs:
-            continue
-        out.append({"memory": recs[0], "score": exact * 1000.0 + count, "matched": count})
-        if len(out) >= limit:
-            break
+    for i in range(0, len(ranked), _IN_CHUNK):
+        chunk = ranked[i : i + _IN_CHUNK]
+        need = [rid for rid, _ in chunk if rid not in recs_by_id]
+        if need:
+            marks = ",".join("?" for _ in need)
+            fetched = {
+                int(row["id"]): row
+                for row in conn.execute(
+                    f"SELECT {_COLS} FROM memories m WHERE m.id IN ({marks}){date_clause}",
+                    (*need, *date_params),
+                ).fetchall()
+            }
+            for rid in need:
+                row = fetched.get(rid)
+                got = _post_filter([row], metadata_filters, tags_any, tags_all, tags_none, project) if row is not None else []
+                recs_by_id[rid] = got[0] if got else None
+        for rid, (exact, count) in chunk:  # rank order is preserved
+            rec = recs_by_id.get(rid)
+            if rec is None:
+                continue
+            out.append({"memory": rec, "score": exact * 1000.0 + count, "matched": count})
+            if len(out) >= limit:
+                return out
     return out
 
 
@@ -470,6 +523,16 @@ def search_v2(
     fusion, as v1 does. Read-only: never writes memories, embeddings or FTS."""
     if not query or not query.strip():
         return []
+    for name, val in (
+        ("dense_weight", dense_weight), ("lexical_weight", lexical_weight),
+        ("identifier_weight", identifier_weight), ("decompose_weight", decompose_weight),
+    ):
+        if not (isinstance(val, (int, float)) and math.isfinite(val) and val >= 0):
+            raise ValueError(f"{name} must be a finite number >= 0")
+    if not (math.isfinite(rrf_k) and rrf_k > 0):
+        raise ValueError("rrf_k must be a finite number > 0")
+    if min(dense_depth, lexical_depth, identifier_depth, max_terms) < 1 or top_k < 1:
+        raise ValueError("depths, max_terms and top_k must be >= 1")
     filt = dict(
         metadata_filters=metadata_filters, date_from=date_from, date_to=date_to,
         tags_any=tags_any, tags_all=tags_all, tags_none=tags_none, project=project,
@@ -492,29 +555,33 @@ def search_v2(
             ids.append(mem["id"])
         return ids
 
-    # identifier leg first: on a score tie an exact identifier hit wins.
-    ident = identifier_lookup(conn, query, limit=identifier_depth, **filt)
-    legs.append((identifier_weight, [h["memory"]["id"] for h in ident]))
-    for h in ident:
-        memories.setdefault(h["memory"]["id"], h["memory"])
+    # A leg with weight 0 is skipped entirely (no query, no embedding call).
+    if identifier_weight > 0:
+        ident = identifier_lookup(conn, query, limit=identifier_depth, **filt)
+        legs.append((identifier_weight, [h["memory"]["id"] for h in ident]))
+        for h in ident:
+            memories.setdefault(h["memory"]["id"], h["memory"])
 
-    legs.append((dense_weight, dense(query, True)))
+    if dense_weight > 0:
+        legs.append((dense_weight, dense(query, True)))
 
-    lex = lexical_search(
-        conn, query, limit=lexical_depth, max_terms=max_terms,
-        bm25_weights=bm25_weights, **filt,
-    )
-    legs.append((lexical_weight, [h["memory"]["id"] for h in lex]))
-    for h in lex:
-        memories.setdefault(h["memory"]["id"], h["memory"])
+    if lexical_weight > 0:
+        lex = lexical_search(
+            conn, query, limit=lexical_depth, max_terms=max_terms,
+            bm25_weights=bm25_weights, **filt,
+        )
+        legs.append((lexical_weight, [h["memory"]["id"] for h in lex]))
+        for h in lex:
+            memories.setdefault(h["memory"]["id"], h["memory"])
 
-    if decompose:
+    if decompose and decompose_weight > 0 and dense_weight > 0:
         paras = _paragraphs(query, decompose_min_chars, decompose_max)
         if len(paras) >= 2:
             for p in paras:
                 legs.append((decompose_weight, dense(p, False)))
 
     scores = weighted_rrf(legs, rrf_k)
+    # Equal fused scores: newer memory (higher id) first.
     order = sorted(scores, key=lambda i: (-scores[i], -i))
     results: List[Dict[str, Any]] = []
     for mid in order:
