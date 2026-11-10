@@ -96,6 +96,19 @@ LEADER_TOOLS: frozenset[str] = AGENT_TOOLS | frozenset({
     "memory_list",
 })
 
+# reader (6): the read-only surface served on /mcp-read/<db> (Item 267).
+# Enforced per request by db_routing, not by pruning the global registry, so it
+# coexists with the process profile. Nothing that writes, and not
+# memory_context (leader-only).
+READER_TOOLS: frozenset[str] = frozenset({
+    "memory_semantic_search",
+    "memory_hybrid_search",
+    "memory_list_compact",
+    "memory_get",
+    "memory_related",
+    "memory_stats",
+})
+
 # `full` is NOT a fixed list — it is every tool actually registered on the
 # server at apply time. Adding a new ``@mcp.tool()`` therefore exposes it
 # under ``full`` automatically; reduced profiles opt in explicitly.

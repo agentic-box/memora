@@ -398,6 +398,27 @@ The binding is **sticky per MCP session**, not per request. A session opened on
 `/mcp/alpha` and reused against `/mcp/beta` still resolves to `alpha`. A client
 cannot half-switch databases mid-conversation.
 
+### Read-only endpoint (`/mcp-read`)
+
+Profiles are process-wide, so a worker cannot be made read-only by a second
+profile in the same process. `/mcp-read/<name>` (and bare `/mcp-read`, the default
+database) is the read-only twin of `/mcp/<name>`: same routing, same
+pre-session guard, same process and store, so there is still exactly one writer
+and one outbox. It is request-scoped filtering in the router and dispatch layer:
+
+- `tools/list` returns only the reader set: `memory_semantic_search`,
+  `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`,
+  `memory_stats`. `memory_context` is leader-only and is not in it.
+- `tools/call` for any other tool is refused with a JSON-RPC error
+  (`-32602`, "not available on the read-only endpoint") before the tool runs, so
+  nothing is written.
+- A session is bound to the path family it was opened on. Replaying a
+  `/mcp` session on `/mcp-read` (or the reverse) is refused with a 404.
+
+Available when serving a registry (`MEMORA_DATABASES` set). Pointing a worker
+folder's MCP configuration at `/mcp-read/<name>` is the operator's change; the
+server does not do it.
+
 Malformed configuration **refuses to start** (it does not fall through to the
 legacy database): bad JSON, a non-object, duplicate keys, an empty URI, a name
 that is not one URL path segment, or `MEMORA_DEFAULT_DB` missing/unknown when

@@ -12,6 +12,10 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.17 — 2026-11-10
+
+- **Read-only MCP endpoint `/mcp-read[/<db>]` (Item 267).** Enforces "workers never write memora" in the server, not only in the skill. Same db routing, pre-session guard, process and store as `/mcp/<db>` (one writer, one D1 outbox); on this path `tools/list` returns only `READER_TOOLS` (`memory_semantic_search`, `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`, `memory_stats`) and any other `tools/call` is refused with a JSON-RPC error before it runs. A session cannot be reused across `/mcp` and `/mcp-read` (404). `/mcp` is unchanged. Registry deployments only. Switching worker folders to `/mcp-read/<store>` is the operator's change. A guard test requires every registered tool to be a reader tool or listed with a reason.
+
 ## 0.5.7.16 — 2026-11-10
 
 - **`memory_context` is now a `leader` tool (Item 266).** 0.5.7.15 shipped `memory_context` hidden by the leader/agent profiles: `memora/tool_profile.py` allow-lists tools and the new tool was in neither set, so the live `leader`-profile server pruned it. It is now in `LEADER_TOOLS` only (leader 20 tools; agent stays 12, workers do not get it). A guard test fails when a registered tool is in neither profile nor an explicit exclusion list with a reason.

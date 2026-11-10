@@ -27,6 +27,7 @@ exists to prevent.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 from typing import Any, Callable, Optional
@@ -36,10 +37,33 @@ from .storage import CURRENT_DB, DatabaseRegistryError, backend_for, default_dat
 logger = logging.getLogger("memora.db_routing")
 
 _MCP_PREFIX = "/mcp"
+_READ_PREFIX = "/mcp-read"
+_SESSION_HEADER = b"mcp-session-id"
+
+# True inside a session opened on /mcp-read (Item 267). Like CURRENT_DB it is
+# captured by the session's long-lived task at initialize, so it is sticky per
+# session. Read by the wrapped tools/list and tools/call handlers.
+READ_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "memora_read_only", default=False)
+# Ids of sessions opened on /mcp-read. A session is bound to ONE path family:
+# the router refuses a read session on /mcp and a write session on /mcp-read.
+_read_sessions: set[str] = set()
 
 
 class NotAnMcpPath(Exception):
     """The path is not under the MCP route at all; delegate it unchanged."""
+
+
+def parse_route(path: str) -> tuple[bool, Optional[str]]:
+    """(read_only, db) for /mcp[/<db>] and /mcp-read[/<db>]."""
+    try:
+        return False, parse_db_from_path(path)
+    except NotAnMcpPath:
+        pass
+    if path == _READ_PREFIX or path.startswith(_READ_PREFIX + "/"):
+        rest = path[len(_READ_PREFIX):]
+        return True, parse_db_from_path(_MCP_PREFIX + rest)
+    raise NotAnMcpPath(path)
 
 
 def parse_db_from_path(path: str) -> Optional[str]:
@@ -77,7 +101,77 @@ async def _reject(send: Callable, status: int, message: str) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def make_router(inner: Any) -> Callable:
+def _read_scoped(inner: Callable, sid: str, live_ids: Optional[Callable] = None) -> Callable:
+    """Run `inner` with READ_ONLY set, and remember the session it opens."""
+
+    async def run(scope, receive, send):
+        async def watch(message):
+            if message["type"] == "http.response.start" and not sid:
+                for k, v in message.get("headers", ()) or ():
+                    if k.lower() == _SESSION_HEADER:
+                        _read_sessions.add(v.decode("latin-1"))
+                if live_ids is not None and len(_read_sessions) > 256:
+                    _read_sessions.intersection_update(live_ids())
+            await send(message)
+
+        token = READ_ONLY.set(True)
+        try:
+            await inner(scope, receive, watch)
+        finally:
+            READ_ONLY.reset(token)
+
+    return run
+
+
+def install_read_only_filter(mcp: Any) -> bool:
+    """Wrap the lowlevel tools/list and tools/call handlers (idempotent).
+
+    Inside a /mcp-read session tools/list returns only READER_TOOLS and
+    tools/call for anything else raises a JSON-RPC error BEFORE the original
+    handler (and so any tool body) runs. Outside one, READ_ONLY is False and the
+    handlers behave exactly as before. Request-scoped, one process: no second
+    server, one writer, one D1 outbox.
+    """
+    from mcp.shared.exceptions import McpError
+    from mcp.types import (CallToolRequest, ErrorData, INVALID_PARAMS,
+                           ListToolsRequest, ListToolsResult, ServerResult)
+
+    from .tool_profile import READER_TOOLS
+
+    handlers = getattr(getattr(mcp, "_mcp_server", None), "request_handlers", None)
+    if not isinstance(handlers, dict) or ListToolsRequest not in handlers \
+            or CallToolRequest not in handlers:
+        # No handlers to filter: /mcp-read must then be UNAVAILABLE, never
+        # served unfiltered (fail closed). The caller disables the route.
+        logger.error("cannot install the /mcp-read filter; the route is disabled")
+        return False
+    if getattr(handlers.get(CallToolRequest), "_memora_read_filter", False):
+        return True
+    orig_list, orig_call = handlers[ListToolsRequest], handlers[CallToolRequest]
+
+    async def list_tools(req):
+        result = await orig_list(req)
+        if not READ_ONLY.get():
+            return result
+        tools = [t for t in result.root.tools if t.name in READER_TOOLS]
+        return ServerResult(ListToolsResult(tools=tools, nextCursor=None))
+
+    async def call_tool(req):
+        if READ_ONLY.get() and req.params.name not in READER_TOOLS:
+            raise McpError(ErrorData(
+                code=INVALID_PARAMS,
+                message=f"tool {req.params.name!r} is not available on the "
+                        "read-only endpoint /mcp-read"))
+        return await orig_call(req)
+
+    call_tool._memora_read_filter = True
+    handlers[ListToolsRequest] = list_tools
+    handlers[CallToolRequest] = call_tool
+    return True
+
+
+def make_router(inner: Any, live_ids: Optional[Callable] = None,
+                read_enabled: bool = True) -> Callable:
     """Wrap FastMCP's streamable-http app with /mcp/<db> selection."""
 
     async def app(scope, receive, send):
@@ -90,16 +184,37 @@ def make_router(inner: Any) -> Callable:
 
         path = scope.get("path", "")
         try:
-            name = parse_db_from_path(path)
+            read_only, name = parse_route(path)
         except NotAnMcpPath:
             # Not an MCP path at all (/health and friends). Never guard these.
             # Not our route. Delegate unchanged rather than rewriting it.
             await inner(scope, receive, send)
             return
+        if read_only and not read_enabled:
+            await _reject(send, 404, "read-only endpoint unavailable")
+            return
+        sid = ""
+        for key, value in scope.get("headers", ()):
+            if key.lower() == _SESSION_HEADER:
+                sid = value.decode("latin-1")
+                break
+        # One session, one path family. Fail closed in BOTH directions, before
+        # anything reaches the SDK: the READ_ONLY flag is captured at
+        # initialize, so only the router can stop a write session from being
+        # replayed on /mcp-read (and a read session on /mcp, for symmetry).
+        if sid:
+            if read_only and sid not in _read_sessions:
+                await _reject(send, 404, "session not opened on this path")
+                return
+            if not read_only and sid in _read_sessions:
+                await _reject(send, 404, "session not opened on this path")
+                return
+        target = _read_scoped(inner, sid, live_ids) if read_only else inner
         if name is None:
-            # Bare /mcp: the registry default, resolved (and validated) by
-            # current_backend(). No binding to set.
-            await inner(scope, receive, send)
+            # Bare /mcp (or /mcp-read): the registry default, resolved (and
+            # validated) by current_backend(). No binding to set.
+            routed = dict(scope, path=_MCP_PREFIX, raw_path=_MCP_PREFIX.encode())
+            await target(routed, receive, send)
             return
 
         # An UNKNOWN database must fail CLOSED with a clear error, never fall
@@ -122,7 +237,7 @@ def make_router(inner: Any) -> Callable:
         routed = dict(scope, path=_MCP_PREFIX, raw_path=_MCP_PREFIX.encode())
         token = CURRENT_DB.set(name)
         try:
-            await inner(routed, receive, send)
+            await target(routed, receive, send)
         finally:
             CURRENT_DB.reset(token)
 
@@ -141,7 +256,11 @@ def routed_streamable_http_app(mcp: Any) -> Callable:
     """
     from .session_guard import guard_sessions, session_wiring
 
-    return make_router(guard_sessions(mcp.streamable_http_app(), **session_wiring(mcp)))
+    read_enabled = install_read_only_filter(mcp)
+    return make_router(
+        guard_sessions(mcp.streamable_http_app(), **session_wiring(mcp)),
+        live_ids=lambda: set(getattr(mcp.session_manager, "_server_instances", {})),
+        read_enabled=read_enabled)
 
 
 def describe_routes() -> str:
@@ -154,4 +273,4 @@ def describe_routes() -> str:
         return "single database (MEMORA_STORAGE_URI); /mcp"
     from .storage import database_registry
     names = sorted(database_registry())
-    return f"databases {names}, default={default!r}; /mcp/<name> or /mcp"
+    return f"databases {names}, default={default!r}; /mcp/<name> or /mcp; read-only /mcp-read/<name> or /mcp-read"

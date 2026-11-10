@@ -18,6 +18,7 @@ import memora.server as server
 from memora.tool_profile import (
     AGENT_TOOLS,
     LEADER_TOOLS,
+    READER_TOOLS,
     ToolProfileError,
     apply_tool_profile,
     profile_tool_names,
@@ -116,6 +117,49 @@ EXCLUDED_FROM_PROFILES = {
         "memory_export", "memory_export_graph", "memory_find_duplicates",
         "memory_hierarchy", "memory_insights", "memory_tag_hierarchy")},
 }
+
+
+# Item 267: every registered tool is either in READER_TOOLS (served read-only on
+# /mcp-read) or listed here with a reason. A new tool left unclassified fails.
+_WRITES = (
+    "memory_absorb", "memory_create", "memory_create_batch", "memory_create_issue",
+    "memory_create_section", "memory_create_todo", "memory_update", "memory_link",
+    "memory_unlink", "memory_delete", "memory_delete_batch", "memory_delete_document",
+    "memory_store_document", "memory_merge", "memory_boost", "memory_import",
+    "memory_import_sweep", "memory_migrate_images", "memory_upload_image",
+    "memory_backfill_tags", "memory_rebuild_embeddings", "memory_rebuild_crossrefs",
+    "memory_events_clear", "memory_digest", "memory_detect_supersessions",
+)
+_READS_NOT_IN_READER = (
+    "memory_context",          # leader-only by decision (Item 266)
+    "memory_list", "memory_get_document", "memory_tags", "memory_clusters",
+    "memory_export", "memory_export_graph", "memory_find_duplicates",
+    "memory_hierarchy", "memory_insights", "memory_tag_hierarchy",
+    "memory_validate_tags", "memory_verify_integrity", "memory_events_poll",
+)
+NOT_READER = {
+    **{t: "writes or mutates state" for t in _WRITES},
+    **{t: "read-only but outside the narrow worker read set" for t in _READS_NOT_IN_READER},
+}
+
+
+class TestReaderClassification:
+    def test_every_registered_tool_is_reader_or_classified(self):
+        registered = set(server.mcp._tool_manager._tools)
+        unclassified = registered - READER_TOOLS - set(NOT_READER)
+        assert not unclassified, (
+            f"unclassified for /mcp-read: {sorted(unclassified)}: add each to "
+            "READER_TOOLS or NOT_READER with a reason")
+
+    def test_reader_is_disjoint_from_not_reader_and_registered(self):
+        assert not READER_TOOLS & set(NOT_READER)
+        assert READER_TOOLS <= set(server.mcp._tool_manager._tools)
+        assert set(NOT_READER) <= set(server.mcp._tool_manager._tools)
+
+    def test_reader_has_no_writer_and_not_memory_context(self):
+        assert not READER_TOOLS & set(_WRITES)
+        assert "memory_context" not in READER_TOOLS
+        assert READER_TOOLS <= AGENT_TOOLS <= LEADER_TOOLS
 
 
 class TestEveryToolIsClassified:
