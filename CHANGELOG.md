@@ -12,6 +12,10 @@ The content was CONCATENATED rather than discarded: git tags exist for every
 version, but the GitHub releases page only carries 0.3.2 and 0.3.3, so the
 0.3.0 and 0.3.1 notes lived nowhere else. Add new releases at the top.
 
+## 0.5.7.16 — 2026-11-10
+
+- **`memory_context` is now a `leader` tool (Item 266).** 0.5.7.15 shipped `memory_context` hidden by the leader/agent profiles: `memora/tool_profile.py` allow-lists tools and the new tool was in neither set, so the live `leader`-profile server pruned it. It is now in `LEADER_TOOLS` only (leader 20 tools; agent stays 12, workers do not get it). A guard test fails when a registered tool is in neither profile nor an explicit exclusion list with a reason.
+
 ## 0.5.7.15 — 2026-11-09
 
 - **`memory_context` (Item 263): one call for the context of a brief or decision.** Returns the newest active project digest (`metadata.kind="digest"`, full content or a prefix of at most half the budget; `null` when there is none) and up to `limit` (default 25) compact hits in retrieval v2 rank order, each `{id, score, preview, tags, created_at, item?}`, within `budget_chars` (default 12000; hits stop before the next would overflow and `truncated` is true). Digest memories are never in `hits`. Same filters as `memory_hybrid_search`. Call it once at the start of a brief or decision, then `memory_get` for the full content of the hits that matter. Read-ledgered. Registered under the `full` tool profile only; adding it to `leader`/`agent` is a separate change.

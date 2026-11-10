@@ -300,7 +300,7 @@ Add to `~/.codex/config.toml`:
 | `MEMORA_PORT`          | Bind port for HTTP transports (default `8000`). Overridable with `--port`. |
 | `MEMORA_GRAPH_PORT`    | Port for the knowledge graph visualization server (default: `8765`)        |
 | `MEMORA_TRANSPORT`     | `stdio` (default), `sse`, or `streamable-http`. An unknown **env** value falls back to `stdio`; `--transport` still rejects unknown values. Multi-database routing and the session guard run only on `streamable-http`. |
-| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 45), `leader` (19), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
+| `MEMORA_TOOL_PROFILE`  | Tool subset exposed to clients: `full` (default, all 45), `leader` (20), `agent` (12). Unset/empty = `full`; an unknown value refuses to start. See [Tool Profiles](#tool-profiles). |
 | `MEMORA_MAX_SESSIONS`  | Hard ceiling on concurrent MCP sessions (default `128`). `0` disables. A creation rate plus an idle timeout is not a bound — a client that keeps session ids alive can grow without limit at the creation rate. Invalid values refuse to start. Streamable-HTTP only. |
 | `MEMORA_MAX_INIT_PER_MIN` | New sessions admitted per minute (default `120`). `0` disables. Invalid values refuse to start. Streamable-HTTP only. |
 | `MEMORA_MAX_INIT_BODY_BYTES` | Maximum initialize request body accepted/buffered (default `65536`, minimum `1024`). Larger requests receive `413`. Invalid values refuse to start. Streamable-HTTP only. |
@@ -347,7 +347,7 @@ All 45 MCP tools register unconditionally, so every agent session is injected wi
 | Value | Tools | Use |
 |-------|-------|-----|
 | `full` (default) | all 45 | Direct stdio use; every existing deployment is byte-for-byte unchanged |
-| `leader` | 19 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest`, `memory_list` |
+| `leader` | 20 | The agent set plus `memory_create_section`, `memory_store_document`, `memory_get_document`, `memory_tags`, `memory_delete`, `memory_digest`, `memory_context`, `memory_list` |
 | `agent` | 12 | The read/create surface a worker agent needs: `memory_absorb`, `memory_semantic_search`, `memory_hybrid_search`, `memory_list_compact`, `memory_get`, `memory_related`, `memory_link`, `memory_stats`, `memory_create`, `memory_create_issue`, `memory_create_todo`, `memory_update` |
 
 - **Unset / empty = `full`.** No existing deployment changes behaviour.
@@ -359,7 +359,7 @@ All 45 MCP tools register unconditionally, so every agent session is injected wi
 - `memora-server` (i.e. `memora.server.main()`) is the sole supported **profiled** serving path. A direct embedder that imports `memora.server.mcp` and calls `mcp.run()` themselves bypasses profiling entirely (the global `mcp` still holds all 45 tools); embedders who want profiling must call `apply_tool_profile` themselves or use `main()`.
 
 ```bash
-# Leader deployment — exposes 19 tools
+# Leader deployment — exposes 20 tools
 MEMORA_TOOL_PROFILE=leader memora-server
 
 # Agent worker — exposes 12 tools

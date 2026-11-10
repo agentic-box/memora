@@ -69,10 +69,10 @@ class TestProfileCounts:
         assert n == 45, f"full must expose all 45 registered tools, got {n}"
         assert _count() == 45
 
-    def test_leader_exposes_exactly_19(self, _clean_env):
+    def test_leader_exposes_exactly_20(self, _clean_env):
         n = apply_tool_profile(server.mcp, "leader")
-        assert n == 19, f"leader must expose exactly 19 tools, got {n}"
-        assert _count() == 19
+        assert n == 20, f"leader must expose exactly 20 tools, got {n}"
+        assert _count() == 20
 
     def test_agent_exposes_exactly_12(self, _clean_env):
         n = apply_tool_profile(server.mcp, "agent")
@@ -85,6 +85,54 @@ class TestProfileCounts:
         assert resolve_tool_profile() == "full"
         n = apply_tool_profile(server.mcp)  # reads env (unset) -> full
         assert n == 45, f"unset env must default to full (45), got {n}"
+
+
+class TestMemoryContextExposed:
+    """Item 266: 0.5.7.15 shipped memory_context hidden by agent/leader."""
+
+    @pytest.mark.parametrize("profile", ["leader", "full"])
+    def test_listed_and_dispatchable(self, _clean_env, profile):
+        apply_tool_profile(server.mcp, profile)
+        assert "memory_context" in _tool_names()
+        assert server.mcp._tool_manager.get_tool("memory_context") is not None
+
+    def test_absent_under_agent(self, _clean_env):
+        apply_tool_profile(server.mcp, "agent")
+        assert "memory_context" not in _tool_names()
+        assert server.mcp._tool_manager.get_tool("memory_context") is None
+
+
+# Registered tools in neither profile, each with the reason. A new tool must
+# be added to AGENT_TOOLS, LEADER_TOOLS or here, or the guard test fails.
+EXCLUDED_FROM_PROFILES = {
+    **{t: "destructive/maintenance or bulk operation: full profile only" for t in (
+        "memory_rebuild_embeddings", "memory_rebuild_crossrefs", "memory_delete_batch",
+        "memory_delete_document", "memory_merge", "memory_import", "memory_import_sweep",
+        "memory_migrate_images", "memory_backfill_tags", "memory_validate_tags",
+        "memory_verify_integrity", "memory_create_batch", "memory_unlink",
+        "memory_events_clear", "memory_boost", "memory_upload_image")},
+    **{t: "analysis/export/browse tool: full profile only" for t in (
+        "memory_clusters", "memory_detect_supersessions", "memory_events_poll",
+        "memory_export", "memory_export_graph", "memory_find_duplicates",
+        "memory_hierarchy", "memory_insights", "memory_tag_hierarchy")},
+}
+
+
+class TestEveryToolIsClassified:
+    def test_every_registered_tool_is_classified(self):
+        registered = set(server.mcp._tool_manager._tools)
+        classified = AGENT_TOOLS | LEADER_TOOLS | set(EXCLUDED_FROM_PROFILES)
+        assert registered <= classified, (
+            f"unclassified tools {sorted(registered - classified)}: add each to "
+            "AGENT_TOOLS, LEADER_TOOLS or EXCLUDED_FROM_PROFILES with a reason")
+
+    def test_exclusions_are_not_stale_or_overlapping(self):
+        registered = set(server.mcp._tool_manager._tools)
+        assert set(EXCLUDED_FROM_PROFILES) <= registered
+        assert not set(EXCLUDED_FROM_PROFILES) & LEADER_TOOLS
+
+    def test_memory_context_is_leader_only(self):
+        assert "memory_context" in LEADER_TOOLS and "memory_context" not in AGENT_TOOLS
 
 
 class TestGatedToolGenuinelyAbsent:
@@ -206,7 +254,7 @@ class TestProfileMembershipIsData:
     """The profile sets are DATA: leader is agent + 6 explicit additions;
     profile_tool_names(full) tracks the actually-registered tools."""
 
-    def test_leader_is_agent_plus_seven_additions(self):
+    def test_leader_is_agent_plus_eight_additions(self):
         assert LEADER_TOOLS - AGENT_TOOLS == frozenset({
             "memory_create_section",
             "memory_store_document",
@@ -215,6 +263,7 @@ class TestProfileMembershipIsData:
             "memory_delete",
             "memory_digest",
             "memory_list",
+            "memory_context",
         })
 
     def test_full_tracks_registered_not_a_constant(self, _clean_env):
@@ -439,7 +488,7 @@ class TestAttestationUsesLowlevelHandlers:
         assert apply_tool_profile(server.mcp, "agent") == 12
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
-        assert apply_tool_profile(server.mcp, "leader") == 19
+        assert apply_tool_profile(server.mcp, "leader") == 20
         server.mcp._tool_manager._tools.clear()
         server.mcp._tool_manager._tools.update(snap)
         assert apply_tool_profile(server.mcp, "full") == 45

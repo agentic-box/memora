@@ -13,7 +13,7 @@ Profiles (see memora issue #981):
 
 * ``full``    (default, all registered tools): every existing direct-stdio
   deployment is byte-for-byte unchanged.
-* ``leader``  (18): the agent set plus section/document/tag/delete/digest.
+* ``leader``  (20): the agent set plus section/document/tag/delete/digest.
 * ``agent``   (12): the read/create surface a worker agent needs.
 
 ``memory_list`` is in ``leader`` but not ``agent``. It was excluded from both
@@ -78,7 +78,7 @@ AGENT_TOOLS: frozenset[str] = frozenset({
     "memory_update",
 })
 
-# leader (18): agent set plus section/document/tag/delete/digest.
+# leader (20): agent set plus section/document/tag/delete/digest/context.
 LEADER_TOOLS: frozenset[str] = AGENT_TOOLS | frozenset({
     "memory_create_section",
     "memory_store_document",
@@ -86,6 +86,8 @@ LEADER_TOOLS: frozenset[str] = AGENT_TOOLS | frozenset({
     "memory_tags",
     "memory_delete",
     "memory_digest",
+    # Leader-only (Item 266): one-call brief/decision context; workers do not get it.
+    "memory_context",
     # Restored to `leader` once #973 landed: memory_list was excluded purely
     # because it cost 163-174s on a D1 store against memory_list_compact's
     # 0.22s. It is now ~1.1s. It stays OUT of `agent` -- not for speed, but
