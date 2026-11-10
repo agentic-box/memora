@@ -27,11 +27,11 @@ exists to prevent.
 """
 from __future__ import annotations
 
-import contextvars
 import json
 import logging
 from typing import Any, Callable, Optional
 
+from .tool_profile import READER_TOOLS, READ_ONLY
 from .storage import CURRENT_DB, DatabaseRegistryError, backend_for, default_database_name
 
 logger = logging.getLogger("memora.db_routing")
@@ -40,11 +40,6 @@ _MCP_PREFIX = "/mcp"
 _READ_PREFIX = "/mcp-read"
 _SESSION_HEADER = b"mcp-session-id"
 
-# True inside a session opened on /mcp-read (Item 267). Like CURRENT_DB it is
-# captured by the session's long-lived task at initialize, so it is sticky per
-# session. Read by the wrapped tools/list and tools/call handlers.
-READ_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "memora_read_only", default=False)
 # Ids of sessions opened on /mcp-read. A session is bound to ONE path family:
 # the router refuses a read session on /mcp and a write session on /mcp-read.
 _read_sessions: set[str] = set()
@@ -136,7 +131,6 @@ def install_read_only_filter(mcp: Any) -> bool:
     from mcp.types import (CallToolRequest, ErrorData, INVALID_PARAMS,
                            ListToolsRequest, ListToolsResult, ServerResult)
 
-    from .tool_profile import READER_TOOLS
 
     handlers = getattr(getattr(mcp, "_mcp_server", None), "request_handlers", None)
     if not isinstance(handlers, dict) or ListToolsRequest not in handlers \

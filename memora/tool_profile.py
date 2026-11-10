@@ -55,6 +55,7 @@ that returned a pre-built server would just move the obligation, not remove it.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 import sys
@@ -95,6 +96,11 @@ LEADER_TOOLS: frozenset[str] = AGENT_TOOLS | frozenset({
     # memory_list_compact covers it.
     "memory_list",
 })
+
+# True inside a session opened on /mcp-read (Item 267). Lives here, not in
+# db_routing, so server.py can branch on it without importing the router.
+READ_ONLY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "memora_read_only", default=False)
 
 # reader (6): the read-only surface served on /mcp-read/<db> (Item 267).
 # Enforced per request by db_routing, not by pruning the global registry, so it

@@ -5790,6 +5790,16 @@ def get_related(conn: sqlite3.Connection, memory_id: int, refresh: bool = False)
     return get_crossrefs(conn, memory_id)
 
 
+def get_related_cached(conn: sqlite3.Connection, memory_id: int) -> Tuple[bool, List[Dict[str, Any]]]:
+    """(computed, stored crossrefs): a pure read, never computes or writes.
+
+    The /mcp-read route for memory_related (Item 267). `computed` is False when
+    the memory's crossrefs were never computed; the list is then empty.
+    """
+    exists, _raw, refs = _load_crossrefs_raw(conn, memory_id)
+    return exists, refs
+
+
 def _remove_memory_from_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
     rows = conn.execute("SELECT memory_id, related FROM memories_crossrefs").fetchall()
     for row in rows:

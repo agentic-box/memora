@@ -46,6 +46,7 @@ from .storage import (
     generate_insights,
     get_crossrefs,
     get_related,
+    get_related_cached,
     project_tag,
     _resolve_project as storage_resolve_project,
     load_projects_config,
@@ -560,6 +561,11 @@ def _find_invalid_tags(conn):
 @_with_connection(writes=True, profile=True)  # May write crossrefs if refresh=True
 def _get_related(conn, memory_id: int, refresh: bool) -> List[Dict[str, Any]]:
     return get_related(conn, memory_id, refresh)
+
+
+@_with_connection(profile=True)   # writes=False: no cloud sync, no compute (Item 267)
+def _get_related_cached(conn, memory_id: int):
+    return get_related_cached(conn, memory_id)
 
 
 @_with_connection(writes=True)
@@ -2797,6 +2803,18 @@ async def memory_related(memory_id: int, refresh: bool = False) -> Dict[str, Any
     computed on read. (Before this change an empty list was recomputed on
     every call.)
     """
+
+    from .tool_profile import READ_ONLY
+
+    if READ_ONLY.get():
+        # /mcp-read: stored crossrefs only. Computing them (refresh=True, or a
+        # memory whose crossrefs were never computed) writes rows and syncs, so
+        # on the read-only endpoint neither happens: refresh is ignored and a
+        # never-computed memory returns computed=false with an empty list.
+        computed, related = await _get_related_cached(memory_id)
+        _ledger_note(related)
+        return {"id": memory_id, "related": related, "computed": computed,
+                "read_only": True, "profile": _last_call_profile()}
 
     related = await _get_related(memory_id, refresh)
     _ledger_note(related)
