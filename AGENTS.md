@@ -17,9 +17,9 @@ memora is a SQLite-backed memory server (MCP + a plain HTTP API). Read
   git checkout — run it from a worktree, never from an extracted tarball.
 - Graph UI changes (`memora/graph/**`, `memora-graph/**`) are covered by
   `memora-graph/scripts/test_ui.mjs` (the `graph-ui` CI job), not pytest.
-- Before a review request, run only the tests you added or changed. After a
-  PASS, run the targeted set plus a mutation (make each claimed test fail
-  once). See the sealed-review skill.
+- Review first, tests after: send the review request without running tests
+  first. After the PASS, run the targeted set (also on Python 3.10) and a
+  mutation (make each claimed test fail once). See the sealed-review skill.
 
 ### Touched module → test file
 
