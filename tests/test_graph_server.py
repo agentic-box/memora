@@ -1,3 +1,4 @@
+import threading
 import urllib.request
 
 import memora
@@ -414,3 +415,36 @@ def test_graph_env_above_safe_no_divergence(monkeypatch, local_db):
 
     assert eff_max == 5000
     assert eff_default == 5000
+
+
+def test_graph_api_builds_off_the_event_loop(monkeypatch, graph_server_url):
+    """/api/graph builds its payload on a worker thread, so a slow build does
+    not stall the graph server's other requests. (That the build still reads
+    the store ?db= selected is test_g1_graph's.)"""
+    import memora.graph.server as graph_server
+
+    building, release = threading.Event(), threading.Event()
+
+    def slow_graph_data(*args, **kwargs):
+        building.set()
+        release.wait(10)
+        return {"nodes": [], "edges": []}
+
+    monkeypatch.setattr(graph_server, "get_graph_data", slow_graph_data)
+    graph_status = {}
+
+    def fetch_graph():
+        with urllib.request.urlopen(f"{graph_server_url}/api/graph", timeout=15) as response:
+            graph_status["code"] = response.status
+
+    fetcher = threading.Thread(target=fetch_graph)
+    fetcher.start()
+    try:
+        assert building.wait(5)
+        # mutation: calling get_graph_data inline blocks the loop and this times out
+        with urllib.request.urlopen(f"{graph_server_url}/_graph_limit.mjs", timeout=2) as response:
+            assert response.status == 200
+    finally:
+        release.set()
+        fetcher.join(15)
+    assert graph_status["code"] == 200
